@@ -6,7 +6,7 @@ Draft order: vision statement first, then core-domain split, then context map, t
 
 ## 1. Domain Vision Statement
 
-status: to draft
+status: drafted 2026-09-19 · [vision.md](./vision.md)
 
 ## 2. Core Domain & Highlighted Core
 
