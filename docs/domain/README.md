@@ -18,7 +18,7 @@ status: to draft
 
 ## 4. Context Map + bounded-context one-pagers
 
-status: to draft
+status: drafted 2026-09-19 · context map with bounded-context cards inline · [context-map.md](./context-map.md)
 
 ## 5. Principles & Refusals
 
