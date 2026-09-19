@@ -10,7 +10,7 @@ status: drafted 2026-09-19 · [vision.md](./vision.md)
 
 ## 2. Core Domain & Highlighted Core
 
-status: to draft
+status: drafted 2026-09-19 · [core-domain.md](./core-domain.md)
 
 ## 3. Ubiquitous Language
 
