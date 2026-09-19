@@ -22,14 +22,14 @@ Schema change is the moment of risk; schemamill exists to make it boring. The pr
 ## What makes it different
 
 - **Hazard-annotated output.** Migration SQL that tells you what could hurt when you run it.
-- **Deterministic, reviewable artifacts.** The same model produces the same output; every artifact reviews like code.
+- **Deterministic, reviewable artifacts.** The same model produces the same output; every artifact — migration SQL, DDL, docs, JSON — reviews like code.
 - **Round-trip fidelity.** Import, edit, and re-export a real schema without losing meaning.
 - **Postgres-native depth first.** Engine-general in shape, PostgreSQL in depth; the dialect seam leaves room for other engines later — a direction, not a promise.
 - **Local-first.** Your schema is sensitive; the tool runs on your machine, and the model stays in one canonical place.
 
 ## Shape
 
-One domain core, two faces: a CLI for automation and scripted workflows, and a local studio — canvas, navigation, diff review — for working visually. Both surfaces are first-class; how deep each reaches in v1 is scoped in Phase C.
+One domain core, two faces: a CLI for automation and scripted workflows, and a local studio — canvas, navigation, diff review — for working visually. Both surfaces are first-class; how deep each reaches in v1 is still to be scoped.
 
 ## Direction, not promises
 
@@ -44,4 +44,4 @@ The canonical model and deterministic outputs are designed to be consumed by oth
 
 ## Open questions
 
-- V1 depth split between studio and CLI (deferred to Phase C scope).
+- V1 depth split between studio and CLI (still to be scoped).
