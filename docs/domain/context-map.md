@@ -4,7 +4,7 @@
 
 ## Contexts
 
-**schemamill** (one bounded context): the canonical schema model, import & introspection, and the change engine, delivered through the canvas studio and the CLI. Every schemamill subdomain lives inside this single context.
+**schemamill** (one bounded context): the canonical model, import & introspection, and the change engine, delivered through the canvas studio and the CLI. Every schemamill subdomain lives inside this single context.
 
 **PostgreSQL** (external, not owned): live databases and their textual forms (DDL dumps, migration files). It has its own vocabulary — catalog names, type and constraint semantics, lock modes — which schemamill never adopts.
 
