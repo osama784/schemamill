@@ -1,6 +1,6 @@
-# Phase A — core distillation
+# Domain docs index
 
-Index and checklist for the Phase A domain artifacts. Each is a one-pager and a living document, revised as the model evolves.
+Index of the domain artifacts and their status. Each is a one-pager and a living document, revised as the model evolves.
 
 Draft order: vision statement first, then core-domain split, then context map, then ubiquitous language.
 
