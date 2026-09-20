@@ -16,7 +16,7 @@ Schema change is the moment of risk; schemamill exists to make it boring. The pr
 
 1. **Design** — author tables and relationships on an interactive canvas. The canonical model is the source of truth; the canvas is one view of it.
 2. **Import** — bring in what already exists: DDL dumps or live introspection. Imported schemas become navigable, connected models rather than text.
-3. **Compare** — capture snapshots of the schema and compare them semantically: what actually changed, not which lines moved.
+3. **Compare** — capture snapshots of the model and compare them semantically: what actually changed, not which lines moved.
 4. **Ship** — export migration SQL that is deterministic, reviewable, and annotated with the hazards of applying it — lock risk, expand/contract sequencing, and similar. Applying it stays your call: schemamill never writes to your database.
 
 ## What makes it different
