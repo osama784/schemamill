@@ -1,6 +1,6 @@
 # 0005 — Framework-free core, NestJS at the server edge
 
-**Date/Status:** 2026-09-20 · proposed
+**Date/Status:** 2026-09-20 · accepted
 
 **Context:** The domain docs state that the core is framework-free and shared by every surface ([core domain](../domain/core-domain.md)). This ADR records the concrete stack boundary that follows. The core carries the semantics, and framework coupling there would tie the engine to one surface and to a framework's upgrade cycle; the CLI also exists to exercise the engine cheaply, which requires the engine to run without a server. The boundary is a deliberate shape, not an incidental arrangement.
 

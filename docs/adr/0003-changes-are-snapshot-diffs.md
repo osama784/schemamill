@@ -1,6 +1,6 @@
 # 0003 — Changes are snapshot diffs, not an accumulated migration history
 
-**Date/Status:** 2026-09-20 · proposed
+**Date/Status:** 2026-09-20 · accepted
 
 **Context:** The dominant model in this space treats accumulated migration files as the record and a database's shape as the sum of its history. That brings ordering, drift, and bookkeeping problems: the files become a second source of truth, and what actually changed is buried in line-level noise. schemamill's promise is semantic comparison — "what actually changed, not which lines moved" ([vision](../domain/vision.md)). A decision was needed on what records a change and how migration SQL is derived.
 

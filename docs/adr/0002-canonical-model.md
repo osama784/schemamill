@@ -1,6 +1,6 @@
 # 0002 — One canonical model is the source of truth
 
-**Date/Status:** 2026-09-20 · proposed
+**Date/Status:** 2026-09-20 · accepted
 
 **Context:** A schema tool can operate directly on DDL or SQL text, or let each feature keep its own partial picture of the schema. Both alternatives diverge: text-level operations compare lines instead of meaning, and features with separate representations produce incoherent diffs and plans. The domain docs already state "one canonical model" as a principle ([principles & refusals](../domain/principles-and-refusals.md)) and keep model and schema strictly apart ([CONTEXT.md](../../CONTEXT.md)). This ADR records the architectural consequence: every feature reads and writes the same representation.
 
