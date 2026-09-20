@@ -22,7 +22,7 @@ status: drafted 2026-09-19 · context map with bounded-context cards inline · [
 
 ## 5. Principles & Refusals
 
-status: to draft
+status: drafted 2026-09-20 · [principles-and-refusals.md](./principles-and-refusals.md)
 
 ---
 
