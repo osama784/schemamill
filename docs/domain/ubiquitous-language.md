@@ -9,7 +9,7 @@ The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the 
 - **The model layer** — model, schema, table, column, relationship, foreign key, snapshot, baseline, target, diff, data.
 - **Crossing the boundary** — import, introspection, DDL dump, apply.
 - **The change engine** — migration plan, migration SQL, hazard, expand/contract, round-trip fidelity.
-- **The product's shape** — safe-change loop, studio, canvas, and the two faces: studio for working visually, CLI for automation.
+- **The product's shape** — safe-change loop, studio, canvas, workspace, and the two faces: studio for working visually, CLI for automation.
 
 ## Resolved conflicts
 
@@ -20,7 +20,4 @@ The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the 
 - **model vs schema, never conflated.** The schema is the real thing in a database; the model is our representation. One canonical model only means something if these stay apart.
 - **import vs introspection, kept distinct.** Text in, or live catalog read? Different risks, different fidelity questions; the two words keep them apart.
 - **PostgreSQL in definitions, "Postgres" in prose, never "PG".** The formal name is PostgreSQL; the short form is fine in flowing text.
-
-## Open terms
-
-- **project** — how the studio and CLI organize work on disk (a folder, a workspace?). Not yet named.
+- **workspace over project / folder.** "Project" is claimed by other tools and by everyday speech for many things; "folder" names storage, not the role. A workspace is the container that organizes a user's work on disk — the unit the studio and the CLI work within. Definition in [CONTEXT.md](../../CONTEXT.md).

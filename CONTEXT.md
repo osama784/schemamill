@@ -98,3 +98,7 @@ _Avoid_: frontend, web app, UI
 **Canvas**:
 The studio's editing surface where the model is seen and shaped.
 _Avoid_: diagram, board, graph
+
+**Workspace**:
+The container that organizes a user's work on disk; the unit the studio and the CLI work within.
+_Avoid_: project, folder
