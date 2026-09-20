@@ -14,7 +14,7 @@ status: drafted 2026-09-19 · [core-domain.md](./core-domain.md)
 
 ## 3. Ubiquitous Language
 
-status: to draft
+status: drafted 2026-09-20 · [ubiquitous-language.md](./ubiquitous-language.md) · glossary: [CONTEXT.md](../../CONTEXT.md)
 
 ## 4. Context Map + bounded-context one-pagers
 
