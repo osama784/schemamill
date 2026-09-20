@@ -8,7 +8,7 @@
 
 ## Who it is for
 
-The solo or embedded backend developer who owns the schema and answers for it in production. Its author is its first user — dogfooding on a real production schema from the start.
+The solo or embedded backend developer who owns the schema and answers for it in production. Its author is its first user — dogfooding on a real production schema from the start. Company size is not the filter: the same kind of developer owns schemas in a two-person startup and inside a large engineering organization; what defines them is owning the schema and answering for it in production.
 
 ## The core domain: the safe-change loop
 
