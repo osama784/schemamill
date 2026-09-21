@@ -1,0 +1,39 @@
+{
+  "name": "@schemamill/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The schemamill command line interface.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "schemamill": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "lint": "eslint .",
+    "typecheck": "tsc -b",
+    "test": "pnpm run build && node --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@schemamill/core": "workspace:*",
+    "@schemamill/postgres": "workspace:*",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

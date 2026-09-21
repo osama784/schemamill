@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+coverage/
+pnpm-lock.yaml
+
+# Prose the maintainers own; not formatted by Prettier.
+docs/
+.agents/

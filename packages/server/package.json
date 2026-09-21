@@ -1,0 +1,35 @@
+{
+  "name": "@schemamill/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The local studio server for schemamill.",
+  "main": "./dist/main.js",
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @schemamill/core --filter @schemamill/postgres run build && vitest run"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.0.4",
+    "@nestjs/core": "^12.0.4",
+    "@nestjs/platform-express": "^12.0.4",
+    "@schemamill/core": "workspace:*",
+    "@schemamill/postgres": "workspace:*",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.3",
+    "@nestjs/testing": "^12.0.4",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}
