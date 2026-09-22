@@ -1,0 +1,254 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="t-import">
+<title id="t-import">Import — first sketch</title>
+<defs>
+<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="#1c1f23" stroke-width="1.5" opacity="0.5"/></pattern>
+<pattern id="hatchFaint" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="9" stroke="#1c1f23" stroke-width="1.1" opacity="0.2"/></pattern>
+</defs>
+<rect width="1200" height="800" fill="#f7f5f0"/>
+<g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" fill="#1c1f23">
+<text x="46.0" y="30.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1c1f23" text-anchor="start" letter-spacing="0.6">Import — first sketch</text>
+<text x="1154.0" y="30.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9b9fa4" text-anchor="end">fat marker wireframe — deliberately rough</text>
+<rect x="44.0" y="44.0" width="1112.0" height="712.0" fill="#fbfaf6" stroke="none"/>
+<path d="M42.2 44.0 C409.1 45.8 776.1 45.9 1158.6 44.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M43.3 45.1 C409.5 46.5 775.7 41.4 1157.5 42.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1156.0 42.2 C1155.6 277.1 1156.3 512.1 1156.0 758.6" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1157.1 43.3 C1156.2 277.5 1157.7 511.8 1154.9 757.5" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1157.8 756.0 C790.9 757.3 423.9 756.2 41.4 756.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1158.9 757.1 C791.2 757.9 423.5 755.9 40.3 754.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M44.0 757.8 C42.0 522.9 42.3 287.9 44.0 41.4" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M45.1 758.9 C45.5 523.2 43.2 287.5 42.9 40.3" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M44.6 80.0 C410.2 80.0 775.9 80.9 1156.0 80.0" fill="none" stroke="#9b9fa4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M72.7 61.2 C72.7 64.0 71.3 67.2 68.5 67.2 C65.7 67.2 63.3 65.0 63.3 62.2 C63.3 59.5 66.1 56.8 68.8 56.8 C71.6 56.8 72.7 58.4 72.7 61.2 " fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round"/>
+<path d="M93.5 61.8 C93.5 64.5 90.9 67.3 88.1 67.3 C85.4 67.3 82.7 64.0 82.7 61.3 C82.7 58.5 85.2 57.4 88.0 57.4 C90.7 57.4 93.5 59.0 93.5 61.8 " fill="url(#hatchFaint)" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round"/>
+<path d="M113.2 61.9 C113.2 64.7 111.0 66.4 108.3 66.4 C105.5 66.4 102.4 64.4 102.4 61.7 C102.4 58.9 105.8 56.5 108.6 56.5 C111.3 56.5 113.2 59.1 113.2 61.9 " fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round"/>
+<text x="130.0" y="68.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.0" font-weight="600" fill="#1c1f23" text-anchor="start">schemamill — import</text>
+<text x="1150.0" y="68.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9b9fa4" text-anchor="end">localhost · offline</text>
+<text x="70.0" y="104.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">Canvas</text>
+<text x="168.0" y="104.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">Snapshots</text>
+<text x="296.0" y="104.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">Compare</text>
+<text x="412.0" y="104.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">Migration plan</text>
+<path d="M44.6 112.0 C410.2 110.5 775.9 110.5 1156.0 112.0" fill="none" stroke="#9b9fa4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1150.0" y="104.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="end">workspace: shop</text>
+<path d="M44.6 148.0 C410.2 146.2 775.9 147.1 1156.0 148.0" fill="none" stroke="#9b9fa4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M44.6 706.0 C410.2 706.3 775.9 707.2 1156.0 706.0" fill="none" stroke="#9b9fa4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="46.0" y="780.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9b9fa4" text-anchor="start">shows: two ways in · read-only introspection · progress · what was skipped and flagged</text>
+<rect x="70.0" y="118.0" width="112.0" height="26.0" fill="url(#hatch)" stroke="none"/>
+<path d="M68.2 118.0 C105.1 117.2 142.1 117.4 184.6 118.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M182.0 116.2 C183.0 124.8 182.9 133.3 182.0 146.6" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M183.8 144.0 C146.9 142.7 109.9 143.8 67.4 144.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M70.0 145.8 C68.9 137.2 68.2 128.7 70.0 115.4" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="126.0" y="135.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">1 · choose</text>
+<text x="190.0" y="136.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">→</text>
+<path d="M210.2 118.0 C241.9 119.3 273.5 118.9 310.6 118.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M308.0 116.2 C306.5 124.8 309.2 133.3 308.0 146.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M309.8 144.0 C278.1 143.8 246.5 142.1 209.4 144.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M212.0 145.8 C212.4 137.2 214.0 128.7 212.0 115.4" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="260.0" y="135.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">2 · read</text>
+<text x="316.0" y="136.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">→</text>
+<path d="M336.2 118.0 C381.7 116.5 427.3 120.2 478.6 118.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M476.0 116.2 C478.0 124.8 476.4 133.3 476.0 146.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M477.8 144.0 C432.3 146.2 386.7 142.6 335.4 144.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M338.0 145.8 C338.9 137.2 340.2 128.7 338.0 115.4" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="407.0" y="135.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">3 · translate</text>
+<text x="484.0" y="136.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="400" fill="#5f6469" text-anchor="start">→</text>
+<path d="M504.2 118.0 C547.1 119.4 590.0 120.0 638.6 118.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M636.0 116.2 C635.8 124.8 633.8 133.3 636.0 146.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M637.8 144.0 C594.9 142.9 552.0 144.7 503.4 144.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M506.0 145.8 C508.2 137.2 505.4 128.7 506.0 115.4" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="571.0" y="135.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">4 · summary</text>
+<text x="644.0" y="136.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">opened from the canvas</text>
+<text x="1134.0" y="136.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="end">nothing in this flow writes to your database</text>
+<rect x="66.0" y="148.0" width="400.0" height="558.0" fill="#efece4" stroke="none"/>
+<path d="M64.2 148.0 C196.2 146.6 328.2 146.1 468.6 148.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M466.0 146.2 C466.2 330.3 467.4 514.5 466.0 708.6" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M467.8 706.0 C335.8 704.0 203.8 703.9 63.4 706.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M66.0 707.8 C64.7 523.7 64.2 339.5 66.0 145.4" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="86.0" y="182.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="600" fill="#5f6469" text-anchor="start" letter-spacing="1.8">ways in</text>
+<text x="86.0" y="216.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="600" fill="#1c1f23" text-anchor="start">Import from a DDL dump</text>
+<path d="M84.2 228.0 C117.2 228.1 150.2 226.5 188.6 228.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M85.3 229.1 C117.6 228.7 149.9 229.5 187.5 226.8" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M186.0 226.2 C187.1 234.8 186.4 243.3 186.0 256.6" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M187.3 227.3 C184.2 234.9 186.1 243.0 184.7 255.5" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M187.8 254.0 C154.8 254.7 121.8 252.2 83.4 254.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M188.9 255.1 C155.2 252.6 121.5 251.3 82.3 252.8" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M86.0 255.8 C86.9 247.2 85.6 238.7 86.0 225.4" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M87.2 256.9 C87.7 247.5 87.7 238.2 84.7 224.3" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="136.0" y="245.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">paste text</text>
+<path d="M196.2 228.0 C233.1 228.6 270.1 226.8 312.6 228.0" fill="none" stroke="#1c1f23" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M310.0 226.2 C310.9 234.8 310.4 243.3 310.0 256.6" fill="none" stroke="#1c1f23" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M311.8 254.0 C274.9 252.8 237.9 253.7 195.4 254.0" fill="none" stroke="#1c1f23" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M198.0 255.8 C198.2 247.2 199.5 238.7 198.0 225.4" fill="none" stroke="#1c1f23" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="254.0" y="245.5" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="middle">choose file…</text>
+<rect x="86.0" y="272.0" width="358.0" height="126.0" fill="#fbfaf6" stroke="none"/>
+<path d="M84.2 272.0 C202.3 270.8 320.5 272.4 446.6 272.0" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M444.0 270.2 C444.5 311.8 443.8 353.3 444.0 400.6" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M445.8 398.0 C327.7 397.0 209.5 398.8 83.4 398.0" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M86.0 399.8 C87.4 358.2 84.7 316.7 86.0 269.4" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="102.0" y="294.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">CREATE TABLE orders (</text>
+<text x="102.0" y="314.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">  id uuid PRIMARY KEY,</text>
+<text x="102.0" y="334.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">  customer_id uuid NOT NULL</text>
+<text x="102.0" y="354.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">    REFERENCES customers (id),</text>
+<text x="102.0" y="374.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">  total numeric(12,2)</text>
+<text x="102.0" y="394.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">);</text>
+<text x="86.0" y="420.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">text in — nothing is connected.</text>
+<text x="86.0" y="440.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">flagged: orders → customers —</text>
+<text x="86.0" y="456.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">customers is not in this dump</text>
+<path d="M78.6 478.0 C200.7 478.2 322.8 478.1 452.0 478.0" fill="none" stroke="#9b9fa4" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 5"/>
+<text x="86.0" y="510.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.0" font-weight="600" fill="#1c1f23" text-anchor="start">Introspect a live database</text>
+<text x="86.0" y="538.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">host</text>
+<text x="166.0" y="538.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">localhost:5432</text>
+<text x="86.0" y="558.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">database</text>
+<text x="166.0" y="558.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">shop</text>
+<text x="86.0" y="578.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">user</text>
+<text x="166.0" y="578.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">any read access</text>
+<g transform="rotate(-2 389 548)"><rect x="330" y="522" width="118" height="52" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linejoin="round"/></g>
+<g transform="rotate(-2 389 548)"><text x="389" y="545" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1c1f23" text-anchor="middle" letter-spacing="2">READ-ONLY</text><text x="389" y="563" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#5f6469" text-anchor="middle">no writes</text></g>
+<text x="86.0" y="608.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">reads: catalog only — tables · columns · keys · indexes</text>
+<text x="86.0" y="626.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">never: writes · DDL · data</text>
+<path d="M84.2 642.0 C143.6 640.8 203.0 642.3 268.6 642.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M85.3 643.1 C144.0 642.2 202.6 641.4 267.5 640.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M266.0 640.2 C265.0 649.4 268.3 658.7 266.0 672.6" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M267.3 641.3 C267.3 649.9 264.1 658.2 264.7 671.5" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M267.8 670.0 C208.4 671.6 149.0 668.3 83.4 670.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M268.9 671.1 C208.8 672.2 148.7 668.6 82.3 668.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M86.0 671.8 C84.5 662.6 85.8 653.3 86.0 639.4" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M87.2 672.9 C86.0 663.0 83.3 653.2 84.7 638.3" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="176.0" y="660.7" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.0" font-weight="400" fill="#1c1f23" text-anchor="middle">connect &amp; introspect</text>
+<path d="M85.2 687.0 C89.2 687.3 93.2 687.0 99.1 687.0" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M98.0 686.2 C97.7 689.4 97.9 692.5 98.0 697.6" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M98.8 696.5 C94.8 696.4 90.8 696.5 84.9 696.5" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M86.0 697.3 C85.7 694.1 86.7 691.0 86.0 685.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M88.0 687.0 C87.4 679.5 96.6 679.5 96.0 687.0" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round"/>
+<path d="M92.6 691.7 C92.6 692.4 93.4 692.3 92.7 692.3 C91.9 692.3 91.2 692.0 91.2 691.3 C91.2 690.6 91.5 689.3 92.2 689.3 C92.9 689.3 92.6 691.0 92.6 691.7 " fill="#1c1f23" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round"/>
+<text x="108.0" y="693.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">no write path exists</text>
+<path d="M471.2 424.0 C482.4 423.3 493.6 423.4 507.2 424.0" fill="none" stroke="#1c1f23" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M506.0 424.0 L493.0 418.0 L493.0 430.0 Z" fill="#1c1f23" stroke="none"/>
+<path d="M506.5 424.2 C501.9 422.9 498.6 418.8 492.3 417.7" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M493.0 417.4 C493.5 421.4 493.4 425.4 493.0 430.8" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M492.5 430.2 C496.7 428.0 501.5 427.3 506.7 423.7" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M811.2 424.0 C822.4 423.9 833.6 424.2 847.2 424.0" fill="none" stroke="#1c1f23" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M846.0 424.0 L833.0 418.0 L833.0 430.0 Z" fill="#1c1f23" stroke="none"/>
+<path d="M846.5 424.2 C841.9 423.0 837.6 421.0 832.3 417.7" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M833.0 417.4 C834.4 421.4 834.0 425.4 833.0 430.8" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M832.5 430.2 C836.4 427.5 841.6 427.4 846.7 423.7" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="489.0" y="400.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#9b9fa4" text-anchor="middle">to the</text>
+<text x="489.0" y="414.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#9b9fa4" text-anchor="middle">model</text>
+<text x="829.0" y="410.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#9b9fa4" text-anchor="middle">result</text>
+<rect x="512.0" y="148.0" width="294.0" height="558.0" fill="#efece4" stroke="none"/>
+<path d="M510.2 148.0 C607.2 148.0 704.2 146.2 808.6 148.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M806.0 146.2 C806.2 330.3 807.7 514.5 806.0 708.6" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M807.8 706.0 C710.8 705.7 613.8 706.3 509.4 706.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M512.0 707.8 C513.6 523.7 510.9 339.5 512.0 145.4" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="532.0" y="182.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="600" fill="#5f6469" text-anchor="start" letter-spacing="1.8">progress</text>
+<text x="532.0" y="216.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">reading: live database — PostgreSQL 17</text>
+<path d="M530.7 261.7 C531.2 263.9 534.0 263.7 535.4 266.4" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M534.8 266.3 C538.1 264.5 539.1 261.0 541.3 257.0" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="556.0" y="266.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">read the input</text>
+<text x="786.0" y="266.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5f6469" text-anchor="end">done</text>
+<path d="M530.7 291.7 C533.1 291.9 532.6 295.1 535.4 296.4" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M534.8 296.3 C536.1 293.1 538.3 290.5 541.3 287.0" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="556.0" y="296.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">translate to the model</text>
+<text x="786.0" y="296.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5f6469" text-anchor="end">done</text>
+<rect x="530.0" y="316.0" width="12.0" height="12.0" fill="url(#hatch)" stroke="none"/>
+<path d="M528.2 316.0 C532.1 314.4 536.1 317.5 544.6 316.0" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M542.0 314.2 C543.9 318.1 540.9 322.1 542.0 330.6" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M543.8 328.0 C539.9 328.5 535.9 327.2 527.4 328.0" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M530.0 329.8 C529.1 325.9 528.1 321.9 530.0 313.4" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M529.4 316.0 C533.3 316.6 537.3 316.2 542.9 316.0" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M542.0 315.4 C542.5 319.3 541.3 323.3 542.0 328.9" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M542.6 328.0 C538.7 327.4 534.7 328.5 529.1 328.0" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M530.0 328.6 C529.3 324.7 530.2 320.7 530.0 315.1" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="556.0" y="326.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">build relationships</text>
+<text x="786.0" y="326.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#5f6469" text-anchor="end">in progress</text>
+<path d="M541.1 352.3 C541.1 355.3 539.0 357.8 536.0 357.8 C532.9 357.8 530.6 355.4 530.6 352.3 C530.6 349.3 533.3 346.6 536.4 346.6 C539.4 346.6 541.1 349.2 541.1 352.3 " fill="none" stroke="#9b9fa4" stroke-width="1.7" stroke-linecap="round"/>
+<text x="556.0" y="356.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">check round-trip fidelity</text>
+<text x="786.0" y="356.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="end">waiting</text>
+<rect x="532.0" y="402.0" width="254.0" height="22.0" fill="#fbfaf6" stroke="none"/>
+<path d="M530.2 402.0 C614.0 402.2 697.8 401.5 788.6 402.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M786.0 400.2 C787.0 407.4 787.1 414.7 786.0 426.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M787.8 424.0 C704.0 423.1 620.2 424.8 529.4 424.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M532.0 425.8 C531.8 418.6 531.5 411.3 532.0 399.4" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="533.0" y="403.0" width="152.0" height="20.0" fill="url(#hatch)" stroke="none"/>
+<path d="M531.2 403.0 C581.3 403.5 631.5 403.2 687.6 403.0" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M685.0 401.2 C683.4 407.8 685.3 414.4 685.0 425.6" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M686.8 423.0 C636.7 423.6 586.5 422.3 530.4 423.0" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M533.0 424.8 C534.1 418.2 534.9 411.6 533.0 400.4" fill="none" stroke="#1c1f23" stroke-width="0.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M531.2 403.0 C581.3 402.6 631.5 403.9 687.6 403.0" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M685.0 401.2 C683.9 407.8 683.9 414.4 685.0 425.6" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M686.8 423.0 C636.7 423.8 586.5 423.3 530.4 423.0" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M533.0 424.8 C533.6 418.2 533.8 411.6 533.0 400.4" fill="none" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="532.0" y="446.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">3 of 4 steps</text>
+<text x="786.0" y="446.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="end">cancel</text>
+<path d="M524.6 480.0 C612.4 478.6 700.2 479.7 794.0 480.0" fill="none" stroke="#9b9fa4" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 5"/>
+<path d="M527.2 507.0 C531.2 507.4 535.1 507.4 541.1 507.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M540.0 506.2 C539.9 509.4 540.5 512.5 540.0 517.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M540.8 516.5 C536.8 516.7 532.9 517.3 526.9 516.5" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M528.0 517.3 C527.7 514.1 527.9 511.0 528.0 505.9" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M530.0 507.0 C529.4 499.5 538.6 499.5 538.0 507.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round"/>
+<path d="M535.9 511.2 C535.9 511.9 534.6 511.8 533.8 511.8 C533.1 511.8 532.4 512.0 532.4 511.3 C532.4 510.6 533.2 509.1 533.9 509.1 C534.6 509.1 535.9 510.4 535.9 511.2 " fill="#1c1f23" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round"/>
+<text x="550.0" y="513.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1c1f23" text-anchor="start">read-only — no writes, no DDL</text>
+<text x="532.0" y="542.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">nothing is written to your database</text>
+<text x="532.0" y="562.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">applying is your call — we only generate</text>
+<text x="532.0" y="600.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">large reads take a while;</text>
+<text x="532.0" y="618.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">safe to walk away.</text>
+<path d="M524.6 646.0 C612.4 647.0 700.2 646.2 794.0 646.0" fill="none" stroke="#9b9fa4" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 5"/>
+<text x="532.0" y="672.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">the fidelity check compares the model</text>
+<text x="532.0" y="690.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#9b9fa4" text-anchor="start">against the input — nothing is lost quietly</text>
+<rect x="852.0" y="148.0" width="302.0" height="558.0" fill="#efece4" stroke="none"/>
+<path d="M850.2 148.0 C949.8 150.1 1049.5 148.2 1156.6 148.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1154.0 146.2 C1153.4 330.3 1154.3 514.5 1154.0 708.6" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1155.8 706.0 C1056.2 705.5 956.5 704.1 849.4 706.0" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M852.0 707.8 C854.2 523.7 852.7 339.5 852.0 145.4" fill="none" stroke="#1c1f23" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="872.0" y="182.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="600" fill="#5f6469" text-anchor="start" letter-spacing="1.8">read summary</text>
+<text x="872.0" y="206.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">introspection — live database shop</text>
+<text x="872.0" y="232.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#1c1f23" text-anchor="start">came in</text>
+<text x="888.0" y="256.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">6 tables</text>
+<text x="888.0" y="276.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">24 columns</text>
+<text x="888.0" y="296.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">4 relationships</text>
+<text x="872.0" y="330.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#1c1f23" text-anchor="start">skipped</text>
+<text x="888.0" y="354.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">view monthly_revenue</text>
+<text x="888.0" y="374.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">trigger orders_audit</text>
+<text x="888.0" y="394.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9b9fa4" text-anchor="start">2 more objects</text>
+<text x="888.0" y="418.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">the model holds only what it</text>
+<text x="888.0" y="434.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">can represent</text>
+<text x="872.0" y="462.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#1c1f23" text-anchor="start">flagged</text>
+<text x="888.0" y="486.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">orders.status — domain type</text>
+<text x="888.0" y="502.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">widened to text; the domain's meaning</text>
+<text x="888.0" y="518.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">may not survive the round trip</text>
+<text x="888.0" y="542.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="400" fill="#1c1f23" text-anchor="start">customers.email — collation</text>
+<text x="888.0" y="558.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">not represented in the model</text>
+<text x="888.0" y="578.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9b9fa4" text-anchor="start">1 more flag — see the full report</text>
+<path d="M864.6 596.0 C955.0 595.8 1045.4 594.7 1142.0 596.0" fill="none" stroke="#9b9fa4" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 5"/>
+<path d="M870.2 612.0 C957.3 613.6 1044.4 611.5 1138.6 612.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M871.3 613.1 C957.7 611.7 1044.0 609.0 1137.5 610.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1136.0 610.2 C1138.1 620.7 1136.5 631.3 1136.0 646.6" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1137.2 611.3 C1133.7 620.9 1134.4 630.8 1134.7 645.5" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1137.8 644.0 C1050.7 643.0 963.6 643.2 869.4 644.0" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1138.9 645.1 C1051.1 645.7 963.2 645.6 868.3 642.9" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M872.0 645.8 C872.5 635.3 870.0 624.7 872.0 609.4" fill="none" stroke="#1c1f23" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M873.2 646.9 C873.0 635.6 871.9 624.3 870.7 608.3" fill="none" stroke="#1c1f23" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1004.0" y="632.7" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.0" font-weight="400" fill="#1c1f23" text-anchor="middle">open the model on the canvas</text>
+<text x="872.0" y="668.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="start">see the full report…</text>
+<path d="M868.6 673.0 C908.2 673.1 947.8 672.1 992.0 673.0" fill="none" stroke="#5f6469" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M871.2 691.0 C875.2 690.3 879.1 691.0 885.1 691.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M884.0 690.2 C884.6 693.4 883.8 696.5 884.0 701.6" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M884.8 700.5 C880.8 700.8 876.9 700.3 870.9 700.5" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M872.0 701.3 C872.4 698.1 872.2 695.0 872.0 689.9" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M874.0 691.0 C873.4 683.5 882.6 683.5 882.0 691.0" fill="none" stroke="#1c1f23" stroke-width="1.8" stroke-linecap="round"/>
+<path d="M879.4 694.5 C879.4 695.2 878.4 697.2 877.7 697.2 C877.0 697.2 876.3 695.3 876.3 694.6 C876.3 693.9 877.3 693.8 878.0 693.8 C878.7 693.8 879.4 693.7 879.4 694.5 " fill="#1c1f23" stroke="#1c1f23" stroke-width="1.4" stroke-linecap="round"/>
+<text x="894.0" y="697.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1c1f23" text-anchor="start">your database: untouched</text>
+<path d="M56.7 729.7 C57.3 731.7 59.8 731.8 61.4 734.4" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M60.8 734.3 C64.0 732.5 63.4 727.8 67.3 725.0" fill="none" stroke="#1c1f23" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76.0" y="736.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#1c1f23" text-anchor="start">done</text>
+<rect x="132.0" y="724.0" width="12.0" height="12.0" fill="url(#hatch)" stroke="none"/>
+<path d="M131.4 724.0 C135.3 724.4 139.3 724.1 144.9 724.0" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M144.0 723.4 C143.4 727.3 144.5 731.3 144.0 736.9" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M144.6 736.0 C140.7 735.7 136.7 735.3 131.1 736.0" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M132.0 736.6 C132.3 732.7 131.4 728.7 132.0 723.1" fill="none" stroke="#1c1f23" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="152.0" y="736.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#1c1f23" text-anchor="start">in progress</text>
+<path d="M264.0 730.6 C264.0 733.6 260.6 735.9 257.5 735.9 C254.5 735.9 252.0 732.5 252.0 729.5 C252.0 726.5 255.3 724.8 258.4 724.8 C261.4 724.8 264.0 727.5 264.0 730.6 " fill="none" stroke="#9b9fa4" stroke-width="1.7" stroke-linecap="round"/>
+<text x="272.0" y="736.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#1c1f23" text-anchor="start">waiting</text>
+<text x="348.0" y="736.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.0" font-weight="400" fill="#5f6469" text-anchor="start">·  skipped and flagged objects are named, never silent</text>
+<text x="1140.0" y="736.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5f6469" text-anchor="end">both paths write the model — never your database</text>
+</g>
+</svg>
