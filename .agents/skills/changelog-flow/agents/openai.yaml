@@ -1,0 +1,3 @@
+interface:
+  display_name: "Changelog Flow"
+  short_description: "Unreleased entries per change, version sections at release"
