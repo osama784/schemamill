@@ -13,11 +13,27 @@
  *   as-is. Leading comments stay in the slice because comment banners are part of the span.
  * - Positions are 1-based line/column and 0-based UTF-16 offsets. `StatementSlice.end` is
  *   exclusive: `text.slice(start.offset, end.offset) === sql`.
- * - `\r\n` counts as one line break; a lone `\r` is also treated as a line break.
- * - A `COPY … FROM stdin;` statement is consumed together with its data lines (through the
- *   terminating `\.` line) and reported as a `copy` diagnostic instead of a slice. A
- *   `COPY … TO stdout;` statement has no inline data and is emitted as an ordinary slice.
+ * - `\r\n` counts as one line break; a lone `\r` is also treated as a line break. A U+FEFF
+ *   byte-order mark counts as whitespace, so a leading BOM neither joins the first statement
+ *   nor blocks meta-command stripping.
+ * - A relation-form `COPY … FROM stdin;` statement is consumed together with its data lines
+ *   (through the terminating `\.` line) and reported as a `copy` diagnostic instead of a
+ *   slice. Here `FROM stdin` must be a bare, unquoted keyword pair outside comments; the query
+ *   form `COPY (…) …`, `COPY … TO stdout;`, `FROM 'file'`, and `FROM PROGRAM …` have no inline
+ *   data and are emitted as ordinary slices.
  * - Whitespace- and comment-only segments produce neither a slice nor a diagnostic.
+ *
+ * Known limitations:
+ * - Lexing is lexical, not grammatical. `E'…'`/`e'…'` and `U&'…'` select backslash handling
+ *   only when the prefix starts a token; a `U&'…'` literal with a custom `UESCAPE` other than
+ *   the default `\` is still scanned with backslash escapes, which can misplace a statement
+ *   boundary in pathological input.
+ * - COPY classification is likewise lexical: it recognizes the query form and a bare
+ *   `FROM stdin`, but does not validate the statement against the COPY grammar, so a malformed
+ *   COPY containing those markers is still classified by them.
+ * - Lexemes left unterminated at end of input (an unclosed string, quoted identifier, block
+ *   comment, or dollar quote) are emitted as an ordinary trailing statement and fall through
+ *   to the parser.
  *
  * This module is internal to the package and intentionally not re-exported from `index.ts`,
  * whose exports are the dialect seam; the dump importer will import it directly.
@@ -86,11 +102,6 @@ const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/
 
 const META_COMMAND = /^\\[^\s]*/;
 
-/** A relation-form COPY statement, i.e. not `COPY (query) TO …`. */
-const COPY_RELATION = /^COPY\s+(?!\()/i;
-
-const COPY_FROM_STDIN = /\bFROM\s+stdin\b/i;
-
 const IDENTIFIER = '(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)';
 
 const COPY_TARGET = new RegExp(`^COPY\\s+(${IDENTIFIER}(?:\\s*\\.\\s*${IDENTIFIER})?)`, 'i');
@@ -102,8 +113,38 @@ function isWhitespace(character: string): boolean {
     character === '\n' ||
     character === '\r' ||
     character === '\f' ||
-    character === '\v'
+    character === '\v' ||
+    character === '\uFEFF'
   );
+}
+
+/** True when `character` can start an unquoted identifier. */
+function isIdentifierStart(character: string | undefined): boolean {
+  if (character === undefined) return false;
+  if (character === '_') return true;
+  const code = character.charCodeAt(0);
+  return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) || code >= 0x80;
+}
+
+/** True when `character` can continue an unquoted identifier or number. */
+function isIdentifierCharacter(character: string | undefined): boolean {
+  if (character === undefined) return false;
+  if (character === '_' || character === '$') return true;
+  const code = character.charCodeAt(0);
+  return (
+    (code >= 0x30 && code <= 0x39) ||
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x61 && code <= 0x7a) ||
+    code >= 0x80
+  );
+}
+
+/** Reads the unquoted word starting at `from`, or `null` when no identifier starts there. */
+function readWord(text: string, from: number): string | null {
+  if (!isIdentifierStart(text[from])) return null;
+  let index = from + 1;
+  while (isIdentifierCharacter(text[index])) index += 1;
+  return text.slice(from, index);
 }
 
 function matchDollarQuoteDelimiter(text: string, index: number): string | null {
@@ -111,27 +152,60 @@ function matchDollarQuoteDelimiter(text: string, index: number): string | null {
   return DOLLAR_QUOTE.exec(text)?.[0] ?? null;
 }
 
+/** Index just past the closing `delimiter`, or the end of the text when unterminated. */
+function skipDollarQuoted(text: string, from: number, delimiter: string): number {
+  const close = text.indexOf(delimiter, from);
+  return close === -1 ? text.length : close + delimiter.length;
+}
+
 /**
- * `E'…'` / `e'…'` and `U&'…'` honor backslash escapes; a plain `'…'` does not. The prefix is
- * read from the characters immediately before the opening quote.
+ * `E'…'` / `e'…'` and `U&'…'` honor backslash escapes; a plain `'…'` does not. A prefix applies
+ * only when it starts a token: if an identifier character precedes `E`/`e` (or `U`/`u`), the
+ * letter belongs to that token and the quote opens a plain string.
  */
 function hasEscapePrefix(text: string, quoteIndex: number): boolean {
   const beforeQuote = text[quoteIndex - 1];
-  if (beforeQuote === 'E' || beforeQuote === 'e') return true;
+  if (beforeQuote === 'E' || beforeQuote === 'e') {
+    return !isIdentifierCharacter(text[quoteIndex - 2]);
+  }
   if (beforeQuote !== '&') return false;
   const beforeAmpersand = text[quoteIndex - 2];
-  return beforeAmpersand === 'U' || beforeAmpersand === 'u';
+  if (beforeAmpersand !== 'U' && beforeAmpersand !== 'u') return false;
+  return !isIdentifierCharacter(text[quoteIndex - 3]);
 }
 
-/** True when only spaces and tabs precede `index` on its line. */
+/** Index just past the quoted span starting at `quoteIndex` (a `'` or `"`), or the end. */
+function skipQuotedSpan(text: string, quoteIndex: number): number {
+  const quote = text[quoteIndex];
+  const escapes = quote === "'" && hasEscapePrefix(text, quoteIndex);
+  let index = quoteIndex + 1;
+  while (index < text.length) {
+    const character = text[index];
+    if (escapes && character === '\\') {
+      index += 2;
+      continue;
+    }
+    if (character === quote) {
+      if (text[index + 1] === quote) {
+        index += 2;
+        continue;
+      }
+      return index + 1;
+    }
+    index += 1;
+  }
+  return text.length;
+}
+
+/** True when only whitespace precedes `index` on its line. */
 function startsLine(text: string, index: number): boolean {
   let lineStart = index;
   while (lineStart > 0 && text[lineStart - 1] !== '\n' && text[lineStart - 1] !== '\r') {
     lineStart -= 1;
   }
   for (let cursor = lineStart; cursor < index; cursor += 1) {
-    const character = text[cursor];
-    if (character !== ' ' && character !== '\t') return false;
+    const character = text[cursor]!;
+    if (!isWhitespace(character)) return false;
   }
   return true;
 }
@@ -190,8 +264,55 @@ function skipTrivia(text: string, from: number, to: number): number {
   return index;
 }
 
+/**
+ * Classifies a statement head lexically. A data-carrying COPY is the relation form whose head
+ * contains a bare `FROM stdin`; comments, string literals, and quoted identifiers are skipped,
+ * and the query form `COPY (…)` is recognized before any keyword scan.
+ */
 function isCopyFromStdin(statement: string): boolean {
-  return COPY_RELATION.test(statement) && COPY_FROM_STDIN.test(statement);
+  let index = skipTrivia(statement, 0, statement.length);
+  const keyword = readWord(statement, index);
+  if (keyword === null || keyword.toUpperCase() !== 'COPY') return false;
+
+  index = skipTrivia(statement, index + keyword.length, statement.length);
+  if (statement[index] === '(') return false;
+
+  while (index < statement.length) {
+    const triviaEnd = skipTrivia(statement, index, statement.length);
+    if (triviaEnd !== index) {
+      index = triviaEnd;
+      continue;
+    }
+
+    const character = statement[index]!;
+    if (character === "'" || character === '"') {
+      index = skipQuotedSpan(statement, index);
+      continue;
+    }
+    if (character === '$') {
+      const delimiter = matchDollarQuoteDelimiter(statement, index);
+      index =
+        delimiter === null
+          ? index + 1
+          : skipDollarQuoted(statement, index + delimiter.length, delimiter);
+      continue;
+    }
+
+    const word = readWord(statement, index);
+    if (word !== null) {
+      if (word.toUpperCase() === 'FROM') {
+        const targetIndex = skipTrivia(statement, index + word.length, statement.length);
+        const target = readWord(statement, targetIndex);
+        if (target !== null && target.toUpperCase() === 'STDIN') return true;
+      }
+      index += word.length;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return false;
 }
 
 function copyConstructName(statement: string): string {

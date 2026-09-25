@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { parse } from 'libpg-query';
+
 import { preprocessDump } from './preprocess.ts';
 
 /**
@@ -98,6 +100,39 @@ test('honors backslash escapes in escape-prefixed strings', () => {
   );
 });
 
+test('reads escape prefixes only when they start a token', async () => {
+  // `date` + a plain string: the backslash is literal and the quote after it closes the string,
+  // so this is two statements, not one merged, unparseable slice.
+  const dump = String.raw`SELECT date'a\'; SELECT 2;`;
+  const { statements, diagnostics } = preprocessDump(dump);
+
+  assert.deepEqual(
+    statements.map((statement) => statement.sql),
+    [String.raw`SELECT date'a\';`, 'SELECT 2;'],
+  );
+  assert.deepEqual(diagnostics, []);
+
+  const [first] = statements;
+  assert.ok(first, 'the first statement is present');
+  const parsed = await parse(first.sql);
+  assert.equal(parsed.stmts?.length, 1, 'the first slice parses as one statement');
+
+  // `U&` likewise needs to start a token; `qU` is the identifier here.
+  const unicodeSuffix = String.raw`SELECT qU&'a\'; SELECT 3;`;
+  assert.deepEqual(
+    preprocessDump(unicodeSuffix).statements.map((statement) => statement.sql),
+    [String.raw`SELECT qU&'a\';`, 'SELECT 3;'],
+  );
+});
+
+test('still honors backslash escapes when the prefix follows an open parenthesis', () => {
+  const dump = String.raw`SELECT (E'it\'s; fine'); SELECT 2;`;
+  assert.deepEqual(
+    preprocessDump(dump).statements.map((statement) => statement.sql),
+    [String.raw`SELECT (E'it\'s; fine');`, 'SELECT 2;'],
+  );
+});
+
 test('does not treat positional parameters as dollar quotes', () => {
   const dump = `SELECT $1, $2 FROM t WHERE id = $1; SELECT 2;`;
   const { statements } = preprocessDump(dump);
@@ -105,6 +140,14 @@ test('does not treat positional parameters as dollar quotes', () => {
   assert.deepEqual(
     statements.map((statement) => statement.sql),
     ['SELECT $1, $2 FROM t WHERE id = $1;', 'SELECT 2;'],
+  );
+
+  // A scanner that treated `$1` as an open dollar-quote tag would swallow the semicolon and
+  // close only at the second `$1`, merging the two statements.
+  const repeats = preprocessDump('SELECT $1; SELECT $1;');
+  assert.deepEqual(
+    repeats.statements.map((statement) => statement.sql),
+    ['SELECT $1;', 'SELECT $1;'],
   );
 });
 
@@ -170,6 +213,33 @@ test('strips an indented meta-command line', () => {
   assert.ok(diagnostic, 'the diagnostic is present');
   assert.equal(diagnostic.name, String.raw`\connect`);
   assert.deepEqual(diagnostic.position, { offset: 2, line: 1, column: 3 });
+});
+
+test('treats a leading byte-order mark as whitespace', () => {
+  const dump = '\uFEFF\\restrict x\nSELECT 1;';
+  const { statements, diagnostics } = preprocessDump(dump);
+
+  assert.deepEqual(
+    statements.map((statement) => statement.sql),
+    ['SELECT 1;'],
+  );
+  assert.deepEqual(
+    statements.map((statement) => statement.start),
+    [{ offset: 13, line: 2, column: 1 }],
+  );
+  assert.equal(diagnostics.length, 1);
+  const [diagnostic] = diagnostics;
+  assert.ok(diagnostic, 'the diagnostic is present');
+  assert.equal(diagnostic.kind, 'psql-meta-command');
+  assert.equal(diagnostic.name, String.raw`\restrict`);
+  assert.deepEqual(diagnostic.position, { offset: 1, line: 1, column: 2 });
+
+  const leading = preprocessDump('\uFEFFSELECT 1;');
+  assert.deepEqual(
+    leading.statements.map((statement) => statement.sql),
+    ['SELECT 1;'],
+  );
+  assert.deepEqual(leading.statements[0]?.start, { offset: 1, line: 1, column: 2 });
 });
 
 test('consumes a COPY FROM stdin data block and resumes splitting after it', () => {
@@ -328,4 +398,47 @@ test('leaves a COPY TO stdout statement as an ordinary slice', () => {
     ['COPY public.users TO stdout;', 'SELECT 1;'],
   );
   assert.deepEqual(diagnostics, []);
+});
+
+test('classifies COPY heads lexically, not textually', () => {
+  const cases: ReadonlyArray<{ readonly dump: string; readonly statements: readonly string[] }> = [
+    {
+      // `from stdin` sits in a line comment, so the COPY is ordinary and both statements split.
+      dump: `COPY t TO stdout -- from stdin\n;\nSELECT 1;`,
+      statements: [`COPY t TO stdout -- from stdin\n;`, 'SELECT 1;'],
+    },
+    {
+      // `from stdin` sits in a string literal.
+      dump: `COPY t TO '/tmp/from stdin.csv';\nSELECT 1;`,
+      statements: [`COPY t TO '/tmp/from stdin.csv';`, 'SELECT 1;'],
+    },
+    {
+      // `from stdin` sits in a quoted identifier; the bare FROM targets a file.
+      dump: `COPY t ("from stdin") FROM 'file';\nSELECT 1;`,
+      statements: [`COPY t ("from stdin") FROM 'file';`, 'SELECT 1;'],
+    },
+    {
+      // The query form is recognized before any keyword scan, so the inner `FROM stdin` is inert.
+      dump: `COPY /* c */ (SELECT * FROM stdin) TO stdout;\nSELECT 1;`,
+      statements: [`COPY /* c */ (SELECT * FROM stdin) TO stdout;`, 'SELECT 1;'],
+    },
+    {
+      dump: `COPY t FROM 'file';\nSELECT 1;`,
+      statements: [`COPY t FROM 'file';`, 'SELECT 1;'],
+    },
+    {
+      dump: `COPY t FROM PROGRAM 'stdin';\nSELECT 1;`,
+      statements: [`COPY t FROM PROGRAM 'stdin';`, 'SELECT 1;'],
+    },
+  ];
+
+  for (const { dump, statements } of cases) {
+    const result = preprocessDump(dump);
+    assert.deepEqual(
+      result.statements.map((statement) => statement.sql),
+      statements,
+      dump,
+    );
+    assert.deepEqual(result.diagnostics, [], dump);
+  }
 });
