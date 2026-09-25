@@ -151,6 +151,56 @@ test('does not treat positional parameters as dollar quotes', () => {
   );
 });
 
+test('keeps dollar-quote delimiters out of identifier context', async () => {
+  const cases: ReadonlyArray<{ readonly dump: string; readonly statements: readonly string[] }> = [
+    { dump: 'SELECT x$$y; SELECT 2;', statements: ['SELECT x$$y;', 'SELECT 2;'] },
+    { dump: 'SELECT a$tag$b; SELECT 2;', statements: ['SELECT a$tag$b;', 'SELECT 2;'] },
+  ];
+
+  for (const { dump, statements } of cases) {
+    const result = preprocessDump(dump);
+    assert.deepEqual(
+      result.statements.map((statement) => statement.sql),
+      statements,
+      dump,
+    );
+    assert.deepEqual(result.diagnostics, [], dump);
+
+    for (const statement of result.statements) {
+      const parsed = await parse(statement.sql);
+      assert.equal(parsed.stmts?.length, 1, `${statement.sql} parses as one statement`);
+    }
+    const whole = await parse(dump);
+    assert.equal(whole.stmts?.length, 2, `${dump} parses as two statements`);
+  }
+});
+
+test('still opens dollar quotes after a non-identifier boundary', async () => {
+  const dump = 'SELECT $$s;$$; SELECT 2;';
+  const { statements, diagnostics } = preprocessDump(dump);
+
+  assert.deepEqual(
+    statements.map((statement) => statement.sql),
+    ['SELECT $$s;$$;', 'SELECT 2;'],
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.equal((await parse(dump)).stmts?.length, 2);
+});
+
+test('still opens dollar quotes after an all-digit token', () => {
+  // libpg-query lexes `1` and then one dollar-quoted token `$$x; SELECT 2;$$` (it reports
+  // `syntax error at or near "$$x; SELECT 2;$$"`), so the inner semicolon stays inside the
+  // dollar quote and only the final semicolon splits.
+  const dump = 'SELECT 1$$x; SELECT 2;$$; SELECT 3;';
+  const { statements, diagnostics } = preprocessDump(dump);
+
+  assert.deepEqual(
+    statements.map((statement) => statement.sql),
+    ['SELECT 1$$x; SELECT 2;$$;', 'SELECT 3;'],
+  );
+  assert.deepEqual(diagnostics, []);
+});
+
 test('strips psql meta-commands and keeps position accuracy', () => {
   const dump = [
     String.raw`\restrict abc123`,
@@ -240,6 +290,24 @@ test('treats a leading byte-order mark as whitespace', () => {
     ['SELECT 1;'],
   );
   assert.deepEqual(leading.statements[0]?.start, { offset: 1, line: 1, column: 2 });
+});
+
+test('treats a byte-order mark as whitespace, not identifier context', () => {
+  // With the BOM as whitespace, `E'…'` starts a token after it, so the backslash escape keeps the
+  // semicolon inside the string.
+  const prefixed = String.raw`SELECT` + '\uFEFF' + String.raw`E'it\'s; fine'; SELECT 2;`;
+  assert.deepEqual(
+    preprocessDump(prefixed).statements.map((statement) => statement.sql),
+    [`SELECT\uFEFFE'it\\'s; fine';`, 'SELECT 2;'],
+  );
+
+  // The BOM also breaks the identifier run, so `$$` opens a dollar quote rather than continuing
+  // the preceding word.
+  const delimited = 'SELECT x\uFEFF$$s;$$; SELECT 2;';
+  assert.deepEqual(
+    preprocessDump(delimited).statements.map((statement) => statement.sql),
+    ['SELECT x\uFEFF$$s;$$;', 'SELECT 2;'],
+  );
 });
 
 test('consumes a COPY FROM stdin data block and resumes splitting after it', () => {

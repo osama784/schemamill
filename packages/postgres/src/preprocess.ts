@@ -14,8 +14,8 @@
  * - Positions are 1-based line/column and 0-based UTF-16 offsets. `StatementSlice.end` is
  *   exclusive: `text.slice(start.offset, end.offset) === sql`.
  * - `\r\n` counts as one line break; a lone `\r` is also treated as a line break. A U+FEFF
- *   byte-order mark counts as whitespace, so a leading BOM neither joins the first statement
- *   nor blocks meta-command stripping.
+ *   byte-order mark counts as whitespace and never as an identifier character, so a leading BOM
+ *   neither joins the first statement nor blocks meta-command stripping.
  * - A relation-form `COPY … FROM stdin;` statement is consumed together with its data lines
  *   (through the terminating `\.` line) and reported as a `copy` diagnostic instead of a
  *   slice. Here `FROM stdin` must be a bare, unquoted keyword pair outside comments; the query
@@ -31,6 +31,9 @@
  * - COPY classification is likewise lexical: it recognizes the query form and a bare
  *   `FROM stdin`, but does not validate the statement against the COPY grammar, so a malformed
  *   COPY containing those markers is still classified by them.
+ * - The COPY diagnostic name is best-effort: it is the relation as written when the head starts
+ *   `COPY <relation>`, and plain `COPY` otherwise (e.g. when a comment sits between the keyword
+ *   and the relation).
  * - Lexemes left unterminated at end of input (an unclosed string, quoted identifier, block
  *   comment, or dollar quote) are emitted as an ordinary trailing statement and fall through
  *   to the parser.
@@ -118,17 +121,23 @@ function isWhitespace(character: string): boolean {
   );
 }
 
-/** True when `character` can start an unquoted identifier. */
+/**
+ * True when `character` can start an unquoted identifier. U+FEFF is deliberately excluded: this
+ * module treats a byte-order mark as whitespace everywhere, never as part of a token.
+ */
 function isIdentifierStart(character: string | undefined): boolean {
-  if (character === undefined) return false;
+  if (character === undefined || character === '\uFEFF') return false;
   if (character === '_') return true;
   const code = character.charCodeAt(0);
   return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) || code >= 0x80;
 }
 
-/** True when `character` can continue an unquoted identifier or number. */
+/**
+ * True when `character` can continue an unquoted identifier or number. U+FEFF is excluded for the
+ * same reason as in {@link isIdentifierStart}.
+ */
 function isIdentifierCharacter(character: string | undefined): boolean {
-  if (character === undefined) return false;
+  if (character === undefined || character === '\uFEFF') return false;
   if (character === '_' || character === '$') return true;
   const code = character.charCodeAt(0);
   return (
@@ -145,6 +154,18 @@ function readWord(text: string, from: number): string | null {
   let index = from + 1;
   while (isIdentifierCharacter(text[index])) index += 1;
   return text.slice(from, index);
+}
+
+/**
+ * True when the characters immediately before `index` form an identifier token. The scan runs
+ * back over identifier characters; an empty run (start of input, whitespace, or punctuation) and
+ * a purely numeric run (a number literal, not an identifier) do not count.
+ */
+function hasIdentifierBefore(text: string, index: number): boolean {
+  let from = index;
+  while (from > 0 && isIdentifierCharacter(text[from - 1])) from -= 1;
+  const token = text.slice(from, index);
+  return token.length > 0 && !/^[0-9]+$/.test(token);
 }
 
 function matchDollarQuoteDelimiter(text: string, index: number): string | null {
@@ -290,7 +311,9 @@ function isCopyFromStdin(statement: string): boolean {
       continue;
     }
     if (character === '$') {
-      const delimiter = matchDollarQuoteDelimiter(statement, index);
+      const delimiter = hasIdentifierBefore(statement, index)
+        ? null
+        : matchDollarQuoteDelimiter(statement, index);
       index =
         delimiter === null
           ? index + 1
@@ -504,7 +527,11 @@ function scanDump(text: string): RawScan {
     }
 
     if (character === '$') {
-      const delimiter = matchDollarQuoteDelimiter(text, index);
+      // `$` continues an identifier, so `x$$y` is one identifier, not an identifier followed by
+      // a `$$` dollar quote. A numeric token (`1$$x$$`) does not absorb the `$`.
+      const delimiter = hasIdentifierBefore(text, index)
+        ? null
+        : matchDollarQuoteDelimiter(text, index);
       if (delimiter !== null) {
         dollarDelimiter = delimiter;
         mode = 'dollar';
