@@ -11,6 +11,10 @@ import { parse } from 'libpg-query';
  * standard build because the JS wrapper and grammar are identical while the WASM linear memory
  * starts at 32 MiB instead of 128 MiB (both may grow up to a 1 GiB maximum).
  *
+ * The canary cannot distinguish the lowmem build from the standard build (identical wrapper and
+ * grammar, same reported grammar version); the exact catalog pin in `pnpm-workspace.yaml` is what
+ * guards the build choice.
+ *
  * Re-run from `packages/postgres` with its `node --test` script, or from the repository root with
  * `pnpm --filter @schemamill/postgres test`.
  */
@@ -63,16 +67,39 @@ test('libpg-query parses a multi-statement DDL fragment', async () => {
     'expected the primary key table constraint',
   );
 
+  const columnConstraints = (columnName: string) => {
+    const column = tableElts.find(
+      (element) => 'ColumnDef' in element && element.ColumnDef.colname === columnName,
+    );
+    assert.ok(column && 'ColumnDef' in column, `expected the ${columnName} column`);
+    return column.ColumnDef.constraints ?? [];
+  };
+  const columnConstraintTypes = (columnName: string) =>
+    columnConstraints(columnName).flatMap((constraint) =>
+      'Constraint' in constraint ? [constraint.Constraint.contype] : [],
+    );
+
   // The inline REFERENCES clause lands as a Constraint node on its column.
-  const organizationId = tableElts.find(
-    (element) => 'ColumnDef' in element && element.ColumnDef.colname === 'organization_id',
+  assert.ok(
+    columnConstraintTypes('organization_id').includes('CONSTR_FOREIGN'),
+    'expected the foreign key constraint',
   );
-  assert.ok(organizationId && 'ColumnDef' in organizationId, 'expected the organization_id column');
-  const columnConstraintTypes = (organizationId.ColumnDef.constraints ?? []).flatMap(
-    (constraint) => ('Constraint' in constraint ? [constraint.Constraint.contype] : []),
+
+  // NOT NULL and DEFAULT clauses must survive as constraints on their columns; a DEFAULT lands as
+  // a Constraint with CONSTR_DEFAULT that carries its expression. A parser regression that
+  // accepted the DDL but silently dropped either clause would otherwise go unnoticed.
+  for (const columnName of ['organization_id', 'user_id', 'role']) {
+    assert.ok(
+      columnConstraintTypes(columnName).includes('CONSTR_NOTNULL'),
+      `expected a NOT NULL constraint on ${columnName}`,
+    );
+  }
+  const roleDefault = columnConstraints('role').find(
+    (constraint) =>
+      'Constraint' in constraint && constraint.Constraint.contype === 'CONSTR_DEFAULT',
   );
   assert.ok(
-    columnConstraintTypes.includes('CONSTR_FOREIGN'),
-    'expected the foreign key constraint',
+    roleDefault && 'Constraint' in roleDefault && roleDefault.Constraint.raw_expr !== undefined,
+    'expected the DEFAULT clause on role to carry its expression',
   );
 });
