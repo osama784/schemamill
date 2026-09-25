@@ -98,8 +98,18 @@ test('libpg-query parses a multi-statement DDL fragment', async () => {
     (constraint) =>
       'Constraint' in constraint && constraint.Constraint.contype === 'CONSTR_DEFAULT',
   );
+  assert.ok(roleDefault && 'Constraint' in roleDefault, 'expected the DEFAULT clause on role');
+
+  // A string DEFAULT lands as an A_Const whose `sval` is a String wrapper. Pinning the literal
+  // text proves the value survives, not merely that some expression node was attached.
+  const defaultExpr = roleDefault.Constraint.raw_expr;
   assert.ok(
-    roleDefault && 'Constraint' in roleDefault && roleDefault.Constraint.raw_expr !== undefined,
-    'expected the DEFAULT clause on role to carry its expression',
+    defaultExpr !== undefined && 'A_Const' in defaultExpr,
+    'expected the DEFAULT expression to be a literal constant',
+  );
+  assert.equal(
+    defaultExpr.A_Const.sval?.sval,
+    'member',
+    'the DEFAULT literal value survives parsing',
   );
 });
