@@ -34,6 +34,8 @@
  * - The COPY diagnostic name is best-effort: it is the relation as written when the head starts
  *   `COPY <relation>`, and plain `COPY` otherwise (e.g. when a comment sits between the keyword
  *   and the relation).
+ * - A mid-file U+FEFF is deliberately treated as whitespace too; PostgreSQL's byte lexer would
+ *   read it as part of an identifier. This only affects corrupt dumps with an embedded BOM.
  * - Lexemes left unterminated at end of input (an unclosed string, quoted identifier, block
  *   comment, or dollar quote) are emitted as an ordinary trailing statement and fall through
  *   to the parser.
@@ -159,7 +161,7 @@ function readWord(text: string, from: number): string | null {
 /**
  * True when the characters immediately before `index` form an identifier token. The scan runs
  * back over identifier characters; an empty run (start of input, whitespace, or punctuation) and
- * a purely numeric run (a number literal, not an identifier) do not count.
+ * a run of only ASCII digits (a number literal, not an identifier) do not count.
  */
 function hasIdentifierBefore(text: string, index: number): boolean {
   let from = index;
