@@ -7,6 +7,9 @@ catalog:
   '@types/node': ^24.13.6
   eslint: ^10.11.0
   eslint-config-prettier: ^10.1.8
+  # Exact pin: the lowmem builds are prerelease versions, so a range would resolve to the
+  # standard 128 MiB WASM build instead.
+  libpg-query: 18.1.5-lowmem-32.0
   prettier: ^3.9.8
   typescript: ~6.0.3
   typescript-eslint: ^8.70.1
