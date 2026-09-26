@@ -44,12 +44,13 @@
  * whose exports are the dialect seam; the dump importer will import it directly.
  */
 
-/** A position in the dump text. 1-based line and column; 0-based UTF-16 offset. */
-export interface Position {
-  readonly offset: number;
-  readonly line: number;
-  readonly column: number;
-}
+import type { SourcePosition } from '@schemamill/core';
+
+/**
+ * A position in the dump text. Contract-identical to core's `SourcePosition`: 1-based line
+ * and column, 0-based UTF-16 offset.
+ */
+export type Position = SourcePosition;
 
 /** One SQL statement ready for parsing. `sql` includes the terminating semicolon when present. */
 export interface StatementSlice {

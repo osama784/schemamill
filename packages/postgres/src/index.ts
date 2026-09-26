@@ -8,3 +8,5 @@ export const version = '0.0.0';
 
 /** Version of the core model package this adapter is built against. */
 export const coreVersionUsed = coreVersion;
+
+export { ddlImporter, importDump } from './import.ts';
