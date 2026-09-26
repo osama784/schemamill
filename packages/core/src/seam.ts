@@ -14,7 +14,8 @@ export interface ReadResult<Model, Diagnostic> {
 
 /** DDL text → the model, plus diagnostics. Import is a translation. */
 export interface DdlImporter<Model, Diagnostic> {
-  import(ddl: string): ReadResult<Model, Diagnostic>;
+  /** Parsing a dump is an async WASM round-trip; a synchronous seam would hide pre-initialization state. */
+  import(ddl: string): Promise<ReadResult<Model, Diagnostic>>;
 }
 
 /** A read-only connection → the model, plus diagnostics. The verb is introspect. */
