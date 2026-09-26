@@ -74,6 +74,11 @@ interface PositionedDiagnostic {
   readonly diagnostic: Diagnostic;
 }
 
+/** Per-statement ALTER TABLE state: `SET DEFAULT` keywords are consumed in source order. */
+interface AlterTableContext {
+  defaultSearchFrom: number;
+}
+
 const DEFAULT_KEYWORD = 'DEFAULT';
 
 const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
@@ -263,17 +268,20 @@ function translateColumn(
     ...boundaries,
     ...constraints
       .map((constraint) => constraint.location)
-      .filter((location): location is number => location !== undefined),
-    ...(column.collClause?.location === undefined ? [] : [column.collClause.location]),
+      .filter((location): location is number => location !== undefined && location >= 0),
+    ...(column.collClause?.location === undefined || column.collClause.location < 0
+      ? []
+      : [column.collClause.location]),
   ];
 
   let type = '';
-  if (column.typeName?.location === undefined) {
+  const typeLocation = column.typeName?.location;
+  if (typeLocation === undefined || typeLocation < 0) {
     diagnostics.push(flagAttribute(statement, identity, `column type on ${place}`));
   } else {
     type = extractSourceText(
       statement.sql,
-      byteOffsetToUtf16(statement.sql, column.typeName.location),
+      byteOffsetToUtf16(statement.sql, typeLocation),
       spanBoundaries,
     );
   }
@@ -429,6 +437,7 @@ function translateAlterTable(
     return;
   }
 
+  const context: AlterTableContext = { defaultSearchFrom: 0 };
   for (const command of alter.cmds ?? []) {
     if (!('AlterTableCmd' in command)) {
       diagnostics.push(
@@ -436,7 +445,14 @@ function translateAlterTable(
       );
       continue;
     }
-    translateAlterTableCommand(statement, command.AlterTableCmd, identity, draft, diagnostics);
+    translateAlterTableCommand(
+      statement,
+      command.AlterTableCmd,
+      identity,
+      draft,
+      diagnostics,
+      context,
+    );
   }
 }
 
@@ -446,6 +462,7 @@ function translateAlterTableCommand(
   identity: string,
   draft: TableDraft,
   diagnostics: PositionedDiagnostic[],
+  context: AlterTableContext,
 ): void {
   if (
     command.subtype === 'AT_AddConstraint' &&
@@ -487,7 +504,7 @@ function translateAlterTableCommand(
   }
 
   if (command.subtype === 'AT_ColumnDefault') {
-    attachColumnDefault(statement, command, identity, draft, diagnostics);
+    attachColumnDefault(statement, command, identity, draft, diagnostics, context);
     return;
   }
 
@@ -511,9 +528,9 @@ function attachColumnDefault(
   identity: string,
   draft: TableDraft,
   diagnostics: PositionedDiagnostic[],
+  context: AlterTableContext,
 ): void {
-  const name = command.name;
-  if (name === undefined || command.def === undefined) {
+  if (command.def === undefined) {
     diagnostics.push(
       skipStatement(
         statement,
@@ -524,35 +541,31 @@ function attachColumnDefault(
     return;
   }
 
-  const column = draft.columns.find((candidate) => candidate.name === name);
-  if (column === undefined) {
+  // Anchor the expression after the keyword: AST locations for type-prefixed literals are -1
+  // and operator locations sit inside wrapping parentheses, so neither bounds the written text.
+  const startIndex = findSetDefaultExpressionStart(statement.sql, context.defaultSearchFrom);
+  if (startIndex === null) {
     diagnostics.push(
       skipStatement(
         statement,
-        `DEFAULT for unknown column ${identity}.${name}`,
-        `${identity}.${name}`,
+        `DEFAULT without a source location on ${identity}`,
+        command.name ?? identity,
       ),
     );
     return;
   }
+  context.defaultSearchFrom = startIndex;
 
-  const startByte = minNodeLocation(command.def);
-  if (startByte === undefined) {
-    diagnostics.push(
-      skipStatement(
-        statement,
-        `DEFAULT without a source location on ${identity}.${name}`,
-        `${identity}.${name}`,
-      ),
-    );
+  const name = command.name;
+  const column =
+    name === undefined ? undefined : draft.columns.find((candidate) => candidate.name === name);
+  if (name === undefined || column === undefined) {
+    const place = name === undefined ? identity : `${identity}.${name}`;
+    diagnostics.push(skipStatement(statement, `DEFAULT for unknown column ${place}`, place));
     return;
   }
 
-  const defaultText = extractSourceText(
-    statement.sql,
-    byteOffsetToUtf16(statement.sql, startByte),
-    [],
-  );
+  const defaultText = extractSourceText(statement.sql, startIndex, []);
 
   if (column.default !== undefined) {
     if (column.default !== defaultText) {
@@ -779,12 +792,17 @@ function clauseBoundaries(element: Node): readonly number[] {
   if (!('ColumnDef' in element)) return [];
   const boundaries: number[] = [];
   for (const constraint of element.ColumnDef.constraints ?? []) {
-    if ('Constraint' in constraint && constraint.Constraint.location !== undefined) {
+    if (
+      'Constraint' in constraint &&
+      constraint.Constraint.location !== undefined &&
+      constraint.Constraint.location >= 0
+    ) {
       boundaries.push(constraint.Constraint.location);
     }
   }
-  if (element.ColumnDef.collClause?.location !== undefined) {
-    boundaries.push(element.ColumnDef.collClause.location);
+  const collation = element.ColumnDef.collClause?.location;
+  if (collation !== undefined && collation >= 0) {
+    boundaries.push(collation);
   }
   return boundaries;
 }
@@ -892,6 +910,7 @@ function extractSourceText(sql: string, startIndex: number, boundaries: readonly
 function spanEndIndex(sql: string, startIndex: number, boundaries: readonly number[]): number {
   let end = terminatorIndex(sql, startIndex);
   for (const boundary of boundaries) {
+    if (boundary < 0) continue;
     const index = byteOffsetToUtf16(sql, boundary);
     if (index > startIndex && index < end) end = index;
   }
@@ -905,7 +924,7 @@ function extractDefaultText(
   boundaries: readonly number[],
 ): string | undefined {
   const keyword = constraint.location;
-  if (keyword === undefined) return undefined;
+  if (keyword === undefined || keyword < 0) return undefined;
   const startIndex = skipTrivia(sql, byteOffsetToUtf16(sql, keyword + DEFAULT_KEYWORD.length));
   return extractSourceText(sql, startIndex, boundaries);
 }
@@ -943,11 +962,9 @@ function normalizeSourceText(text: string): string {
     }
 
     if (character === '$') {
-      const delimiter = matchDollarDelimiter(text, index);
-      if (delimiter !== null) {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
         appendSpace();
-        const close = text.indexOf(delimiter, index + delimiter.length);
-        const end = close === -1 ? text.length : close + delimiter.length;
         normalized += text.slice(index, end);
         index = end;
         continue;
@@ -1014,10 +1031,9 @@ function terminatorIndex(text: string, startIndex: number): number {
       continue;
     }
     if (character === '$') {
-      const delimiter = matchDollarDelimiter(text, index);
-      if (delimiter !== null) {
-        const close = text.indexOf(delimiter, index + delimiter.length);
-        index = close === -1 ? text.length : close + delimiter.length;
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
         continue;
       }
     }
@@ -1110,6 +1126,62 @@ function matchDollarDelimiter(text: string, index: number): string | null {
   return DOLLAR_QUOTE.exec(text)?.[0] ?? null;
 }
 
+/** Index just past a dollar-quoted span starting at `index`, or `null` when none starts there. */
+function dollarQuotedEnd(text: string, index: number): number | null {
+  const delimiter = matchDollarDelimiter(text, index);
+  if (delimiter === null) return null;
+  const close = text.indexOf(delimiter, index + delimiter.length);
+  return close === -1 ? text.length : close + delimiter.length;
+}
+
+/** True when `keyword` (uppercase) sits at `index` as a whole word. */
+function isKeywordAt(text: string, index: number, keyword: string): boolean {
+  if (text.slice(index, index + keyword.length).toUpperCase() !== keyword) return false;
+  if (IDENTIFIER_CHARACTER.test(text[index - 1] ?? '')) return false;
+  return !IDENTIFIER_CHARACTER.test(text[index + keyword.length] ?? '');
+}
+
+/**
+ * Index just past the `SET DEFAULT` keyword pair at or after `from`, or `null` when there is
+ * none at or after it. Anchoring here keeps the written expression intact — including
+ * type-prefixed literals and wrapping parentheses, whose AST locations point inside the
+ * expression or are unknown.
+ */
+function findSetDefaultExpressionStart(sql: string, from: number): number | null {
+  let index = from;
+  while (index < sql.length) {
+    const character = sql[index]!;
+
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(sql, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(sql, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && sql[index + 1] === '-') {
+      index = lineCommentEnd(sql, index);
+      continue;
+    }
+    if (character === '/' && sql[index + 1] === '*') {
+      index = blockCommentEnd(sql, index);
+      continue;
+    }
+    if (isKeywordAt(sql, index, 'SET')) {
+      const defaultIndex = skipTrivia(sql, index + 'SET'.length);
+      if (isKeywordAt(sql, defaultIndex, DEFAULT_KEYWORD)) {
+        return skipTrivia(sql, defaultIndex + DEFAULT_KEYWORD.length);
+      }
+    }
+    index += 1;
+  }
+  return null;
+}
+
 function skipTrivia(text: string, from: number): number {
   let index = from;
   for (;;) {
@@ -1148,26 +1220,4 @@ function utf8ByteLength(codePoint: number): number {
   if (codePoint <= 0x7ff) return 2;
   if (codePoint <= 0xffff) return 3;
   return 4;
-}
-
-/** Minimum `location` (UTF-8 bytes) anywhere in a node subtree, or `undefined` when none. */
-function minNodeLocation(node: unknown): number | undefined {
-  let minimum: number | undefined;
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-    if (value === null || typeof value !== 'object') return;
-    const record = value as Record<string, unknown>;
-    if (
-      typeof record.location === 'number' &&
-      (minimum === undefined || record.location < minimum)
-    ) {
-      minimum = record.location;
-    }
-    for (const key of Object.keys(record)) visit(record[key]);
-  };
-  visit(node);
-  return minimum;
 }

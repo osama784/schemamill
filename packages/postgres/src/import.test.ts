@@ -358,6 +358,30 @@ test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and u
   assert.match(diagnostics[1]?.message ?? '', /conflicting DEFAULT on public\.t\.a/);
 });
 
+test('preserves type-prefixed and parenthesized SET DEFAULT expressions', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c interval, d date, e timestamp, f integer, g integer);`,
+    `ALTER TABLE public.t ALTER COLUMN c SET DEFAULT interval '1 day', ALTER COLUMN d SET DEFAULT date '2026-01-01';`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN e SET DEFAULT timestamp '2026-01-01 00:00:00';`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN f SET DEFAULT ((1 + 2)) /* keep */;`,
+    `ALTER TABLE public.t ALTER COLUMN missing SET DEFAULT 1, ALTER COLUMN g SET DEFAULT 2;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(
+    table.columns.map((column) => column.default),
+    ["interval '1 day'", "date '2026-01-01'", "timestamp '2026-01-01 00:00:00'", '((1 + 2))', '2'],
+  );
+
+  // A skipped unknown column still consumes its keyword, so the next command attaches correctly.
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t.missing' },
+  ]);
+});
+
 test('replaces a repeated CREATE TABLE wholesale', async () => {
   const dump = [
     `CREATE TABLE public.t (id integer, legacy_id integer);`,
