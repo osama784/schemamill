@@ -40,7 +40,6 @@ import type {
   ReadResult,
   ReferentialAction,
   SkipDiagnosticCode,
-  SourcePosition,
   Table,
   TableIdentity,
 } from '@schemamill/core';
@@ -55,7 +54,7 @@ import type {
 } from 'libpg-query';
 
 import { parseDump, type ParseFailure, type ParsedStatement } from './parse.ts';
-import type { Position, PreprocessDiagnostic } from './preprocess.ts';
+import type { PreprocessDiagnostic } from './preprocess.ts';
 
 /** A local, writable view of a readonly payload, used while assembling it. */
 type Mutable<Payload> = { -readonly [Key in keyof Payload]: Payload[Key] };
@@ -105,9 +104,10 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     });
   }
   for (const failure of parsed.failures) {
-    // The cursor is the most precise location the parser gave; the statement start is the fallback.
-    const position = failure.cursor ?? failure.position;
-    diagnostics.push({ offset: position.offset, diagnostic: fromParseFailure(failure, position) });
+    diagnostics.push({
+      offset: failure.cursor?.offset ?? failure.position.offset,
+      diagnostic: fromParseFailure(failure),
+    });
   }
 
   const tables = new Map<string, TableDraft>();
@@ -133,21 +133,18 @@ function fromPreprocessDiagnostic(diagnostic: PreprocessDiagnostic): Diagnostic 
     code,
     object: diagnostic.name,
     message: diagnostic.message,
-    position: toSourcePosition(diagnostic.position),
+    position: diagnostic.position,
   };
 }
 
-function fromParseFailure(failure: ParseFailure, position: Position): Diagnostic {
+function fromParseFailure(failure: ParseFailure): Diagnostic {
+  // The cursor is the most precise location the parser gave; the statement start is the fallback.
   return {
     kind: 'error',
     code: 'parse-failure',
     message: failure.message,
-    position: toSourcePosition(position),
+    position: failure.cursor ?? failure.position,
   };
-}
-
-function toSourcePosition(position: Position): SourcePosition {
-  return { offset: position.offset, line: position.line, column: position.column };
 }
 
 function translateStatement(
@@ -163,7 +160,7 @@ function translateStatement(
         kind: 'error',
         code: 'parse-failure',
         message: 'statement produced no parse tree',
-        position: toSourcePosition(statement.start),
+        position: statement.start,
       },
     });
     return;
@@ -655,7 +652,7 @@ function skipStatement(
       code: 'unsupported-statement',
       object,
       message: `skipped ${description}`,
-      position: toSourcePosition(statement.start),
+      position: statement.start,
     },
   };
 }
@@ -672,7 +669,7 @@ function flagAttribute(
       code: 'unsupported-attribute',
       object: identity,
       message: `dropped ${description} from ${identity}`,
-      position: toSourcePosition(statement.start),
+      position: statement.start,
     },
   };
 }
