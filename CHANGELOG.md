@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **PostgreSQL parser foundation** — `@schemamill/postgres` pinned `libpg-query` (PostgreSQL 18 grammar, WASM) and gained a `pg_dump`-style dump preprocessor: psql meta-commands and `COPY … FROM stdin` data blocks were skipped and named, statements were split safely around dollar quotes, comments, and escaped strings, and every statement was parsed on its own so one bad statement never sinks a dump — parse failures were reported with positions.
-- **Import dumps into the canonical model** — `@schemamill/postgres` gained `importDump`: a `pg_dump`-style dump is translated into the canonical model — tables, columns with as-written type and `DEFAULT` text, primary keys, foreign keys, schema-qualified identity — and everything outside the first-slice subset is skipped or flagged with a named, positioned diagnostic.
+- **Import dumps into the canonical model** — `@schemamill/postgres` gained `importDump`: a `pg_dump`-style dump was translated into the canonical model — tables, columns with as-written type and `DEFAULT` text, primary keys, foreign keys, schema-qualified identity — and everything outside the first-slice subset was skipped or flagged with a named, positioned diagnostic.
 
 ### Documentation
 
