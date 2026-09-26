@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **PostgreSQL parser foundation** — `@schemamill/postgres` now pins `libpg-query` (PostgreSQL 18 grammar, WASM) and can ingest `pg_dump`-style files: psql meta-commands and `COPY … FROM stdin` data blocks are skipped and named, statements are split safely around dollar quotes, comments, and escaped strings, and each statement is parsed on its own so one bad statement never sinks a dump — parse failures are reported with positions.
+- **PostgreSQL parser foundation** — `@schemamill/postgres` pinned `libpg-query` (PostgreSQL 18 grammar, WASM) and gained a `pg_dump`-style dump preprocessor: psql meta-commands and `COPY … FROM stdin` data blocks were skipped and named, statements were split safely around dollar quotes, comments, and escaped strings, and every statement was parsed on its own so one bad statement never sinks a dump — parse failures were reported with positions.
 
 ### Documentation
 
