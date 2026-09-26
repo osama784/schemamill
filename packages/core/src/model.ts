@@ -16,8 +16,9 @@
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
  * - `columns` keep source order: ordinal position is part of a table's shape.
  * - `primaryKey.columns` and `foreignKey.columns` keep the constraint's column order.
- * - `foreignKeys` are sorted by referencing columns, then referenced table (schema, then
- *   name), then constraint name.
+ * - `foreignKeys` are sorted by referencing columns (element-wise lexicographic), then
+ *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
+ *   first).
  *
  * This module declares shapes only; it holds no behavior.
  */
@@ -74,17 +75,18 @@ export interface ForeignKey {
   readonly columns: readonly string[];
   /** The referenced table, schema-qualified. */
   readonly referencedTable: TableIdentity;
-  /** Referenced columns, in the constraint's order. */
+  /** Referenced columns, in the constraint's order; empty when the source omits them. */
   readonly referencedColumns: readonly string[];
-  /** The `ON UPDATE` action, when the source states it. */
+  /** The `ON UPDATE` action when the source states a non-default one. */
   readonly onUpdate?: ReferentialAction;
-  /** The `ON DELETE` action, when the source states it. */
+  /** The `ON DELETE` action when the source states a non-default one. */
   readonly onDelete?: ReferentialAction;
 }
 
 /**
- * A referential action, in SQL's canonical spelling. These five are the actions
- * PostgreSQL enforces; the model keeps no source spelling or letter case. The optional
- * column list some PostgreSQL versions allow with `SET NULL` / `SET DEFAULT` is not carried.
+ * A non-default referential action, in SQL's canonical spelling. `NO ACTION` is the default,
+ * so it is represented by an absent action and is not a member here. Dialect-specific
+ * extensions, such as a set of columns with `SET NULL` / `SET DEFAULT`, are outside the
+ * model; importers report them as dropped.
  */
-export type ReferentialAction = 'NO ACTION' | 'RESTRICT' | 'CASCADE' | 'SET NULL' | 'SET DEFAULT';
+export type ReferentialAction = 'RESTRICT' | 'CASCADE' | 'SET NULL' | 'SET DEFAULT';

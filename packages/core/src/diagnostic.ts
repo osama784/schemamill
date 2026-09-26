@@ -11,7 +11,7 @@
 
 /**
  * A position in a source text. Offsets count 0-based UTF-16 code units (JavaScript string
- * indices); line and column are 1-based.
+ * indices); line and column are 1-based, and a CRLF pair counts as one line break.
  */
 export interface SourcePosition {
   readonly offset: number;
