@@ -11,12 +11,20 @@ schemamill's representation of a database schema — the single source of truth 
 _Avoid_: schema, entity, class, diagram
 
 **Schema**:
-The database structure itself, as it really exists in PostgreSQL. Our representation of it is the model, never "the schema".
+The database structure itself, as it really exists in PostgreSQL. Our representation of it is the model, never "the schema". PostgreSQL also calls a namespace a schema; a table's identity in the model is schema-qualified, e.g. `public.users`.
 _Avoid_: model
+
+**Table**:
+A named set of columns in the model, identified by its schema and name together, e.g. `public.users`. Tables are what the plan creates, alters, and drops.
+_Avoid_: relation, entity
 
 **Column**:
 A table's attribute, named as PostgreSQL names it. Tables have columns.
 _Avoid_: field, attribute
+
+**Primary key**:
+A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one.
+_Avoid_: pk, key
 
 **Relationship**:
 A link between two tables in the model — what the canvas draws and the plan creates or drops. In v1, every relationship comes from a foreign key.
