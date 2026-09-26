@@ -204,6 +204,9 @@ test('reports failures in dump order with CRLF-accurate positions', async () => 
   );
   assert.equal(first.position.column, 1);
   assert.equal(second.position.column, 1);
+  // Hardcoded columns keep a shared bug in the mirrored `positionAt` helper from hiding.
+  assert.equal(first.cursor?.column, 45);
+  assert.equal(second.cursor?.column, 46);
   assert.ok(
     (first.cursor?.offset ?? 0) < secondBrokenOffset,
     'failures are reported in dump order',
