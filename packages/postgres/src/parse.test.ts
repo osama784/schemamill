@@ -8,9 +8,41 @@ import { parseDump } from './parse.ts';
  * expected positions are computed from the fixture text so they cannot drift from the layout.
  */
 
+/**
+ * Absolute position of `offset`, mirroring the line-break rules of `parse.ts`/`preprocess.ts`:
+ * `\r\n` counts as one break, a bare `\r` is also a break, and an offset on the `\n` of a pair
+ * resolves to the line the pair ends.
+ */
 const positionAt = (text: string, offset: number) => {
-  const before = text.slice(0, offset);
-  return { offset, line: before.split('\n').length, column: offset - before.lastIndexOf('\n') };
+  let line = 1;
+  let lineStart = 0;
+  let index = 0;
+
+  while (index <= text.length) {
+    if (index === offset) return { offset, line, column: offset - lineStart + 1 };
+    if (index === text.length) break;
+
+    const character = text[index]!;
+    if (character === '\n') {
+      index += 1;
+      line += 1;
+      lineStart = index;
+      continue;
+    }
+    if (character === '\r') {
+      index += 1;
+      if (text[index] === '\n') {
+        if (index === offset) return { offset, line, column: offset - lineStart + 1 };
+        index += 1;
+      }
+      line += 1;
+      lineStart = index;
+      continue;
+    }
+    index += 1;
+  }
+
+  return { offset, line, column: offset - lineStart + 1 };
 };
 
 const positionOf = (text: string, needle: string) => {
@@ -133,6 +165,52 @@ test('maps the error cursor through multibyte characters in the same statement',
   assert.deepEqual(failure.cursor, positionAt(dump, cursorOffset));
   assert.equal(failure.cursor?.line, 3);
   assert.match(failure.message, /syntax error at or near ";"/);
+});
+
+test('reports failures in dump order with CRLF-accurate positions', async () => {
+  const dump = [
+    `SET statement_timeout = 0;`,
+    `CREATE TABLE public.first_broken (id bigint UNSIGNED);`,
+    `SELECT 1;`,
+    `CREATE TABLE public.second_broken (id bigint UNSIGNED);`,
+    `SELECT 2;`,
+  ].join('\r\n');
+
+  const result = await parseDump(dump);
+
+  assert.deepEqual(
+    result.statements.map((statement) => statement.sql),
+    ['SET statement_timeout = 0;', 'SELECT 1;', 'SELECT 2;'],
+  );
+
+  assert.equal(result.failures.length, 2);
+  const [first, second] = result.failures;
+  assert.ok(first && second, 'both failures are reported');
+
+  const firstBrokenOffset = dump.indexOf('CREATE TABLE public.first_broken');
+  const firstUnsignedOffset = dump.indexOf('UNSIGNED');
+  const secondBrokenOffset = dump.indexOf('CREATE TABLE public.second_broken');
+  const secondUnsignedOffset = dump.indexOf('UNSIGNED', firstUnsignedOffset + 1);
+
+  assert.deepEqual(first.position, positionAt(dump, firstBrokenOffset));
+  assert.deepEqual(first.cursor, positionAt(dump, firstUnsignedOffset));
+  assert.deepEqual(second.position, positionAt(dump, secondBrokenOffset));
+  assert.deepEqual(second.cursor, positionAt(dump, secondUnsignedOffset));
+
+  // `\r\n` counts as one line break, so the two failing statements sit on lines 2 and 4.
+  assert.deepEqual(
+    [first.position.line, first.cursor?.line, second.position.line, second.cursor?.line],
+    [2, 2, 4, 4],
+  );
+  assert.equal(first.position.column, 1);
+  assert.equal(second.position.column, 1);
+  assert.ok(
+    (first.cursor?.offset ?? 0) < secondBrokenOffset,
+    'failures are reported in dump order',
+  );
+
+  assert.match(first.message, /syntax error at or near "UNSIGNED"/);
+  assert.match(second.message, /syntax error at or near "UNSIGNED"/);
 });
 
 test('returns empty results for empty and whitespace-only input', async () => {
