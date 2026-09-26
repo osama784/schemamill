@@ -7,7 +7,8 @@
  * - `CREATE TABLE` becomes a `Table`: columns in source order, the primary key (inline,
  *   table-level, or a later `ALTER TABLE`), and foreign keys. Types and DEFAULT expressions
  *   are sliced from the source text — the AST normalizes types (`int` becomes `int4`), so the
- *   model keeps the written spelling, whitespace-normalized.
+ *   model keeps the written spelling, whitespace-normalized. A repeated `CREATE TABLE` for the
+ *   same schema-qualified identity replaces the table wholesale, clearing its foreign keys.
  * - `ALTER TABLE … ADD CONSTRAINT` attaches a foreign key or primary key to an already
  *   imported table; any other constraint kind, and any other `ALTER TABLE` action, is skipped
  *   and named.
@@ -205,7 +206,9 @@ function translateCreateTable(
   const elements = create.tableElts ?? [];
 
   const columns: Column[] = [];
+  // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys.
   draft.primaryKey = undefined;
+  draft.foreignKeys.length = 0;
 
   for (const element of elements) {
     const boundaries = clauseBoundaries(element);

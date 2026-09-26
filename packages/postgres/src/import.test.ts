@@ -358,6 +358,32 @@ test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and u
   assert.match(diagnostics[1]?.message ?? '', /conflicting DEFAULT on public\.t\.a/);
 });
 
+test('replaces a repeated CREATE TABLE wholesale', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, legacy_id integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_legacy_fkey FOREIGN KEY (legacy_id) REFERENCES public.other(id);`,
+    `CREATE TABLE public.t (id integer, name text);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The second definition wins wholesale: stale columns, primary key, and foreign keys are gone.
+  assert.deepEqual(model, {
+    tables: [
+      {
+        schema: 'public',
+        name: 't',
+        columns: [
+          { name: 'id', type: 'integer', notNull: false },
+          { name: 'name', type: 'text', notNull: false },
+        ],
+        foreignKeys: [],
+      },
+    ],
+  });
+  assert.deepEqual(diagnostics, []);
+});
+
 test('extracts spans around comments and preserves quoted text', async () => {
   const dump = [
     `CREATE TABLE public.t (a int, -- note`,
