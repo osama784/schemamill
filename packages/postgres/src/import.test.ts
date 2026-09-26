@@ -317,6 +317,35 @@ test('records only stated referential actions and flags foreign-key extras', asy
   );
 });
 
+test('extracts spans around comments and preserves quoted text', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a int, -- note`,
+    `b text);`,
+    `CREATE TABLE public.u (a int /* c */, b text);`,
+    `CREATE TABLE public.v (a int DEFAULT 'x' /* , y */, b int);`,
+    `CREATE TABLE public.w (a int DEFAULT 'x' -- , y`,
+    `, b int);`,
+    `CREATE TABLE public.x (a text DEFAULT 'a--b, c', b numeric(12, 2));`,
+  ].join('\n');
+
+  const { model } = await importDump(dump);
+  const columnsOf = (name: string) => {
+    const table = model.tables.find((candidate) => candidate.name === name);
+    assert.ok(table, `table ${name} is imported`);
+    return Object.fromEntries(table.columns.map((column) => [column.name, column]));
+  };
+
+  // Comments inside a column definition are dropped, not absorbed into the type or default.
+  assert.equal(columnsOf('t').a?.type, 'int');
+  assert.equal(columnsOf('t').b?.type, 'text');
+  assert.equal(columnsOf('u').a?.type, 'int');
+  assert.equal(columnsOf('v').a?.default, "'x'");
+  assert.equal(columnsOf('w').a?.default, "'x'");
+  // Comment markers inside a string literal survive verbatim.
+  assert.equal(columnsOf('x').a?.default, "'a--b, c'");
+  assert.equal(columnsOf('x').b?.type, 'numeric(12,2)');
+});
+
 test('skips a partition and flags a partitioned table', async () => {
   const dump = [
     `CREATE TABLE app.events (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,

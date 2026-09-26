@@ -203,15 +203,12 @@ function translateCreateTable(
 
   const draft = getOrCreateTable(tables, schema, name);
   const elements = create.tableElts ?? [];
-  const elementLocations = elements
-    .map(elementLocation)
-    .filter((location): location is number => location !== undefined);
 
   const columns: Column[] = [];
   draft.primaryKey = undefined;
 
   for (const element of elements) {
-    const boundaries = clauseBoundaries(element, elementLocations);
+    const boundaries = clauseBoundaries(element);
     if ('ColumnDef' in element) {
       const translated = translateColumn(
         statement,
@@ -699,28 +696,21 @@ function finalizeTable(draft: TableDraft): Table {
 }
 
 /**
- * Byte offsets for the clauses that follow an element: its own clause locations plus every
- * table element's location. `extractSourceText` picks the nearest one after the span start.
+ * Byte offsets of the clauses inside one table element. Clause ends stop at the nearest one,
+ * so a type never swallows the `DEFAULT` or `NOT NULL` that follows it.
  */
-function clauseBoundaries(element: Node, elementLocations: readonly number[]): readonly number[] {
-  const boundaries = [...elementLocations];
-  if ('ColumnDef' in element) {
-    for (const constraint of element.ColumnDef.constraints ?? []) {
-      if ('Constraint' in constraint && constraint.Constraint.location !== undefined) {
-        boundaries.push(constraint.Constraint.location);
-      }
-    }
-    if (element.ColumnDef.collClause?.location !== undefined) {
-      boundaries.push(element.ColumnDef.collClause.location);
+function clauseBoundaries(element: Node): readonly number[] {
+  if (!('ColumnDef' in element)) return [];
+  const boundaries: number[] = [];
+  for (const constraint of element.ColumnDef.constraints ?? []) {
+    if ('Constraint' in constraint && constraint.Constraint.location !== undefined) {
+      boundaries.push(constraint.Constraint.location);
     }
   }
+  if (element.ColumnDef.collClause?.location !== undefined) {
+    boundaries.push(element.ColumnDef.collClause.location);
+  }
   return boundaries;
-}
-
-function elementLocation(element: Node): number | undefined {
-  if ('ColumnDef' in element) return element.ColumnDef.location;
-  if ('Constraint' in element) return element.Constraint.location;
-  return undefined;
 }
 
 function constraintOf(node: Node): Constraint | undefined {
@@ -812,8 +802,8 @@ function compareStringArrays(left: readonly string[], right: readonly string[]):
 }
 
 /**
- * Slices source text from a UTF-16 start index, ending at the nearest byte boundary after it
- * or at the enclosing list's terminator, then whitespace-normalizes it.
+ * Slices source text from a UTF-16 start index to the enclosing list's terminator (or the
+ * nearest following clause), then drops comments and whitespace-normalizes what remains.
  */
 function extractSourceText(sql: string, startIndex: number, boundaries: readonly number[]): string {
   const normalized = normalizeSourceText(
@@ -822,13 +812,14 @@ function extractSourceText(sql: string, startIndex: number, boundaries: readonly
   return normalized.endsWith(',') ? normalized.slice(0, -1).trimEnd() : normalized;
 }
 
+/** The terminator scan bounds the span; a following clause location only tightens it. */
 function spanEndIndex(sql: string, startIndex: number, boundaries: readonly number[]): number {
-  let end = sql.length;
+  let end = terminatorIndex(sql, startIndex);
   for (const boundary of boundaries) {
     const index = byteOffsetToUtf16(sql, boundary);
     if (index > startIndex && index < end) end = index;
   }
-  return end === sql.length ? terminatorIndex(sql, startIndex) : end;
+  return end;
 }
 
 /** Extracts a DEFAULT expression, starting just past the `DEFAULT` keyword. */
@@ -843,7 +834,7 @@ function extractDefaultText(
   return extractSourceText(sql, startIndex, boundaries);
 }
 
-/** Whitespace-normalizes source text outside quoted spans; `numeric(12, 2)` reads `numeric(12,2)`. */
+/** Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads `numeric(12,2)`. */
 function normalizeSourceText(text: string): string {
   let normalized = '';
   let pendingSpace = false;
@@ -885,6 +876,18 @@ function normalizeSourceText(text: string): string {
         index = end;
         continue;
       }
+    }
+
+    if (character === '-' && text[index + 1] === '-') {
+      pendingSpace = true;
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+
+    if (character === '/' && text[index + 1] === '*') {
+      pendingSpace = true;
+      index = blockCommentEnd(text, index);
+      continue;
     }
 
     if (isWhitespaceCharacter(character)) {
@@ -942,6 +945,14 @@ function terminatorIndex(text: string, startIndex: number): number {
         continue;
       }
     }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
     if (character === '(' || character === '[') {
       depth += 1;
     } else if (character === ')' || character === ']') {
@@ -951,6 +962,34 @@ function terminatorIndex(text: string, startIndex: number): number {
       return index;
     }
     index += 1;
+  }
+  return text.length;
+}
+
+/** Index of the line break ending a `--` comment that starts at `index`, or the end of text. */
+function lineCommentEnd(text: string, index: number): number {
+  let cursor = index + 2;
+  while (cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '\r') cursor += 1;
+  return cursor;
+}
+
+/** Index just past a possibly nested block comment starting at `index`, or the end of text. */
+function blockCommentEnd(text: string, index: number): number {
+  let depth = 0;
+  let cursor = index;
+  while (cursor < text.length) {
+    if (text.startsWith('/*', cursor)) {
+      depth += 1;
+      cursor += 2;
+      continue;
+    }
+    if (text.startsWith('*/', cursor)) {
+      depth -= 1;
+      cursor += 2;
+      if (depth === 0) return cursor;
+      continue;
+    }
+    cursor += 1;
   }
   return text.length;
 }
@@ -1000,13 +1039,11 @@ function skipTrivia(text: string, from: number): number {
   for (;;) {
     while (index < text.length && isWhitespaceCharacter(text[index]!)) index += 1;
     if (text.startsWith('/*', index)) {
-      const close = text.indexOf('*/', index + 2);
-      index = close === -1 ? text.length : close + 2;
+      index = blockCommentEnd(text, index);
       continue;
     }
     if (text.startsWith('--', index)) {
-      const breakIndex = text.slice(index).search(/[\r\n]/);
-      index = breakIndex === -1 ? text.length : index + breakIndex;
+      index = lineCommentEnd(text, index);
       continue;
     }
     return index;
