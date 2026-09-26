@@ -38,7 +38,7 @@ const DUMP = [
   `    CACHE 1;`,
   '',
   `CREATE TABLE public.users (`,
-  `    id bigint DEFAULT nextval('public.users_id_seq'::regclass) NOT NULL,`,
+  `    id bigint NOT NULL,`,
   `    email character varying(12) NOT NULL UNIQUE,`,
   `    display_name text COLLATE "C",`,
   `    age numeric(12, 2),`,
@@ -75,6 +75,8 @@ const DUMP = [
   `ALTER TABLE public.users OWNER TO app;`,
   '',
   `ALTER TABLE public.users ALTER COLUMN display_name SET DEFAULT 'anon';`,
+  '',
+  `ALTER TABLE ONLY public.users ALTER COLUMN id SET DEFAULT nextval('public.users_id_seq'::regclass);`,
   '',
   `CREATE INDEX idx_users_email ON public.users USING btree (email);`,
   '',
@@ -140,7 +142,7 @@ const EXPECTED_MODEL: Model = {
           default: "nextval('public.users_id_seq'::regclass)",
         },
         { name: 'email', type: 'character varying(12)', notNull: true },
-        { name: 'display_name', type: 'text', notNull: false },
+        { name: 'display_name', type: 'text', notNull: false, default: "'anon'" },
         { name: 'age', type: 'numeric(12,2)', notNull: false },
         { name: 'score', type: 'double precision', notNull: false, default: '0.0' },
         { name: 'active', type: 'boolean', notNull: true, default: 'true' },
@@ -176,7 +178,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
   { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'idx_users_email' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
@@ -199,6 +200,13 @@ test('imports a pg_dump-shaped dump into the canonical model', async () => {
   assert.equal(intLike?.type, 'int');
   assert.equal(integerLike?.type, 'integer');
   assert.notEqual(intLike?.type, integerLike?.type);
+
+  // Sequence-backed defaults arrive via ALTER TABLE … SET DEFAULT (the pg_dump serial path).
+  assert.equal(
+    users.columns.find((column) => column.name === 'id')?.default,
+    "nextval('public.users_id_seq'::regclass)",
+  );
+  assert.equal(users.columns.find((column) => column.name === 'display_name')?.default, "'anon'");
 
   // Source order is the column order; schema-qualified identity orders the tables.
   assert.deepEqual(
@@ -265,14 +273,18 @@ test('reports skips, flags, and failures in dump order', async () => {
 
   assert.match(byMessage('consumed 2 data lines')?.message ?? '', /terminating/);
   assert.match(byMessage('AT_ChangeOwner')?.message ?? '', /ALTER TABLE action/);
-  assert.ok(byMessage('AT_ColumnDefault'), 'ALTER COLUMN SET DEFAULT is skipped and named');
+  assert.equal(
+    byMessage('AT_ColumnDefault'),
+    undefined,
+    'SET DEFAULT attaches instead of being skipped',
+  );
   assert.ok(byMessage('COMMENT ON TABLE public.users'), 'COMMENT is skipped and named');
   const failure = diagnostics.find((diagnostic) => diagnostic.code === 'parse-failure');
   assert.match(failure?.message ?? '', /syntax error at or near "UNSIGNED"/);
   // Failures point at the parser's error cursor when it has one.
   assert.deepEqual(failure?.position, {
     offset: DUMP.indexOf('UNSIGNED'),
-    line: 66,
+    line: 68,
     column: 39,
   });
 });
@@ -315,6 +327,35 @@ test('records only stated referential actions and flags foreign-key extras', asy
       'dropped deferrability on foreign key child_a_fkey from public.child',
     ],
   );
+});
+
+test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and unknowns', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer DEFAULT 1, b integer, c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET DEFAULT now();`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c DROP DEFAULT;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET DEFAULT 2;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN missing SET DEFAULT 3;`,
+    `ALTER TABLE ONLY public.other ALTER COLUMN x SET DEFAULT 4;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: false, default: '1' },
+    { name: 'b', type: 'integer', notNull: false, default: 'now()' },
+    { name: 'c', type: 'integer', notNull: false },
+  ]);
+
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t.missing' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.other' },
+  ]);
+  assert.match(diagnostics[1]?.message ?? '', /conflicting DEFAULT on public\.t\.a/);
 });
 
 test('extracts spans around comments and preserves quoted text', async () => {

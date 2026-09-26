@@ -483,12 +483,85 @@ function translateAlterTableCommand(
     return;
   }
 
+  if (command.subtype === 'AT_ColumnDefault') {
+    attachColumnDefault(statement, command, identity, draft, diagnostics);
+    return;
+  }
+
   diagnostics.push(
     skipStatement(
       statement,
       `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
       identity,
     ),
+  );
+}
+
+/**
+ * Attaches `ALTER COLUMN … SET DEFAULT` to an imported column — the form pg_dump uses for
+ * sequence-backed defaults. `DROP DEFAULT` carries no expression and stays a skip; a different
+ * existing default is kept and flagged.
+ */
+function attachColumnDefault(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const name = command.name;
+  if (name === undefined || command.def === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
+        identity,
+      ),
+    );
+    return;
+  }
+
+  const column = draft.columns.find((candidate) => candidate.name === name);
+  if (column === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `DEFAULT for unknown column ${identity}.${name}`,
+        `${identity}.${name}`,
+      ),
+    );
+    return;
+  }
+
+  const startByte = minNodeLocation(command.def);
+  if (startByte === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `DEFAULT without a source location on ${identity}.${name}`,
+        `${identity}.${name}`,
+      ),
+    );
+    return;
+  }
+
+  const defaultText = extractSourceText(
+    statement.sql,
+    byteOffsetToUtf16(statement.sql, startByte),
+    [],
+  );
+
+  if (column.default !== undefined) {
+    if (column.default !== defaultText) {
+      diagnostics.push(
+        flagAttribute(statement, identity, `conflicting DEFAULT on ${identity}.${name}`),
+      );
+    }
+    return;
+  }
+
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? { ...candidate, default: defaultText } : candidate,
   );
 }
 
@@ -1072,4 +1145,26 @@ function utf8ByteLength(codePoint: number): number {
   if (codePoint <= 0x7ff) return 2;
   if (codePoint <= 0xffff) return 3;
   return 4;
+}
+
+/** Minimum `location` (UTF-8 bytes) anywhere in a node subtree, or `undefined` when none. */
+function minNodeLocation(node: unknown): number | undefined {
+  let minimum: number | undefined;
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (value === null || typeof value !== 'object') return;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.location === 'number' &&
+      (minimum === undefined || record.location < minimum)
+    ) {
+      minimum = record.location;
+    }
+    for (const key of Object.keys(record)) visit(record[key]);
+  };
+  visit(node);
+  return minimum;
 }
