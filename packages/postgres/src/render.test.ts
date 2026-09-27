@@ -18,7 +18,7 @@ import { renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin four whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin five whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -362,6 +362,76 @@ test('golden: alters columns, primary key, and foreign keys', () => {
     'alter-table',
     model(events, mail, names, users),
     model(events, mail, names, usersTarget),
+  );
+});
+
+test('golden: changes primary keys under surviving foreign keys', () => {
+  const c = table('c', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+  });
+  const eKey = foreignKey(['c_id'], identity('c'), {
+    name: 'e_c_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const e = table('e', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'e_pkey', columns: ['id'] },
+    foreignKeys: [eKey],
+  });
+  const fKey = foreignKey(['c_id'], identity('c'), { name: 'f_c_id_fkey' });
+  const f = table('f', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'f_pkey', columns: ['id'] },
+    foreignKeys: [fKey],
+  });
+  const p = table('p', {
+    columns: [
+      column('a', { type: 'integer', notNull: true }),
+      column('b', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { name: 'p_pkey', columns: ['a', 'b'] },
+  });
+  const qKey = foreignKey(['pa', 'pb'], identity('p'), {
+    name: 'q_p_fkey',
+    referencedColumns: ['a', 'b'],
+  });
+  const q = table('q', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('pa', { type: 'integer' }),
+      column('pb', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'q_pkey', columns: ['id'] },
+    foreignKeys: [qKey],
+  });
+  const tKey = foreignKey(['parent_id'], identity('t'), {
+    name: 't_parent_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const t = table('t', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+    foreignKeys: [tKey],
+  });
+
+  const cTarget = { ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } };
+  const pTarget = { ...p, primaryKey: { name: 'p_pkey_v2', columns: ['b', 'a'] } };
+  const tTarget = { ...t, primaryKey: { name: 't_pkey_v2', columns: ['id'] } };
+
+  assertGolden(
+    'primary-key-change',
+    model(c, e, f, p, q, t),
+    model(cTarget, e, f, pTarget, q, tTarget),
   );
 });
 
