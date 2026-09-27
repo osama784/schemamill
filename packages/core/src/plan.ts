@@ -6,9 +6,9 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * The migration plan: what to change, in the order that works.
  *
  * `plan` runs the diff between a baseline model and a target model, expands every change into
- * executable steps, and reorders them so no step depends on one that comes later. It is the
- * change engine's ordering pass: the plan carries every payload a renderer needs, and hazards
- * and transaction grouping are later work.
+ * executable steps, and reorders them so the dependencies the model can express are respected.
+ * It is the change engine's ordering pass: the plan carries every payload a renderer needs,
+ * and hazards and transaction grouping are later work.
  *
  * A step is one of nine kinds. A table addition becomes a create-table step carrying the
  * table's columns and primary key as they are, plus one add-foreign-key step per foreign key —
@@ -23,10 +23,14 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  *
  * The final sequence is the concatenation of nine phases, in this exact order:
  *
- * 1. drop-foreign-key — a constraint never outlives the table or column it relies on;
- * 2. drop-primary-key — before the columns it covers are dropped;
- * 3. drop-column;
- * 4. drop-table — dependency-ordered among themselves, see below;
+ * 1. drop-foreign-key — the diff-derived drops, then the cycle-breaking drops below;
+ * 2. drop-table — dependency-ordered among themselves, see below. Removed tables go before the
+ *    primary-key and column drops, so a constraint a removed table still holds on a kept
+ *    table's primary key or column is gone with that table before the primary key or column is
+ *    dropped;
+ * 3. drop-primary-key — after the tables that may reference it are gone, and before the
+ *    columns it covers are dropped;
+ * 4. drop-column;
  * 5. create-table;
  * 6. add-column;
  * 7. alter-column;
@@ -36,21 +40,24 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * Within a phase, steps keep the relative order the diff produced: table changes in identity
  * order, and inside a changed table the diff's documented member order. A table addition
  * contributes its foreign-key steps to phase 9 in the added table's canonical foreign-key
- * order.
+ * order. The cycle-breaking drop-foreign-key steps follow phase 1's diff-derived steps in the
+ * order the cycle-breaking pass discovers them.
  *
- * Phase 4 is dependency-ordered. When a removed table references another removed table, the
- * referencing table must be dropped first, or the referenced table's constraint would still be
- * in the way. The order is a deterministic Kahn's algorithm:
+ * Phase 2 is dependency-ordered. When a removed table references another removed table, the
+ * referencing table must be dropped first, or the referenced table's constraint would still
+ * be in the way. The order is a deterministic Kahn's algorithm:
  *
  * - A remaining removed table is ready when no other remaining removed table references it.
  *   Among ready tables, the one with the smallest identity wins: schema, then name, plain
- *   JavaScript string comparison, which is the order the diff reports identities in. A foreign
- *   key a table holds to itself never blocks it; dropping the table drops the key too.
+ *   JavaScript string comparison, which is the order the diff reports identities in. A
+ *   foreign key a table holds to itself never blocks it; dropping the table drops the key too.
  * - When no table is ready and tables remain, the remainder holds at least one reference
- *   cycle. The smallest-identity remaining table is scheduled next, but first one
- *   drop-foreign-key step is emitted for each of its foreign keys that still points at a
- *   remaining removed table, in the table's canonical foreign-key order. Those steps are
- *   appended to phase 1 after its diff-derived drops, in discovery order.
+ *   cycle. The smallest-identity remaining table T is scheduled next, but first one
+ *   drop-foreign-key step is emitted for every foreign key on another remaining removed table
+ *   that references T. Those steps are ordered by the referencing table's identity, and within
+ *   one table by its canonical foreign-key order. A self-reference never needs one: it goes
+ *   away with the table. After them T has no incoming reference left from a remaining table,
+ *   so its drop is legal, and the algorithm continues with the tables that remain.
  *
  * The algorithm never depends on the order either model's table or foreign-key arrays arrive
  * in: the diff is order-insensitive, and the ordering rules above are total. Structurally
@@ -235,9 +242,9 @@ export function plan(baseline: Model, target: Model): Plan {
     steps: [
       ...foreignKeyDrops,
       ...breaks,
+      ...tableDrops,
       ...primaryKeyDrops,
       ...columnDrops,
-      ...tableDrops,
       ...tableCreates,
       ...columnAdds,
       ...columnAlters,
@@ -247,17 +254,17 @@ export function plan(baseline: Model, target: Model): Plan {
   };
 }
 
-/** A removed table, held with its canonical payload while phase 4 orders the drops. */
+/** A removed table, held with its canonical payload while phase 2 orders the drops. */
 interface RemovedTable {
   readonly identity: TableIdentity;
   readonly table: Table;
 }
 
 /**
- * Phase 4: orders the removed tables' drops so a table is dropped only once no remaining
+ * Phase 2: orders the removed tables' drops so a table is dropped only once no remaining
  * removed table references it, breaking reference cycles with explicit drop-foreign-key
- * steps. Returns the drops in execution order and the cycle-breaking steps in discovery
- * order.
+ * steps aimed at the table about to be dropped. Returns the drops in execution order and the
+ * cycle-breaking steps in discovery order.
  */
 function orderTableDrops(removed: readonly RemovedTable[]): { drops: Step[]; breaks: Step[] } {
   const drops: Step[] = [];
@@ -268,22 +275,28 @@ function orderTableDrops(removed: readonly RemovedTable[]): { drops: Step[]; bre
     let next = smallestReady(remaining);
     if (next === undefined) {
       next = smallestIdentity(remaining);
-      for (const foreignKey of next.table.foreignKeys) {
-        if (sameIdentity(foreignKey.referencedTable, next.identity)) continue;
-        if (remaining.some((table) => sameIdentity(table.identity, foreignKey.referencedTable))) {
+      for (const other of byIdentity(remaining)) {
+        if (other === next) continue;
+        for (const foreignKey of other.table.foreignKeys) {
+          if (!sameIdentity(foreignKey.referencedTable, next.identity)) continue;
           breaks.push({
             kind: 'drop-foreign-key',
-            table: copyIdentity(next.table),
+            table: copyIdentity(other.identity),
             foreignKey: copyForeignKey(foreignKey),
           });
         }
       }
     }
     remaining.splice(remaining.indexOf(next), 1);
-    drops.push({ kind: 'drop-table', table: copyIdentity(next.table) });
+    drops.push({ kind: 'drop-table', table: copyIdentity(next.identity) });
   }
 
   return { drops, breaks };
+}
+
+/** A copy of `remaining` sorted by identity, leaving the caller's array untouched. */
+function byIdentity(remaining: readonly RemovedTable[]): RemovedTable[] {
+  return [...remaining].sort((left, right) => compareIdentities(left.identity, right.identity));
 }
 
 /** The ready remaining table with the smallest identity, or `undefined` when none is ready. */
