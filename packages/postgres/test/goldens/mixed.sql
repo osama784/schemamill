@@ -1,11 +1,11 @@
 ALTER TABLE public.orders DROP CONSTRAINT orders_legacy_id_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_obsolete_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_group_id_fkey;
-ALTER TABLE public.users DROP CONSTRAINT users_pkey;
-ALTER TABLE public.users DROP COLUMN obsolete;
 DROP TABLE public.audit;
 DROP TABLE public.legacy_notes;
 DROP TABLE public.legacy;
+ALTER TABLE public.users DROP CONSTRAINT users_pkey;
+ALTER TABLE public.users DROP COLUMN obsolete;
 CREATE TABLE public.sessions (
     id integer NOT NULL,
     user_id integer NOT NULL,

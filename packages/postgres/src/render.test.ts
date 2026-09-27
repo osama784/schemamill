@@ -278,7 +278,7 @@ test('golden: creates every table and attaches foreign keys last', () => {
   const orders = table('orders', {
     columns: [
       column('id', { type: 'bigint', notNull: true }),
-      column('user'),
+      column('user', { type: 'bigint' }),
       column('total', { type: 'numeric(12,2)', default: '0' }),
     ],
     primaryKey: { name: 'orders_pkey', columns: ['id'] },
@@ -303,28 +303,35 @@ test('golden: creates every table and attaches foreign keys last', () => {
 
 test('golden: alters columns, primary key, and foreign keys', () => {
   const events = table('events', {
-    columns: [column('at', { type: 'timestamp with time zone' })],
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'events_pkey', columns: ['id'] },
   });
   const mail = table('mail', {
-    columns: [column('email', { type: 'character varying(12)' }), column('address')],
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'mail_pkey', columns: ['id'] },
   });
-  const names = table('names', { columns: [column('name')] });
+  const names = table('names', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'names_pkey', columns: ['id'] },
+  });
   const users = table('users', {
     columns: [
       column('id', { type: 'bigint', notNull: true }),
-      column('legacy', { type: 'integer', default: '1' }),
-      column('name'),
+      column('name', { type: 'character varying(12)' }),
       column('email', { type: 'character varying(12)' }),
+      column('legacy', { type: 'integer', default: '1' }),
+      column('mail_id', { type: 'bigint' }),
+      column('name_id', { type: 'bigint' }),
     ],
     primaryKey: { name: 'users_pkey', columns: ['id'] },
     foreignKeys: [
-      foreignKey(['email'], identity('mail'), {
-        name: 'users_email_fkey',
-        referencedColumns: ['email'],
+      foreignKey(['mail_id'], identity('mail'), {
+        name: 'users_mail_id_fkey',
+        referencedColumns: ['id'],
       }),
-      foreignKey(['name'], identity('names'), {
-        name: 'users_name_fkey',
-        referencedColumns: ['name'],
+      foreignKey(['name_id'], identity('names'), {
+        name: 'users_name_id_fkey',
+        referencedColumns: ['id'],
       }),
     ],
   });
@@ -334,16 +341,19 @@ test('golden: alters columns, primary key, and foreign keys', () => {
       column('name', { notNull: true }),
       column('email', { type: 'character varying(24)' }),
       column('created_at', { type: 'timestamp with time zone', default: 'now()' }),
+      column('mail_id', { type: 'bigint' }),
+      column('event_id', { type: 'bigint' }),
     ],
     primaryKey: { columns: ['id'] },
     foreignKeys: [
-      foreignKey(['created_at'], identity('events'), {
-        name: 'users_created_at_fkey',
-        referencedColumns: ['at'],
+      foreignKey(['mail_id'], identity('mail'), {
+        name: 'users_mail_id_fkey',
+        referencedColumns: ['id'],
+        onDelete: 'CASCADE',
       }),
-      foreignKey(['email'], identity('mail'), {
-        name: 'users_email_fkey',
-        referencedColumns: ['address'],
+      foreignKey(['event_id'], identity('events'), {
+        name: 'users_event_id_fkey',
+        referencedColumns: ['id'],
       }),
     ],
   });
@@ -361,6 +371,7 @@ test('golden: drops tables in dependency order, breaking a cycle', () => {
       column('id', { type: 'integer', notNull: true }),
       column('b_id', { type: 'integer' }),
     ],
+    primaryKey: { name: 'a_pkey', columns: ['id'] },
     foreignKeys: [
       foreignKey(['b_id'], identity('b'), { name: 'a_b_id_fkey', referencedColumns: ['id'] }),
     ],
@@ -370,6 +381,7 @@ test('golden: drops tables in dependency order, breaking a cycle', () => {
       column('id', { type: 'integer', notNull: true }),
       column('a_id', { type: 'integer' }),
     ],
+    primaryKey: { name: 'b_pkey', columns: ['id'] },
     foreignKeys: [
       foreignKey(['a_id'], identity('a'), { name: 'b_a_id_fkey', referencedColumns: ['id'] }),
     ],
@@ -379,6 +391,7 @@ test('golden: drops tables in dependency order, breaking a cycle', () => {
       column('id', { type: 'integer', notNull: true }),
       column('parent_id', { type: 'integer' }),
     ],
+    primaryKey: { name: 'child_pkey', columns: ['id'] },
     foreignKeys: [
       foreignKey(['parent_id'], identity('parent'), {
         name: 'child_parent_id_fkey',
@@ -391,6 +404,7 @@ test('golden: drops tables in dependency order, breaking a cycle', () => {
       column('id', { type: 'integer', notNull: true }),
       column('parent_id', { type: 'integer' }),
     ],
+    primaryKey: { name: 'node_pkey', columns: ['id'] },
     foreignKeys: [
       foreignKey(['parent_id'], identity('node'), {
         name: 'node_parent_id_fkey',
@@ -398,7 +412,10 @@ test('golden: drops tables in dependency order, breaking a cycle', () => {
       }),
     ],
   });
-  const parent = table('parent', { columns: [column('id', { type: 'integer', notNull: true })] });
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
 
   assertGolden('drop-table', model(a, b, child, node, parent), model());
 });

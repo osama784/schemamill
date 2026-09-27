@@ -5,7 +5,7 @@ CREATE TABLE public.accounts (
 );
 CREATE TABLE public.orders (
     id bigint NOT NULL,
-    "user" text,
+    "user" bigint,
     total numeric(12,2) DEFAULT 0,
     CONSTRAINT orders_pkey PRIMARY KEY (id)
 );

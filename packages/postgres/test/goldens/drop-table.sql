@@ -1,4 +1,4 @@
-ALTER TABLE public.a DROP CONSTRAINT a_b_id_fkey;
+ALTER TABLE public.b DROP CONSTRAINT b_a_id_fkey;
 DROP TABLE public.child;
 DROP TABLE public.node;
 DROP TABLE public.parent;
