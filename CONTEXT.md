@@ -74,6 +74,10 @@ _Avoid_: run, execute, deploy
 
 ### The change engine
 
+**Change**:
+One atom of a diff — a table, column, primary key, or foreign key added, removed, or changed between a baseline and a target.
+_Avoid_: edit, modification, alteration
+
 **Migration plan**:
 The engine's analysis of a diff: the ordered changes that move a baseline to a target, with hazard annotations.
 _Avoid_: changeset, script
