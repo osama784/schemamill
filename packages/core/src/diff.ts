@@ -38,17 +38,22 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  *    order, with only the fields that differ, in the fixed order `type`, `notNull`,
  *    `default`); then at most one primary-key addition, removal, or change; then foreign keys
  *    removed, added, and changed, each sorted in the model's foreign-key order (referencing
- *    columns element-wise, referenced table schema then name, then `name ?? ''`). Changed
- *    pairs are ordered by their baseline foreign key in that order, then by their target
- *    foreign key the same way.
+ *    columns element-wise, referenced table schema then name, then name, absent first — an
+ *    absent name sorts before any present one, including the empty string, which remains a
+ *    distinct, later entry). Changed pairs are ordered by their baseline foreign key in that
+ *    order, then by their target foreign key the same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
- *    come from, as point 2 describes, and no entry states a column's position.
+ *    come from, as point 2 describes, and no entry states a column's position. A table with no
+ *    reported changes is therefore not necessarily structurally identical to its counterpart:
+ *    the two may store their columns in different orders.
  *
  * Duplicate foreign-key identities — several constraints with the same referencing columns
  * and referenced table — pair structurally identical foreign keys first, then pair the rest
- * after sorting each side by referenced columns (element-wise), `name ?? ''`, `onUpdate ?? ''`,
- * then `onDelete ?? ''`; leftovers are reported as removals and additions. Structurally equal
- * models therefore produce identical output no matter how their arrays were built.
+ * after sorting each side by referenced columns (element-wise), then by name, `onUpdate`, and
+ * `onDelete`, each presence-aware: absent sorts first, then present values compare as strings,
+ * so an absent name precedes the empty string, which remains a distinct, later entry.
+ * Leftovers are reported as removals and additions. Structurally equal models therefore
+ * produce identical output no matter how their arrays were built.
  *
  * Returned payloads are independent copies: mutating a payload never affects the caller's
  * models, and `diff` never mutates its inputs.
@@ -363,7 +368,7 @@ function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {
     compareStringArrays(left.columns, right.columns) ||
     compareStrings(left.referencedTable.schema, right.referencedTable.schema) ||
     compareStrings(left.referencedTable.name, right.referencedTable.name) ||
-    compareStrings(left.name ?? '', right.name ?? '')
+    compareOptionalStrings(left.name, right.name)
   );
 }
 
@@ -377,17 +382,17 @@ function compareForeignKeysCanonically(left: ForeignKey, right: ForeignKey): num
 }
 
 /**
- * The pairing order for unmatched duplicates: referenced columns element-wise, then
- * `name ?? ''`, then `onUpdate ?? ''`, then `onDelete ?? ''`. Structurally identical foreign
- * keys have already cancelled, so this full chain decides which remaining baseline foreign
- * key pairs with which remaining target foreign key.
+ * The pairing order for unmatched duplicates: referenced columns element-wise, then `name`,
+ * `onUpdate`, and `onDelete`, each ordered by presence — absent first — and then by value.
+ * Structurally identical foreign keys have already cancelled, so this full chain decides
+ * which remaining baseline foreign key pairs with which remaining target foreign key.
  */
 function compareForeignKeyPairing(left: ForeignKey, right: ForeignKey): number {
   return (
     compareStringArrays(left.referencedColumns, right.referencedColumns) ||
-    compareStrings(left.name ?? '', right.name ?? '') ||
-    compareStrings(left.onUpdate ?? '', right.onUpdate ?? '') ||
-    compareStrings(left.onDelete ?? '', right.onDelete ?? '')
+    compareOptionalStrings(left.name, right.name) ||
+    compareOptionalStrings(left.onUpdate, right.onUpdate) ||
+    compareOptionalStrings(left.onDelete, right.onDelete)
   );
 }
 
@@ -404,6 +409,16 @@ function compareForeignKeyChanges(left: ForeignKeyPair, right: ForeignKeyPair): 
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Orders optional strings by presence first — absent before present — then by value, so
+ * `undefined` sorts before every string, including `''`.
+ */
+function compareOptionalStrings(left: string | undefined, right: string | undefined): number {
+  if (left === undefined) return right === undefined ? 0 : -1;
+  if (right === undefined) return 1;
+  return compareStrings(left, right);
 }
 
 function compareStringArrays(left: readonly string[], right: readonly string[]): number {

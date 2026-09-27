@@ -909,6 +909,65 @@ test('canonical copies break foreign key order ties deterministically', () => {
   ]);
 });
 
+test('absent and empty foreign key names order deterministically and stay distinct', () => {
+  const parent = identity('parent');
+  const unnamed = foreignKey(['a'], parent, { referencedColumns: ['id'] });
+  const empty = foreignKey(['a'], parent, { name: '', referencedColumns: ['id'] });
+  const columns = [column('a')];
+
+  // Two foreign keys that differ only in name presence and value: absent sorts first.
+  const forward = model(table('t', { columns, foreignKeys: [empty, unnamed] }));
+  const reversed = model(table('t', { columns, foreignKeys: [unnamed, empty] }));
+  const canonical = table('t', { columns, foreignKeys: [unnamed, empty] });
+
+  assertDiff(model(), forward, [{ kind: 'table-added', table: canonical }]);
+  assertDiff(model(), reversed, [{ kind: 'table-added', table: canonical }]);
+  assertDiff(forward, model(), [{ kind: 'table-removed', table: canonical }]);
+  assertDiff(reversed, model(), [{ kind: 'table-removed', table: canonical }]);
+
+  // Replacing an absent name with an empty one is a change, never a silent collapse.
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [unnamed] })),
+    model(table('t', { columns, foreignKeys: [empty] })),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [{ kind: 'foreign-key-changed', before: unnamed, after: empty }],
+      },
+    ],
+  );
+
+  // Both duplicates change at once: pairing and emission are identical under either input
+  // order.
+  const unnamedAfter = foreignKey(['a'], parent, {
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const emptyAfter = foreignKey(['a'], parent, {
+    name: '',
+    referencedColumns: ['id'],
+    onDelete: 'RESTRICT',
+  });
+  const targetForward = model(table('t', { columns, foreignKeys: [emptyAfter, unnamedAfter] }));
+  const targetReversed = model(table('t', { columns, foreignKeys: [unnamedAfter, emptyAfter] }));
+  const expected: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'foreign-key-changed', before: unnamed, after: unnamedAfter },
+        { kind: 'foreign-key-changed', before: empty, after: emptyAfter },
+      ],
+    },
+  ];
+
+  assertDiff(forward, targetForward, expected);
+  assertDiff(reversed, targetForward, expected);
+  assertDiff(forward, targetReversed, expected);
+  assertDiff(reversed, targetReversed, expected);
+});
+
 test('added and removed tables are independent copies', () => {
   const parent = identity('parent');
   const key = foreignKey(['a'], parent, {
