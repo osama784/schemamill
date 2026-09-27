@@ -19,26 +19,39 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * whitespace-normalizes at the boundary, so even a difference in whitespace is a change.
  * Names are case-sensitive.
  *
+ * A column is identified by name alone: the ordinal position of an existing column is not
+ * part of the diff. The model stores `columns` in source order for fidelity, and column
+ * entries are reported in the stored order of the side they come from, but a pure reorder of
+ * existing columns is not a change, the change vocabulary has no positional change, and an
+ * added column carries no position.
+ *
  * The result is deterministic and never depends on the order arrays arrive in:
  *
  * 1. Table identities are merge-walked over the union of both models, sorted by schema, then
  *    name (plain JavaScript string comparison, not locale collation). A baseline-only
  *    identity is a removal, a target-only identity an addition, and an identity present in
- *    both is compared; when nothing differs, it produces no entry.
+ *    both is compared; when nothing differs, it produces no entry. An added or removed table
+ *    is reported as a canonical copy of the table whose foreign keys are in the model's
+ *    foreign-key order, so the caller's array order never leaks into the result.
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
  *    order, with only the fields that differ, in the fixed order `type`, `notNull`,
  *    `default`); then at most one primary-key addition, removal, or change; then foreign keys
  *    removed, added, and changed, each sorted in the model's foreign-key order (referencing
- *    columns element-wise, referenced table schema then name, then `name ?? ''`).
- * 3. Columns keep source order. Ordinal position is part of a table's shape, so columns are
- *    never sorted; only the order of the change entries follows the rules above.
+ *    columns element-wise, referenced table schema then name, then `name ?? ''`). Changed
+ *    pairs are ordered by their baseline foreign key in that order, then by their target
+ *    foreign key the same way.
+ * 3. Columns are never sorted: column entries keep the stored source order of the side they
+ *    come from, as point 2 describes, and no entry states a column's position.
  *
  * Duplicate foreign-key identities — several constraints with the same referencing columns
  * and referenced table — pair structurally identical foreign keys first, then pair the rest
- * by referenced columns and name; leftovers are reported as removals and additions.
- * Structurally equal models therefore produce identical output no matter how their arrays
- * were built.
+ * after sorting each side by referenced columns (element-wise), `name ?? ''`, `onUpdate ?? ''`,
+ * then `onDelete ?? ''`; leftovers are reported as removals and additions. Structurally equal
+ * models therefore produce identical output no matter how their arrays were built.
+ *
+ * Returned payloads are independent copies: mutating a payload never affects the caller's
+ * models, and `diff` never mutates its inputs.
  */
 
 /** One difference at the table level: a table added, removed, or changed. */
@@ -80,7 +93,11 @@ export type ColumnFieldChange =
   | { field: 'notNull'; before: boolean; after: boolean }
   | { field: 'default'; before?: string; after?: string };
 
-/** The changes from `baseline` to `target`, in the module's deterministic order. */
+/**
+ * The changes from `baseline` to `target`, in the module's deterministic order. Returned
+ * payloads are independent copies: mutating them never affects the caller's models, and
+ * neither input is mutated.
+ */
 export function diff(baseline: Model, target: Model): readonly Change[] {
   const baselineTables = [...baseline.tables].sort(compareTables);
   const targetTables = [...target.tables].sort(compareTables);
@@ -94,10 +111,10 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     const targetTable = targetTables[targetIndex]!;
     const comparison = compareTables(baselineTable, targetTable);
     if (comparison < 0) {
-      changes.push({ kind: 'table-removed', table: baselineTable });
+      changes.push({ kind: 'table-removed', table: copyTable(baselineTable) });
       baselineIndex += 1;
     } else if (comparison > 0) {
-      changes.push({ kind: 'table-added', table: targetTable });
+      changes.push({ kind: 'table-added', table: copyTable(targetTable) });
       targetIndex += 1;
     } else {
       const tableChanges = diffTable(baselineTable, targetTable);
@@ -114,13 +131,48 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
   }
 
   for (; baselineIndex < baselineTables.length; baselineIndex += 1) {
-    changes.push({ kind: 'table-removed', table: baselineTables[baselineIndex]! });
+    changes.push({ kind: 'table-removed', table: copyTable(baselineTables[baselineIndex]!) });
   }
   for (; targetIndex < targetTables.length; targetIndex += 1) {
-    changes.push({ kind: 'table-added', table: targetTables[targetIndex]! });
+    changes.push({ kind: 'table-added', table: copyTable(targetTables[targetIndex]!) });
   }
 
   return changes;
+}
+
+/** A copy of `column`, independent of the caller's model. */
+function copyColumn(column: Column): Column {
+  return { ...column };
+}
+
+/** A copy of `primaryKey`, independent of the caller's model. */
+function copyPrimaryKey(primaryKey: PrimaryKey): PrimaryKey {
+  return { ...primaryKey, columns: [...primaryKey.columns] };
+}
+
+/** A copy of `foreignKey`, independent of the caller's model. */
+function copyForeignKey(foreignKey: ForeignKey): ForeignKey {
+  return {
+    ...foreignKey,
+    columns: [...foreignKey.columns],
+    referencedTable: { ...foreignKey.referencedTable },
+    referencedColumns: [...foreignKey.referencedColumns],
+  };
+}
+
+/**
+ * A copy of `table`, independent of the caller's model, whose foreign keys are in canonical
+ * order: the model's foreign-key order, ties on it broken by the duplicate-pairing order.
+ * Added and removed tables are reported this way, so the caller's `foreignKeys` array order
+ * cannot leak into the result.
+ */
+function copyTable(table: Table): Table {
+  return {
+    ...table,
+    columns: table.columns.map(copyColumn),
+    ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
+    foreignKeys: [...table.foreignKeys].sort(compareForeignKeysCanonically).map(copyForeignKey),
+  };
 }
 
 /** One matched foreign-key pair, remembered with both sides for a change entry. */
@@ -143,10 +195,14 @@ function diffColumns(baseline: readonly Column[], target: readonly Column[]): Ta
   const targetColumns = indexColumns(target);
 
   for (const column of baseline) {
-    if (!targetColumns.has(column.name)) changes.push({ kind: 'column-removed', column });
+    if (!targetColumns.has(column.name)) {
+      changes.push({ kind: 'column-removed', column: copyColumn(column) });
+    }
   }
   for (const column of target) {
-    if (!baselineColumns.has(column.name)) changes.push({ kind: 'column-added', column });
+    if (!baselineColumns.has(column.name)) {
+      changes.push({ kind: 'column-added', column: copyColumn(column) });
+    }
   }
   for (const column of target) {
     const before = baselineColumns.get(column.name);
@@ -181,15 +237,21 @@ function diffPrimaryKey(
   target: PrimaryKey | undefined,
 ): TableChange | undefined {
   if (baseline === undefined) {
-    return target === undefined ? undefined : { kind: 'primary-key-added', primaryKey: target };
+    return target === undefined
+      ? undefined
+      : { kind: 'primary-key-added', primaryKey: copyPrimaryKey(target) };
   }
   if (target === undefined) {
-    return { kind: 'primary-key-removed', primaryKey: baseline };
+    return { kind: 'primary-key-removed', primaryKey: copyPrimaryKey(baseline) };
   }
   if (baseline.name === target.name && sameStrings(baseline.columns, target.columns)) {
     return undefined;
   }
-  return { kind: 'primary-key-changed', before: baseline, after: target };
+  return {
+    kind: 'primary-key-changed',
+    before: copyPrimaryKey(baseline),
+    after: copyPrimaryKey(target),
+  };
 }
 
 function diffForeignKeys(
@@ -231,12 +293,18 @@ function diffForeignKeys(
   changed.sort(compareForeignKeyChanges);
 
   return [
-    ...removed.map((foreignKey): TableChange => ({ kind: 'foreign-key-removed', foreignKey })),
-    ...added.map((foreignKey): TableChange => ({ kind: 'foreign-key-added', foreignKey })),
+    ...removed.map((foreignKey): TableChange => ({
+      kind: 'foreign-key-removed',
+      foreignKey: copyForeignKey(foreignKey),
+    })),
+    ...added.map((foreignKey): TableChange => ({
+      kind: 'foreign-key-added',
+      foreignKey: copyForeignKey(foreignKey),
+    })),
     ...changed.map((pair): TableChange => ({
       kind: 'foreign-key-changed',
-      before: pair.before,
-      after: pair.after,
+      before: copyForeignKey(pair.before),
+      after: copyForeignKey(pair.after),
     })),
   ];
 }
@@ -299,7 +367,21 @@ function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {
   );
 }
 
-/** The pairing order for unmatched duplicates: referenced columns, then the full content. */
+/**
+ * The canonical order of a copied `foreignKeys` array: the model's foreign-key order, ties on
+ * it — foreign keys differing only in referenced columns or actions — broken by the
+ * duplicate-pairing order. Both comparators are shared with the rest of the module.
+ */
+function compareForeignKeysCanonically(left: ForeignKey, right: ForeignKey): number {
+  return compareForeignKeys(left, right) || compareForeignKeyPairing(left, right);
+}
+
+/**
+ * The pairing order for unmatched duplicates: referenced columns element-wise, then
+ * `name ?? ''`, then `onUpdate ?? ''`, then `onDelete ?? ''`. Structurally identical foreign
+ * keys have already cancelled, so this full chain decides which remaining baseline foreign
+ * key pairs with which remaining target foreign key.
+ */
 function compareForeignKeyPairing(left: ForeignKey, right: ForeignKey): number {
   return (
     compareStringArrays(left.referencedColumns, right.referencedColumns) ||
@@ -309,6 +391,11 @@ function compareForeignKeyPairing(left: ForeignKey, right: ForeignKey): number {
   );
 }
 
+/**
+ * Orders changed pairs by their baseline foreign key in the model's foreign-key order, then
+ * by their target foreign key the same way, so each pair has one deterministic position even
+ * when its two sides would order differently.
+ */
 function compareForeignKeyChanges(left: ForeignKeyPair, right: ForeignKeyPair): number {
   return (
     compareForeignKeys(left.before, right.before) || compareForeignKeys(left.after, right.after)

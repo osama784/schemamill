@@ -53,6 +53,34 @@ const foreignKey = (
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({ tables });
 
+/** Freezes `value` and every object and array nested inside it. */
+const deepFreeze = <T>(value: T): T => {
+  if (typeof value === 'object' && value !== null) {
+    Object.freeze(value);
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+  }
+  return value;
+};
+
+/** Asserts that a table payload shares no object or array with its source table. */
+const assertCopiedTable = (copy: Table, source: Table): void => {
+  assert.notEqual(copy, source);
+  assert.notEqual(copy.columns, source.columns);
+  copy.columns.forEach((column, index) => assert.notEqual(column, source.columns[index]));
+  if (source.primaryKey !== undefined) {
+    assert.notEqual(copy.primaryKey, source.primaryKey);
+    assert.notEqual(copy.primaryKey?.columns, source.primaryKey.columns);
+  }
+  assert.notEqual(copy.foreignKeys, source.foreignKeys);
+  copy.foreignKeys.forEach((foreignKey, index) => {
+    const sourceForeignKey = source.foreignKeys[index];
+    assert.notEqual(foreignKey, sourceForeignKey);
+    assert.notEqual(foreignKey.columns, sourceForeignKey?.columns);
+    assert.notEqual(foreignKey.referencedTable, sourceForeignKey?.referencedTable);
+    assert.notEqual(foreignKey.referencedColumns, sourceForeignKey?.referencedColumns);
+  });
+};
+
 /** Asserts that diffing `baseline` with `target` yields exactly `expected`. */
 const assertDiff = (baseline: Model, target: Model, expected: readonly Change[]) =>
   assert.deepStrictEqual(diff(baseline, target), expected);
@@ -822,4 +850,264 @@ test('duplicate foreign key identities pair identical constraints first', () => 
       ],
     },
   ]);
+});
+
+test('reordering existing columns is not a change', () => {
+  const baseline = model(table('t', { columns: [column('a'), column('b'), column('c')] }));
+  const target = model(table('t', { columns: [column('c'), column('a'), column('b')] }));
+
+  assertDiff(baseline, target, []);
+});
+
+test('inserting a column mid-list reports only its addition', () => {
+  const baseline = model(table('t', { columns: [column('a'), column('c')] }));
+  const target = model(table('t', { columns: [column('a'), column('b'), column('c')] }));
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'column-added', column: column('b') }],
+    },
+  ]);
+});
+
+test('added and removed tables carry foreign keys in canonical order', () => {
+  const parent = identity('parent');
+  const alpha = foreignKey(['a'], parent, { name: 'alpha', referencedColumns: ['id'] });
+  const beta = foreignKey(['b'], parent, { name: 'beta', referencedColumns: ['id'] });
+  const columns = [column('a'), column('b')];
+  const forward = model(table('t', { columns, foreignKeys: [beta, alpha] }));
+  const reversed = model(table('t', { columns, foreignKeys: [alpha, beta] }));
+  const canonical = table('t', { columns, foreignKeys: [alpha, beta] });
+
+  assertDiff(model(), forward, [{ kind: 'table-added', table: canonical }]);
+  assertDiff(model(), reversed, [{ kind: 'table-added', table: canonical }]);
+  assertDiff(forward, model(), [{ kind: 'table-removed', table: canonical }]);
+  assertDiff(reversed, model(), [{ kind: 'table-removed', table: canonical }]);
+});
+
+test('canonical copies break foreign key order ties deterministically', () => {
+  const parent = identity('parent');
+  const cascade = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const restrict = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onDelete: 'RESTRICT',
+  });
+  const columns = [column('a')];
+
+  assertDiff(model(), model(table('t', { columns, foreignKeys: [restrict, cascade] })), [
+    {
+      kind: 'table-added',
+      table: table('t', { columns, foreignKeys: [cascade, restrict] }),
+    },
+  ]);
+});
+
+test('added and removed tables are independent copies', () => {
+  const parent = identity('parent');
+  const key = foreignKey(['a'], parent, {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const source = table('t', {
+    columns: [column('a')],
+    primaryKey: { name: 't_pkey', columns: ['a'] },
+    foreignKeys: [key],
+  });
+
+  const added = diff(model(), model(source))[0]!;
+  assert.equal(added.kind, 'table-added');
+  if (added.kind !== 'table-added') throw new Error('expected a table addition');
+  assert.deepStrictEqual(added.table, source);
+  assertCopiedTable(added.table, source);
+
+  const removed = diff(model(source), model())[0]!;
+  assert.equal(removed.kind, 'table-removed');
+  if (removed.kind !== 'table-removed') throw new Error('expected a table removal');
+  assert.deepStrictEqual(removed.table, source);
+  assertCopiedTable(removed.table, source);
+});
+
+test('changed table members are independent copies', () => {
+  const parent = identity('parent');
+  const key = foreignKey(['a'], parent, { name: 't_a_fkey', referencedColumns: ['id'] });
+  const changedKey = foreignKey(['a'], parent, {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const goneColumn = column('gone');
+  const freshColumn = column('fresh');
+  const sourcePrimaryKey = { name: 't_pkey', columns: ['a'] };
+  const targetPrimaryKey = { name: 't_pkey', columns: ['a', 'fresh'] };
+
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), goneColumn],
+      primaryKey: sourcePrimaryKey,
+      foreignKeys: [key],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), freshColumn],
+      primaryKey: targetPrimaryKey,
+      foreignKeys: [changedKey],
+    }),
+  );
+
+  const changed = diff(baseline, target)[0]!;
+  assert.equal(changed.kind, 'table-changed');
+  if (changed.kind !== 'table-changed') throw new Error('expected a changed table');
+
+  const removed = changed.changes[0];
+  assert.equal(removed?.kind, 'column-removed');
+  if (removed?.kind === 'column-removed') assert.notEqual(removed.column, goneColumn);
+
+  const added = changed.changes[1];
+  assert.equal(added?.kind, 'column-added');
+  if (added?.kind === 'column-added') assert.notEqual(added.column, freshColumn);
+
+  const primaryKey = changed.changes[2];
+  assert.equal(primaryKey?.kind, 'primary-key-changed');
+  if (primaryKey?.kind === 'primary-key-changed') {
+    assert.notEqual(primaryKey.before, sourcePrimaryKey);
+    assert.notEqual(primaryKey.before.columns, sourcePrimaryKey.columns);
+    assert.notEqual(primaryKey.after, targetPrimaryKey);
+    assert.notEqual(primaryKey.after.columns, targetPrimaryKey.columns);
+  }
+
+  const foreignKeyChange = changed.changes[3];
+  assert.equal(foreignKeyChange?.kind, 'foreign-key-changed');
+  if (foreignKeyChange?.kind === 'foreign-key-changed') {
+    assert.notEqual(foreignKeyChange.before, key);
+    assert.notEqual(foreignKeyChange.before.columns, key.columns);
+    assert.notEqual(foreignKeyChange.before.referencedTable, key.referencedTable);
+    assert.notEqual(foreignKeyChange.before.referencedColumns, key.referencedColumns);
+    assert.notEqual(foreignKeyChange.after, changedKey);
+    assert.notEqual(foreignKeyChange.after.columns, changedKey.columns);
+    assert.notEqual(foreignKeyChange.after.referencedTable, changedKey.referencedTable);
+    assert.notEqual(foreignKeyChange.after.referencedColumns, changedKey.referencedColumns);
+  }
+});
+
+test('a deep-frozen model can be diffed', () => {
+  const key = foreignKey(['a'], identity('parent'), { referencedColumns: ['id'] });
+  const baseline = deepFreeze(model(table('a', { columns: [column('x')], foreignKeys: [key] })));
+  const target = deepFreeze(
+    model(
+      table('b', {
+        columns: [column('y')],
+        primaryKey: { columns: ['y'] },
+        foreignKeys: [key],
+      }),
+    ),
+  );
+
+  assertDiff(baseline, target, [
+    { kind: 'table-removed', table: table('a', { columns: [column('x')], foreignKeys: [key] }) },
+    {
+      kind: 'table-added',
+      table: table('b', {
+        columns: [column('y')],
+        primaryKey: { columns: ['y'] },
+        foreignKeys: [key],
+      }),
+    },
+  ]);
+});
+
+test('duplicate identities tied on referenced columns pair by name and actions', () => {
+  const parent = identity('parent');
+  const cascade = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onUpdate: 'CASCADE',
+  });
+  const restrict = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onUpdate: 'RESTRICT',
+  });
+  const deleteCascade = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const deleteRestrict = foreignKey(['a'], parent, {
+    name: 'same',
+    referencedColumns: ['id'],
+    onDelete: 'RESTRICT',
+  });
+  const columns = [column('a')];
+
+  const expected: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'foreign-key-changed', before: cascade, after: deleteCascade },
+        { kind: 'foreign-key-changed', before: restrict, after: deleteRestrict },
+      ],
+    },
+  ];
+
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [cascade, restrict] })),
+    model(table('t', { columns, foreignKeys: [deleteCascade, deleteRestrict] })),
+    expected,
+  );
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [restrict, cascade] })),
+    model(table('t', { columns, foreignKeys: [deleteRestrict, deleteCascade] })),
+    expected,
+  );
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [cascade, restrict] })),
+    model(table('t', { columns, foreignKeys: [deleteRestrict, deleteCascade] })),
+    expected,
+  );
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [restrict, cascade] })),
+    model(table('t', { columns, foreignKeys: [deleteCascade, deleteRestrict] })),
+    expected,
+  );
+});
+
+test('changed foreign key pairs order by before then after', () => {
+  const parent = identity('parent');
+  const beforeFirst = foreignKey(['a'], parent, { name: 'a', referencedColumns: ['a'] });
+  const beforeSecond = foreignKey(['a'], parent, { name: 'b', referencedColumns: ['b'] });
+  const afterFirst = foreignKey(['a'], parent, { name: 'b', referencedColumns: ['a'] });
+  const afterSecond = foreignKey(['a'], parent, { name: 'a', referencedColumns: ['b'] });
+  const columns = [column('a')];
+
+  const expected: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'foreign-key-changed', before: beforeFirst, after: afterFirst },
+        { kind: 'foreign-key-changed', before: beforeSecond, after: afterSecond },
+      ],
+    },
+  ];
+
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [beforeFirst, beforeSecond] })),
+    model(table('t', { columns, foreignKeys: [afterFirst, afterSecond] })),
+    expected,
+  );
+  assertDiff(
+    model(table('t', { columns, foreignKeys: [beforeSecond, beforeFirst] })),
+    model(table('t', { columns, foreignKeys: [afterSecond, afterFirst] })),
+    expected,
+  );
 });
