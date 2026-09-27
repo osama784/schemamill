@@ -10,3 +10,4 @@ export const version = '0.0.0';
 export const coreVersionUsed = coreVersion;
 
 export { ddlImporter, importDump } from './import.ts';
+export { renderSql, sqlRenderer } from './render.ts';
