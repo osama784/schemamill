@@ -1,0 +1,10 @@
+ALTER TABLE public.users DROP CONSTRAINT users_name_fkey;
+ALTER TABLE public.users DROP CONSTRAINT users_email_fkey;
+ALTER TABLE public.users DROP CONSTRAINT users_pkey;
+ALTER TABLE public.users DROP COLUMN legacy;
+ALTER TABLE public.users ADD COLUMN created_at timestamp with time zone DEFAULT now();
+ALTER TABLE public.users ALTER COLUMN name SET NOT NULL;
+ALTER TABLE public.users ALTER COLUMN email TYPE character varying(24);
+ALTER TABLE public.users ADD PRIMARY KEY (id);
+ALTER TABLE public.users ADD CONSTRAINT users_created_at_fkey FOREIGN KEY (created_at) REFERENCES public.events(at);
+ALTER TABLE public.users ADD CONSTRAINT users_email_fkey FOREIGN KEY (email) REFERENCES public.mail(address);
