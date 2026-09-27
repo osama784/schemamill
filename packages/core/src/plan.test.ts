@@ -7,9 +7,10 @@ import type { Step } from './plan.ts';
 
 /**
  * Tests for the migration plan: the nine-phase order, dependency-ordered table drops, cycle
- * breaking, determinism, and a dependency-invariant simulator run over hand-built cases and
- * seeded pseudo-random model pairs. Builders keep the fixtures small; expected values are
- * complete steps, asserted with `deepStrictEqual`.
+ * breaking, primary-key changes that set surviving foreign keys aside, determinism, and a
+ * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
+ * pairs. Builders keep the fixtures small; expected values are complete steps, asserted with
+ * `deepStrictEqual`.
  */
 
 /** A table identity: `public` unless another schema is given. */
@@ -440,11 +441,29 @@ const freshColumnName = (table: GeneratedTable, prefix: string): string => {
 };
 
 /**
- * Mutates one generated target table: drops or adds a primary key, drops, adds, or alters a
- * text column, and drops or changes a foreign key. A primary key is only added when the
- * baseline table had none, so a key is never renamed under the foreign keys that reference it.
- * Foreign-key targets are always the referenced table's `integer` `id` primary key, so the
- * pair stays well-formed.
+ * Renames or reorders one generated target primary key. The column set stays the same, so the
+ * foreign keys that resolve to it stay well-formed, and the planner has to set them aside
+ * while the key is replaced.
+ */
+const mutatePrimaryKey = (table: GeneratedTable, random: Random): void => {
+  const primaryKey = table.primaryKey;
+  if (primaryKey === undefined) return;
+  const columns =
+    primaryKey.columns.length > 1 && random.chance(0.5)
+      ? [...primaryKey.columns].reverse()
+      : [...primaryKey.columns];
+  table.primaryKey = {
+    ...(random.chance(0.5) ? {} : { name: `${table.name}_pkey_v2` }),
+    columns,
+  };
+};
+
+/**
+ * Mutates one generated target table: drops, renames, or reorders a primary key; drops, adds,
+ * or alters a text column; and drops or changes a foreign key. A primary key is only added
+ * when the baseline table had none, and a rename or reorder keeps its column set, so every
+ * generated target stays well-formed. Foreign-key targets are always a present table's
+ * `integer` primary-key columns, so the pair stays well-formed too.
  */
 const mutateTable = (
   table: GeneratedTable,
@@ -452,8 +471,11 @@ const mutateTable = (
   random: Random,
   textTypes: readonly string[],
 ): void => {
-  if (random.chance(0.3)) table.primaryKey = undefined;
-  if (!startedWithPrimaryKey && random.chance(0.3)) {
+  if (table.primaryKey !== undefined && random.chance(0.3)) {
+    table.primaryKey = undefined;
+  } else if (table.primaryKey !== undefined && random.chance(0.35)) {
+    mutatePrimaryKey(table, random);
+  } else if (!startedWithPrimaryKey && random.chance(0.3)) {
     table.primaryKey = { columns: ['id'] };
   }
   const extras = table.columns.filter((entry) => entry.name.startsWith('e'));
@@ -491,19 +513,28 @@ const mutateTable = (
 
 /**
  * One well-formed pseudo-random pair: 2–6 baseline tables, every foreign key pointing at a
- * present table's `integer` `id` primary key, a target built from kept, removed, changed, and
- * added tables, and target foreign keys that never reference a removed table or a dropped
- * primary key. Table order is shuffled so the planner sees arbitrary insertion orders.
+ * present table's `integer` primary-key columns (single-column or composite), a target built
+ * from kept, removed, changed, and added tables, and target foreign keys that never reference
+ * a removed table or a dropped primary key. Table order is shuffled so the planner sees
+ * arbitrary insertion orders.
  */
 const generatePair = (random: Random): { baseline: Model; target: Model } => {
   const textTypes = ['text', 'character varying(12)', 'character varying(24)'];
   const tableCount = 2 + Math.floor(random.next() * 5);
   const names = Array.from({ length: tableCount }, (_, index) => `t${index}`);
-  const startPrimaryKey = new Map(names.map((name) => [name, random.chance(0.8)]));
-  const keyed = names.filter((name) => startPrimaryKey.get(name) === true);
+  const hasPrimaryKey = new Map(names.map((name) => [name, random.chance(0.8)]));
+  const primaryKeyColumns = new Map(
+    names.map((name) => [
+      name,
+      hasPrimaryKey.get(name) === true && random.chance(0.35) ? ['id', 'k2'] : ['id'],
+    ]),
+  );
+  const keyed = names.filter((name) => hasPrimaryKey.get(name) === true);
 
   const baselineTables = names.map((name): Table => {
+    const keyColumns = primaryKeyColumns.get(name)!;
     const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
+    if (keyColumns.length > 1) columns.push(column('k2', { type: 'integer', notNull: true }));
     const extras = Math.floor(random.next() * 3);
     for (let index = 0; index < extras; index += 1) {
       columns.push(
@@ -518,10 +549,20 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     const keyCount = keyed.length === 0 ? 0 : Math.floor(random.next() * 3);
     for (let index = 0; index < keyCount; index += 1) {
       const referenced = random.pick(keyed);
-      columns.push(column(`f${index}`, { type: 'integer' }));
+      const referencedKey = primaryKeyColumns.get(referenced)!;
+      const omitReferencedColumns = random.chance(0.25);
+      const referencing = referencedKey.map((_, position) => {
+        const columnName = `f${index}_${position}`;
+        columns.push(column(columnName, { type: 'integer' }));
+        return columnName;
+      });
       foreignKeys.push(
-        foreignKey([`f${index}`], identity(referenced), {
-          referencedColumns: ['id'],
+        foreignKey(referencing, identity(referenced), {
+          referencedColumns: omitReferencedColumns
+            ? []
+            : random.chance(0.5)
+              ? [...referencedKey].reverse()
+              : [...referencedKey],
           ...(random.chance(0.4) ? { name: `${name}_f${index}_fkey` } : {}),
           ...(random.chance(0.3) ? { onDelete: 'CASCADE' as const } : {}),
         }),
@@ -529,8 +570,8 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     }
     return table(name, {
       columns,
-      ...(startPrimaryKey.get(name) === true
-        ? { primaryKey: { name: `${name}_pkey`, columns: ['id'] } }
+      ...(hasPrimaryKey.get(name) === true
+        ? { primaryKey: { name: `${name}_pkey`, columns: [...keyColumns] } }
         : {}),
       foreignKeys,
     });
@@ -546,7 +587,7 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       foreignKeys: source.foreignKeys.map(copyForeignKey),
     };
     if (random.chance(0.55))
-      mutateTable(generated, startPrimaryKey.get(source.name) === true, random, textTypes);
+      mutateTable(generated, hasPrimaryKey.get(source.name) === true, random, textTypes);
     target.set(source.name, generated);
   }
 
@@ -554,10 +595,12 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     const name = `u${index}`;
     const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
     if (random.chance(0.5)) columns.push(column('e0', { type: random.pick(textTypes) }));
+    const composite = random.chance(0.3);
+    if (composite) columns.push(column('k2', { type: 'integer', notNull: true }));
     target.set(name, {
       name,
       columns,
-      primaryKey: { name: `${name}_pkey`, columns: ['id'] },
+      primaryKey: { name: `${name}_pkey`, columns: composite ? ['id', 'k2'] : ['id'] },
       foreignKeys: [],
     });
   }
@@ -589,12 +632,16 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
   for (const generated of target.values()) {
     if (candidates.length === 0 || !random.chance(0.25)) continue;
     const referenced = random.pick(candidates);
-    const columnName = freshColumnName(generated, 'h');
-    generated.columns.push(column(columnName, { type: 'integer' }));
+    const referencedKey = referenced.primaryKey!;
+    const referencing = referencedKey.columns.map(() => {
+      const columnName = freshColumnName(generated, 'h');
+      generated.columns.push(column(columnName, { type: 'integer' }));
+      return columnName;
+    });
     generated.foreignKeys.push(
-      foreignKey([columnName], identity(referenced.name), {
-        referencedColumns: ['id'],
-        ...(random.chance(0.5) ? { name: `${generated.name}_${columnName}_fkey` } : {}),
+      foreignKey(referencing, identity(referenced.name), {
+        referencedColumns: random.chance(0.3) ? [] : [...referencedKey.columns],
+        ...(random.chance(0.5) ? { name: `${generated.name}_${referencing.join('_')}_fkey` } : {}),
       }),
     );
   }
@@ -933,6 +980,273 @@ test('a removed table referencing a kept column drops before the column does', (
   simulate(baseline, target);
 });
 
+test('a renamed primary key sets aside the foreign keys that reference it', () => {
+  const key = foreignKey(['c_id'], identity('c'), {
+    name: 'e_c_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const c = table('c', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+  });
+  const e = table('e', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'e_pkey', columns: ['id'] },
+    foreignKeys: [key],
+  });
+  const baseline = model(c, e);
+  const target = model({ ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } }, e);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('e'), foreignKey: key },
+    {
+      kind: 'drop-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey_v2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('e'), foreignKey: key },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a reordered composite primary key sets aside a composite foreign key', () => {
+  const key = foreignKey(['pa', 'pb'], identity('p'), {
+    name: 'q_p_fkey',
+    referencedColumns: ['a', 'b'],
+  });
+  const p = table('p', {
+    columns: [
+      column('a', { type: 'integer', notNull: true }),
+      column('b', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { name: 'p_pkey', columns: ['a', 'b'] },
+  });
+  const q = table('q', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('pa', { type: 'integer' }),
+      column('pb', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'q_pkey', columns: ['id'] },
+    foreignKeys: [key],
+  });
+  const baseline = model(p, q);
+  const target = model({ ...p, primaryKey: { name: 'p_pkey_v2', columns: ['b', 'a'] } }, q);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('q'), foreignKey: key },
+    {
+      kind: 'drop-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey', columns: ['a', 'b'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey_v2', columns: ['b', 'a'] },
+    },
+    { kind: 'add-foreign-key', table: identity('q'), foreignKey: key },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a renamed primary key sets aside a foreign key that omits its referenced columns', () => {
+  const key = foreignKey(['c_id'], identity('c'), { name: 'e_c_id_fkey' });
+  const c = table('c', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+  });
+  const e = table('e', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'e_pkey', columns: ['id'] },
+    foreignKeys: [key],
+  });
+  const baseline = model(c, e);
+  const target = model({ ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } }, e);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('e'), foreignKey: key },
+    {
+      kind: 'drop-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey_v2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('e'), foreignKey: key },
+  ]);
+  simulate(baseline, target);
+});
+
+test('primary-key dependents are set aside in identity order, including a self-reference', () => {
+  const aBKey = foreignKey(['b_id'], identity('c'), {
+    name: 'a_b_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const aAKey = foreignKey(['a_id'], identity('c'), {
+    name: 'a_a_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const cKey = foreignKey(['parent_id'], identity('c'), {
+    name: 'c_parent_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const zKey = foreignKey(['c_id'], identity('c'), {
+    name: 'z_c_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const c = table('c', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+    foreignKeys: [cKey],
+  });
+  const a = table('a', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('b_id', { type: 'integer' }),
+      column('a_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'a_pkey', columns: ['id'] },
+    foreignKeys: [aBKey, aAKey],
+  });
+  const z = table('z', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'z_pkey', columns: ['id'] },
+    foreignKeys: [zKey],
+  });
+  const baseline = model(z, c, a);
+  const target = model({ ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } }, z, a);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('a'), foreignKey: aAKey },
+    { kind: 'drop-foreign-key', table: identity('a'), foreignKey: aBKey },
+    { kind: 'drop-foreign-key', table: identity('c'), foreignKey: cKey },
+    { kind: 'drop-foreign-key', table: identity('z'), foreignKey: zKey },
+    {
+      kind: 'drop-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey_v2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('a'), foreignKey: aAKey },
+    { kind: 'add-foreign-key', table: identity('a'), foreignKey: aBKey },
+    { kind: 'add-foreign-key', table: identity('c'), foreignKey: cKey },
+    { kind: 'add-foreign-key', table: identity('z'), foreignKey: zKey },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a removed table referencing a renamed primary key needs no sets-aside pair', () => {
+  const key = foreignKey(['c_id'], identity('c'), {
+    name: 'x_c_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const c = table('c', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+  });
+  const x = table('x', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'x_pkey', columns: ['id'] },
+    foreignKeys: [key],
+  });
+  const baseline = model(c, x);
+  const target = model({ ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } });
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('x') },
+    {
+      kind: 'drop-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey_v2', columns: ['id'] },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('the diff replaces a foreign key under a primary-key change without a duplicate', () => {
+  const before = foreignKey(['c_id'], identity('c'), {
+    name: 'e_c_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const after = foreignKey(['c_id'], identity('c'), {
+    name: 'e_c_id_fkey',
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  });
+  const c = table('c', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'c_pkey', columns: ['id'] },
+  });
+  const e = table('e', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'e_pkey', columns: ['id'] },
+    foreignKeys: [before],
+  });
+  const cTarget = { ...c, primaryKey: { name: 'c_pkey_v2', columns: ['id'] } };
+  const eTarget = table('e', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('c_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'e_pkey', columns: ['id'] },
+    foreignKeys: [after],
+  });
+  const baseline = model(c, e);
+  const target = model(cTarget, eTarget);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('e'), foreignKey: before },
+    {
+      kind: 'drop-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('c'),
+      primaryKey: { name: 'c_pkey_v2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('e'), foreignKey: after },
+  ]);
+  simulate(baseline, target);
+});
+
 test('a removed primary key drops before the column it covers', () => {
   const baseline = model(
     table('t', { columns: [column('id')], primaryKey: { name: 't_pkey', columns: ['id'] } }),
@@ -1267,6 +1581,8 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
   let drops = 0;
   let creates = 0;
   let cuts = 0;
+  let keyChanges = 0;
+  let setAsides = 0;
   for (let round = 0; round < 500; round += 1) {
     const { baseline, target } = generatePair(random);
     try {
@@ -1278,9 +1594,22 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
       );
     }
     const targetKeys = new Set(target.tables.map(keyOf));
+    const surviving = new Map(
+      target.tables.map((table) => [keyOf(table), new Set(table.foreignKeys.map(foreignKeyKey))]),
+    );
     const { steps } = plan(baseline, target);
     if (steps.some((step) => step.kind === 'drop-table')) drops += 1;
     if (steps.some((step) => step.kind === 'create-table')) creates += 1;
+    if (steps.some((step) => step.kind === 'drop-primary-key')) keyChanges += 1;
+    if (
+      steps.some(
+        (step) =>
+          step.kind === 'drop-foreign-key' &&
+          surviving.get(keyOf(step.table))?.has(foreignKeyKey(step.foreignKey)) === true,
+      )
+    ) {
+      setAsides += 1;
+    }
     if (
       steps.some((step) => step.kind === 'drop-foreign-key' && !targetKeys.has(keyOf(step.table)))
     ) {
@@ -1290,4 +1619,9 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
   assert.ok(drops > 0, 'the generated pairs must include removed tables');
   assert.ok(creates > 0, 'the generated pairs must include added tables');
   assert.ok(cuts > 0, 'the generated pairs must include removed reference cycles');
+  assert.ok(keyChanges > 0, 'the generated pairs must include primary-key changes');
+  assert.ok(
+    setAsides > 0,
+    'the generated pairs must include primary-key changes with surviving foreign keys',
+  );
 });
