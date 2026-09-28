@@ -47,3 +47,53 @@ jobs:
 
       - name: Format check
         run: pnpm format:check
+
+  verify-postgres:
+    name: verify-postgres (node 24, postgres 18)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The pnpm version comes from the "packageManager" field in package.json.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The live-PostgreSQL harness spawns psql and pg_dump from PATH; install the PGDG client
+      # tools so they match the postgres:18 service.
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+          sudo apt-get -y install postgresql-client-18
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test against live PostgreSQL
+        env:
+          SCHEMAMILL_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: PATH="/usr/lib/postgresql/18/bin:$PATH" pnpm --filter @schemamill/postgres test
