@@ -1,0 +1,36 @@
+14 steps:
+  1. drop-foreign-key  public.fk_changed: foreign key fk_changed_target_id_fkey (target_id) → public.fk_added (id) on delete CASCADE
+  2. drop-foreign-key  public.fk_removed: foreign key fk_removed_target_id_fkey (target_id) → public.fk_added (id)
+  3. drop-table        public.gone
+  4. drop-primary-key  public.pk_changed: primary key pk_changed_pkey (a)
+  5. drop-primary-key  public.pk_removed: primary key pk_removed_pkey (id)
+  6. drop-column       public.kept.removed text
+  7. create-table      public.added
+  8. add-column        public.kept.added text
+  9. alter-column      public.kept.metric: type integer → bigint, not null false → true, default (none) → 0
+ 10. alter-column      public.kept.note: default 'old' → (none)
+ 11. add-primary-key   public.pk_added: primary key pk_added_pkey (id)
+ 12. add-primary-key   public.pk_changed: primary key pk_changed_pkey_v2 (b, a)
+ 13. add-foreign-key   public.fk_added: foreign key fk_added_target_id_fkey (target_id) → public.pk_added (id)
+ 14. add-foreign-key   public.fk_changed: foreign key fk_changed_target_id_fkey (target_id) → public.fk_added (id) on delete RESTRICT
+
+ALTER TABLE public.fk_changed DROP CONSTRAINT fk_changed_target_id_fkey;
+ALTER TABLE public.fk_removed DROP CONSTRAINT fk_removed_target_id_fkey;
+DROP TABLE public.gone;
+ALTER TABLE public.pk_changed DROP CONSTRAINT pk_changed_pkey;
+ALTER TABLE public.pk_removed DROP CONSTRAINT pk_removed_pkey;
+ALTER TABLE public.kept DROP COLUMN removed;
+CREATE TABLE public.added (
+    id integer NOT NULL,
+    name text NOT NULL,
+    CONSTRAINT added_pkey PRIMARY KEY (id)
+);
+ALTER TABLE public.kept ADD COLUMN added text;
+ALTER TABLE public.kept ALTER COLUMN metric TYPE bigint;
+ALTER TABLE public.kept ALTER COLUMN metric SET NOT NULL;
+ALTER TABLE public.kept ALTER COLUMN metric SET DEFAULT 0;
+ALTER TABLE public.kept ALTER COLUMN note DROP DEFAULT;
+ALTER TABLE public.pk_added ADD CONSTRAINT pk_added_pkey PRIMARY KEY (id);
+ALTER TABLE public.pk_changed ADD CONSTRAINT pk_changed_pkey_v2 PRIMARY KEY (b, a);
+ALTER TABLE public.fk_added ADD CONSTRAINT fk_added_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.pk_added(id);
+ALTER TABLE public.fk_changed ADD CONSTRAINT fk_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_added(id) ON DELETE RESTRICT;
