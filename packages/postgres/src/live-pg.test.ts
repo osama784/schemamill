@@ -156,8 +156,16 @@ async function writeSceneFiles(
   const baselineBuild = join(workDir, `${slug}.baseline.build.sql`);
   const targetBuild = join(workDir, `${slug}.target.build.sql`);
   const migration = join(workDir, `${slug}.migrate.sql`);
-  await writeFile(baselineBuild, renderSql(plan({ tables: [] }, scene.baseline)), 'utf8');
-  await writeFile(targetBuild, renderSql(plan({ tables: [] }, scene.target)), 'utf8');
+  await writeFile(
+    baselineBuild,
+    renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+    'utf8',
+  );
+  await writeFile(
+    targetBuild,
+    renderSql(plan({ tables: [], sequences: [] }, scene.target)),
+    'utf8',
+  );
   await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
   return {
     baselineBuild,

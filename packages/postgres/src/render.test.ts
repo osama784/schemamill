@@ -9,6 +9,8 @@ import type {
   Model,
   Plan,
   PrimaryKey,
+  Sequence,
+  SequenceOwner,
   Step,
   Table,
   TableIdentity,
@@ -62,7 +64,37 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+
+/** A sequence named `name`: bigint ascending defaults unless overridden. */
+const sequence = (
+  name: string,
+  fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
+  schema = 'public',
+): Sequence => ({
+  schema,
+  name,
+  dataType: 'bigint',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  start: '1',
+  cache: '1',
+  cycle: false,
+  ...fields,
+});
+
+/** An owner of table `table`'s column `column`, `public` unless a schema is given. */
+const owner = (table: string, column: string, schema = 'public'): SequenceOwner => ({
+  table: { schema, name: table },
+  column,
+});
+
+/** A model of the given sequences, with no tables unless they are supplied. */
+const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
+  tables,
+  sequences,
+});
 
 /** A plan of the given steps, for renderer edge cases. */
 const planOf = (...steps: readonly Step[]): Plan => ({ steps });
@@ -505,4 +537,143 @@ test('structurally equal models in any insertion order render the same SQL', () 
 
   assert.equal(firstSql, secondSql);
   assert.match(firstSql, /ALTER TABLE public\.sessions ADD CONSTRAINT sessions_user_id_fkey/);
+});
+
+test('renders CREATE SEQUENCE with every effective option, exactly', () => {
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'create-sequence',
+        sequence: sequence('s', {
+          increment: '-2',
+          minValue: '1',
+          maxValue: '9223372036854775807',
+          start: '9007199254740993',
+          cache: '2147483647',
+          cycle: true,
+        }),
+      }),
+    ),
+    'CREATE SEQUENCE public.s AS bigint INCREMENT BY -2 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 9007199254740993 CACHE 2147483647 CYCLE;\n',
+  );
+});
+
+test('renders one ALTER SEQUENCE statement carrying every changed field, in order', () => {
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [
+          { field: 'dataType', before: 'smallint', after: 'integer' },
+          { field: 'increment', before: '1', after: '2' },
+          { field: 'minValue', before: '1', after: '0' },
+          { field: 'maxValue', before: '100', after: '200' },
+          { field: 'start', before: '1', after: '5' },
+          { field: 'cache', before: '1', after: '4' },
+          { field: 'cycle', before: false, after: true },
+        ],
+      }),
+    ),
+    'ALTER SEQUENCE public.s AS integer INCREMENT BY 2 MINVALUE 0 MAXVALUE 200 START WITH 5 CACHE 4 CYCLE;\n',
+  );
+});
+
+test('renders the AS conversion and the bounds it would move in one statement', () => {
+  // The exact repro shape: `AS bigint` alone would rewrite the baseline's integer maximum to
+  // bigint's, so the statement restates the target's maximum after the type change.
+  const baseline = sequenceModel([sequence('s', { dataType: 'integer', maxValue: '2147483647' })]);
+  const target = sequenceModel([sequence('s', { maxValue: '2147483647' })]);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    'ALTER SEQUENCE public.s AS bigint MAXVALUE 2147483647;\n',
+  );
+});
+
+test('renders ownership changes as OWNED BY and OWNED BY NONE', () => {
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [{ field: 'ownedBy', before: owner('old', 'id'), after: owner('new', 'id') }],
+      }),
+    ),
+    'ALTER SEQUENCE public.s OWNED BY public.new.id;\n',
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [{ field: 'ownedBy', before: owner('old', 'id') }],
+      }),
+    ),
+    'ALTER SEQUENCE public.s OWNED BY NONE;\n',
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [{ field: 'ownedBy', after: owner('new', 'id') }],
+      }),
+    ),
+    'ALTER SEQUENCE public.s OWNED BY public.new.id;\n',
+  );
+});
+
+test('quotes sequence and owner identifiers only when PostgreSQL needs it', () => {
+  assert.equal(
+    renderSql(planOf({ kind: 'drop-sequence', sequence: { schema: 'user', name: 'select' } })),
+    'DROP SEQUENCE "user"."select";\n',
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-sequence',
+        sequence: { schema: 'public', name: 'Mixed Case' },
+        fields: [{ field: 'ownedBy', after: owner('Order', 'we"ird') }],
+      }),
+    ),
+    'ALTER SEQUENCE public."Mixed Case" OWNED BY public."Order"."we""ird";\n',
+  );
+});
+
+test('golden: a sequence lifecycle renders create, attach, alter, re-own, and drop', () => {
+  const t = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('x', { type: 'bigint' })],
+  });
+  const baseline = sequenceModel(
+    [sequence('s', { ownedBy: owner('t', 'id') }), sequence('gone')],
+    t,
+  );
+  const target = sequenceModel([sequence('s', { increment: '5', ownedBy: owner('t', 'x') })], t);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'ALTER SEQUENCE public.s OWNED BY public.t.x;',
+      'ALTER SEQUENCE public.s INCREMENT BY 5;',
+      'DROP SEQUENCE public.gone;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('structurally equal models with sequences in any insertion order render the same SQL', () => {
+  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const baselineSequences = [sequence('a', { ownedBy: owner('t', 'id') }), sequence('b')];
+  const baseline = sequenceModel(baselineSequences, t);
+  const reversed = sequenceModel([...baselineSequences].reverse(), t);
+  const target = sequenceModel([sequence('a', { increment: '9' })], t);
+
+  const first = renderSql(plan(baseline, target));
+  const second = renderSql(plan(reversed, target));
+
+  assert.equal(first, second);
+  assert.match(first, /^ALTER SEQUENCE public\.a OWNED BY NONE;/m);
+  assert.match(first, /^ALTER SEQUENCE public\.a INCREMENT BY 9;/m);
+  assert.match(first, /^DROP SEQUENCE public\.b;/m);
 });

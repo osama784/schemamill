@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sequence modeling and normalization** — `@schemamill/core` gained a first-class `Sequence` entity and a `sequences` array on `Model`: schema-qualified identity, `dataType` (`smallint`, `integer`, `bigint`), `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, and an optional `ownedBy` (`{ table, column }`). Every numeric option was stored as an exact 64-bit integer in canonical decimal form, never a JavaScript `number`, so the type bounds (`9223372036854775807` and friends) survived intact; `effectiveSequence` normalized omitted options and `NO MINVALUE`/`NO MAXVALUE` to the engine defaults, including the direction-dependent bounds of descending sequences.
+- **Sequence import** — `@schemamill/postgres` imported `CREATE SEQUENCE` (options and inline `OWNED BY`) and the `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max, start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — applying them in the engine's fixed order, converting old-type-default bounds on `AS` changes, and modelling the separate `ALTER SEQUENCE … OWNED BY` statements `pg_dump` emits. `RESTART` (sequence state), renames, `SET SCHEMA`, `setval` calls, and dump-side `DROP SEQUENCE` stayed skip-and-named, as did unsupported options and values; `UNLOGGED` and `TEMPORARY` sequence persistence was flagged and dropped, like a table's.
+- **Sequence diff, plan, and render** — `diff` gained a deterministic sequences group with field-level changes (`dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, `ownedBy`), comparing effective values so an omitted option and its explicit default were not a change and, on a data type change, comparing bounds against the engine's `AS` conversion so the plan restated any bound the conversion would have moved; `plan` gained `create-sequence`, `alter-sequence`, and `drop-sequence` steps ordered by policy — creates, ownership detaches before a removed owner, the table phases, ownership attaches/re-owns, option alters, then drops — suppressing an explicit `DROP SEQUENCE` when the plan also removed the table or column that owned it, because PostgreSQL drops an owned sequence with its owner; and `renderSql` rendered the canonical full-explicit `CREATE SEQUENCE`, one `ALTER SEQUENCE` statement per changed field set (ownership included), and `DROP SEQUENCE`. `@schemamill/cli` gained a `sequences` golden scene covering sequence add and drop, an owned sequence for a new table, option alters, ownership detach and re-own, and drop suppression.
+
+### Changed
+
+- **`compare` and `plan` outputs include sequences** — sequence changes now render as `sequence <schema>.<name>` blocks after the table changes in `compare`, with one option per line and field-level changes; `plan` numbers sequence steps inline in policy order. The previous sequence skip diagnostics disappeared: `CREATE SEQUENCE` and mapped `ALTER SEQUENCE` statements are part of the model now.
+
 ## [0.1.0] - 2026-09-29
 
 ### Added

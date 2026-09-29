@@ -1,23 +1,40 @@
-import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from './model.ts';
+import type {
+  Column,
+  ForeignKey,
+  Model,
+  PrimaryKey,
+  Sequence,
+  SequenceDataType,
+  SequenceIdentity,
+  SequenceOwner,
+  Table,
+  TableIdentity,
+} from './model.ts';
+import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
 /**
  * The diff: what changed between a baseline model and a target model.
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
- * column, primary key, or foreign key. It never guesses a rename: a table or column under a
- * new name is a removal and an addition, a primary key with a different column list is a
- * primary-key change, and a foreign key pointing at a different table is a removal and an
+ * column, primary key, foreign key, or sequence. It never guesses a rename: a table or column
+ * under a new name is a removal and an addition, a primary key with a different column list is
+ * a primary-key change, and a foreign key pointing at a different table is a removal and an
  * addition.
  *
  * Identity is the model's identity. A table is its schema and name; a column is its name
  * within its table; a table has at most one primary key, compared by its name and its column
  * list; two foreign keys belong together when their referencing columns (order-sensitive) and
  * their referenced table are the same, and any other difference — name, referenced columns,
- * actions — reads as a change to that pair.
+ * actions — reads as a change to that pair; a sequence is its schema and name, like a table.
  *
  * Text is compared exactly as stored. Core never normalizes or lexes SQL: import
  * whitespace-normalizes at the boundary, so even a difference in whitespace is a change.
- * Names are case-sensitive.
+ * Names are case-sensitive. Sequence options are the exception: they compare on effective
+ * values, so an omitted option and its explicit default are the same value, and a sequence
+ * that only restates its defaults is not a change (`sequence.ts` holds the rules). A sequence
+ * whose `dataType` differs is additionally compared against the engine's `AS` conversion: a
+ * bound equal to the old type's bound becomes the new type's bound, so the conversion is
+ * applied first and `minValue`/`maxValue` are reported against its result.
  *
  * A column is identified by name alone: the ordinal position of an existing column is not
  * part of the diff. The model stores `columns` in source order for fidelity, and column
@@ -46,6 +63,14 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  *    come from, as point 2 describes, and no entry states a column's position. A table with no
  *    reported changes is therefore not necessarily structurally identical to its counterpart:
  *    the two may store their columns in different orders.
+ * 4. Sequence identities are merge-walked the same way, after every table change, and reported
+ *    as a group in identity order: a baseline-only identity is `sequence-removed`, a target-only
+ *    identity `sequence-added`, and a shared identity is compared on effective option values.
+ *    A changed sequence reports only the fields that differ, in the fixed order `dataType`,
+ *    `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, `ownedBy`; with a
+ *    `dataType` change, `minValue`/`maxValue` compare the bounds the engine's `AS` conversion
+ *    would leave, so a bound that only differs from the target after the conversion is still
+ *    reported.
  *
  * Duplicate foreign-key identities — several constraints with the same referencing columns
  * and referenced table — pair structurally identical foreign keys first, then pair the rest
@@ -66,7 +91,17 @@ export type Change =
   /** The baseline has a table the target does not. */
   | { kind: 'table-removed'; table: Table }
   /** Both sides have the table, and at least one of its members differs. */
-  | { kind: 'table-changed'; table: TableIdentity; changes: readonly TableChange[] };
+  | { kind: 'table-changed'; table: TableIdentity; changes: readonly TableChange[] }
+  /** The target has a sequence the baseline does not. */
+  | { kind: 'sequence-added'; sequence: Sequence }
+  /** The baseline has a sequence the target does not. */
+  | { kind: 'sequence-removed'; sequence: Sequence }
+  /** Both sides have the sequence, and at least one of its options differs. */
+  | {
+      kind: 'sequence-changed';
+      sequence: SequenceIdentity;
+      changes: readonly SequenceFieldChange[];
+    };
 
 /** One difference within a changed table. */
 export type TableChange =
@@ -97,6 +132,24 @@ export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
   | { field: 'notNull'; before: boolean; after: boolean }
   | { field: 'default'; before?: string; after?: string };
+
+/**
+ * One differing option of a changed sequence; only fields that differ are reported, in the
+ * fixed order `dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`,
+ * `ownedBy`. A `minValue`/`maxValue` change reports the value in effect after the step's
+ * `dataType` change — the engine rewrites a bound equal to the old type's bound to the new
+ * type's — as `before`, so a bound the target restores after that conversion is still
+ * reported. An `ownedBy` change omits the side that has no owner.
+ */
+export type SequenceFieldChange =
+  | { field: 'dataType'; before: SequenceDataType; after: SequenceDataType }
+  | { field: 'increment'; before: string; after: string }
+  | { field: 'minValue'; before: string; after: string }
+  | { field: 'maxValue'; before: string; after: string }
+  | { field: 'start'; before: string; after: string }
+  | { field: 'cache'; before: string; after: string }
+  | { field: 'cycle'; before: boolean; after: boolean }
+  | { field: 'ownedBy'; before?: SequenceOwner; after?: SequenceOwner };
 
 /**
  * The changes from `baseline` to `target`, in the module's deterministic order. Returned
@@ -142,7 +195,110 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     changes.push({ kind: 'table-added', table: copyTable(targetTables[targetIndex]!) });
   }
 
+  return [...changes, ...diffSequences(baseline, target)];
+}
+
+/**
+ * The sequence group of the diff, in identity order. Sequences compare on effective option
+ * values: both sides normalize through `effectiveSequence`, so an omitted option and its
+ * explicit default are not a change, and reported payloads are effective sequences.
+ */
+function diffSequences(baseline: Model, target: Model): readonly Change[] {
+  const baselineSequences = [...baseline.sequences].sort(compareSequences).map(effectiveSequence);
+  const targetSequences = [...target.sequences].sort(compareSequences).map(effectiveSequence);
+
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineSequences.length && targetIndex < targetSequences.length) {
+    const baselineSequence = baselineSequences[baselineIndex]!;
+    const targetSequence = targetSequences[targetIndex]!;
+    const comparison = compareSequences(baselineSequence, targetSequence);
+    if (comparison < 0) {
+      changes.push({ kind: 'sequence-removed', sequence: copySequence(baselineSequence) });
+      baselineIndex += 1;
+    } else if (comparison > 0) {
+      changes.push({ kind: 'sequence-added', sequence: copySequence(targetSequence) });
+      targetIndex += 1;
+    } else {
+      const fields = diffSequenceFields(baselineSequence, targetSequence);
+      if (fields.length > 0) {
+        changes.push({
+          kind: 'sequence-changed',
+          sequence: { schema: baselineSequence.schema, name: baselineSequence.name },
+          changes: fields,
+        });
+      }
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+
+  for (; baselineIndex < baselineSequences.length; baselineIndex += 1) {
+    changes.push({
+      kind: 'sequence-removed',
+      sequence: copySequence(baselineSequences[baselineIndex]!),
+    });
+  }
+  for (; targetIndex < targetSequences.length; targetIndex += 1) {
+    changes.push({ kind: 'sequence-added', sequence: copySequence(targetSequences[targetIndex]!) });
+  }
+
   return changes;
+}
+
+function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceFieldChange[] {
+  const fields: SequenceFieldChange[] = [];
+  const dataTypeChanged = baseline.dataType !== target.dataType;
+  if (dataTypeChanged) {
+    fields.push({ field: 'dataType', before: baseline.dataType, after: target.dataType });
+  }
+  if (baseline.increment !== target.increment) {
+    fields.push({ field: 'increment', before: baseline.increment, after: target.increment });
+  }
+  // With a data type change, the bounds the step lands on without explicit clauses are the
+  // ones the engine's `AS` conversion leaves, not the baseline's: a bound equal to the old
+  // type's bound becomes the new type's. Compare against those so the plan restates a bound
+  // the conversion would otherwise move.
+  const converted = dataTypeChanged
+    ? sequenceTypeChange(baseline.dataType, baseline.minValue, baseline.maxValue, target.dataType)
+    : { minValue: baseline.minValue, maxValue: baseline.maxValue };
+  if (converted.minValue !== target.minValue) {
+    fields.push({ field: 'minValue', before: converted.minValue, after: target.minValue });
+  }
+  if (converted.maxValue !== target.maxValue) {
+    fields.push({ field: 'maxValue', before: converted.maxValue, after: target.maxValue });
+  }
+  if (baseline.start !== target.start) {
+    fields.push({ field: 'start', before: baseline.start, after: target.start });
+  }
+  if (baseline.cache !== target.cache) {
+    fields.push({ field: 'cache', before: baseline.cache, after: target.cache });
+  }
+  if (baseline.cycle !== target.cycle) {
+    fields.push({ field: 'cycle', before: baseline.cycle, after: target.cycle });
+  }
+  if (!sameOwner(baseline.ownedBy, target.ownedBy)) {
+    fields.push({
+      field: 'ownedBy',
+      ...(baseline.ownedBy === undefined ? {} : { before: copyOwner(baseline.ownedBy) }),
+      ...(target.ownedBy === undefined ? {} : { after: copyOwner(target.ownedBy) }),
+    });
+  }
+  return fields;
+}
+
+/** Whether two optional owners name the same table and column. */
+function sameOwner(left: SequenceOwner | undefined, right: SequenceOwner | undefined): boolean {
+  if (left === undefined) return right === undefined;
+  if (right === undefined) return false;
+  return sameIdentity(left.table, right.table) && left.column === right.column;
+}
+
+/** Whether both identities name the same table. */
+function sameIdentity(left: TableIdentity, right: TableIdentity): boolean {
+  return left.schema === right.schema && left.name === right.name;
 }
 
 /** A copy of `column`, independent of the caller's model. */
@@ -162,6 +318,19 @@ function copyForeignKey(foreignKey: ForeignKey): ForeignKey {
     columns: [...foreignKey.columns],
     referencedTable: { ...foreignKey.referencedTable },
     referencedColumns: [...foreignKey.referencedColumns],
+  };
+}
+
+/** A copy of `owner`, independent of the caller's model. */
+function copyOwner(owner: SequenceOwner): SequenceOwner {
+  return { table: { ...owner.table }, column: owner.column };
+}
+
+/** A copy of `sequence`, independent of the caller's model. */
+function copySequence(sequence: Sequence): Sequence {
+  return {
+    ...sequence,
+    ...(sequence.ownedBy === undefined ? {} : { ownedBy: copyOwner(sequence.ownedBy) }),
   };
 }
 
@@ -360,6 +529,10 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 }
 
 function compareTables(left: TableIdentity, right: TableIdentity): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareSequences(left: SequenceIdentity, right: SequenceIdentity): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 

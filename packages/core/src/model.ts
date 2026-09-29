@@ -11,6 +11,7 @@
  * - A column is identified by its name within its table.
  * - A primary key or foreign key is identified by the columns it covers; a constraint
  *   `name` travels with it when the source has one but is not part of its identity.
+ * - A sequence is identified by its schema and its name together, like a table.
  *
  * Ordering — deterministic, so two models of the same schema compare structurally:
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
@@ -19,6 +20,7 @@
  * - `foreignKeys` are sorted by referencing columns (element-wise lexicographic), then
  *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
  *   first).
+ * - `sequences` are sorted by schema, then name (JavaScript string comparison).
  *
  * This module declares shapes only; it holds no behavior.
  */
@@ -31,10 +33,12 @@ export interface TableIdentity {
   readonly name: string;
 }
 
-/** The canonical model: the whole schema, as tables. */
+/** The canonical model: the whole schema, as tables and sequences. */
 export interface Model {
   /** Every imported table, in the model's deterministic order. */
   readonly tables: readonly Table[];
+  /** Every imported sequence, in the model's deterministic order. */
+  readonly sequences: readonly Sequence[];
 }
 
 /** A table and its imported structure. */
@@ -90,3 +94,51 @@ export interface ForeignKey {
  * model; importers report them as dropped.
  */
 export type ReferentialAction = 'RESTRICT' | 'CASCADE' | 'SET NULL' | 'SET DEFAULT';
+
+/** Identifies a sequence in the model: the schema-qualified name, e.g. `public.users_id_seq`. */
+export interface SequenceIdentity {
+  /** The namespace that qualifies the sequence, e.g. `public`. */
+  readonly schema: string;
+  /** The sequence's name, as written without quoting. */
+  readonly name: string;
+}
+
+/** The data type of a sequence; PostgreSQL allows exactly these three. */
+export type SequenceDataType = 'smallint' | 'integer' | 'bigint';
+
+/** The table and column a sequence is owned by. */
+export interface SequenceOwner {
+  /** The owning table, schema-qualified. */
+  readonly table: TableIdentity;
+  /** The owning column's name, as written without quoting. */
+  readonly column: string;
+}
+
+/**
+ * A sequence and its effective options. Every numeric option is an exact 64-bit integer in
+ * canonical decimal form — an optional minus followed by digits, no leading zeros — never a
+ * JavaScript `number`: the type bounds exceed `Number.MAX_SAFE_INTEGER`. The values are the
+ * effective ones PostgreSQL would use, so an option the source omitted and the same option
+ * stated explicitly are the same value here (normalization lives in `sequence.ts`).
+ *
+ * `ownedBy` is the sequence's optional ownership: when present, PostgreSQL drops the sequence
+ * together with the owning table or column. Absent means unowned.
+ */
+export interface Sequence extends SequenceIdentity {
+  /** The sequence's data type; `bigint` when the source omits `AS`. */
+  readonly dataType: SequenceDataType;
+  /** The `INCREMENT BY` step, an exact integer. */
+  readonly increment: string;
+  /** The `MINVALUE`, an exact integer. */
+  readonly minValue: string;
+  /** The `MAXVALUE`, an exact integer. */
+  readonly maxValue: string;
+  /** The `START WITH` value, an exact integer. */
+  readonly start: string;
+  /** The `CACHE` size, an exact positive integer. */
+  readonly cache: string;
+  /** Whether the sequence wraps with `CYCLE`. */
+  readonly cycle: boolean;
+  /** The owning table and column, when the sequence is owned. */
+  readonly ownedBy?: SequenceOwner;
+}

@@ -2,13 +2,23 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { plan } from './index.ts';
-import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from './model.ts';
+import type {
+  Column,
+  ForeignKey,
+  Model,
+  PrimaryKey,
+  Sequence,
+  SequenceOwner,
+  Table,
+  TableIdentity,
+} from './model.ts';
 import type { Step } from './plan.ts';
 
 /**
- * Tests for the migration plan: the nine-phase order, dependency-ordered table drops, cycle
- * breaking, primary-key changes that set surviving foreign keys aside, determinism, and a
- * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
+ * Tests for the migration plan: the six global phases with the nine table phases at their
+ * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
+ * surviving foreign keys aside, sequence ownership detaches and drop suppression, determinism,
+ * and a dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
  * pairs. Builders keep the fixtures small; expected values are complete steps, asserted with
  * `deepStrictEqual`.
  */
@@ -72,7 +82,50 @@ const idForeignKey = (from: string, columnName: string, to: string): ForeignKey 
   });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+
+/** A sequence named `name`: bigint ascending defaults unless overridden. */
+const sequence = (
+  name: string,
+  fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
+  schema = 'public',
+): Sequence => ({
+  schema,
+  name,
+  dataType: 'bigint',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  start: '1',
+  cache: '1',
+  cycle: false,
+  ...fields,
+});
+
+/** An owner of table `table`'s column `column`, `public` unless a schema is given. */
+const owner = (table: string, column: string, schema = 'public'): SequenceOwner => ({
+  table: { schema, name: table },
+  column,
+});
+
+/** A copy of `value` without its `ownedBy`, the shape `create-sequence` steps carry. */
+const unowned = (value: Sequence): Sequence => ({
+  schema: value.schema,
+  name: value.name,
+  dataType: value.dataType,
+  increment: value.increment,
+  minValue: value.minValue,
+  maxValue: value.maxValue,
+  start: value.start,
+  cache: value.cache,
+  cycle: value.cycle,
+});
+
+/** A model of the given sequences, with no tables unless they are supplied. */
+const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
+  tables,
+  sequences,
+});
 
 /** Asserts that planning `baseline` to `target` yields exactly `expected`. */
 const assertPlan = (baseline: Model, target: Model, expected: readonly Step[]): void => {
@@ -1624,4 +1677,225 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
     setAsides > 0,
     'the generated pairs must include primary-key changes with surviving foreign keys',
   );
+});
+
+test('a new owned sequence is created before its table and attached after it', () => {
+  const fresh = table('fresh', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const owned = sequence('fresh_id_seq', { ownedBy: owner('fresh', 'id') });
+  const standalone = sequence('standalone');
+
+  // Phase 1 creates both sequences (identity order), phase 3 the table, phase 4 the ownership.
+  assertPlan(model(), sequenceModel([standalone, owned], fresh), [
+    { kind: 'create-sequence', sequence: unowned(owned) },
+    { kind: 'create-sequence', sequence: standalone },
+    { kind: 'create-table', table: fresh },
+    {
+      kind: 'alter-sequence',
+      sequence: identity('fresh_id_seq'),
+      fields: [{ field: 'ownedBy', after: owner('fresh', 'id') }],
+    },
+  ]);
+});
+
+test('a kept sequence detaches before its removed owner table and re-owns after', () => {
+  const oldOwner = table('old_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+  });
+  const newOwner = table('new_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+  });
+
+  assertPlan(
+    sequenceModel(
+      [sequence('moved_seq', { ownedBy: owner('old_owner', 'id') })],
+      oldOwner,
+      newOwner,
+    ),
+    sequenceModel([sequence('moved_seq', { ownedBy: owner('new_owner', 'id') })], newOwner),
+    [
+      {
+        kind: 'alter-sequence',
+        sequence: identity('moved_seq'),
+        fields: [{ field: 'ownedBy', before: owner('old_owner', 'id') }],
+      },
+      { kind: 'drop-table', table: identity('old_owner') },
+      {
+        kind: 'alter-sequence',
+        sequence: identity('moved_seq'),
+        fields: [
+          {
+            field: 'ownedBy',
+            before: owner('old_owner', 'id'),
+            after: owner('new_owner', 'id'),
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('a kept sequence detaches before its removed owner column', () => {
+  const baselineTable = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('x', { type: 'bigint' })],
+  });
+  const targetTable = table('t', { columns: [column('x', { type: 'bigint' })] });
+
+  assertPlan(
+    sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], baselineTable),
+    sequenceModel([sequence('s')], targetTable),
+    [
+      {
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [{ field: 'ownedBy', before: owner('t', 'id') }],
+      },
+      {
+        kind: 'drop-column',
+        table: identity('t'),
+        column: column('id', { type: 'bigint', notNull: true }),
+      },
+    ],
+  );
+});
+
+test('a removed sequence cascades with its removed owner table and is not dropped explicitly', () => {
+  const goneOwner = table('gone_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+  });
+
+  assertPlan(
+    sequenceModel([sequence('cascaded_seq', { ownedBy: owner('gone_owner', 'id') })], goneOwner),
+    model(),
+    [{ kind: 'drop-table', table: identity('gone_owner') }],
+  );
+});
+
+test('a removed sequence cascades with its removed owner column and is not dropped explicitly', () => {
+  const baselineTable = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('x', { type: 'bigint' })],
+  });
+  const targetTable = table('t', { columns: [column('x', { type: 'bigint' })] });
+
+  assertPlan(
+    sequenceModel([sequence('cascaded_seq', { ownedBy: owner('t', 'id') })], baselineTable),
+    sequenceModel([], targetTable),
+    [
+      {
+        kind: 'drop-column',
+        table: identity('t'),
+        column: column('id', { type: 'bigint', notNull: true }),
+      },
+    ],
+  );
+});
+
+test('a removed sequence whose owner survives is dropped explicitly, in identity order', () => {
+  const surviving = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+
+  assertPlan(
+    sequenceModel(
+      [sequence('s', { ownedBy: owner('t', 'id') }), sequence('u', { ownedBy: owner('t', 'id') })],
+      surviving,
+    ),
+    model(surviving),
+    [
+      { kind: 'drop-sequence', sequence: identity('s') },
+      { kind: 'drop-sequence', sequence: identity('u') },
+    ],
+  );
+});
+
+test('ownership attaches, then option alters, then sequence drops', () => {
+  const t = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('x', { type: 'bigint' })],
+  });
+
+  assertPlan(
+    sequenceModel(
+      [
+        sequence('s1', { ownedBy: owner('t', 'id') }),
+        sequence('s2'),
+        sequence('s3', { ownedBy: owner('t', 'id') }),
+      ],
+      t,
+    ),
+    sequenceModel([sequence('s1', { increment: '5', ownedBy: owner('t', 'x') })], t),
+    [
+      {
+        kind: 'alter-sequence',
+        sequence: identity('s1'),
+        fields: [{ field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'x') }],
+      },
+      {
+        kind: 'alter-sequence',
+        sequence: identity('s1'),
+        fields: [{ field: 'increment', before: '1', after: '5' }],
+      },
+      { kind: 'drop-sequence', sequence: identity('s2') },
+      { kind: 'drop-sequence', sequence: identity('s3') },
+    ],
+  );
+});
+
+test('a data type change keeps a bound the AS conversion would move explicit', () => {
+  // The exact repro shape: both sides state the integer maximum, but the engine converts the
+  // baseline's integer maximum on `AS bigint`, so the plan restates the target's maximum.
+  const baseline = sequenceModel([sequence('s', { dataType: 'integer', maxValue: '2147483647' })]);
+  const target = sequenceModel([sequence('s', { maxValue: '2147483647' })]);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-sequence',
+      sequence: identity('s'),
+      fields: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+      ],
+    },
+  ]);
+});
+
+test('structurally equal models with sequences in any insertion order plan identically', () => {
+  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const baselineSequences = [sequence('kept', { ownedBy: owner('t', 'id') }), sequence('dropped')];
+  const targetSequences = [sequence('kept', { increment: '3', ownedBy: owner('t', 'id') })];
+
+  const forward = plan(sequenceModel(baselineSequences, t), sequenceModel(targetSequences, t));
+  const reversed = plan(
+    sequenceModel([...baselineSequences].reverse(), t),
+    sequenceModel(targetSequences, t),
+  );
+
+  assert.deepStrictEqual(reversed, forward);
+  assert.deepStrictEqual(
+    forward.steps.map((step) => step.kind),
+    ['alter-sequence', 'drop-sequence'],
+  );
+});
+
+test('a deep-frozen model with sequences can be planned, and steps are independent copies', () => {
+  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const source = sequence('s', { ownedBy: owner('t', 'id') });
+  const baseline = deepFreeze(sequenceModel([source], t));
+  const target = deepFreeze(model(t));
+
+  const { steps } = plan(baseline, target);
+  const drop = steps.find((step) => step.kind === 'drop-sequence');
+  assert.ok(drop !== undefined, 'the removed sequence is dropped');
+  assert.notEqual(drop.sequence, source);
+});
+
+test('a deep-frozen model with a changed sequence can be planned without mutation', () => {
+  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const baseline = deepFreeze(sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], t));
+  const target = deepFreeze(sequenceModel([sequence('s', { ownedBy: owner('t', 'other') })], t));
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'alter-sequence',
+      sequence: identity('s'),
+      fields: [{ field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'other') }],
+    },
+  ]);
 });

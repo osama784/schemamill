@@ -12,8 +12,18 @@
  * - `ALTER TABLE … ADD CONSTRAINT` attaches a foreign key or primary key to an already
  *   imported table; any other constraint kind, and any other `ALTER TABLE` action, is skipped
  *   and named.
- * - Everything outside the imported subset (schemas, sequences, indexes, views, functions,
- *   comments, grants, settings, …) is skipped and named.
+ * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
+ *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
+ *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
+ *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale, and unlogged or
+ *   temporary sequence persistence is flagged.
+ * - `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max,
+ *   start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — apply to the already imported
+ *   sequence, in the order the engine processes them, and are skipped and named when the
+ *   sequence was not imported. `RESTART` (sequence state), renames, `SET SCHEMA`, and
+ *   `setval` calls are skipped and named; so is a dump-side `DROP SEQUENCE`.
+ * - Everything outside the imported subset (schemas, indexes, views, functions, comments,
+ *   grants, settings, …) is skipped and named.
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
@@ -40,16 +50,30 @@ import type {
   PrimaryKey,
   ReadResult,
   ReferentialAction,
+  Sequence,
+  SequenceDataType,
+  SequenceOptions,
+  SequenceOwner,
   SkipDiagnosticCode,
   Table,
   TableIdentity,
 } from '@schemamill/core';
+import {
+  defaultSequenceMax,
+  defaultSequenceMin,
+  effectiveSequence,
+  sequenceTypeBounds,
+  sequenceTypeChange,
+} from '@schemamill/core';
 import type {
+  AlterSeqStmt,
   AlterTableCmd,
   AlterTableStmt,
   ColumnDef,
   Constraint,
+  CreateSeqStmt,
   CreateStmt,
+  DefElem,
   Node,
   RangeVar,
 } from 'libpg-query';
@@ -68,6 +92,9 @@ interface TableDraft {
   primaryKey?: PrimaryKey;
   readonly foreignKeys: ForeignKey[];
 }
+
+/** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
+type SequenceDraft = Mutable<Sequence>;
 
 interface PositionedDiagnostic {
   readonly offset: number;
@@ -117,14 +144,18 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
   }
 
   const tables = new Map<string, TableDraft>();
+  const sequences = new Map<string, SequenceDraft>();
   for (const statement of parsed.statements) {
-    translateStatement(statement, tables, diagnostics);
+    translateStatement(statement, tables, sequences, diagnostics);
   }
 
   diagnostics.sort((left, right) => left.offset - right.offset);
 
   return {
-    model: { tables: [...tables.values()].map(finalizeTable).sort(compareTables) },
+    model: {
+      tables: [...tables.values()].map(finalizeTable).sort(compareTables),
+      sequences: [...sequences.values()].sort(compareSequences),
+    },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
 }
@@ -156,6 +187,7 @@ function fromParseFailure(failure: ParseFailure): Diagnostic {
 function translateStatement(
   statement: ParsedStatement,
   tables: Map<string, TableDraft>,
+  sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
@@ -178,6 +210,14 @@ function translateStatement(
   }
   if ('AlterTableStmt' in node) {
     translateAlterTable(statement, node.AlterTableStmt, tables, diagnostics);
+    return;
+  }
+  if ('CreateSeqStmt' in node) {
+    translateCreateSequence(statement, node.CreateSeqStmt, sequences, diagnostics);
+    return;
+  }
+  if ('AlterSeqStmt' in node) {
+    translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics);
     return;
   }
 
@@ -414,6 +454,318 @@ function translateCreateTableExtras(
   if (create.relation?.relpersistence === 't') flag('temporary-table persistence');
 }
 
+/** Maps PostgreSQL's normalized sequence type names onto the model's data types. */
+const SEQUENCE_DATA_TYPES: Readonly<Record<string, SequenceDataType>> = {
+  int2: 'smallint',
+  int4: 'integer',
+  int8: 'bigint',
+  smallint: 'smallint',
+  integer: 'integer',
+  bigint: 'bigint',
+};
+
+/** The sequence options the importer models; every other option is skipped and named. */
+const SEQUENCE_OPTIONS: ReadonlySet<string> = new Set([
+  'as',
+  'increment',
+  'minvalue',
+  'maxvalue',
+  'start',
+  'cache',
+  'cycle',
+  'owned_by',
+]);
+
+function translateCreateSequence(
+  statement: ParsedStatement,
+  create: CreateSeqStmt,
+  sequences: Map<string, SequenceDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const schema = create.sequence?.schemaname ?? 'public';
+  const name = create.sequence?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const options = readCreateSequenceOptions(statement, create.options ?? [], identity, diagnostics);
+  if (options === undefined) return;
+
+  // Persistence is not modeled; the re-render is a plain sequence, so flag the loss, exactly
+  // as the table path flags unlogged and temporary tables.
+  if (create.sequence?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
+  }
+  if (create.sequence?.relpersistence === 't') {
+    diagnostics.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+  }
+
+  // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE.
+  sequences.set(tableKey(schema, name), effectiveSequence({ schema, name, ...options }));
+}
+
+/**
+ * The options a `CREATE SEQUENCE` states, normalized later by `effectiveSequence`. Returns
+ * `undefined` and names the statement when an option or value the model cannot represent
+ * appears; a dump with such a statement would not apply anyway.
+ */
+function readCreateSequenceOptions(
+  statement: ParsedStatement,
+  elements: readonly Node[],
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): SequenceOptions | undefined {
+  const defs = sequenceOptionDefs(elements);
+  for (const defname of defs.keys()) {
+    if (!SEQUENCE_OPTIONS.has(defname)) {
+      diagnostics.push(
+        skipStatement(statement, `CREATE SEQUENCE ${identity} (option ${defname})`, identity),
+      );
+      return undefined;
+    }
+  }
+
+  const unsupported = (description: string): undefined => {
+    diagnostics.push(
+      skipStatement(statement, `CREATE SEQUENCE ${identity} (${description})`, identity),
+    );
+    return undefined;
+  };
+
+  const options: Mutable<SequenceOptions> = {};
+  const asType = defs.get('as');
+  if (asType !== undefined) {
+    const dataType = sequenceDataType(asType.arg);
+    if (dataType === undefined) return unsupported('unsupported data type');
+    options.dataType = dataType;
+  }
+
+  for (const defname of ['increment', 'minvalue', 'maxvalue', 'start', 'cache'] as const) {
+    const defel = defs.get(defname);
+    if (defel === undefined) continue;
+    const value = integerOption(defel.arg);
+    if (value === null) return unsupported(`non-integer ${defname}`);
+    // An absent argument is only `NO MINVALUE` / `NO MAXVALUE`: the engine default.
+    if (value !== undefined) {
+      if (defname === 'increment') options.increment = value;
+      else if (defname === 'minvalue') options.minValue = value;
+      else if (defname === 'maxvalue') options.maxValue = value;
+      else if (defname === 'start') options.start = value;
+      else options.cache = value;
+    }
+  }
+
+  const cycle = defs.get('cycle');
+  if (cycle !== undefined && cycle.arg !== undefined && 'Boolean' in cycle.arg) {
+    options.cycle = cycle.arg.Boolean.boolval ?? false;
+  }
+
+  const ownedBy = defs.get('owned_by');
+  if (ownedBy !== undefined) {
+    const owner = parseSequenceOwner(ownedBy);
+    if (owner.kind === 'invalid') return unsupported('invalid OWNED BY');
+    if (owner.kind === 'owner') options.ownedBy = owner.owner;
+  }
+
+  return options;
+}
+
+function translateAlterSequence(
+  statement: ParsedStatement,
+  alter: AlterSeqStmt,
+  sequences: Map<string, SequenceDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const schema = alter.sequence?.schemaname ?? 'public';
+  const name = alter.sequence?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+
+  const draft = sequences.get(tableKey(schema, name));
+  if (draft === undefined) {
+    diagnostics.push(
+      skipStatement(statement, `ALTER SEQUENCE ${identity} (sequence not imported)`, identity),
+    );
+    return;
+  }
+
+  const defs = sequenceOptionDefs(alter.options ?? []);
+  const skip = (description: string): void => {
+    diagnostics.push(
+      skipStatement(statement, `ALTER SEQUENCE ${identity} (${description})`, identity),
+    );
+  };
+
+  // The engine collects every option first and then applies them in this fixed order, not in
+  // source order: AS type, increment, cycle, maximum, minimum, start, restart, cache.
+  const asType = defs.get('as');
+  let resetMin = false;
+  let resetMax = false;
+  if (asType !== undefined) {
+    const dataType = sequenceDataType(asType.arg);
+    if (dataType === undefined) {
+      skip('unsupported data type');
+    } else {
+      // The engine converts a bound that is exactly the old type's bound to the new type's,
+      // and remembers the conversion: a later `NO MINVALUE`/`NO MAXVALUE` then takes the new
+      // type's bound rather than the direction-dependent default.
+      const change = sequenceTypeChange(draft.dataType, draft.minValue, draft.maxValue, dataType);
+      resetMin = change.resetMin;
+      resetMax = change.resetMax;
+      draft.minValue = change.minValue;
+      draft.maxValue = change.maxValue;
+      draft.dataType = dataType;
+    }
+  }
+
+  const increment = defs.get('increment');
+  if (increment !== undefined) {
+    const value = integerOption(increment.arg);
+    if (value === null) skip('non-integer increment');
+    else if (value !== undefined) draft.increment = value;
+  }
+
+  const cycle = defs.get('cycle');
+  if (cycle !== undefined && cycle.arg !== undefined && 'Boolean' in cycle.arg) {
+    draft.cycle = cycle.arg.Boolean.boolval ?? false;
+  }
+
+  const maxValue = defs.get('maxvalue');
+  if (maxValue !== undefined) {
+    if (maxValue.arg === undefined) {
+      draft.maxValue = resetMax
+        ? sequenceTypeBounds(draft.dataType).maxValue
+        : defaultSequenceMax(draft.dataType, draft.increment);
+    } else {
+      const value = integerOption(maxValue.arg);
+      if (value === null || value === undefined) skip('non-integer maxvalue');
+      else draft.maxValue = value;
+    }
+  }
+
+  const minValue = defs.get('minvalue');
+  if (minValue !== undefined) {
+    if (minValue.arg === undefined) {
+      draft.minValue = resetMin
+        ? sequenceTypeBounds(draft.dataType).minValue
+        : defaultSequenceMin(draft.dataType, draft.increment);
+    } else {
+      const value = integerOption(minValue.arg);
+      if (value === null || value === undefined) skip('non-integer minvalue');
+      else draft.minValue = value;
+    }
+  }
+
+  const start = defs.get('start');
+  if (start !== undefined) {
+    const value = integerOption(start.arg);
+    if (value === null) skip('non-integer start');
+    else if (value !== undefined) draft.start = value;
+  }
+
+  const cache = defs.get('cache');
+  if (cache !== undefined) {
+    const value = integerOption(cache.arg);
+    if (value === null) skip('non-integer cache');
+    else if (value !== undefined) draft.cache = value;
+  }
+
+  const ownedBy = defs.get('owned_by');
+  if (ownedBy !== undefined) {
+    const owner = parseSequenceOwner(ownedBy);
+    if (owner.kind === 'invalid') skip('invalid OWNED BY');
+    else if (owner.kind === 'none') delete draft.ownedBy;
+    else draft.ownedBy = owner.owner;
+  }
+
+  for (const defname of defs.keys()) {
+    if (defname === 'restart') skip('RESTART');
+    else if (!SEQUENCE_OPTIONS.has(defname)) skip(`option ${defname}`);
+  }
+}
+
+/**
+ * The `DefElem` options a sequence statement carries, keyed by name. A repeated option
+ * overwrites the earlier one — the last wins — where the engine would reject the statement
+ * with `errorConflictingDefElem`; pg_dump never repeats one.
+ */
+function sequenceOptionDefs(elements: readonly Node[]): Map<string, DefElem> {
+  const defs = new Map<string, DefElem>();
+  for (const element of elements) {
+    if ('DefElem' in element && element.DefElem.defname !== undefined) {
+      defs.set(element.DefElem.defname, element.DefElem);
+    }
+  }
+  return defs;
+}
+
+/**
+ * The exact canonical decimal string an integer option argument states, `null` when the
+ * argument is present but not an exact integer (invalid for the engine), and `undefined` when
+ * it has no argument at all — which only `NO MINVALUE` and `NO MAXVALUE` do. Values beyond
+ * 32-bit use the AST's string form, so no 64-bit value ever passes through a JavaScript number.
+ */
+function integerOption(argument: Node | undefined): string | null | undefined {
+  if (argument === undefined) return undefined;
+  if ('Integer' in argument) {
+    // Protobuf drops a zero value from the JSON form, so `{ Integer: {} }` is the literal 0.
+    return BigInt(argument.Integer.ival ?? 0).toString();
+  }
+  if ('Float' in argument && argument.Float.fval !== undefined && argument.Float.fval !== '') {
+    try {
+      return BigInt(argument.Float.fval).toString();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** The model data type an `AS` argument names, or `undefined` when it is not a sequence type. */
+function sequenceDataType(argument: Node | undefined): SequenceDataType | undefined {
+  if (argument === undefined || !('TypeName' in argument)) return undefined;
+  const names = stringList(argument.TypeName.names);
+  const last = names.at(-1);
+  return last === undefined ? undefined : SEQUENCE_DATA_TYPES[last];
+}
+
+/** What an `OWNED BY` option names: an owner, `OWNED BY NONE`, or an unusable argument. */
+type ParsedOwner =
+  | { readonly kind: 'owner'; readonly owner: SequenceOwner }
+  | { readonly kind: 'none' }
+  | { readonly kind: 'invalid' };
+
+/** Parses an `OWNED BY` option; the table is `public` when the source omits the schema. */
+function parseSequenceOwner(defel: DefElem): ParsedOwner {
+  const argument = defel.arg;
+  if (argument === undefined || !('List' in argument)) return { kind: 'invalid' };
+  const names = stringList(argument.List.items);
+  if (names.length === 1 && names[0] === 'none') return { kind: 'none' };
+  if (names.length === 2) {
+    return {
+      kind: 'owner',
+      owner: { table: { schema: 'public', name: names[0]! }, column: names[1]! },
+    };
+  }
+  if (names.length === 3) {
+    return {
+      kind: 'owner',
+      owner: { table: { schema: names[0]!, name: names[1]! }, column: names[2]! },
+    };
+  }
+  return { kind: 'invalid' };
+}
+
+/** The SQL keyword an `AlterTableStmt.objtype` enum names, for readable skip descriptions. */
+const ALTER_OBJECT_KINDS: Readonly<Record<string, string>> = {
+  OBJECT_FOREIGN_TABLE: 'FOREIGN TABLE',
+  OBJECT_INDEX: 'INDEX',
+  OBJECT_MATVIEW: 'MATERIALIZED VIEW',
+  OBJECT_SEQUENCE: 'SEQUENCE',
+  OBJECT_VIEW: 'VIEW',
+};
+
+/** The SQL keyword for an `objtype`, with `OBJECT_` stripped as the fallback. */
+function alterObjectKind(objtype: string): string {
+  return ALTER_OBJECT_KINDS[objtype] ?? objtype.replace(/^OBJECT_/, '');
+}
+
 function translateAlterTable(
   statement: ParsedStatement,
   alter: AlterTableStmt,
@@ -425,7 +777,9 @@ function translateAlterTable(
   const identity = tableIdentityName({ schema, name });
 
   if (alter.objtype !== undefined && alter.objtype !== 'OBJECT_TABLE') {
-    diagnostics.push(skipStatement(statement, `ALTER ${alter.objtype} ${identity}`, identity));
+    diagnostics.push(
+      skipStatement(statement, `ALTER ${alterObjectKind(alter.objtype)} ${identity}`, identity),
+    );
     return;
   }
 
@@ -675,9 +1029,20 @@ function describeStatement(node: Node): { readonly description: string; readonly
     const object = node.IndexStmt.idxname ?? rangeVarName(node.IndexStmt.relation) ?? 'index';
     return { description: `CREATE INDEX ${object}`, object };
   }
-  if ('CreateSeqStmt' in node) {
-    const object = rangeVarName(node.CreateSeqStmt.sequence) ?? 'sequence';
-    return { description: `CREATE SEQUENCE ${object}`, object };
+  if ('DropStmt' in node && node.DropStmt.removeType === 'OBJECT_SEQUENCE') {
+    const object = listObjectName(node.DropStmt.objects?.[0]) ?? 'sequence';
+    return { description: `DROP SEQUENCE ${object}`, object };
+  }
+  if ('RenameStmt' in node && node.RenameStmt.renameType === 'OBJECT_SEQUENCE') {
+    const object = rangeVarName(node.RenameStmt.relation) ?? 'sequence';
+    return { description: `ALTER SEQUENCE ${object} RENAME`, object };
+  }
+  if (
+    'AlterObjectSchemaStmt' in node &&
+    node.AlterObjectSchemaStmt.objectType === 'OBJECT_SEQUENCE'
+  ) {
+    const object = rangeVarName(node.AlterObjectSchemaStmt.relation) ?? 'sequence';
+    return { description: `ALTER SEQUENCE ${object} SET SCHEMA`, object };
   }
   if ('ViewStmt' in node) {
     const object = rangeVarName(node.ViewStmt.view) ?? 'view';
@@ -831,6 +1196,13 @@ function rangeVarName(relation: RangeVar | undefined): string | undefined {
     : `${relation.schemaname}.${relation.relname}`;
 }
 
+/** The dotted name of a `DROP` statement's object list entry, when it has one. */
+function listObjectName(node: Node | undefined): string | undefined {
+  if (node === undefined || !('List' in node)) return undefined;
+  const names = stringList(node.List.items);
+  return names.length > 0 ? names.join('.') : undefined;
+}
+
 function tableIdentityName(identity: TableIdentity): string {
   return `${identity.schema}.${identity.name}`;
 }
@@ -870,6 +1242,10 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 }
 
 function compareTables(left: Table, right: Table): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareSequences(left: Sequence, right: Sequence): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 
