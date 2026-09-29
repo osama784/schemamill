@@ -1,17 +1,28 @@
 import { diff } from './diff.ts';
-import type { ColumnFieldChange } from './diff.ts';
-import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from './model.ts';
+import type { ColumnFieldChange, SequenceFieldChange } from './diff.ts';
+import type {
+  Column,
+  ForeignKey,
+  Model,
+  PrimaryKey,
+  Sequence,
+  SequenceIdentity,
+  SequenceOwner,
+  Table,
+  TableIdentity,
+} from './model.ts';
 
 /**
  * The migration plan: what to change, in the order that works.
  *
  * `plan` runs the diff between a baseline model and a target model, expands every change into
  * executable steps, and reorders them so the dependencies the model can express are respected:
- * referencing tables before the tables they reference, and constraints before the primary keys
- * and columns they depend on. It is the change engine's ordering pass: the plan carries every
- * payload a renderer needs, and hazards and transaction grouping are later work.
+ * sequences before the tables that own them, referencing tables before the tables they
+ * reference, and constraints before the primary keys and columns they depend on. It is the
+ * change engine's ordering pass: the plan carries every payload a renderer needs, and hazards
+ * and transaction grouping are later work.
  *
- * A step is one of nine kinds. A table addition becomes a create-table step carrying the
+ * A step is one of twelve kinds. A table addition becomes a create-table step carrying the
  * table's columns and primary key as they are, plus one add-foreign-key step per foreign key —
  * the create-table payload is always free of foreign keys, so constraints attach only once
  * every referenced table exists. A table removal becomes a drop-table step. A changed table is
@@ -22,7 +33,36 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * drop-foreign-key and/or add-foreign-key step. A changed primary key or foreign key
  * decomposes into its drop half and its add half.
  *
- * The final sequence is the concatenation of nine phases, in this exact order:
+ * A sequence addition becomes a create-sequence step carrying the sequence's effective options
+ * but never its ownership, plus, when the target owns the sequence, an attach step in the
+ * ownership phase. A removed sequence becomes a drop-sequence step unless the plan also
+ * removes the table or column that owned it: PostgreSQL drops an owned sequence together with
+ * its owner, so an explicit drop is suppressed — but only then. A changed sequence maps field
+ * by field: an ownership change becomes an ownership alter-sequence step in one of the two
+ * ownership phases, and every other changed field becomes an option alter-sequence step,
+ * carrying only the fields that differ.
+ *
+ * The final sequence is the concatenation of six global phases, in this exact order:
+ *
+ * 1. create-sequence — one per added sequence, in sequence identity order;
+ * 2. ownership detaches — an ownership alter-sequence step for every kept sequence whose
+ *    baseline owner table or column the plan removes and whose ownership the target changes.
+ *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
+ *    the sequence away;
+ * 3. table operations — the nine table phases listed below, in their exact order;
+ * 4. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
+ *    whose target ownership differs from its baseline one and whose baseline owner is not
+ *    removed in phase 2: a new owner after a phase-2 detach, a new owner over a surviving
+ *    baseline one, or a detach when the target drops ownership but keeps the owner;
+ * 5. sequence option alters — one alter-sequence step per changed sequence, carrying its
+ *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
+ *    statement without passing through an invalid intermediate state;
+ * 6. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
+ *    identity order. Drops come last, after the table phases, so a column `DROP DEFAULT` has
+ *    already released the sequence by the time its drop runs; a surviving default that still
+ *    references a dropped sequence is a broken target and fails at apply.
+ *
+ * The table phases inside phase 3 are numbered as before (and keep their documented semantics):
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -40,11 +80,11 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * 9. add-foreign-key — last, once both the table and the referenced table exist, with the
  *    synthesized primary-key dependents after the diff-derived adds.
  *
- * Within a phase, steps keep the relative order the diff produced: table changes in identity
- * order, and inside a changed table the diff's documented member order. A table addition
- * contributes its foreign-key steps to phase 9 in the added table's canonical foreign-key
- * order. The steps synthesized for primary-key changes are ordered as described below, and
- * the cycle-breaking drop-foreign-key steps close phase 1.
+ * Within a phase, steps keep the relative order the diff produced: table and sequence changes
+ * in identity order, and inside a changed table the diff's documented member order. A table
+ * addition contributes its foreign-key steps to table phase 9 in the added table's canonical
+ * foreign-key order. The steps synthesized for primary-key changes are ordered as described
+ * below, and the cycle-breaking drop-foreign-key steps close table phase 1.
  *
  * A surviving foreign key can depend on a primary key that changes. Dropping a key while a
  * live foreign key still references it fails, whatever engine runs the plan, so the ordering
@@ -52,17 +92,17 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * baseline foreign key on a table that survives whose resolved referenced columns are exactly
  * T's dropped primary-key columns — an empty `referencedColumns` resolves to T's baseline
  * primary key — and whose payload the target still carries unchanged (same owning table, same
- * identity, equal fields) gets a drop-foreign-key step with the baseline payload in phase 1
- * and an add-foreign-key step with the target payload in phase 9. The diff's own drops and
- * adds are never duplicated: only the occurrences the diff's identical-pair cancellation
- * leaves in place are synthesized, so a foreign key the diff removes or replaces needs nothing
- * here, and a removed table's constraints are already gone when phase 2 finishes. The
- * synthesized drops follow the diff-derived drops and precede the cycle-breaking drops; the
- * synthesized adds follow the diff-derived adds. Primary-key drops are walked in diff order,
- * and for each drop its dependents come in owning-table identity order, then in canonical
- * foreign-key order.
+ * identity, equal fields) gets a drop-foreign-key step with the baseline payload in table
+ * phase 1 and an add-foreign-key step with the target payload in table phase 9. The diff's own
+ * drops and adds are never duplicated: only the occurrences the diff's identical-pair
+ * cancellation leaves in place are synthesized, so a foreign key the diff removes or replaces
+ * needs nothing here, and a removed table's constraints are already gone when table phase 2
+ * finishes. The synthesized drops follow the diff-derived drops and precede the cycle-breaking
+ * drops; the synthesized adds follow the diff-derived adds. Primary-key drops are walked in
+ * diff order, and for each drop its dependents come in owning-table identity order, then in
+ * canonical foreign-key order.
  *
- * Phase 2 is dependency-ordered. When a removed table references another removed table, the
+ * Table phase 2 is dependency-ordered. When a removed table references another removed table, the
  * referencing table must be dropped first, or the referenced table's constraint would still
  * be in the way. The order is a deterministic Kahn's algorithm:
  *
@@ -83,10 +123,11 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * equal models in any insertion order therefore produce deep-equal plans.
  *
  * The plan assumes well-formed models: foreign keys point at tables the model contains, key
- * columns exist, and a table's columns are unique by name. It validates nothing; import and
- * introspection are where well-formedness comes from. Every step carries an independent copy
- * of the payloads it embeds, so mutating a plan never affects the caller's models, and `plan`
- * never mutates its inputs.
+ * columns exist, a table's columns are unique by name, and a sequence's `ownedBy` names a
+ * table and column the model contains. It validates nothing; import and introspection are
+ * where well-formedness comes from. Every step carries an independent copy of the payloads it
+ * embeds, so mutating a plan never affects the caller's models, and `plan` never mutates its
+ * inputs.
  */
 
 /** A migration plan: the ordered steps that move a baseline model to its target. */
@@ -119,7 +160,17 @@ export type Step =
   /** The target has a foreign key the baseline does not. */
   | { kind: 'add-foreign-key'; table: TableIdentity; foreignKey: ForeignKey }
   /** The baseline has a foreign key the target does not. */
-  | { kind: 'drop-foreign-key'; table: TableIdentity; foreignKey: ForeignKey };
+  | { kind: 'drop-foreign-key'; table: TableIdentity; foreignKey: ForeignKey }
+  /** The target has a sequence the baseline does not; a copy without its ownership. */
+  | { kind: 'create-sequence'; sequence: Sequence }
+  /** The baseline has a sequence the target does not. */
+  | { kind: 'drop-sequence'; sequence: SequenceIdentity }
+  /** A sequence both sides have with differing fields, in the diff's fixed field order. */
+  | {
+      kind: 'alter-sequence';
+      sequence: SequenceIdentity;
+      fields: readonly SequenceFieldChange[];
+    };
 
 /**
  * The steps from `baseline` to `target`, in dependency-correct order. Returned payloads are
@@ -138,6 +189,12 @@ export function plan(baseline: Model, target: Model): Plan {
   const columnAlters: Step[] = [];
   const primaryKeyAdds: Step[] = [];
   const foreignKeyAdds: Step[] = [];
+  const sequenceCreates: Step[] = [];
+  const optionAlters: Step[] = [];
+  const ownershipChanges: SequenceOwnershipChange[] = [];
+  const removedSequences: RemovedSequence[] = [];
+  const removedTableKeys = new Set<string>();
+  const removedColumnKeys = new Set<string>();
 
   for (const change of changes) {
     switch (change.kind) {
@@ -146,6 +203,7 @@ export function plan(baseline: Model, target: Model): Plan {
           identity: copyIdentity(change.table),
           table: copyTable(change.table),
         });
+        removedTableKeys.add(keyOf(change.table));
         break;
       }
       case 'table-added': {
@@ -171,6 +229,7 @@ export function plan(baseline: Model, target: Model): Plan {
                 table: copyIdentity(change.table),
                 column: copyColumn(tableChange.column),
               });
+              removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
               break;
             }
             case 'column-added': {
@@ -252,6 +311,49 @@ export function plan(baseline: Model, target: Model): Plan {
         }
         break;
       }
+      case 'sequence-added': {
+        sequenceCreates.push({
+          kind: 'create-sequence',
+          sequence: copySequenceWithoutOwner(change.sequence),
+        });
+        if (change.sequence.ownedBy !== undefined) {
+          ownershipChanges.push({
+            sequence: copySequenceIdentity(change.sequence),
+            after: copyOwner(change.sequence.ownedBy),
+          });
+        }
+        break;
+      }
+      case 'sequence-removed': {
+        removedSequences.push({
+          identity: copySequenceIdentity(change.sequence),
+          ...(change.sequence.ownedBy === undefined
+            ? {}
+            : { ownedBy: copyOwner(change.sequence.ownedBy) }),
+        });
+        break;
+      }
+      case 'sequence-changed': {
+        const identity = copySequenceIdentity(change.sequence);
+        const ownership = change.changes.filter((field) => field.field === 'ownedBy');
+        const options = change.changes.filter((field) => field.field !== 'ownedBy');
+        if (options.length > 0) {
+          optionAlters.push({
+            kind: 'alter-sequence',
+            sequence: identity,
+            fields: options.map(copySequenceFieldChange),
+          });
+        }
+        for (const field of ownership) {
+          if (field.field !== 'ownedBy') continue;
+          ownershipChanges.push({
+            sequence: copySequenceIdentity(identity),
+            ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
+            ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+          });
+        }
+        break;
+      }
     }
   }
 
@@ -262,8 +364,51 @@ export function plan(baseline: Model, target: Model): Plan {
     primaryKeyDrops,
   );
 
+  const ownerRemoved = (owner: SequenceOwner): boolean =>
+    removedTableKeys.has(keyOf(owner.table)) ||
+    removedColumnKeys.has(columnKey(owner.table, owner.column));
+
+  const ownershipDetaches: Step[] = [];
+  const ownershipAttaches: Step[] = [];
+  for (const change of ownershipChanges) {
+    if (change.before !== undefined && ownerRemoved(change.before)) {
+      ownershipDetaches.push({
+        kind: 'alter-sequence',
+        sequence: change.sequence,
+        fields: [{ field: 'ownedBy', before: change.before }],
+      });
+      if (change.after !== undefined) {
+        ownershipAttaches.push({
+          kind: 'alter-sequence',
+          sequence: copySequenceIdentity(change.sequence),
+          fields: [{ field: 'ownedBy', before: change.before, after: change.after }],
+        });
+      }
+    } else {
+      ownershipAttaches.push({
+        kind: 'alter-sequence',
+        sequence: change.sequence,
+        fields: [
+          {
+            field: 'ownedBy',
+            ...(change.before === undefined ? {} : { before: change.before }),
+            ...(change.after === undefined ? {} : { after: change.after }),
+          },
+        ],
+      });
+    }
+  }
+
+  const sequenceDrops: Step[] = [];
+  for (const removed of removedSequences) {
+    if (removed.ownedBy !== undefined && ownerRemoved(removed.ownedBy)) continue;
+    sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
+  }
+
   return {
     steps: [
+      ...sequenceCreates,
+      ...ownershipDetaches,
       ...foreignKeyDrops,
       ...dependentKeyDrops,
       ...breaks,
@@ -276,8 +421,24 @@ export function plan(baseline: Model, target: Model): Plan {
       ...primaryKeyAdds,
       ...foreignKeyAdds,
       ...dependentKeyAdds,
+      ...ownershipAttaches,
+      ...optionAlters,
+      ...sequenceDrops,
     ],
   };
+}
+
+/** A changed sequence's ownership, held until the plan knows which owners it removes. */
+interface SequenceOwnershipChange {
+  readonly sequence: SequenceIdentity;
+  readonly before?: SequenceOwner;
+  readonly after?: SequenceOwner;
+}
+
+/** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
+interface RemovedSequence {
+  readonly identity: SequenceIdentity;
+  readonly ownedBy?: SequenceOwner;
 }
 
 /** A removed table, held with its canonical payload while phase 2 orders the drops. */
@@ -401,6 +562,41 @@ function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
   return { ...field };
 }
 
+/** A copy of one sequence field change, independent of the diff's payload. */
+function copySequenceFieldChange(field: SequenceFieldChange): SequenceFieldChange {
+  if (field.field !== 'ownedBy') return { ...field };
+  return {
+    field: 'ownedBy',
+    ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
+    ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+  };
+}
+
+/** A copy of `identity`, independent of the caller's model. */
+function copySequenceIdentity(identity: SequenceIdentity): SequenceIdentity {
+  return { schema: identity.schema, name: identity.name };
+}
+
+/** A copy of `owner`, independent of the caller's model. */
+function copyOwner(owner: SequenceOwner): SequenceOwner {
+  return { table: copyIdentity(owner.table), column: owner.column };
+}
+
+/** A copy of `sequence`, independent of the caller's model, without its owner. */
+function copySequenceWithoutOwner(sequence: Sequence): Sequence {
+  return {
+    schema: sequence.schema,
+    name: sequence.name,
+    dataType: sequence.dataType,
+    increment: sequence.increment,
+    minValue: sequence.minValue,
+    maxValue: sequence.maxValue,
+    start: sequence.start,
+    cache: sequence.cache,
+    cycle: sequence.cycle,
+  };
+}
+
 /** A copy of `table`, independent of the caller's model. */
 function copyTable(table: Table): Table {
   return {
@@ -492,6 +688,11 @@ function dependentForeignKeySteps(
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
 function keyOf(identity: TableIdentity): string {
   return JSON.stringify([identity.schema, identity.name]);
+}
+
+/** The map key of a table and column pair; JSON and a NUL keep any characters unambiguous. */
+function columnKey(table: TableIdentity, column: string): string {
+  return `${keyOf(table)}\u0000${column}`;
 }
 
 /** A structural key for a foreign key, comparing every field including absent ones. */

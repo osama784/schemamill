@@ -1,0 +1,57 @@
+- table public.gone_owner
+    id bigint NOT NULL
+
++ table public.new_table
+    id bigint NOT NULL
+
+- table public.old_owner
+    id bigint NOT NULL
+
++ sequence public.added_seq
+    data type bigint
+    increment 2
+    min value 1
+    max value 100
+    start 3
+    cache 4
+    cycle true
+
+- sequence public.cascaded_seq
+    data type bigint
+    increment 1
+    min value 1
+    max value 9223372036854775807
+    start 1
+    cache 1
+    cycle false
+    owned by public.gone_owner.id
+
+- sequence public.dropped_seq
+    data type bigint
+    increment 1
+    min value 1
+    max value 9223372036854775807
+    start 1
+    cache 1
+    cycle false
+
+~ sequence public.kept_seq
+    data type integer → bigint
+    increment 1 → 5
+    max value 2147483647 → 9223372036854775807
+    start 5 → 10
+    cache 1 → 8
+    cycle false → true
+
+~ sequence public.moved_seq
+    owned by public.old_owner.id → public.target_owner.id
+
++ sequence public.new_table_id_seq
+    data type bigint
+    increment 1
+    min value 1
+    max value 9223372036854775807
+    start 1
+    cache 1
+    cycle false
+    owned by public.new_table.id

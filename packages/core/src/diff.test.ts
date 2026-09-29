@@ -3,7 +3,16 @@ import { test } from 'node:test';
 
 import { diff } from './index.ts';
 import type { Change } from './diff.ts';
-import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from './model.ts';
+import type {
+  Column,
+  ForeignKey,
+  Model,
+  PrimaryKey,
+  Sequence,
+  SequenceOwner,
+  Table,
+  TableIdentity,
+} from './model.ts';
 
 /**
  * Tests for the model diff: identity, no rename detection, text compared exactly as stored,
@@ -51,7 +60,37 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+
+/** A sequence named `name`: bigint ascending defaults unless overridden. */
+const sequence = (
+  name: string,
+  fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
+  schema = 'public',
+): Sequence => ({
+  schema,
+  name,
+  dataType: 'bigint',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  start: '1',
+  cache: '1',
+  cycle: false,
+  ...fields,
+});
+
+/** An owner of table `table`'s column `column`, `public` unless a schema is given. */
+const owner = (table: string, column: string, schema = 'public'): SequenceOwner => ({
+  table: { schema, name: table },
+  column,
+});
+
+/** A model of the given sequences, with no tables unless they are supplied. */
+const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
+  tables,
+  sequences,
+});
 
 /** Freezes `value` and every object and array nested inside it. */
 const deepFreeze = <T>(value: T): T => {
@@ -1169,4 +1208,185 @@ test('changed foreign key pairs order by before then after', () => {
     model(table('t', { columns, foreignKeys: [afterSecond, afterFirst] })),
     expected,
   );
+});
+
+test('sequences in different insertion orders compare as identical', () => {
+  const appSeq = sequence('a', {}, 'app');
+  const publicSeq = sequence('b');
+
+  assertDiff(sequenceModel([appSeq, publicSeq]), sequenceModel([publicSeq, appSeq]), []);
+});
+
+test('removed sequences follow the table changes, in identity order', () => {
+  const appSeq = sequence('a', {}, 'app');
+  const publicSeq = sequence('b');
+  const gone = table('gone', { columns: [column('id')] });
+
+  assertDiff(sequenceModel([publicSeq, appSeq], gone), model(), [
+    { kind: 'table-removed', table: gone },
+    { kind: 'sequence-removed', sequence: appSeq },
+    { kind: 'sequence-removed', sequence: publicSeq },
+  ]);
+});
+
+test('added sequences follow the table changes, in identity order', () => {
+  const appSeq = sequence('a', {}, 'app');
+  const publicSeq = sequence('b');
+  const fresh = table('fresh', { columns: [column('id')] });
+
+  assertDiff(model(), sequenceModel([publicSeq, appSeq], fresh), [
+    { kind: 'table-added', table: fresh },
+    { kind: 'sequence-added', sequence: appSeq },
+    { kind: 'sequence-added', sequence: publicSeq },
+  ]);
+});
+
+test('a changed sequence reports its differing fields in the fixed order', () => {
+  const baseline = sequence('s', { minValue: '1', maxValue: '5' });
+  const before = sequence('s', {
+    dataType: 'bigint',
+    increment: '3',
+    minValue: '2',
+    maxValue: '100',
+    start: '7',
+    cache: '4',
+    cycle: true,
+    ownedBy: owner('t', 'id'),
+  });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([before]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'increment', before: '1', after: '3' },
+        { field: 'minValue', before: '1', after: '2' },
+        { field: 'maxValue', before: '5', after: '100' },
+        { field: 'start', before: '1', after: '7' },
+        { field: 'cache', before: '1', after: '4' },
+        { field: 'cycle', before: false, after: true },
+        { field: 'ownedBy', after: { table: identity('t'), column: 'id' } },
+      ],
+    },
+  ]);
+});
+
+test('a changed sequence reports data type first and detaches last', () => {
+  const baseline = sequence('s', {
+    dataType: 'integer',
+    maxValue: '2147483647',
+    ownedBy: owner('t', 'id'),
+  });
+  const target = sequence('s', { ownedBy: undefined });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([target]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'maxValue', before: '2147483647', after: '9223372036854775807' },
+        { field: 'ownedBy', before: { table: identity('t'), column: 'id' } },
+      ],
+    },
+  ]);
+});
+
+test('a re-owned sequence reports both sides of the ownership field', () => {
+  const before = owner('t', 'id');
+  const after = owner('u', 'id');
+
+  assertDiff(
+    sequenceModel([sequence('s', { ownedBy: before })]),
+    sequenceModel([sequence('s', { ownedBy: after })]),
+    [
+      {
+        kind: 'sequence-changed',
+        sequence: identity('s'),
+        changes: [{ field: 'ownedBy', before, after }],
+      },
+    ],
+  );
+});
+
+test('a sparse sequence compares equal to its effective form', () => {
+  const effective = sequence('s');
+  const sparse = {
+    schema: 'public',
+    name: 's',
+    dataType: 'bigint',
+    increment: '1',
+  } as unknown as Sequence;
+
+  assertDiff(sequenceModel([sparse]), sequenceModel([effective]), []);
+  assertDiff(sequenceModel([effective]), sequenceModel([sparse]), []);
+});
+
+test('a deep-frozen model with sequences can be diffed', () => {
+  const before = deepFreeze(sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })]));
+  const after = deepFreeze(
+    sequenceModel([
+      sequence('s', {
+        increment: '-1',
+        minValue: '-9223372036854775808',
+        maxValue: '-1',
+        start: '-1',
+      }),
+    ]),
+  );
+
+  assertDiff(before, after, [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'increment', before: '1', after: '-1' },
+        { field: 'minValue', before: '1', after: '-9223372036854775808' },
+        { field: 'maxValue', before: '9223372036854775807', after: '-1' },
+        { field: 'start', before: '1', after: '-1' },
+        { field: 'ownedBy', before: { table: identity('t'), column: 'id' } },
+      ],
+    },
+  ]);
+});
+
+test('added and removed sequences are independent copies', () => {
+  const source = sequence('s', { ownedBy: owner('t', 'id') });
+
+  const added = diff(model(), sequenceModel([source]))[0]!;
+  assert.equal(added.kind, 'sequence-added');
+  if (added.kind !== 'sequence-added') throw new Error('expected a sequence addition');
+  assert.deepStrictEqual(added.sequence, source);
+  assert.notEqual(added.sequence, source);
+  assert.notEqual(added.sequence.ownedBy, source.ownedBy);
+  assert.notEqual(added.sequence.ownedBy?.table, source.ownedBy?.table);
+
+  const removed = diff(sequenceModel([source]), model())[0]!;
+  assert.equal(removed.kind, 'sequence-removed');
+  if (removed.kind !== 'sequence-removed') throw new Error('expected a sequence removal');
+  assert.deepStrictEqual(removed.sequence, source);
+  assert.notEqual(removed.sequence, source);
+  assert.notEqual(removed.sequence.ownedBy, source.ownedBy);
+  assert.notEqual(removed.sequence.ownedBy?.table, source.ownedBy?.table);
+});
+
+test('changed sequence owners are independent copies', () => {
+  const before = owner('t', 'id');
+  const after = owner('u', 'id');
+
+  const changed = diff(
+    sequenceModel([sequence('s', { ownedBy: before })]),
+    sequenceModel([sequence('s', { ownedBy: after })]),
+  )[0]!;
+  assert.equal(changed.kind, 'sequence-changed');
+  if (changed.kind !== 'sequence-changed') throw new Error('expected a changed sequence');
+
+  const field = changed.changes[0];
+  assert.equal(field?.field, 'ownedBy');
+  if (field?.field === 'ownedBy') {
+    assert.notEqual(field.before, before);
+    assert.notEqual(field.before?.table, before.table);
+    assert.notEqual(field.after, after);
+    assert.notEqual(field.after?.table, after.table);
+  }
 });

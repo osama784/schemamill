@@ -5,6 +5,9 @@ import type {
   ForeignKey,
   Plan,
   PrimaryKey,
+  Sequence,
+  SequenceFieldChange,
+  SequenceOwner,
   Step,
   Table,
   TableChange,
@@ -16,14 +19,17 @@ import type {
  *
  * The functions here are pure and deterministic: the same payload always renders the same
  * text, with no I/O, no dates, and no environment reads. Model values are emitted exactly as
- * stored — names unquoted, `type` and `default` text untouched, no colour and no TTY
- * detection — and `(none)` stands in for a field a payload omits.
+ * stored — names unquoted, `type` and `default` text untouched, sequence option values as
+ * their exact decimal strings, no colour and no TTY detection — and `(none)` stands in for a
+ * field a payload omits.
  *
  * A diff renders as one block per change, blank-line separated: `+`, `-`, or `~` then
- * `table <schema>.<name>`, followed by four-space-indented member lines. A plan renders as a
- * numbered header and one line per step; a step's kind label is padded to the longest label
- * in the plan so the details align, and a step's details expose every payload field it
- * carries. SQL is not rendered here: the `plan` command appends `renderSql`'s output.
+ * `table <schema>.<name>`, followed by four-space-indented member lines; sequences render the
+ * same way after the table changes, as `sequence <schema>.<name>` with one option per line. A
+ * plan renders as a numbered header and one line per step; a step's kind label is padded to
+ * the longest label in the plan so the details align, and a step's details expose every
+ * payload field it carries. SQL is not rendered here: the `plan` command appends `renderSql`'s
+ * output.
  */
 
 /** The whole diff as `compare` prints it: `No changes.` or one block per change, in order. */
@@ -58,6 +64,17 @@ function formatChange(change: Change): string {
       const lines = [`~ table ${formatIdentity(change.table)}`];
       for (const tableChange of change.changes) {
         lines.push(`    ${formatTableChange(tableChange)}`);
+      }
+      return lines.join('\n');
+    }
+    case 'sequence-added':
+      return formatSequence('+', change.sequence);
+    case 'sequence-removed':
+      return formatSequence('-', change.sequence);
+    case 'sequence-changed': {
+      const lines = [`~ sequence ${formatIdentity(change.sequence)}`];
+      for (const field of change.changes) {
+        lines.push(`    ${formatSequenceField(field)}`);
       }
       return lines.join('\n');
     }
@@ -118,6 +135,11 @@ function formatStep(step: Step): string {
     case 'add-foreign-key':
     case 'drop-foreign-key':
       return `${formatIdentity(step.table)}: ${formatForeignKey(step.foreignKey)}`;
+    case 'create-sequence':
+    case 'drop-sequence':
+      return formatIdentity(step.sequence);
+    case 'alter-sequence':
+      return `${formatIdentity(step.sequence)}: ${step.fields.map(formatSequenceField).join(', ')}`;
   }
 }
 
@@ -162,6 +184,52 @@ function formatForeignKey(foreignKey: ForeignKey): string {
   if (foreignKey.onUpdate !== undefined) text += ` on update ${foreignKey.onUpdate}`;
   if (foreignKey.onDelete !== undefined) text += ` on delete ${foreignKey.onDelete}`;
   return text;
+}
+
+/** A sequence line and its options: the signed identity, then every option one per line. */
+function formatSequence(sign: string, sequence: Sequence): string {
+  const lines = [`${sign} sequence ${formatIdentity(sequence)}`];
+  lines.push(`    data type ${sequence.dataType}`);
+  lines.push(`    increment ${sequence.increment}`);
+  lines.push(`    min value ${sequence.minValue}`);
+  lines.push(`    max value ${sequence.maxValue}`);
+  lines.push(`    start ${sequence.start}`);
+  lines.push(`    cache ${sequence.cache}`);
+  lines.push(`    cycle ${String(sequence.cycle)}`);
+  if (sequence.ownedBy !== undefined) lines.push(`    owned by ${formatOwner(sequence.ownedBy)}`);
+  return lines.join('\n');
+}
+
+/** One changed sequence option, in the diff's fixed order; an absent owner prints `(none)`. */
+function formatSequenceField(field: SequenceFieldChange): string {
+  switch (field.field) {
+    case 'dataType':
+      return `data type ${field.before} → ${field.after}`;
+    case 'increment':
+      return `increment ${field.before} → ${field.after}`;
+    case 'minValue':
+      return `min value ${field.before} → ${field.after}`;
+    case 'maxValue':
+      return `max value ${field.before} → ${field.after}`;
+    case 'start':
+      return `start ${field.before} → ${field.after}`;
+    case 'cache':
+      return `cache ${field.before} → ${field.after}`;
+    case 'cycle':
+      return `cycle ${String(field.before)} → ${String(field.after)}`;
+    case 'ownedBy':
+      return `owned by ${formatOptionalOwner(field.before)} → ${formatOptionalOwner(field.after)}`;
+  }
+}
+
+/** A sequence owner as `<schema>.<table>.<column>`, names unquoted. */
+function formatOwner(owner: SequenceOwner): string {
+  return `${formatIdentity(owner.table)}.${owner.column}`;
+}
+
+/** An optional sequence owner: the owner, or `(none)`. */
+function formatOptionalOwner(owner: SequenceOwner | undefined): string {
+  return owner === undefined ? '(none)' : formatOwner(owner);
 }
 
 /** A changed column's differing fields, in the diff's order, joined `, `. */

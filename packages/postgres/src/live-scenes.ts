@@ -62,7 +62,7 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
 
 /** One catalog fact: `sql` is read with `psql -tA` and compared exactly to `expected`. */
 export interface SceneCheck {
