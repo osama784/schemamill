@@ -4,6 +4,9 @@ import type {
   ForeignKey,
   Plan,
   PrimaryKey,
+  Sequence,
+  SequenceFieldChange,
+  SequenceIdentity,
   SqlRenderer,
   Step,
   Table,
@@ -21,12 +24,22 @@ import type {
  * line, indented four spaces, and its primary key, when present, is the trailing line. A table
  * with neither columns nor a primary key renders on one line as `CREATE TABLE <q> ();`.
  *
- * Every table reference is schema-qualified: `<schema>.<name>`. An identifier — table, column,
- * or constraint name — is emitted bare only when it is a lowercase, unquoted-identifier shape
- * (`/^[a-z_][a-z0-9_$]*$/`) and not a reserved key word; otherwise it is double-quoted, with
- * embedded quotes doubled. `RESERVED_KEYWORDS` holds the words that rule covers. Column types
- * and DEFAULT expressions are emitted exactly as the model stores them: core never lexes or
- * normalizes SQL, so rendering never rewrites a type or an expression.
+ * `create-sequence` renders the canonical full-explicit form — `AS`, `INCREMENT BY`,
+ * `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`/`NO CYCLE` — with the plan's
+ * effective values, so re-importing the rendered SQL reproduces the same sequence.
+ * `alter-sequence` renders one `ALTER SEQUENCE` statement carrying one clause per changed
+ * field: the engine validates a sequence's bounds as a whole, so separate statements could
+ * fail on an intermediate state that the final one satisfies. An ownership change renders
+ * `OWNED BY <table>.<column>` or `OWNED BY NONE`; `drop-sequence` renders `DROP SEQUENCE`.
+ *
+ * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
+ * table, sequence, column, or constraint name — is emitted bare only when it is a lowercase,
+ * unquoted-identifier shape (`/^[a-z_][a-z0-9_$]*$/`) and not a reserved key word; otherwise
+ * it is double-quoted, with embedded quotes doubled. `RESERVED_KEYWORDS` holds the words that
+ * rule covers. Column types and DEFAULT expressions are emitted exactly as the model stores
+ * them: core never lexes or normalizes SQL, so rendering never rewrites a type or an
+ * expression. Sequence option values are emitted exactly as the model stores them: canonical
+ * decimal strings, never JavaScript numbers, so 64-bit values render exactly.
  *
  * A constraint drop must name its constraint, but the model permits unnamed constraints.
  * Rendering then synthesizes PostgreSQL's conventional name — `<table>_pkey` for a primary
@@ -197,6 +210,12 @@ function renderStep(step: Step): string {
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
         step.foreignKey.name ?? synthesizedForeignKeyName(step.table, step.foreignKey),
       )};`;
+    case 'create-sequence':
+      return renderCreateSequence(step.sequence);
+    case 'drop-sequence':
+      return `DROP SEQUENCE ${renderSequence(step.sequence)};`;
+    case 'alter-sequence':
+      return renderAlterSequence(step.sequence, step.fields);
   }
 }
 
@@ -275,4 +294,53 @@ function renderColumnAlteration(
 /** A schema-qualified table reference: `<schema>.<name>`, each part quoted as needed. */
 function renderTable(identity: TableIdentity): string {
   return `${quoteIdentifier(identity.schema)}.${quoteIdentifier(identity.name)}`;
+}
+
+/** A schema-qualified sequence reference, quoted exactly like a table reference. */
+function renderSequence(identity: SequenceIdentity): string {
+  return renderTable(identity);
+}
+
+/** `CREATE SEQUENCE` in canonical full-explicit form, every effective option stated. */
+function renderCreateSequence(sequence: Sequence): string {
+  const cycle = sequence.cycle ? 'CYCLE' : 'NO CYCLE';
+  return (
+    `CREATE SEQUENCE ${renderSequence(sequence)} AS ${sequence.dataType}` +
+    ` INCREMENT BY ${sequence.increment} MINVALUE ${sequence.minValue}` +
+    ` MAXVALUE ${sequence.maxValue} START WITH ${sequence.start}` +
+    ` CACHE ${sequence.cache} ${cycle};`
+  );
+}
+
+/** One `ALTER SEQUENCE` statement carrying one clause per changed field, in field order. */
+function renderAlterSequence(
+  sequence: SequenceIdentity,
+  fields: readonly SequenceFieldChange[],
+): string {
+  const clauses = fields.map(renderSequenceAlteration).join(' ');
+  return `ALTER SEQUENCE ${renderSequence(sequence)} ${clauses};`;
+}
+
+/** One differing sequence field as its `ALTER SEQUENCE` clause; reverts state the default. */
+function renderSequenceAlteration(field: SequenceFieldChange): string {
+  switch (field.field) {
+    case 'dataType':
+      return `AS ${field.after}`;
+    case 'increment':
+      return `INCREMENT BY ${field.after}`;
+    case 'minValue':
+      return `MINVALUE ${field.after}`;
+    case 'maxValue':
+      return `MAXVALUE ${field.after}`;
+    case 'start':
+      return `START WITH ${field.after}`;
+    case 'cache':
+      return `CACHE ${field.after}`;
+    case 'cycle':
+      return field.after ? 'CYCLE' : 'NO CYCLE';
+    case 'ownedBy':
+      return field.after === undefined
+        ? 'OWNED BY NONE'
+        : `OWNED BY ${renderTable(field.after.table)}.${quoteIdentifier(field.after.column)}`;
+  }
 }

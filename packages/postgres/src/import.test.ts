@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Diagnostic, Model } from '@schemamill/core';
+import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
 import { ddlImporter, importDump } from './index.ts';
 
@@ -10,6 +10,24 @@ const summarize = (diagnostic: Diagnostic) =>
   diagnostic.kind === 'error'
     ? { kind: diagnostic.kind, code: diagnostic.code }
     : { kind: diagnostic.kind, code: diagnostic.code, object: diagnostic.object };
+
+/** A sequence named `name`: bigint ascending defaults unless overridden. */
+const sequence = (
+  name: string,
+  fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
+  schema = 'public',
+): Sequence => ({
+  schema,
+  name,
+  dataType: 'bigint',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  start: '1',
+  cache: '1',
+  cycle: false,
+  ...fields,
+});
 
 /**
  * Tests for the dump importer. The fixture is a fabricated pg_dump-shaped dump (no real client
@@ -163,6 +181,19 @@ const EXPECTED_MODEL: Model = {
       primaryKey: { name: 'users_pkey', columns: ['id'] },
     },
   ],
+  sequences: [
+    {
+      schema: 'public',
+      name: 'users_id_seq',
+      dataType: 'bigint',
+      increment: '1',
+      minValue: '1',
+      maxValue: '9223372036854775807',
+      start: '1',
+      cache: '1',
+      cycle: false,
+    },
+  ],
 };
 
 const EXPECTED_DIAGNOSTICS = [
@@ -170,7 +201,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'statement_timeout' },
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'public.users_id_seq' },
   { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
   { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
   { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
@@ -404,6 +434,7 @@ test('replaces a repeated CREATE TABLE wholesale', async () => {
         foreignKeys: [],
       },
     ],
+    sequences: [],
   });
   assert.deepEqual(diagnostics, []);
 });
@@ -501,5 +532,240 @@ test('binds the DdlImporter seam', async () => {
         foreignKeys: [],
       },
     ],
+    sequences: [],
   });
+});
+
+test('imports sequences with effective values, in both directions', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.plain;`,
+    `CREATE SEQUENCE app.custom AS smallint INCREMENT 3 MINVALUE 0 MAXVALUE 100 START 10 CACHE 7 CYCLE;`,
+    `CREATE SEQUENCE public.desc INCREMENT -5;`,
+    `CREATE SEQUENCE public.big MAXVALUE 9223372036854775807 START 9007199254740993;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence(
+      'custom',
+      {
+        dataType: 'smallint',
+        increment: '3',
+        minValue: '0',
+        maxValue: '100',
+        start: '10',
+        cache: '7',
+        cycle: true,
+      },
+      'app',
+    ),
+    sequence('big', { start: '9007199254740993' }),
+    sequence('desc', {
+      increment: '-5',
+      minValue: '-9223372036854775808',
+      maxValue: '-1',
+      start: '-1',
+    }),
+    sequence('plain'),
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports 64-bit sequence values exactly, never through a number', async () => {
+  const dump = `CREATE SEQUENCE public.s MAXVALUE 9223372036854775807 START 9007199254740993;`;
+
+  const { model } = await importDump(dump);
+  const imported = model.sequences[0]!;
+
+  assert.equal(imported.maxValue, '9223372036854775807');
+  assert.equal(imported.start, '9007199254740993');
+  // A JavaScript number would have rounded the start value down.
+  assert.equal(Number(imported.start), 9007199254740992);
+});
+
+test('attaches separate OWNED BY options, NONE, and unqualified table names', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id bigint NOT NULL, x bigint);`,
+    `CREATE SEQUENCE public.t_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;`,
+    `ALTER SEQUENCE public.t_id_seq OWNED BY public.t.id;`,
+    `CREATE SEQUENCE public.attached;`,
+    `ALTER SEQUENCE public.attached OWNED BY public.t.x;`,
+    `CREATE SEQUENCE public.detached;`,
+    `ALTER SEQUENCE public.detached OWNED BY public.t.x;`,
+    `ALTER SEQUENCE public.detached OWNED BY NONE;`,
+    `CREATE SEQUENCE public.unqualified;`,
+    `ALTER SEQUENCE public.unqualified OWNED BY t.x;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const byName = new Map(model.sequences.map((entry) => [entry.name, entry]));
+
+  assert.deepEqual(byName.get('t_id_seq')?.ownedBy, {
+    table: { schema: 'public', name: 't' },
+    column: 'id',
+  });
+  assert.deepEqual(byName.get('attached')?.ownedBy, {
+    table: { schema: 'public', name: 't' },
+    column: 'x',
+  });
+  assert.equal('ownedBy' in (byName.get('detached') ?? {}), false);
+  assert.deepEqual(byName.get('unqualified')?.ownedBy, {
+    table: { schema: 'public', name: 't' },
+    column: 'x',
+  });
+  // The `AS integer` bounds are the effective ones.
+  assert.equal(byName.get('t_id_seq')?.maxValue, '2147483647');
+  assert.deepEqual(diagnostics, []);
+});
+
+test('applies ALTER SEQUENCE options as the engine does, not in source order', async () => {
+  const dump = [
+    // NO MINVALUE / NO MAXVALUE resolve against the type and the direction at that point.
+    `CREATE SEQUENCE public.desc INCREMENT -1;`,
+    `ALTER SEQUENCE public.desc AS integer;`,
+    `ALTER SEQUENCE public.desc AS bigint;`,
+    `ALTER SEQUENCE public.desc MINVALUE -100 MAXVALUE 100;`,
+    `ALTER SEQUENCE public.desc NO MINVALUE NO MAXVALUE;`,
+    // Clauses in a scrambled source order still apply in the engine's fixed order.
+    `CREATE SEQUENCE public.scrambled;`,
+    `ALTER SEQUENCE public.scrambled CACHE 5 INCREMENT 2 NO MAXVALUE NO MINVALUE START 3 CYCLE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const byName = new Map(model.sequences.map((entry) => [entry.name, entry]));
+
+  // AS bigint after AS integer converts the integer bounds back to bigint's.
+  assert.deepEqual(byName.get('desc'), {
+    schema: 'public',
+    name: 'desc',
+    dataType: 'bigint',
+    increment: '-1',
+    minValue: '-9223372036854775808',
+    maxValue: '-1',
+    start: '-1',
+    cache: '1',
+    cycle: false,
+  });
+  // Increment is applied before the NO MAXVALUE/NO MINVALUE resets.
+  assert.deepEqual(byName.get('scrambled'), {
+    schema: 'public',
+    name: 'scrambled',
+    dataType: 'bigint',
+    increment: '2',
+    minValue: '1',
+    maxValue: '9223372036854775807',
+    start: '3',
+    cache: '5',
+    cycle: true,
+  });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('AS type converts old-type-default bounds and lets NO MINVALUE/NO MAXVALUE force them', async () => {
+  const dump = [
+    // Old max is the bigint maximum, so `AS integer` converts it; the explicit NO MAXVALUE
+    // then takes the new type's maximum rather than the descending default of -1.
+    `CREATE SEQUENCE public.resetmax INCREMENT -1 MAXVALUE 9223372036854775807 START -1;`,
+    `ALTER SEQUENCE public.resetmax AS integer NO MAXVALUE;`,
+    // Old min is the bigint minimum; NO MINVALUE takes the new type's minimum, not 1.
+    `CREATE SEQUENCE public.resetmin MINVALUE -9223372036854775808 START 1;`,
+    `ALTER SEQUENCE public.resetmin AS integer NO MINVALUE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const byName = new Map(model.sequences.map((entry) => [entry.name, entry]));
+
+  assert.equal(byName.get('resetmax')?.dataType, 'integer');
+  assert.equal(byName.get('resetmax')?.maxValue, '2147483647');
+  assert.equal(byName.get('resetmax')?.minValue, '-2147483648');
+  assert.equal(byName.get('resetmin')?.dataType, 'integer');
+  assert.equal(byName.get('resetmin')?.minValue, '-2147483648');
+  assert.equal(byName.get('resetmin')?.maxValue, '2147483647');
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags unlogged and temporary sequence persistence', async () => {
+  const dump = [`CREATE UNLOGGED SEQUENCE public.u;`, `CREATE TEMPORARY SEQUENCE t;`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The sequence still imports; only its persistence is dropped, exactly like a table's.
+  assert.deepEqual(model.sequences, [sequence('t'), sequence('u')]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /dropped unlogged-sequence persistence from public\.u/);
+  assert.match(messages, /dropped temporary-sequence persistence from public\.t/);
+});
+
+test('names an ALTER SEQUENCE persistence change readably when skipping it', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s SET LOGGED;`,
+    `ALTER SEQUENCE public.s SET UNLOGGED;`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.equal(messages.match(/ALTER SEQUENCE public\.s/g)?.length, 2);
+  assert.doesNotMatch(messages, /OBJECT_SEQUENCE/);
+});
+
+test('replaces a repeated CREATE SEQUENCE wholesale', async () => {
+  const dump = [`CREATE SEQUENCE public.s AS smallint CYCLE;`, `CREATE SEQUENCE public.s;`].join(
+    '\n',
+  );
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips sequence state, missing sequences, and unmapped options by name', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.missing INCREMENT 2;`,
+    `ALTER SEQUENCE public.s RESTART WITH 5;`,
+    `ALTER SEQUENCE public.s INCREMENT 2 RESTART;`,
+    `ALTER SEQUENCE public.s RENAME TO s2;`,
+    `ALTER SEQUENCE public.s SET SCHEMA app;`,
+    `DROP SEQUENCE public.s;`,
+    `SELECT pg_catalog.setval('public.s', 1, false);`,
+    `CREATE SEQUENCE public.bad AS numeric;`,
+    `CREATE SEQUENCE public.fractional CACHE 1.5;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The RESTART options are state and stay skipped; the increment still applies.
+  assert.deepEqual(model.sequences, [sequence('s', { increment: '2' })]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.missing' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.bad' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.fractional' },
+  ]);
+
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /ALTER SEQUENCE public\.missing \(sequence not imported\)/);
+  assert.match(messages, /ALTER SEQUENCE public\.s \(RESTART\)/);
+  assert.match(messages, /ALTER SEQUENCE public\.s RENAME/);
+  assert.match(messages, /ALTER SEQUENCE public\.s SET SCHEMA/);
+  assert.match(messages, /DROP SEQUENCE public\.s/);
+  assert.match(messages, /CREATE SEQUENCE public\.bad \(unsupported data type\)/);
+  assert.match(messages, /CREATE SEQUENCE public\.fractional \(non-integer cache\)/);
 });
