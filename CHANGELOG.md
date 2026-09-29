@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
 ### Added
 
 - **Sequence modeling and normalization** — `@schemamill/core` gained a first-class `Sequence` entity and a `sequences` array on `Model`: schema-qualified identity, `dataType` (`smallint`, `integer`, `bigint`), `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, and an optional `ownedBy` (`{ table, column }`). Every numeric option was stored as an exact 64-bit integer in canonical decimal form, never a JavaScript `number`, so the type bounds (`9223372036854775807` and friends) survived intact; `effectiveSequence` normalized omitted options and `NO MINVALUE`/`NO MAXVALUE` to the engine defaults, including the direction-dependent bounds of descending sequences.
