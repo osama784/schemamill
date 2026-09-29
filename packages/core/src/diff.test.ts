@@ -1274,6 +1274,8 @@ test('a changed sequence reports its differing fields in the fixed order', () =>
 test('a changed sequence reports data type first and detaches last', () => {
   const baseline = sequence('s', {
     dataType: 'integer',
+    // The integer maximum; the engine's `AS bigint` converts it to bigint's own maximum,
+    // which is also the target's, so the plan needs no explicit max value.
     maxValue: '2147483647',
     ownedBy: owner('t', 'id'),
   });
@@ -1285,8 +1287,82 @@ test('a changed sequence reports data type first and detaches last', () => {
       sequence: identity('s'),
       changes: [
         { field: 'dataType', before: 'integer', after: 'bigint' },
-        { field: 'maxValue', before: '2147483647', after: '9223372036854775807' },
         { field: 'ownedBy', before: { table: identity('t'), column: 'id' } },
+      ],
+    },
+  ]);
+});
+
+test('a data type change restates a bound the AS conversion would move', () => {
+  // The exact repro shape: both sides state the integer maximum, but `AS bigint` converts
+  // the baseline's integer maximum to bigint's, so the target's value needs restating.
+  const baseline = sequence('s', { dataType: 'integer', maxValue: '2147483647' });
+  const target = sequence('s', { maxValue: '2147483647' });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([target]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+      ],
+    },
+  ]);
+});
+
+test('a data type change restates a minimum the AS conversion would move', () => {
+  const baseline = sequence('s', {
+    dataType: 'integer',
+    minValue: '-2147483648',
+    maxValue: '100',
+  });
+  const target = sequence('s', { minValue: '-2147483648', maxValue: '100' });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([target]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'minValue', before: '-9223372036854775808', after: '-2147483648' },
+      ],
+    },
+  ]);
+});
+
+test('a data type change restates both bounds the AS conversion would move', () => {
+  const baseline = sequence('s', {
+    dataType: 'integer',
+    minValue: '-2147483648',
+    maxValue: '2147483647',
+  });
+  const target = sequence('s', { minValue: '-2147483648', maxValue: '2147483647' });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([target]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'minValue', before: '-9223372036854775808', after: '-2147483648' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+      ],
+    },
+  ]);
+});
+
+test('a smallint to integer change restates the smallint maximum', () => {
+  const baseline = sequence('s', { dataType: 'smallint', maxValue: '32767' });
+  const target = sequence('s', { dataType: 'integer', maxValue: '32767' });
+
+  assertDiff(sequenceModel([baseline]), sequenceModel([target]), [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'dataType', before: 'smallint', after: 'integer' },
+        { field: 'maxValue', before: '2147483647', after: '32767' },
       ],
     },
   ]);

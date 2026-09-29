@@ -14,7 +14,9 @@ import type { Sequence, SequenceDataType, SequenceIdentity, SequenceOwner } from
  *
  * Every value is an exact 64-bit integer in canonical decimal form (see `Sequence`): the
  * helpers here compare and canonicalize with `bigint`, never JavaScript `number`, because the
- * type bounds exceed `Number.MAX_SAFE_INTEGER`.
+ * type bounds exceed `Number.MAX_SAFE_INTEGER`. `sequenceTypeChange` holds the engine's `AS`
+ * bound reset — a bound equal to the old type's bound becomes the new type's — shared by
+ * import and diff.
  *
  * This module holds the normalization rules in one place: import calls `effectiveSequence` to
  * build a `Sequence`, and `diff` calls it to compare on effective values. Normalizing an
@@ -48,6 +50,43 @@ export function defaultSequenceMin(dataType: SequenceDataType, increment: string
 /** The effective `MAXVALUE` an omitted or `NO MAXVALUE` option resolves to. */
 export function defaultSequenceMax(dataType: SequenceDataType, increment: string): string {
   return isAscending(increment) ? sequenceTypeBounds(dataType).maxValue : '-1';
+}
+
+/** What the engine's `AS` data type change does to a sequence's `MINVALUE` and `MAXVALUE`. */
+export interface SequenceTypeChange {
+  /** The `MINVALUE` after the change: the old type's minimum becomes the new type's. */
+  readonly minValue: string;
+  /** The `MAXVALUE` after the change: the old type's maximum becomes the new type's. */
+  readonly maxValue: string;
+  /** Whether `minValue` was exactly the old type's minimum and so was rewritten. */
+  readonly resetMin: boolean;
+  /** Whether `maxValue` was exactly the old type's maximum and so was rewritten. */
+  readonly resetMax: boolean;
+}
+
+/**
+ * The bounds an `AS` change from `dataType` to `newDataType` leaves: the engine rewrites a
+ * bound exactly equal to the old type's bound to the new type's, and keeps every other bound.
+ * The flags report the rewrites, which the engine remembers, so a `NO MINVALUE`/`NO MAXVALUE`
+ * later in the same change takes the new type's bound rather than the direction-dependent
+ * default.
+ */
+export function sequenceTypeChange(
+  dataType: SequenceDataType,
+  minValue: string,
+  maxValue: string,
+  newDataType: SequenceDataType,
+): SequenceTypeChange {
+  const oldBounds = sequenceTypeBounds(dataType);
+  const newBounds = sequenceTypeBounds(newDataType);
+  const resetMin = minValue === oldBounds.minValue;
+  const resetMax = maxValue === oldBounds.maxValue;
+  return {
+    minValue: resetMin ? newBounds.minValue : minValue,
+    maxValue: resetMax ? newBounds.maxValue : maxValue,
+    resetMin,
+    resetMax,
+  };
 }
 
 /**

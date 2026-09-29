@@ -8,6 +8,7 @@ export {
   defaultSequenceMin,
   effectiveSequence,
   sequenceTypeBounds,
+  sequenceTypeChange,
 } from './sequence.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';

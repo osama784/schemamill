@@ -10,7 +10,7 @@ import type {
   Table,
   TableIdentity,
 } from './model.ts';
-import { effectiveSequence } from './sequence.ts';
+import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
 /**
  * The diff: what changed between a baseline model and a target model.
@@ -31,7 +31,10 @@ import { effectiveSequence } from './sequence.ts';
  * whitespace-normalizes at the boundary, so even a difference in whitespace is a change.
  * Names are case-sensitive. Sequence options are the exception: they compare on effective
  * values, so an omitted option and its explicit default are the same value, and a sequence
- * that only restates its defaults is not a change (`sequence.ts` holds the rules).
+ * that only restates its defaults is not a change (`sequence.ts` holds the rules). A sequence
+ * whose `dataType` differs is additionally compared against the engine's `AS` conversion: a
+ * bound equal to the old type's bound becomes the new type's bound, so the conversion is
+ * applied first and `minValue`/`maxValue` are reported against its result.
  *
  * A column is identified by name alone: the ordinal position of an existing column is not
  * part of the diff. The model stores `columns` in source order for fidelity, and column
@@ -64,7 +67,10 @@ import { effectiveSequence } from './sequence.ts';
  *    as a group in identity order: a baseline-only identity is `sequence-removed`, a target-only
  *    identity `sequence-added`, and a shared identity is compared on effective option values.
  *    A changed sequence reports only the fields that differ, in the fixed order `dataType`,
- *    `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, `ownedBy`.
+ *    `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, `ownedBy`; with a
+ *    `dataType` change, `minValue`/`maxValue` compare the bounds the engine's `AS` conversion
+ *    would leave, so a bound that only differs from the target after the conversion is still
+ *    reported.
  *
  * Duplicate foreign-key identities — several constraints with the same referencing columns
  * and referenced table — pair structurally identical foreign keys first, then pair the rest
@@ -130,7 +136,10 @@ export type ColumnFieldChange =
 /**
  * One differing option of a changed sequence; only fields that differ are reported, in the
  * fixed order `dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`,
- * `ownedBy`. An `ownedBy` change omits the side that has no owner.
+ * `ownedBy`. A `minValue`/`maxValue` change reports the value in effect after the step's
+ * `dataType` change — the engine rewrites a bound equal to the old type's bound to the new
+ * type's — as `before`, so a bound the target restores after that conversion is still
+ * reported. An `ownedBy` change omits the side that has no owner.
  */
 export type SequenceFieldChange =
   | { field: 'dataType'; before: SequenceDataType; after: SequenceDataType }
@@ -241,17 +250,25 @@ function diffSequences(baseline: Model, target: Model): readonly Change[] {
 
 function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceFieldChange[] {
   const fields: SequenceFieldChange[] = [];
-  if (baseline.dataType !== target.dataType) {
+  const dataTypeChanged = baseline.dataType !== target.dataType;
+  if (dataTypeChanged) {
     fields.push({ field: 'dataType', before: baseline.dataType, after: target.dataType });
   }
   if (baseline.increment !== target.increment) {
     fields.push({ field: 'increment', before: baseline.increment, after: target.increment });
   }
-  if (baseline.minValue !== target.minValue) {
-    fields.push({ field: 'minValue', before: baseline.minValue, after: target.minValue });
+  // With a data type change, the bounds the step lands on without explicit clauses are the
+  // ones the engine's `AS` conversion leaves, not the baseline's: a bound equal to the old
+  // type's bound becomes the new type's. Compare against those so the plan restates a bound
+  // the conversion would otherwise move.
+  const converted = dataTypeChanged
+    ? sequenceTypeChange(baseline.dataType, baseline.minValue, baseline.maxValue, target.dataType)
+    : { minValue: baseline.minValue, maxValue: baseline.maxValue };
+  if (converted.minValue !== target.minValue) {
+    fields.push({ field: 'minValue', before: converted.minValue, after: target.minValue });
   }
-  if (baseline.maxValue !== target.maxValue) {
-    fields.push({ field: 'maxValue', before: baseline.maxValue, after: target.maxValue });
+  if (converted.maxValue !== target.maxValue) {
+    fields.push({ field: 'maxValue', before: converted.maxValue, after: target.maxValue });
   }
   if (baseline.start !== target.start) {
     fields.push({ field: 'start', before: baseline.start, after: target.start });

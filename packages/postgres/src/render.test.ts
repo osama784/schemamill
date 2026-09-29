@@ -579,6 +579,18 @@ test('renders one ALTER SEQUENCE statement carrying every changed field, in orde
   );
 });
 
+test('renders the AS conversion and the bounds it would move in one statement', () => {
+  // The exact repro shape: `AS bigint` alone would rewrite the baseline's integer maximum to
+  // bigint's, so the statement restates the target's maximum after the type change.
+  const baseline = sequenceModel([sequence('s', { dataType: 'integer', maxValue: '2147483647' })]);
+  const target = sequenceModel([sequence('s', { maxValue: '2147483647' })]);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    'ALTER SEQUENCE public.s AS bigint MAXVALUE 2147483647;\n',
+  );
+});
+
 test('renders ownership changes as OWNED BY and OWNED BY NONE', () => {
   assert.equal(
     renderSql(

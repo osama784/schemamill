@@ -6,6 +6,7 @@ import {
   defaultSequenceMin,
   effectiveSequence,
   sequenceTypeBounds,
+  sequenceTypeChange,
 } from './index.ts';
 import type { Sequence, SequenceInput } from './index.ts';
 
@@ -112,6 +113,37 @@ test('each data type has its own bounds, in both directions', () => {
       { minValue: min, maxValue: '-1', start: '-1' },
     );
   }
+});
+
+test('a data type change rewrites only the bounds the old type owned', () => {
+  // The exact repro: the integer maximum becomes bigint's, and resetMax reports the rewrite.
+  assert.deepStrictEqual(sequenceTypeChange('integer', '1', '2147483647', 'bigint'), {
+    minValue: '1',
+    maxValue: '9223372036854775807',
+    resetMin: false,
+    resetMax: true,
+  });
+  // The integer minimum on the other side.
+  assert.deepStrictEqual(sequenceTypeChange('integer', '-2147483648', '100', 'bigint'), {
+    minValue: '-9223372036854775808',
+    maxValue: '100',
+    resetMin: true,
+    resetMax: false,
+  });
+  // Both bounds are rewritten on smallint → integer.
+  assert.deepStrictEqual(sequenceTypeChange('smallint', '-32768', '32767', 'integer'), {
+    minValue: '-2147483648',
+    maxValue: '2147483647',
+    resetMin: true,
+    resetMax: true,
+  });
+  // A bound the old type did not own is kept exactly, past Number.MAX_SAFE_INTEGER included.
+  assert.deepStrictEqual(sequenceTypeChange('bigint', '1', '9007199254740993', 'smallint'), {
+    minValue: '1',
+    maxValue: '9007199254740993',
+    resetMin: false,
+    resetMax: false,
+  });
 });
 
 test('exact 64-bit values survive normalization untouched', () => {

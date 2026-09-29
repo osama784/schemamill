@@ -7,7 +7,7 @@
   6. create-table     public.new_table
   7. alter-sequence   public.moved_seq: owned by public.old_owner.id → public.target_owner.id
   8. alter-sequence   public.new_table_id_seq: owned by (none) → public.new_table.id
-  9. alter-sequence   public.kept_seq: data type integer → bigint, increment 1 → 5, max value 2147483647 → 9223372036854775807, start 5 → 10, cache 1 → 8, cycle false → true
+  9. alter-sequence   public.kept_seq: data type integer → bigint, increment 1 → 5, start 5 → 10, cache 1 → 8, cycle false → true
  10. drop-sequence    public.dropped_seq
 
 CREATE SEQUENCE public.added_seq AS bigint INCREMENT BY 2 MINVALUE 1 MAXVALUE 100 START WITH 3 CACHE 4 CYCLE;
@@ -20,5 +20,5 @@ CREATE TABLE public.new_table (
 );
 ALTER SEQUENCE public.moved_seq OWNED BY public.target_owner.id;
 ALTER SEQUENCE public.new_table_id_seq OWNED BY public.new_table.id;
-ALTER SEQUENCE public.kept_seq AS bigint INCREMENT BY 5 MAXVALUE 9223372036854775807 START WITH 10 CACHE 8 CYCLE;
+ALTER SEQUENCE public.kept_seq AS bigint INCREMENT BY 5 START WITH 10 CACHE 8 CYCLE;
 DROP SEQUENCE public.dropped_seq;

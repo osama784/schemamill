@@ -685,6 +685,40 @@ test('AS type converts old-type-default bounds and lets NO MINVALUE/NO MAXVALUE 
   assert.deepEqual(diagnostics, []);
 });
 
+test('flags unlogged and temporary sequence persistence', async () => {
+  const dump = [`CREATE UNLOGGED SEQUENCE public.u;`, `CREATE TEMPORARY SEQUENCE t;`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The sequence still imports; only its persistence is dropped, exactly like a table's.
+  assert.deepEqual(model.sequences, [sequence('t'), sequence('u')]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /dropped unlogged-sequence persistence from public\.u/);
+  assert.match(messages, /dropped temporary-sequence persistence from public\.t/);
+});
+
+test('names an ALTER SEQUENCE persistence change readably when skipping it', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s SET LOGGED;`,
+    `ALTER SEQUENCE public.s SET UNLOGGED;`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.equal(messages.match(/ALTER SEQUENCE public\.s/g)?.length, 2);
+  assert.doesNotMatch(messages, /OBJECT_SEQUENCE/);
+});
+
 test('replaces a repeated CREATE SEQUENCE wholesale', async () => {
   const dump = [`CREATE SEQUENCE public.s AS smallint CYCLE;`, `CREATE SEQUENCE public.s;`].join(
     '\n',

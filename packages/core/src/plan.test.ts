@@ -1837,6 +1837,24 @@ test('ownership attaches, then option alters, then sequence drops', () => {
   );
 });
 
+test('a data type change keeps a bound the AS conversion would move explicit', () => {
+  // The exact repro shape: both sides state the integer maximum, but the engine converts the
+  // baseline's integer maximum on `AS bigint`, so the plan restates the target's maximum.
+  const baseline = sequenceModel([sequence('s', { dataType: 'integer', maxValue: '2147483647' })]);
+  const target = sequenceModel([sequence('s', { maxValue: '2147483647' })]);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-sequence',
+      sequence: identity('s'),
+      fields: [
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+      ],
+    },
+  ]);
+});
+
 test('structurally equal models with sequences in any insertion order plan identically', () => {
   const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
   const baselineSequences = [sequence('kept', { ownedBy: owner('t', 'id') }), sequence('dropped')];

@@ -15,7 +15,8 @@
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
- *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale.
+ *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale, and unlogged or
+ *   temporary sequence persistence is flagged.
  * - `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max,
  *   start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — apply to the already imported
  *   sequence, in the order the engine processes them, and are skipped and named when the
@@ -62,6 +63,7 @@ import {
   defaultSequenceMin,
   effectiveSequence,
   sequenceTypeBounds,
+  sequenceTypeChange,
 } from '@schemamill/core';
 import type {
   AlterSeqStmt,
@@ -486,6 +488,15 @@ function translateCreateSequence(
   const options = readCreateSequenceOptions(statement, create.options ?? [], identity, diagnostics);
   if (options === undefined) return;
 
+  // Persistence is not modeled; the re-render is a plain sequence, so flag the loss, exactly
+  // as the table path flags unlogged and temporary tables.
+  if (create.sequence?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
+  }
+  if (create.sequence?.relpersistence === 't') {
+    diagnostics.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+  }
+
   // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE.
   sequences.set(tableKey(schema, name), effectiveSequence({ schema, name, ...options }));
 }
@@ -594,12 +605,11 @@ function translateAlterSequence(
       // The engine converts a bound that is exactly the old type's bound to the new type's,
       // and remembers the conversion: a later `NO MINVALUE`/`NO MAXVALUE` then takes the new
       // type's bound rather than the direction-dependent default.
-      const oldBounds = sequenceTypeBounds(draft.dataType);
-      const newBounds = sequenceTypeBounds(dataType);
-      resetMin = draft.minValue === oldBounds.minValue;
-      resetMax = draft.maxValue === oldBounds.maxValue;
-      if (resetMin) draft.minValue = newBounds.minValue;
-      if (resetMax) draft.maxValue = newBounds.maxValue;
+      const change = sequenceTypeChange(draft.dataType, draft.minValue, draft.maxValue, dataType);
+      resetMin = change.resetMin;
+      resetMax = change.resetMax;
+      draft.minValue = change.minValue;
+      draft.maxValue = change.maxValue;
       draft.dataType = dataType;
     }
   }
@@ -670,7 +680,11 @@ function translateAlterSequence(
   }
 }
 
-/** The `DefElem` options a sequence statement carries, keyed by name; a repeat wins. */
+/**
+ * The `DefElem` options a sequence statement carries, keyed by name. A repeated option
+ * overwrites the earlier one — the last wins — where the engine would reject the statement
+ * with `errorConflictingDefElem`; pg_dump never repeats one.
+ */
 function sequenceOptionDefs(elements: readonly Node[]): Map<string, DefElem> {
   const defs = new Map<string, DefElem>();
   for (const element of elements) {
@@ -738,6 +752,20 @@ function parseSequenceOwner(defel: DefElem): ParsedOwner {
   return { kind: 'invalid' };
 }
 
+/** The SQL keyword an `AlterTableStmt.objtype` enum names, for readable skip descriptions. */
+const ALTER_OBJECT_KINDS: Readonly<Record<string, string>> = {
+  OBJECT_FOREIGN_TABLE: 'FOREIGN TABLE',
+  OBJECT_INDEX: 'INDEX',
+  OBJECT_MATVIEW: 'MATERIALIZED VIEW',
+  OBJECT_SEQUENCE: 'SEQUENCE',
+  OBJECT_VIEW: 'VIEW',
+};
+
+/** The SQL keyword for an `objtype`, with `OBJECT_` stripped as the fallback. */
+function alterObjectKind(objtype: string): string {
+  return ALTER_OBJECT_KINDS[objtype] ?? objtype.replace(/^OBJECT_/, '');
+}
+
 function translateAlterTable(
   statement: ParsedStatement,
   alter: AlterTableStmt,
@@ -749,7 +777,9 @@ function translateAlterTable(
   const identity = tableIdentityName({ schema, name });
 
   if (alter.objtype !== undefined && alter.objtype !== 'OBJECT_TABLE') {
-    diagnostics.push(skipStatement(statement, `ALTER ${alter.objtype} ${identity}`, identity));
+    diagnostics.push(
+      skipStatement(statement, `ALTER ${alterObjectKind(alter.objtype)} ${identity}`, identity),
+    );
     return;
   }
 

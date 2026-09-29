@@ -38,7 +38,6 @@
 ~ sequence public.kept_seq
     data type integer → bigint
     increment 1 → 5
-    max value 2147483647 → 9223372036854775807
     start 5 → 10
     cache 1 → 8
     cycle false → true
