@@ -1095,8 +1095,14 @@ const unnamedKeptScene = (): LiveScene => ({
   checks: [
     { description: 'tables kept', sql: TABLES, expected: 'ufk,up' },
     {
-      description: 'constraints left in public',
-      sql: "select count(*) from pg_constraint where connamespace = 'public'::regnamespace",
+      description: 'table constraints left in public',
+      // PostgreSQL 18 records column NOT NULL specifications in
+      // `pg_constraint` with `contype = 'n'`; the scene asserts only that the
+      // unnamed primary-key and foreign-key constraints are gone, so count
+      // real table constraints and ignore the NOT NULL records.
+      sql:
+        'select count(*) from pg_constraint' +
+        " where connamespace = 'public'::regnamespace and contype in ('p', 'f', 'u', 'c', 'x')",
       expected: '0',
     },
   ],
