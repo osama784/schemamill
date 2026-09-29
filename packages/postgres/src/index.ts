@@ -4,7 +4,7 @@ import { version as coreVersion } from '@schemamill/core';
 export const dialect = 'postgres';
 
 /** The schemamill version. */
-export const version = '0.1.0';
+export const version = '0.2.0';
 
 /** Version of the core model package this adapter is built against. */
 export const coreVersionUsed = coreVersion;
