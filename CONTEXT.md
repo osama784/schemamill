@@ -54,6 +54,22 @@ _Avoid_: comparison, delta, changeset
 The rows inside tables. Out of scope: schemamill works on structure, never data.
 _Avoid_: records, contents
 
+**Sequence**:
+A PostgreSQL object that produces numbers on demand, modeled as a first-class entity with schema-qualified identity, its effective options, and optional ownership.
+_Avoid_: counter, autoincrement
+
+**Sequence-backed default**:
+A column's `DEFAULT` that calls `nextval()` on a sequence — what the `serial` and `bigserial` sugar produces. The default stays opaque text in the model; the sequence is its own entity, and ownership links the two.
+_Avoid_: serial column, autoincrement
+
+**Ownership**:
+The link from a sequence to the table column it serves, stated as `OWNED BY`. PostgreSQL drops an owned sequence together with its owning table or column, so the plan detaches before a removed owner and suppresses a redundant drop.
+_Avoid_: dependency, association
+
+**Identity column**:
+A column declared `GENERATED … AS IDENTITY`: a distinct PostgreSQL object from a sequence-backed default. Out of the model; import flags it by name.
+_Avoid_: serial, sequence column
+
 ### Crossing the boundary
 
 **Import**:
