@@ -1,4 +1,14 @@
-import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from '@schemamill/core';
+import { effectiveSequence } from '@schemamill/core';
+import type {
+  Column,
+  ForeignKey,
+  Model,
+  PrimaryKey,
+  Sequence,
+  SequenceOwner,
+  Table,
+  TableIdentity,
+} from '@schemamill/core';
 
 /**
  * Scenes for the live-PostgreSQL harness (`live-pg.test.ts`).
@@ -15,6 +25,14 @@ import type { Column, ForeignKey, Model, PrimaryKey, Table, TableIdentity } from
  * under a surviving foreign key (`r1a`-`r1d`), a dropped primary key or column that a removed
  * table still references (`pkdrop-removedref`, `coldrop-removedref`), and unnamed constraints
  * dropped under the conventional names PostgreSQL gives them (`unnamed-drop`, `unnamed-kept`).
+ *
+ * The sequence scenes cover the shapes the sequences slice was built for, against a live
+ * server: a new table with a new owned sequence-backed default whose ownership and generated
+ * keys are checked (`serial-create`), standalone sequences added and removed
+ * (`sequence-add-drop`), option alters including the `AS` bound reset
+ * (`sequence-alter`), owner drops with detach-before-drop and drop suppression
+ * (`owner-drop-order`), and a default drop ordered before the sequence drop it releases
+ * (`detached-drop`).
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -63,6 +81,26 @@ const foreignKey = (
 
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+
+/** A model of the given tables and sequences together. */
+const withSequences = (tables: readonly Table[], sequences: readonly Sequence[]): Model => ({
+  tables,
+  sequences,
+});
+
+/** A sequence named `name`: the effective defaults for its stated options. */
+const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence =>
+  effectiveSequence({ schema: 'public', name, ...fields });
+
+/** The owner link for a sequence: `tableName.columnName`, `public` unless overridden. */
+const sequenceOwner = (
+  tableName: string,
+  columnName: string,
+  schema = 'public',
+): SequenceOwner => ({
+  table: identity(tableName, schema),
+  column: columnName,
+});
 
 /** One catalog fact: `sql` is read with `psql -tA` and compared exactly to `expected`. */
 export interface SceneCheck {
@@ -119,6 +157,46 @@ const constraintDef = (conname: string): string =>
 /** A named table is present: `name|0` or `name|1`, pinned as one text fact. */
 const tableExists = (tableName: string): string =>
   `select '${tableName}' || '|' || count(*) from pg_tables where schemaname = 'public' and tablename = '${tableName}'`;
+
+/** `public` sequences in name order, or the empty string when there are none. */
+const SEQUENCES =
+  "select string_agg(sequencename, ',' order by sequencename) from pg_sequences where schemaname = 'public'";
+
+/**
+ * One sequence's effective options, as one `-tA` text fact: data type, start, minimum,
+ * maximum, increment, cycle, cache. `pg_sequences` reads them back from the live catalog, and
+ * `||` casts the boolean to `true`/`false`.
+ */
+const sequenceParams = (name: string, schema = 'public'): string =>
+  `select data_type || '|' || start_value || '|' || min_value || '|' || max_value` +
+  ` || '|' || increment_by || '|' || cycle || '|' || cache_size` +
+  ` from pg_sequences where schemaname = '${schema}' and sequencename = '${name}'`;
+
+/** The table and column `name` is owned by, as `table.column`, or `none`, via `pg_depend`. */
+const sequenceOwnership = (name: string, schema = 'public'): string =>
+  `select coalesce((select owner.relname || '.' || attribute.attname` +
+  ` from pg_depend dependency` +
+  ` join pg_class sequence on sequence.oid = dependency.objid` +
+  ` join pg_namespace namespace on namespace.oid = sequence.relnamespace` +
+  ` join pg_class owner on owner.oid = dependency.refobjid` +
+  ` join pg_attribute attribute on attribute.attrelid = dependency.refobjid` +
+  ` and attribute.attnum = dependency.refobjsubid` +
+  ` where dependency.deptype = 'a' and namespace.nspname = '${schema}'` +
+  ` and sequence.relname = '${name}'), 'none')`;
+
+/** Whether `pg_get_serial_sequence` resolves `tableName.columnName` to `name`: `name|true`. */
+const serialSequenceIs = (
+  tableName: string,
+  columnName: string,
+  name: string,
+  schema = 'public',
+): string =>
+  `select '${name}' || '|' || coalesce((pg_get_serial_sequence('${schema}.${tableName}',` +
+  ` '${columnName}')::regclass = '${schema}.${name}'::regclass), false)`;
+
+/** The sequence `pg_get_serial_sequence` resolves `tableName.columnName` to, or `none`. */
+const serialSequenceOrNone = (tableName: string, columnName: string, schema = 'public'): string =>
+  `select coalesce(pg_get_serial_sequence('${schema}.${tableName}', '${columnName}'), 'none')`;
 
 const createTableScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -1108,6 +1186,364 @@ const unnamedKeptScene = (): LiveScene => ({
   ],
 });
 
+const serialCreateScene = (): LiveScene => {
+  const users = table('users', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'users_pkey', columns: ['id'] },
+  });
+  const auditEntries = table('audit_entries', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        default: "nextval('public.audit_entries_id_seq'::regclass)",
+      }),
+      column('actor', { notNull: true }),
+      column('action', { notNull: true }),
+      column('at', { type: 'timestamp with time zone', notNull: true, default: 'now()' }),
+    ],
+    primaryKey: { name: 'audit_entries_pkey', columns: ['id'] },
+  });
+  const auditEntriesIdSeq = sequence('audit_entries_id_seq', {
+    ownedBy: sequenceOwner('audit_entries', 'id'),
+  });
+
+  return {
+    name: 'serial-create',
+    baseline: model(users),
+    target: withSequences([users, auditEntries], [auditEntriesIdSeq]),
+    baselineChecks: [
+      { description: 'baseline tables', sql: TABLES, expected: 'users' },
+      { description: 'baseline has no sequences', sql: SEQUENCES, expected: '' },
+    ],
+    probes: [
+      "INSERT INTO public.audit_entries (actor, action) VALUES ('ada', 'login'), ('ada', 'logout');",
+    ],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'audit_entries,users' },
+      {
+        description: 'audit_entries.id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('audit_entries', 'id', 'audit_entries_id_seq'),
+        expected: 'audit_entries_id_seq|true',
+      },
+      {
+        description: 'audit_entries_id_seq ownership',
+        sql: sequenceOwnership('audit_entries_id_seq'),
+        expected: 'audit_entries.id',
+      },
+      {
+        description: 'audit_entries_id_seq parameters',
+        sql: sequenceParams('audit_entries_id_seq'),
+        expected: 'bigint|1|1|9223372036854775807|1|false|1',
+      },
+      {
+        description: 'audit_entries.id carries a default',
+        sql: columnFact('audit_entries', 'id', 'column_default is not null'),
+        expected: 't',
+      },
+      {
+        description: 'the default generated keys 1 and 2',
+        sql: "select string_agg(id::text, ',' order by id) from public.audit_entries",
+        expected: '1,2',
+      },
+    ],
+  };
+};
+
+const sequenceAddDropScene = (): LiveScene => {
+  const users = table('users', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'users_pkey', columns: ['id'] },
+  });
+  const dropMe = sequence('drop_me', {
+    dataType: 'integer',
+    increment: '3',
+    minValue: '-10',
+    maxValue: '1000',
+    start: '-7',
+    cache: '5',
+    cycle: true,
+  });
+  const keepMe = sequence('keep_me', { dataType: 'smallint' });
+  const addMe = sequence('add_me', {
+    dataType: 'smallint',
+    increment: '2',
+    minValue: '10',
+    maxValue: '32000',
+    start: '20',
+    cache: '7',
+  });
+
+  return {
+    name: 'sequence-add-drop',
+    baseline: withSequences([users], [dropMe, keepMe]),
+    target: withSequences([users], [addMe, keepMe]),
+    baselineChecks: [
+      { description: 'baseline sequences', sql: SEQUENCES, expected: 'drop_me,keep_me' },
+      {
+        description: 'baseline drop_me parameters',
+        sql: sequenceParams('drop_me'),
+        expected: 'integer|-7|-10|1000|3|true|5',
+      },
+    ],
+    checks: [
+      { description: 'sequences left', sql: SEQUENCES, expected: 'add_me,keep_me' },
+      {
+        description: 'added sequence parameters',
+        sql: sequenceParams('add_me'),
+        expected: 'smallint|20|10|32000|2|false|7',
+      },
+      {
+        description: 'kept sequence parameters',
+        sql: sequenceParams('keep_me'),
+        expected: 'smallint|1|1|32767|1|false|1',
+      },
+      {
+        description: 'removed sequence is gone',
+        sql:
+          "select count(*) from pg_sequences where schemaname = 'public'" +
+          " and sequencename = 'drop_me'",
+        expected: '0',
+      },
+      {
+        description: 'added sequence is unowned',
+        sql: sequenceOwnership('add_me'),
+        expected: 'none',
+      },
+      { description: 'tables left', sql: TABLES, expected: 'users' },
+    ],
+  };
+};
+
+const sequenceAlterScene = (): LiveScene => {
+  const oldOwner = table('old_owner', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('marker', { type: 'bigint' }),
+    ],
+    primaryKey: { name: 'old_owner_pkey', columns: ['id'] },
+  });
+  const newOwner = table('new_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'new_owner_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'sequence-alter',
+    baseline: withSequences(
+      [oldOwner, newOwner],
+      [
+        sequence('as_type_seq', { dataType: 'integer' }),
+        sequence('opts_seq'),
+        sequence('replace_seq', { ownedBy: sequenceOwner('old_owner', 'id') }),
+        sequence('detach_seq', { ownedBy: sequenceOwner('old_owner', 'marker') }),
+      ],
+    ),
+    target: withSequences(
+      [oldOwner, newOwner],
+      [
+        sequence('as_type_seq', { dataType: 'bigint', maxValue: '2147483647' }),
+        sequence('opts_seq', { increment: '5', start: '10', cache: '4', cycle: true }),
+        sequence('replace_seq', { ownedBy: sequenceOwner('new_owner', 'id') }),
+        sequence('detach_seq'),
+      ],
+    ),
+    baselineChecks: [
+      {
+        description: 'baseline sequences',
+        sql: SEQUENCES,
+        expected: 'as_type_seq,detach_seq,opts_seq,replace_seq',
+      },
+      {
+        description: 'baseline as_type_seq parameters',
+        sql: sequenceParams('as_type_seq'),
+        expected: 'integer|1|1|2147483647|1|false|1',
+      },
+      {
+        description: 'baseline replace_seq ownership',
+        sql: sequenceOwnership('replace_seq'),
+        expected: 'old_owner.id',
+      },
+      {
+        description: 'baseline detach_seq ownership',
+        sql: sequenceOwnership('detach_seq'),
+        expected: 'old_owner.marker',
+      },
+    ],
+    probes: [
+      `DO $do$
+BEGIN
+    INSERT INTO public.old_owner (id, marker) VALUES (1, 2);
+    INSERT INTO public.new_owner (id) VALUES (1);
+END
+$do$;`,
+    ],
+    checks: [
+      {
+        description: 'as_type_seq parameters after the AS change',
+        sql: sequenceParams('as_type_seq'),
+        expected: 'bigint|1|1|2147483647|1|false|1',
+      },
+      {
+        description: 'opts_seq parameters after the option alters',
+        sql: sequenceParams('opts_seq'),
+        expected: 'bigint|10|1|9223372036854775807|5|true|4',
+      },
+      {
+        description: 'replace_seq re-owned to new_owner.id',
+        sql: sequenceOwnership('replace_seq'),
+        expected: 'new_owner.id',
+      },
+      {
+        description: 'old_owner.id no longer resolves a serial sequence',
+        sql: serialSequenceOrNone('old_owner', 'id'),
+        expected: 'none',
+      },
+      {
+        description: 'detach_seq is detached',
+        sql: sequenceOwnership('detach_seq'),
+        expected: 'none',
+      },
+      {
+        description: 'inserted rows across the scene',
+        sql:
+          'select (select count(*) from public.old_owner)' +
+          ' + (select count(*) from public.new_owner)',
+        expected: '2',
+      },
+    ],
+  };
+};
+
+const ownerDropOrderScene = (): LiveScene => {
+  const detachOwner = table('detach_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'detach_owner_pkey', columns: ['id'] },
+  });
+  const cascadeOwner = table('cascade_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'cascade_owner_pkey', columns: ['id'] },
+  });
+  const columnOwner = table('column_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('extra', { type: 'bigint' })],
+    primaryKey: { name: 'column_owner_pkey', columns: ['id'] },
+  });
+  const columnOwnerTarget = table('column_owner', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { name: 'column_owner_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'owner-drop-order',
+    baseline: withSequences(
+      [detachOwner, cascadeOwner, columnOwner],
+      [
+        sequence('detach_owner_id_seq', { ownedBy: sequenceOwner('detach_owner', 'id') }),
+        sequence('cascade_owner_id_seq', { ownedBy: sequenceOwner('cascade_owner', 'id') }),
+        sequence('column_owner_extra_seq', { ownedBy: sequenceOwner('column_owner', 'extra') }),
+      ],
+    ),
+    target: withSequences([columnOwnerTarget], [sequence('detach_owner_id_seq')]),
+    baselineChecks: [
+      {
+        description: 'baseline sequences',
+        sql: SEQUENCES,
+        expected: 'cascade_owner_id_seq,column_owner_extra_seq,detach_owner_id_seq',
+      },
+      {
+        description: 'baseline detach_owner_id_seq ownership',
+        sql: sequenceOwnership('detach_owner_id_seq'),
+        expected: 'detach_owner.id',
+      },
+      {
+        description: 'baseline column_owner_extra_seq ownership',
+        sql: sequenceOwnership('column_owner_extra_seq'),
+        expected: 'column_owner.extra',
+      },
+    ],
+    probes: [
+      'INSERT INTO public.column_owner (id) VALUES (1);',
+      "SELECT nextval('public.detach_owner_id_seq');",
+    ],
+    checks: [
+      { description: 'tables left', sql: TABLES, expected: 'column_owner' },
+      { description: 'sequences left', sql: SEQUENCES, expected: 'detach_owner_id_seq' },
+      {
+        description: 'detach_owner_id_seq survived its owner, unowned',
+        sql: sequenceOwnership('detach_owner_id_seq'),
+        expected: 'none',
+      },
+      {
+        description: 'detach_owner_id_seq parameters are unchanged',
+        sql: sequenceParams('detach_owner_id_seq'),
+        expected: 'bigint|1|1|9223372036854775807|1|false|1',
+      },
+      {
+        description: 'column_owner columns',
+        sql: columnsByPosition('column_owner'),
+        expected: 'id',
+      },
+      {
+        description: 'the inserted column_owner row',
+        sql: 'select count(*) from public.column_owner',
+        expected: '1',
+      },
+    ],
+  };
+};
+
+const detachedDropScene = (): LiveScene => {
+  const t = table('t', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        default: "nextval('public.gone_seq'::regclass)",
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const tTarget = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('note')],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'detached-drop',
+    baseline: withSequences([t], [sequence('gone_seq', { start: '1000' })]),
+    target: model(tTarget),
+    baselineChecks: [
+      { description: 'baseline sequences', sql: SEQUENCES, expected: 'gone_seq' },
+      {
+        description: 'baseline gone_seq is unowned',
+        sql: sequenceOwnership('gone_seq'),
+        expected: 'none',
+      },
+      {
+        description: 'baseline t.id default references gone_seq',
+        sql: columnFact('t', 'id', "position('gone_seq' in column_default) > 0"),
+        expected: 't',
+      },
+    ],
+    probes: ["INSERT INTO public.t (id, note) VALUES (5, 'kept');"],
+    checks: [
+      { description: 'sequences left', sql: SEQUENCES, expected: '' },
+      {
+        description: 't.id default is dropped',
+        sql: columnFact('t', 'id', "coalesce(column_default, 'none')"),
+        expected: 'none',
+      },
+      { description: 't columns', sql: columnsByPosition('t'), expected: 'id,note' },
+      {
+        description: 'the inserted row',
+        sql: 'select count(*) from public.t where id = 5',
+        expected: '1',
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -1122,4 +1558,9 @@ export const scenes: readonly LiveScene[] = [
   smallvictimScene(),
   unnamedDropScene(),
   unnamedKeptScene(),
+  serialCreateScene(),
+  sequenceAddDropScene(),
+  sequenceAlterScene(),
+  ownerDropOrderScene(),
+  detachedDropScene(),
 ];
