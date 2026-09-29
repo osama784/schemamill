@@ -1,0 +1,3 @@
+interface:
+  display_name: "Branch & PR Flow"
+  short_description: "Feature branches, PRs into dev, releases to main"

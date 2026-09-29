@@ -11,12 +11,20 @@ schemamill's representation of a database schema — the single source of truth 
 _Avoid_: schema, entity, class, diagram
 
 **Schema**:
-The database structure itself, as it really exists in PostgreSQL. Our representation of it is the model, never "the schema".
+The database structure itself, as it really exists in PostgreSQL. Our representation of it is the model, never "the schema". PostgreSQL also calls a namespace a schema; a table's identity in the model is schema-qualified, e.g. `public.users`.
 _Avoid_: model
+
+**Table**:
+A named set of columns in the model, identified by its schema and name together, e.g. `public.users`. Tables are what the plan creates, alters, and drops.
+_Avoid_: relation, entity
 
 **Column**:
 A table's attribute, named as PostgreSQL names it. Tables have columns.
 _Avoid_: field, attribute
+
+**Primary key**:
+A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one.
+_Avoid_: pk, key
 
 **Relationship**:
 A link between two tables in the model — what the canvas draws and the plan creates or drops. In v1, every relationship comes from a foreign key.
@@ -65,6 +73,10 @@ What the user does with migration SQL — runs it against their database. Schema
 _Avoid_: run, execute, deploy
 
 ### The change engine
+
+**Change**:
+One atom of a diff — a table, column, primary key, or foreign key added, removed, or changed between a baseline and a target.
+_Avoid_: edit, modification, alteration
 
 **Migration plan**:
 The engine's analysis of a diff: the ordered changes that move a baseline to a target, with hazard annotations.

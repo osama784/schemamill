@@ -176,6 +176,9 @@ catalogs:
     eslint-config-prettier:
       specifier: ^10.1.8
       version: 10.1.8
+    libpg-query:
+      specifier: 18.1.5-lowmem-32.0
+      version: 18.1.5-lowmem-32.0
     prettier:
       specifier: ^3.9.8
       version: 3.9.8
@@ -248,6 +251,9 @@ importers:
       '@schemamill/core':
         specifier: workspace:*
         version: link:../core
+      libpg-query:
+        specifier: 'catalog:'
+        version: 18.1.5-lowmem-32.0
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -650,6 +656,9 @@ packages:
 
   '@oxc-project/types@0.150.0':
     resolution: {integrity: sha512-rDS5/31E9HfPl/CIzGrn0DOlvBbXFseQ5URJ9sYMfstbKLD/c6Gm9vmRzRGDdAXyOIL4zmO37lc9RIwYqVruZw==}
+
+  '@pgsql/types@18.0.0':
+    resolution: {integrity: sha512-jtAY4JU7jdVYZ/Vv3zlZqVP+FRWZokyCLKPPCnAApiaJAElpyyiMC3HRiquBu29kSrVs+rkqZD50SUIb/zyEGw==}
 
   '@rolldown/binding-android-arm-eabi@1.2.9':
     resolution: {integrity: sha512-tNISae1QEf/vkb3xkRcjV5SEdzPE97We5IVaa2Z8jSszQPZ8U60B/YCYpw4QI7VidYsBtKavczXf+DyDs9WGxw==}
@@ -1325,6 +1334,9 @@ packages:
   levn@0.4.1:
     resolution: {integrity: sha512-+bT2uH4E5LGE7h/n3evcS/sQlJXCpIp6ym8OWJ5eV6+67Dsql/LaaT7qJBAt2rzfoa/5QBGBhxDix1dMt2kQKQ==}
     engines: {node: '>= 0.8.0'}
+
+  libpg-query@18.1.5-lowmem-32.0:
+    resolution: {integrity: sha512-qMDXv/BAcnWRHz2i3RQcXIKJGarf+LCiYNm2rhSgFs11VJyLUiUn7TP4wIUD+em/FjfRfJdRqoUVrHyqo7G5Fw==}
 
   lightningcss-android-arm64@1.33.0:
     resolution: {integrity: sha512-gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg==}
@@ -2250,6 +2262,8 @@ snapshots:
 
   '@oxc-project/types@0.150.0': {}
 
+  '@pgsql/types@18.0.0': {}
+
   '@rolldown/binding-android-arm-eabi@1.2.9':
     optional: true
 
@@ -2887,6 +2901,10 @@ snapshots:
     dependencies:
       prelude-ls: 1.2.1
       type-check: 0.4.0
+
+  libpg-query@18.1.5-lowmem-32.0:
+    dependencies:
+      '@pgsql/types': 18.0.0
 
   lightningcss-android-arm64@1.33.0:
     optional: true
