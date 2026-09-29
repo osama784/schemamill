@@ -126,6 +126,12 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
 
     assertNoErrors(`${appliedDb}: imported after the migration`, applied);
     assertNoErrors(`${targetDb}: imported from the target model's build`, expected);
+    assertSequencesRetained(`${appliedDb}: imported after the migration`, scene, applied.model);
+    assertSequencesRetained(
+      `${targetDb}: imported from the target model's build`,
+      scene,
+      expected.model,
+    );
 
     assert.deepEqual(
       diff(applied.model, expected.model),
@@ -189,6 +195,38 @@ function assertNoErrors(what: string, result: ReadResult<Model, Diagnostic>): vo
     .filter((diagnostic) => diagnostic.kind === 'error')
     .map((diagnostic) => diagnostic.message);
   assert.deepEqual(errors, [], `${what}: the import reported errors`);
+}
+
+/**
+ * Asserts that the target model's sequences all survived an import, and that the import
+ * invented none. Both dumps describe a database that should end in the scene's target state
+ * — the target database is built from it, the applied database is migrated to it — so the
+ * target's sequence identities must come back exactly. This guards a sequence import gap
+ * that loses sequences symmetrically on both sides: `diff` between the two imports would
+ * stay empty, while this failure names the scene and the sequence. Baseline-only sequences
+ * are exempt, because the migration drops them by design and the diff assertion covers the
+ * result. Scenes whose target has no sequences pass vacuously.
+ */
+function assertSequencesRetained(what: string, scene: LiveScene, imported: Model): void {
+  const declared = sequenceIdentities(scene.target);
+  const found = sequenceIdentities(imported);
+  const missing = [...declared].filter((identity) => !found.has(identity));
+  const invented = [...found].filter((identity) => !declared.has(identity));
+  assert.deepEqual(
+    missing,
+    [],
+    `${scene.name}: ${what}: the import dropped modeled sequence(s): ${missing.join(', ')}`,
+  );
+  assert.deepEqual(
+    invented,
+    [],
+    `${scene.name}: ${what}: the imported model has sequence(s) the target model does not declare: ${invented.join(', ')}`,
+  );
+}
+
+/** The `schema.name` identities of a model's sequences. */
+function sequenceIdentities(model: Model): ReadonlySet<string> {
+  return new Set(model.sequences.map((sequence) => `${sequence.schema}.${sequence.name}`));
 }
 
 /** The base connection pointed at `database`, by replacing the URI's database name. */
