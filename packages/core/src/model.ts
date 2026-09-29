@@ -1,3 +1,5 @@
+import type { Identity } from './identity.ts';
+
 /**
  * The canonical model payload shapes.
  *
@@ -21,6 +23,10 @@
  *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
  *   first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
+ *
+ * `GENERATED … AS IDENTITY` is a column property, not a sequence entity: an identity column
+ * carries its effective descriptor on the column (`Column.identity`) and never among
+ * `Model.sequences`.
  *
  * This module declares shapes only; it holds no behavior.
  */
@@ -61,6 +67,11 @@ export interface Column {
   readonly notNull: boolean;
   /** The `DEFAULT` expression as written, whitespace-normalized; opaque to the model. */
   readonly default?: string;
+  /**
+   * The column's identity descriptor when it is declared `GENERATED … AS IDENTITY`, in
+   * effective values (normalization lives in `identity.ts`); absent when it is not.
+   */
+  readonly identity?: Identity;
 }
 
 /** A table's primary key. */
