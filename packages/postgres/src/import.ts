@@ -7,11 +7,16 @@
  * - `CREATE TABLE` becomes a `Table`: columns in source order, the primary key (inline,
  *   table-level, or a later `ALTER TABLE`), and foreign keys. Types and DEFAULT expressions
  *   are sliced from the source text — the AST normalizes types (`int` becomes `int4`), so the
- *   model keeps the written spelling, whitespace-normalized. A repeated `CREATE TABLE` for the
- *   same schema-qualified identity replaces the table wholesale, clearing its foreign keys.
- * - `ALTER TABLE … ADD CONSTRAINT` attaches a foreign key or primary key to an already
- *   imported table; any other constraint kind, and any other `ALTER TABLE` action, is skipped
- *   and named.
+ *   model keeps the written spelling, whitespace-normalized. A column declared
+ *   `GENERATED … AS IDENTITY` becomes the column's effective identity descriptor (see
+ *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
+ *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
+ *   schema-qualified identity replaces the table wholesale, clearing its foreign keys.
+ * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
+ *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
+ *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key or primary key to
+ *   an already imported table. Any other action is skipped and named, as is an identity action
+ *   on a column that is not a modeled identity.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -28,10 +33,10 @@
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
  * behaviour, tablespace, access method, storage parameters, unlogged or temporary
- * persistence, and column-level UNIQUE, CHECK, EXCLUDE, IDENTITY, GENERATED, COLLATE,
- * compression, and storage. The one exception is a partition (`partbound`): a plain-table
- * representation would be a different object, so the whole statement is skipped and named.
- * `ALTER TABLE` on anything but a plain table is skipped the same way.
+ * persistence, and column-level UNIQUE, CHECK, EXCLUDE, GENERATED, COLLATE, compression, and
+ * storage. The one exception is a partition (`partbound`): a plain-table representation would
+ * be a different object, so the whole statement is skipped and named. `ALTER TABLE` on
+ * anything but a plain table is skipped the same way.
  *
  * Diagnostics come back in dump order (by source offset). The model obeys the ordering in
  * `model.ts`: tables by schema then name, columns in source order, foreign keys by
@@ -46,12 +51,17 @@ import type {
   DdlImporter,
   Diagnostic,
   ForeignKey,
+  Identity,
+  IdentityGeneration,
+  IdentityInput,
+  IdentityOptions,
   Model,
   PrimaryKey,
   ReadResult,
   ReferentialAction,
   Sequence,
   SequenceDataType,
+  SequenceIdentity,
   SequenceOptions,
   SequenceOwner,
   SkipDiagnosticCode,
@@ -59,8 +69,10 @@ import type {
   TableIdentity,
 } from '@schemamill/core';
 import {
+  canonicalIntType,
   defaultSequenceMax,
   defaultSequenceMin,
+  effectiveIdentity,
   effectiveSequence,
   sequenceTypeBounds,
   sequenceTypeChange,
@@ -116,7 +128,6 @@ const CONSTRAINT_LABELS: Readonly<Record<string, string>> = {
   CONSTR_UNIQUE: 'unique constraint',
   CONSTR_CHECK: 'check constraint',
   CONSTR_EXCLUSION: 'exclusion constraint',
-  CONSTR_IDENTITY: 'identity semantics',
   CONSTR_GENERATED: 'generated column expression',
   CONSTR_PRIMARY: 'primary key',
   CONSTR_FOREIGN: 'foreign key',
@@ -262,6 +273,7 @@ function translateCreateTable(
         statement,
         element.ColumnDef,
         boundaries,
+        schema,
         identity,
         diagnostics,
       );
@@ -295,6 +307,7 @@ function translateColumn(
   statement: ParsedStatement,
   column: ColumnDef,
   boundaries: readonly number[],
+  schema: string,
   identity: string,
   diagnostics: PositionedDiagnostic[],
 ): { column: Column; primaryKey?: PrimaryKey; foreignKeys: readonly ForeignKey[] } {
@@ -368,6 +381,16 @@ function translateColumn(
         );
         break;
       case 'CONSTR_IDENTITY':
+        translated.column = columnWithIdentity(
+          statement,
+          constraint,
+          translated.column,
+          schema,
+          identity,
+          place,
+          diagnostics,
+        );
+        break;
       case 'CONSTR_GENERATED':
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
@@ -752,6 +775,243 @@ function parseSequenceOwner(defel: DefElem): ParsedOwner {
   return { kind: 'invalid' };
 }
 
+/** SQL spellings of identity options the model cannot carry, for by-name flags. */
+const IDENTITY_OPTION_LABELS: Readonly<Record<string, string>> = {
+  as: 'AS',
+  owned_by: 'OWNED BY',
+  logged: 'LOGGED',
+  unlogged: 'UNLOGGED',
+  restart: 'RESTART',
+};
+
+/** PostgreSQL's `generated_when` codes: `'a'` (`GENERATED ALWAYS`) and `'d'` (`BY DEFAULT`). */
+const GENERATED_ALWAYS = 'a'.charCodeAt(0);
+const GENERATED_BY_DEFAULT = 'd'.charCodeAt(0);
+
+/**
+ * A copy of `column` carrying the effective identity descriptor `constraint` states. A column
+ * type PostgreSQL does not accept for identity columns is flagged and left without one.
+ */
+function columnWithIdentity(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  column: Column,
+  schema: string,
+  identity: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): Column {
+  const dataType = canonicalIntType(column.type);
+  if (dataType === undefined) {
+    diagnostics.push(flagIdentityType(statement, identity, place));
+    return column;
+  }
+  const identityValue = identityFromConstraint(
+    statement,
+    constraint,
+    dataType,
+    schema,
+    identity,
+    place,
+    diagnostics,
+  );
+  return { ...column, identity: identityValue };
+}
+
+/** The identity descriptor a `CONSTR_IDENTITY` constraint states, in effective values. */
+function identityFromConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  dataType: SequenceDataType,
+  schema: string,
+  identity: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): Identity {
+  const options: Mutable<IdentityOptions> = {};
+  applyIdentityOptions(
+    statement,
+    constraint.options ?? [],
+    options,
+    schema,
+    identity,
+    place,
+    diagnostics,
+  );
+  return effectiveIdentity(dataType, {
+    generated: constraintGeneration(constraint.generated_when),
+    ...options,
+  });
+}
+
+/** The model mode a constraint's `generated_when` states; PostgreSQL writes `'a'` or `'d'`. */
+function constraintGeneration(generatedWhen: string | undefined): IdentityGeneration {
+  return generatedWhen === 'd' ? 'by default' : 'always';
+}
+
+/** The mode an `AT_SetIdentity` `generated` clause states, or `undefined` when malformed. */
+function setIdentityGeneration(argument: Node | undefined): IdentityGeneration | undefined {
+  if (argument === undefined || !('Integer' in argument)) return undefined;
+  const value = argument.Integer.ival ?? 0;
+  if (value === GENERATED_ALWAYS) return 'always';
+  if (value === GENERATED_BY_DEFAULT) return 'by default';
+  return undefined;
+}
+
+/**
+ * Applies identity option clauses to `options`, in source order. Every option the model cannot
+ * carry — or cannot read — is flagged by name; `NO MINVALUE`/`NO MAXVALUE` remove the option
+ * so normalization resolves the engine default for the current direction.
+ */
+function applyIdentityOptions(
+  statement: ParsedStatement,
+  elements: readonly Node[],
+  options: Mutable<IdentityOptions>,
+  schema: string,
+  identity: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  for (const element of elements) {
+    if ('DefElem' in element) {
+      applyIdentityOption(
+        statement,
+        element.DefElem,
+        options,
+        schema,
+        identity,
+        place,
+        diagnostics,
+      );
+    }
+  }
+}
+
+function applyIdentityOption(
+  statement: ParsedStatement,
+  def: DefElem,
+  options: Mutable<IdentityOptions>,
+  schema: string,
+  identity: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const name = def.defname;
+  if (name === undefined) return;
+
+  switch (name) {
+    case 'sequence_name': {
+      const sequenceName = readIdentitySequenceName(
+        statement,
+        def,
+        schema,
+        identity,
+        place,
+        diagnostics,
+      );
+      if (sequenceName === undefined) delete options.sequenceName;
+      else options.sequenceName = sequenceName;
+      return;
+    }
+    case 'increment':
+    case 'start':
+    case 'cache': {
+      const value = integerOption(def.arg);
+      if (value === null || value === undefined) {
+        flagIdentityOption(statement, identity, name, place, diagnostics);
+      } else if (name === 'increment') options.increment = value;
+      else if (name === 'start') options.start = value;
+      else options.cache = value;
+      return;
+    }
+    case 'minvalue':
+    case 'maxvalue': {
+      const value = integerOption(def.arg);
+      if (value === null) {
+        flagIdentityOption(statement, identity, name, place, diagnostics);
+      } else if (value === undefined) {
+        // NO MINVALUE / NO MAXVALUE: the engine default for the current direction.
+        if (name === 'minvalue') delete options.minValue;
+        else delete options.maxValue;
+      } else if (name === 'minvalue') {
+        options.minValue = value;
+      } else {
+        options.maxValue = value;
+      }
+      return;
+    }
+    case 'cycle':
+      if (def.arg !== undefined && 'Boolean' in def.arg) {
+        options.cycle = def.arg.Boolean.boolval ?? false;
+      } else {
+        flagIdentityOption(statement, identity, 'cycle', place, diagnostics);
+      }
+      return;
+    default:
+      flagIdentityOption(
+        statement,
+        identity,
+        IDENTITY_OPTION_LABELS[name] ?? name,
+        place,
+        diagnostics,
+      );
+  }
+}
+
+/**
+ * The schema-qualified name a `SEQUENCE NAME` option states: an unqualified name takes the
+ * table's schema, and a name qualified with another schema — or with an unusable shape — is
+ * flagged and returns `undefined` so the identity is modeled without a name.
+ */
+function readIdentitySequenceName(
+  statement: ParsedStatement,
+  def: DefElem,
+  schema: string,
+  identity: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): SequenceIdentity | undefined {
+  const names = def.arg !== undefined && 'List' in def.arg ? stringList(def.arg.List.items) : [];
+  if (names.length === 1) return { schema, name: names[0]! };
+  if (names.length === 2 && names[0] === schema) return { schema, name: names[1]! };
+
+  const stated = names.join('.');
+  diagnostics.push(
+    flagAttribute(
+      statement,
+      identity,
+      names.length === 2
+        ? `cross-schema identity sequence name ${stated} on ${place}`
+        : `identity sequence name ${stated} on ${place}`,
+    ),
+  );
+  return undefined;
+}
+
+/** Flags a non-integer identity column type, the one type rejection PostgreSQL makes. */
+function flagIdentityType(
+  statement: ParsedStatement,
+  identity: string,
+  place: string,
+): PositionedDiagnostic {
+  return flagAttribute(
+    statement,
+    identity,
+    `identity semantics (identity column type must be smallint, integer, or bigint) on ${place}`,
+  );
+}
+
+/** Flags one identity option by name. */
+function flagIdentityOption(
+  statement: ParsedStatement,
+  identity: string,
+  label: string,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  diagnostics.push(flagAttribute(statement, identity, `identity option ${label} on ${place}`));
+}
+
 /** The SQL keyword an `AlterTableStmt.objtype` enum names, for readable skip descriptions. */
 const ALTER_OBJECT_KINDS: Readonly<Record<string, string>> = {
   OBJECT_FOREIGN_TABLE: 'FOREIGN TABLE',
@@ -862,6 +1122,30 @@ function translateAlterTableCommand(
     return;
   }
 
+  if (command.subtype === 'AT_AddColumn' && command.def !== undefined) {
+    attachColumn(statement, command.def, identity, draft, diagnostics);
+    return;
+  }
+
+  if (
+    command.subtype === 'AT_AddIdentity' &&
+    command.def !== undefined &&
+    'Constraint' in command.def
+  ) {
+    attachIdentity(statement, command, command.def.Constraint, identity, draft, diagnostics);
+    return;
+  }
+
+  if (command.subtype === 'AT_SetIdentity' && command.def !== undefined && 'List' in command.def) {
+    setIdentity(statement, command, command.def.List.items ?? [], identity, draft, diagnostics);
+    return;
+  }
+
+  if (command.subtype === 'AT_DropIdentity') {
+    dropIdentity(statement, command, identity, draft, diagnostics);
+    return;
+  }
+
   diagnostics.push(
     skipStatement(
       statement,
@@ -933,6 +1217,199 @@ function attachColumnDefault(
   draft.columns = draft.columns.map((candidate) =>
     candidate === column ? { ...candidate, default: defaultText } : candidate,
   );
+}
+
+/**
+ * Appends an `ALTER TABLE … ADD COLUMN` column to the draft, with inline primary key and
+ * foreign keys, exactly as a `CREATE TABLE` column (including inline identity).
+ */
+function attachColumn(
+  statement: ParsedStatement,
+  element: Node,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  if (!('ColumnDef' in element)) {
+    diagnostics.push(
+      skipStatement(statement, `ADD COLUMN without a definition on ${identity}`, identity),
+    );
+    return;
+  }
+  const translated = translateColumn(
+    statement,
+    element.ColumnDef,
+    clauseBoundaries(element),
+    draft.schema,
+    identity,
+    diagnostics,
+  );
+  draft.columns = [...draft.columns, translated.column];
+  if (translated.primaryKey !== undefined) {
+    attachPrimaryKey(statement, draft, translated.primaryKey, identity, diagnostics);
+  }
+  for (const foreignKey of translated.foreignKeys) {
+    attachForeignKey(draft, foreignKey);
+  }
+}
+
+/**
+ * Applies `ALTER TABLE … ALTER COLUMN … ADD GENERATED … AS IDENTITY` to an existing column:
+ * the column's type must resolve to an identity data type, and the descriptor replaces any
+ * earlier one, implying `NOT NULL`.
+ */
+function attachIdentity(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  constraint: Constraint,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const target = findColumnTarget(statement, command, identity, draft, diagnostics);
+  if (target === undefined) return;
+  const { place, column } = target;
+
+  const dataType = canonicalIntType(column.type);
+  if (dataType === undefined) {
+    diagnostics.push(flagIdentityType(statement, identity, place));
+    return;
+  }
+  const identityValue = identityFromConstraint(
+    statement,
+    constraint,
+    dataType,
+    draft.schema,
+    identity,
+    place,
+    diagnostics,
+  );
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? { ...candidate, notNull: true, identity: identityValue } : candidate,
+  );
+}
+
+/**
+ * Applies one `ALTER TABLE … ALTER COLUMN … SET …` identity clause list to a modeled identity
+ * column, in source order: `generated` flips the mode, and the supported options overwrite the
+ * effective values they name. Clauses the model cannot carry are flagged by name, and a column
+ * that is not a modeled identity is skipped and named.
+ */
+function setIdentity(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  elements: readonly Node[],
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const target = findColumnTarget(statement, command, identity, draft, diagnostics);
+  if (target === undefined) return;
+  const { place, column } = target;
+
+  if (column.identity === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `identity change on ${place} (column is not an identity column)`,
+        place,
+      ),
+    );
+    return;
+  }
+  const dataType = canonicalIntType(column.type);
+  if (dataType === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `identity change on ${place} (identity column type must be smallint, integer, or bigint)`,
+        place,
+      ),
+    );
+    return;
+  }
+
+  const input: Mutable<IdentityInput> = { ...column.identity };
+  for (const element of elements) {
+    if (!('DefElem' in element)) continue;
+    const def = element.DefElem;
+    if (def.defname === 'generated') {
+      const generated = setIdentityGeneration(def.arg);
+      if (generated === undefined) {
+        flagIdentityOption(statement, identity, 'GENERATED', place, diagnostics);
+      } else {
+        input.generated = generated;
+      }
+      continue;
+    }
+    applyIdentityOption(statement, def, input, draft.schema, identity, place, diagnostics);
+  }
+
+  const identityValue = effectiveIdentity(dataType, input);
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? { ...candidate, identity: identityValue } : candidate,
+  );
+}
+
+/**
+ * Applies `ALTER TABLE … ALTER COLUMN … DROP IDENTITY`: the descriptor goes and `NOT NULL`
+ * stays. A column that is not a modeled identity is skipped and named.
+ */
+function dropIdentity(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const target = findColumnTarget(statement, command, identity, draft, diagnostics);
+  if (target === undefined) return;
+  const { place, column } = target;
+
+  if (column.identity === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `identity change on ${place} (column is not an identity column)`,
+        place,
+      ),
+    );
+    return;
+  }
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? withoutIdentity(candidate) : candidate,
+  );
+}
+
+/**
+ * Resolves the column an identity action targets. A missing table column skips the action and
+ * names the unknown target, following the `SET DEFAULT` path.
+ */
+function findColumnTarget(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): { readonly place: string; readonly column: Column } | undefined {
+  const name = command.name;
+  const column =
+    name === undefined ? undefined : draft.columns.find((candidate) => candidate.name === name);
+  if (column === undefined || name === undefined) {
+    const place = name === undefined ? identity : `${identity}.${name}`;
+    diagnostics.push(
+      skipStatement(statement, `identity change for unknown column ${place}`, place),
+    );
+    return undefined;
+  }
+  return { place: `${identity}.${name}`, column };
+}
+
+/** A copy of `column` without its identity descriptor. */
+function withoutIdentity(column: Column): Column {
+  const copy: Mutable<Column> = { name: column.name, type: column.type, notNull: column.notNull };
+  if (column.default !== undefined) copy.default = column.default;
+  return copy;
 }
 
 function attachPrimaryKey(
