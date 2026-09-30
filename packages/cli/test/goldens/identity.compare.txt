@@ -1,0 +1,45 @@
+~ table app.recreate
+    ~ column id: identity: recreated
+
+~ table public.gain
+    ~ column id: identity: added
+
+~ table public.lose
+    ~ column id: identity: removed
+
+~ table public.to_identity
+    ~ column id: default nextval('public.to_identity_id_seq'::regclass) → (none)
+        identity: added
+
+~ table public.to_serial
+    ~ column id: default (none) → nextval('public.to_serial_id_seq'::regclass)
+        identity: removed
+
+~ table public.tune
+    ~ column id: identity: GENERATED ALWAYS → BY DEFAULT
+        identity: increment 1 → 2
+        identity: min value 1 → 0
+        identity: max value 2147483647 → 99
+        identity: start 1 → 5
+        identity: cache 1 → 10
+        identity: cycle false → true
+
+- sequence public.to_identity_id_seq
+    data type integer
+    increment 1
+    min value 1
+    max value 2147483647
+    start 1
+    cache 1
+    cycle false
+    owned by public.to_identity.id
+
++ sequence public.to_serial_id_seq
+    data type integer
+    increment 1
+    min value 1
+    max value 2147483647
+    start 1
+    cache 1
+    cycle false
+    owned by public.to_serial.id

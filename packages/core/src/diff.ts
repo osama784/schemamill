@@ -1,3 +1,5 @@
+import { canonicalIntType } from './identity.ts';
+import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
   Column,
   ForeignKey,
@@ -36,6 +38,19 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * bound equal to the old type's bound becomes the new type's bound, so the conversion is
  * applied first and `minValue`/`maxValue` are reported against its result.
  *
+ * A column's identity — its `GENERATED … AS IDENTITY` descriptor — is a column property, not
+ * a sequence entity, and compares as the `identity` part of the column's change, alongside
+ * the scalar fields `type`, `notNull`, and `default`. One identity against a column without
+ * one is an addition or a removal carrying that descriptor; two identities compare as a
+ * change with only their differing options, in the fixed order `generated`, `increment`,
+ * `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is deliberately not an
+ * option: it compares only when both sides state one, a stated mismatch is a recreation
+ * carrying the target descriptor (the plan drops the baseline identity and adds the target's),
+ * and a name absent on either side is a don't-care. When the column's type change crosses
+ * canonical integer types (`canonicalIntType`), the identity's `minValue`/`maxValue` compare
+ * against the bounds the engine's `AS` conversion would leave, exactly like a sequence's, so
+ * the conversion never churns a bound and any bound it would move is restated.
+ *
  * A column is identified by name alone: the ordinal position of an existing column is not
  * part of the diff. The model stores `columns` in source order for fidelity, and column
  * entries are reported in the stored order of the side they come from, but a pure reorder of
@@ -52,8 +67,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    foreign-key order, so the caller's array order never leaks into the result.
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
- *    order, with only the fields that differ, in the fixed order `type`, `notNull`,
- *    `default`); then at most one primary-key addition, removal, or change; then foreign keys
+ *    order, with only the scalar fields that differ, in the fixed order `type`, `notNull`,
+ *    `default`, plus the column's identity change when it has one); then at most one
+ *    primary-key addition, removal, or change; then foreign keys
  *    removed, added, and changed, each sorted in the model's foreign-key order (referencing
  *    columns element-wise, referenced table schema then name, then name, absent first — an
  *    absent name sorts before any present one, including the empty string, which remains a
@@ -109,8 +125,16 @@ export type TableChange =
   | { kind: 'column-added'; column: Column }
   /** A column only the baseline has. */
   | { kind: 'column-removed'; column: Column }
-  /** A column both sides have with differing fields. */
-  | { kind: 'column-changed'; name: string; fields: readonly ColumnFieldChange[] }
+  /**
+   * A column both sides have with differing fields: the scalar fields, plus the identity
+   * difference when the column's identity differs.
+   */
+  | {
+      kind: 'column-changed';
+      name: string;
+      fields: readonly ColumnFieldChange[];
+      identity?: IdentityChange;
+    }
   /** The target has a primary key the baseline does not. */
   | { kind: 'primary-key-added'; primaryKey: PrimaryKey }
   /** The baseline has a primary key the target does not. */
@@ -125,8 +149,10 @@ export type TableChange =
   | { kind: 'foreign-key-changed'; before: ForeignKey; after: ForeignKey };
 
 /**
- * One differing field of a changed column; only fields that differ are reported. A
- * `default` change omits the side that has no `DEFAULT`.
+ * One differing scalar field of a changed column; only fields that differ are reported, in
+ * the fixed order `type`, `notNull`, `default`. A `default` change omits the side that has no
+ * `DEFAULT`. A column's identity is not a scalar field: it travels as the `identity` part of
+ * the `column-changed` entry.
  */
 export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
@@ -134,18 +160,49 @@ export type ColumnFieldChange =
   | { field: 'default'; before?: string; after?: string };
 
 /**
+ * One differing option of a changed identity; only options that differ are reported, in the
+ * fixed order `generated`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`.
+ * The sequence name is never a field: it compares only when both sides state one, and a
+ * stated mismatch recreates the identity. A `minValue`/`maxValue` change reports the value in
+ * effect after the column's integer-type change — the engine rewrites a bound equal to the
+ * old type's bound to the new type's — as `before`, flagged `converted` when the conversion
+ * is what produced it, so a bound the target restores after that conversion is still reported
+ * and never reads as an as-written baseline value.
+ */
+export type IdentityFieldChange =
+  | { field: 'generated'; before: IdentityGeneration; after: IdentityGeneration }
+  | { field: 'increment'; before: string; after: string }
+  | { field: 'minValue'; before: string; after: string; converted?: boolean }
+  | { field: 'maxValue'; before: string; after: string; converted?: boolean }
+  | { field: 'start'; before: string; after: string }
+  | { field: 'cache'; before: string; after: string }
+  | { field: 'cycle'; before: boolean; after: boolean };
+
+/**
+ * One column's identity difference. `added` and `removed` carry the one descriptor; a
+ * `recreated` carries the target descriptor when both sides state sequence names that differ,
+ * and the plan replaces the whole identity; `changed` carries only the differing options.
+ */
+export type IdentityChange =
+  | { kind: 'added'; identity: Identity }
+  | { kind: 'removed'; identity: Identity }
+  | { kind: 'recreated'; identity: Identity }
+  | { kind: 'changed'; fields: readonly IdentityFieldChange[] };
+
+/**
  * One differing option of a changed sequence; only fields that differ are reported, in the
  * fixed order `dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`,
  * `ownedBy`. A `minValue`/`maxValue` change reports the value in effect after the step's
  * `dataType` change — the engine rewrites a bound equal to the old type's bound to the new
- * type's — as `before`, so a bound the target restores after that conversion is still
- * reported. An `ownedBy` change omits the side that has no owner.
+ * type's — as `before`, flagged `converted` when the conversion is what produced it, so a
+ * bound the target restores after that conversion is still reported and never reads as an
+ * as-written baseline value. An `ownedBy` change omits the side that has no owner.
  */
 export type SequenceFieldChange =
   | { field: 'dataType'; before: SequenceDataType; after: SequenceDataType }
   | { field: 'increment'; before: string; after: string }
-  | { field: 'minValue'; before: string; after: string }
-  | { field: 'maxValue'; before: string; after: string }
+  | { field: 'minValue'; before: string; after: string; converted?: boolean }
+  | { field: 'maxValue'; before: string; after: string; converted?: boolean }
   | { field: 'start'; before: string; after: string }
   | { field: 'cache'; before: string; after: string }
   | { field: 'cycle'; before: boolean; after: boolean }
@@ -260,15 +317,31 @@ function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceField
   // With a data type change, the bounds the step lands on without explicit clauses are the
   // ones the engine's `AS` conversion leaves, not the baseline's: a bound equal to the old
   // type's bound becomes the new type's. Compare against those so the plan restates a bound
-  // the conversion would otherwise move.
+  // the conversion would otherwise move, and flag a rewritten bound as converted so no output
+  // presents it as the as-written baseline value.
   const converted = dataTypeChanged
     ? sequenceTypeChange(baseline.dataType, baseline.minValue, baseline.maxValue, target.dataType)
-    : { minValue: baseline.minValue, maxValue: baseline.maxValue };
+    : {
+        minValue: baseline.minValue,
+        maxValue: baseline.maxValue,
+        resetMin: false,
+        resetMax: false,
+      };
   if (converted.minValue !== target.minValue) {
-    fields.push({ field: 'minValue', before: converted.minValue, after: target.minValue });
+    fields.push({
+      field: 'minValue',
+      before: converted.minValue,
+      after: target.minValue,
+      ...(converted.resetMin ? { converted: true } : {}),
+    });
   }
   if (converted.maxValue !== target.maxValue) {
-    fields.push({ field: 'maxValue', before: converted.maxValue, after: target.maxValue });
+    fields.push({
+      field: 'maxValue',
+      before: converted.maxValue,
+      after: target.maxValue,
+      ...(converted.resetMax ? { converted: true } : {}),
+    });
   }
   if (baseline.start !== target.start) {
     fields.push({ field: 'start', before: baseline.start, after: target.start });
@@ -301,9 +374,12 @@ function sameIdentity(left: TableIdentity, right: TableIdentity): boolean {
   return left.schema === right.schema && left.name === right.name;
 }
 
-/** A copy of `column`, independent of the caller's model. */
+/** A copy of `column`, independent of the caller's model, nested identity included. */
 function copyColumn(column: Column): Column {
-  return { ...column };
+  return {
+    ...column,
+    ...(column.identity === undefined ? {} : { identity: copyIdentity(column.identity) }),
+  };
 }
 
 /** A copy of `primaryKey`, independent of the caller's model. */
@@ -382,7 +458,15 @@ function diffColumns(baseline: readonly Column[], target: readonly Column[]): Ta
     const before = baselineColumns.get(column.name);
     if (before === undefined) continue;
     const fields = diffColumnFields(before, column);
-    if (fields.length > 0) changes.push({ kind: 'column-changed', name: column.name, fields });
+    const identity = diffIdentity(before, column);
+    if (fields.length > 0 || identity !== undefined) {
+      changes.push({
+        kind: 'column-changed',
+        name: column.name,
+        fields,
+        ...(identity === undefined ? {} : { identity }),
+      });
+    }
   }
 
   return changes;
@@ -404,6 +488,110 @@ function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[]
     });
   }
   return fields;
+}
+
+/**
+ * The identity difference of a pair of columns, or `undefined` when the identities compare
+ * equal. The sequence name compares only when both sides state one: a stated mismatch is a
+ * recreation, and a name absent on either side is a don't-care.
+ */
+function diffIdentity(baseline: Column, target: Column): IdentityChange | undefined {
+  const before = baseline.identity;
+  const after = target.identity;
+  if (before === undefined) {
+    return after === undefined ? undefined : { kind: 'added', identity: copyIdentity(after) };
+  }
+  if (after === undefined) {
+    return { kind: 'removed', identity: copyIdentity(before) };
+  }
+  if (!sameIdentityName(before.sequenceName, after.sequenceName)) {
+    return { kind: 'recreated', identity: copyIdentity(after) };
+  }
+  const fields = diffIdentityFields(baseline.type, target.type, before, after);
+  return fields.length === 0 ? undefined : { kind: 'changed', fields };
+}
+
+/**
+ * The differing options of two identities, in the fixed order `generated`, `increment`,
+ * `minValue`, `maxValue`, `start`, `cache`, `cycle`. When the column's type change crosses
+ * canonical integer types, the bounds compare against the ones the engine's `AS` conversion
+ * would leave, and a rewritten bound is flagged `converted`.
+ */
+function diffIdentityFields(
+  baselineType: string,
+  targetType: string,
+  baseline: Identity,
+  target: Identity,
+): IdentityFieldChange[] {
+  const fields: IdentityFieldChange[] = [];
+  if (baseline.generated !== target.generated) {
+    fields.push({ field: 'generated', before: baseline.generated, after: target.generated });
+  }
+  if (baseline.increment !== target.increment) {
+    fields.push({ field: 'increment', before: baseline.increment, after: target.increment });
+  }
+  const baselineIntType = canonicalIntType(baselineType);
+  const targetIntType = canonicalIntType(targetType);
+  const converted =
+    baselineIntType !== undefined &&
+    targetIntType !== undefined &&
+    baselineIntType !== targetIntType
+      ? sequenceTypeChange(baselineIntType, baseline.minValue, baseline.maxValue, targetIntType)
+      : {
+          minValue: baseline.minValue,
+          maxValue: baseline.maxValue,
+          resetMin: false,
+          resetMax: false,
+        };
+  if (converted.minValue !== target.minValue) {
+    fields.push({
+      field: 'minValue',
+      before: converted.minValue,
+      after: target.minValue,
+      ...(converted.resetMin ? { converted: true } : {}),
+    });
+  }
+  if (converted.maxValue !== target.maxValue) {
+    fields.push({
+      field: 'maxValue',
+      before: converted.maxValue,
+      after: target.maxValue,
+      ...(converted.resetMax ? { converted: true } : {}),
+    });
+  }
+  if (baseline.start !== target.start) {
+    fields.push({ field: 'start', before: baseline.start, after: target.start });
+  }
+  if (baseline.cache !== target.cache) {
+    fields.push({ field: 'cache', before: baseline.cache, after: target.cache });
+  }
+  if (baseline.cycle !== target.cycle) {
+    fields.push({ field: 'cycle', before: baseline.cycle, after: target.cycle });
+  }
+  return fields;
+}
+
+/**
+ * Whether two optional identity sequence names state the same name. A side that states none
+ * is a don't-care: only two stated names can differ.
+ */
+function sameIdentityName(
+  left: SequenceIdentity | undefined,
+  right: SequenceIdentity | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return true;
+  return left.schema === right.schema && left.name === right.name;
+}
+
+/**
+ * A copy of `identity`, independent of the caller's model. The descriptor is never mutated,
+ * so only the optional nested sequence name needs its own copy.
+ */
+function copyIdentity(identity: Identity): Identity {
+  return {
+    ...identity,
+    ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
+  };
 }
 
 function diffPrimaryKey(
