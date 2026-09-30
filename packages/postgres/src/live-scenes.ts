@@ -1,11 +1,16 @@
-import { effectiveSequence } from '@schemamill/core';
+import { effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
   Column,
   ForeignKey,
+  Identity,
+  IdentityInput,
   Model,
   PrimaryKey,
   Sequence,
+  SequenceDataType,
+  SequenceIdentity,
   SequenceOwner,
+  Step,
   Table,
   TableIdentity,
 } from '@schemamill/core';
@@ -33,6 +38,15 @@ import type {
  * (`sequence-alter`), owner drops with detach-before-drop and drop suppression
  * (`owner-drop-order`), and a default drop ordered before the sequence drop it releases
  * (`detached-drop`).
+ *
+ * The identity scenes cover the shapes the identity slice was built for: new tables with
+ * `GENERATED … AS IDENTITY` columns whose descriptors, dependencies, and generated keys are
+ * checked (`identity-create`), one multi-clause `SET` that flips the generation mode and
+ * rewrites every option (`identity-alter`), identity removal three ways — `DROP IDENTITY`
+ * keeping the column and its `NOT NULL`, a dropped identity column, and a dropped identity
+ * table, the last two cascading their implicit sequences without a `drop-sequence` step
+ * (`identity-drop`) — and both conversions between an identity and an owned `nextval` default
+ * reusing the same sequence name (`identity-to-sequence`, `sequence-to-identity`).
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -102,11 +116,34 @@ const sequenceOwner = (
   column: columnName,
 });
 
+/** A schema-qualified sequence identity: `public` unless another schema is given. */
+const sequenceIdentity = (name: string, schema = 'public'): SequenceIdentity => ({
+  schema,
+  name,
+});
+
+/** An effective identity descriptor for `dataType`, `GENERATED ALWAYS` unless overridden. */
+const identityColumn = (
+  dataType: SequenceDataType,
+  fields: Partial<IdentityInput> = {},
+): Identity => effectiveIdentity(dataType, { generated: 'always', ...fields });
+
 /** One catalog fact: `sql` is read with `psql -tA` and compared exactly to `expected`. */
 export interface SceneCheck {
   readonly description: string;
   readonly sql: string;
   readonly expected: string;
+}
+
+/**
+ * One plan fact: `failure` reads the migration plan's steps and returns what is wrong, or
+ * `undefined` when the plan is right. Plan facts are asserted before any SQL runs — they pin
+ * what the plan does, which the live round trip alone cannot name, such as a step the plan
+ * must not emit because a cascade would make it redundant.
+ */
+export interface ScenePlanCheck {
+  readonly description: string;
+  readonly failure: (steps: readonly Step[]) => string | undefined;
 }
 
 /** One scene of the live-PostgreSQL harness. */
@@ -119,6 +156,8 @@ export interface LiveScene {
   readonly target: Model;
   /** Catalog facts to assert after the baseline build, before the migration. */
   readonly baselineChecks?: readonly SceneCheck[];
+  /** Plan facts to assert on `plan(baseline, target)`, before any SQL runs. */
+  readonly planChecks?: readonly ScenePlanCheck[];
   /** Statements to run after the migration; a non-zero exit fails the scene. */
   readonly probes?: readonly string[];
   /** Catalog facts to assert after the migration and the probes. */
@@ -197,6 +236,26 @@ const serialSequenceIs = (
 /** The sequence `pg_get_serial_sequence` resolves `tableName.columnName` to, or `none`. */
 const serialSequenceOrNone = (tableName: string, columnName: string, schema = 'public'): string =>
   `select coalesce(pg_get_serial_sequence('${schema}.${tableName}', '${columnName}'), 'none')`;
+
+/** A column's `pg_attribute.attidentity` code: `a` (`ALWAYS`), `d` (`BY DEFAULT`), or empty. */
+const attributeIdentity = (tableName: string, columnName: string, schema = 'public'): string =>
+  `select attidentity from pg_attribute where attrelid = '${schema}.${tableName}'::regclass` +
+  ` and attname = '${columnName}'`;
+
+/**
+ * The table and column the identity sequence `name` depends on, as `table.column` or `none`,
+ * via `pg_depend` `deptype = 'i'` — the internal dependency an identity creates.
+ */
+const identityOwnership = (name: string, schema = 'public'): string =>
+  `select coalesce((select owner.relname || '.' || attribute.attname` +
+  ` from pg_depend dependency` +
+  ` join pg_class sequence on sequence.oid = dependency.objid` +
+  ` join pg_namespace namespace on namespace.oid = sequence.relnamespace` +
+  ` join pg_class owner on owner.oid = dependency.refobjid` +
+  ` join pg_attribute attribute on attribute.attrelid = dependency.refobjid` +
+  ` and attribute.attnum = dependency.refobjsubid` +
+  ` where dependency.deptype = 'i' and namespace.nspname = '${schema}'` +
+  ` and sequence.relname = '${name}'), 'none')`;
 
 const createTableScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -1544,6 +1603,635 @@ const detachedDropScene = (): LiveScene => {
   };
 };
 
+const identityCreateScene = (): LiveScene => {
+  const users = table('users', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { sequenceName: sequenceIdentity('users_id_seq') }),
+      }),
+      column('alias_id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'by default',
+          sequenceName: sequenceIdentity('users_alias_seq'),
+          increment: '5',
+          minValue: '10',
+          maxValue: '500',
+          start: '100',
+          cache: '4',
+          cycle: true,
+        }),
+      }),
+      column('name', { notNull: true }),
+    ],
+    primaryKey: { name: 'users_pkey', columns: ['id'] },
+  });
+  const events = table('events', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', {
+          sequenceName: sequenceIdentity('events_id_seq'),
+          increment: '-1',
+        }),
+      }),
+      column('seq', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'by default',
+          sequenceName: sequenceIdentity('events_seq_seq'),
+          increment: '-4',
+          minValue: '-1000',
+          start: '-8',
+          cache: '2',
+          cycle: true,
+        }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 'events_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'identity-create',
+    baseline: model(),
+    target: model(users, events),
+    baselineChecks: [
+      { description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' },
+      { description: 'baseline has no sequences', sql: SEQUENCES, expected: '' },
+    ],
+    probes: [
+      "INSERT INTO public.users (name) VALUES ('ada'), ('grace');",
+      "INSERT INTO public.events (note) VALUES ('boot'), ('halt');",
+    ],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'events,users' },
+      {
+        description: 'users.id is GENERATED ALWAYS',
+        sql: attributeIdentity('users', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'users.alias_id is GENERATED BY DEFAULT',
+        sql: attributeIdentity('users', 'alias_id'),
+        expected: 'd',
+      },
+      {
+        description: 'events.id is GENERATED ALWAYS',
+        sql: attributeIdentity('events', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'events.seq is GENERATED BY DEFAULT',
+        sql: attributeIdentity('events', 'seq'),
+        expected: 'd',
+      },
+      {
+        description: 'users.id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('users', 'id', 'users_id_seq'),
+        expected: 'users_id_seq|true',
+      },
+      {
+        description: 'users.alias_id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('users', 'alias_id', 'users_alias_seq'),
+        expected: 'users_alias_seq|true',
+      },
+      {
+        description: 'events.id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('events', 'id', 'events_id_seq'),
+        expected: 'events_id_seq|true',
+      },
+      {
+        description: 'users_id_seq is an identity dependency (pg_depend deptype i)',
+        sql: identityOwnership('users_id_seq'),
+        expected: 'users.id',
+      },
+      {
+        description: 'users_alias_seq is an identity dependency (pg_depend deptype i)',
+        sql: identityOwnership('users_alias_seq'),
+        expected: 'users.alias_id',
+      },
+      {
+        description: 'events_id_seq is a descending identity dependency',
+        sql: identityOwnership('events_id_seq'),
+        expected: 'events.id',
+      },
+      {
+        description: 'users_id_seq parameters',
+        sql: sequenceParams('users_id_seq'),
+        expected: 'bigint|1|1|9223372036854775807|1|false|1',
+      },
+      {
+        description: 'users_alias_seq parameters',
+        sql: sequenceParams('users_alias_seq'),
+        expected: 'integer|100|10|500|5|true|4',
+      },
+      {
+        description: 'events_id_seq parameters, descending defaults',
+        sql: sequenceParams('events_id_seq'),
+        expected: 'bigint|-1|-9223372036854775808|-1|-1|false|1',
+      },
+      {
+        description: 'events_seq_seq parameters, descending and explicit',
+        sql: sequenceParams('events_seq_seq'),
+        expected: 'integer|-8|-1000|-1|-4|true|2',
+      },
+      {
+        description: 'the generated keys',
+        sql:
+          "select (select string_agg(id::text, ',' order by id) from public.users)" +
+          " || '|' || (select string_agg(alias_id::text, ',' order by alias_id) from public.users)" +
+          " || '|' || (select string_agg(id::text, ',' order by id desc) from public.events)" +
+          " || '|' || (select string_agg(seq::text, ',' order by seq desc) from public.events)",
+        expected: '1,2|100,105|-1,-2|-8,-12',
+      },
+    ],
+  };
+};
+
+const identityAlterScene = (): LiveScene => {
+  const appUsers = table('app_users', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          sequenceName: sequenceIdentity('app_users_id_seq'),
+          minValue: '1',
+          maxValue: '1000',
+          start: '500',
+        }),
+      }),
+      column('name'),
+    ],
+    primaryKey: { name: 'app_users_pkey', columns: ['id'] },
+  });
+  const auditLog = table('audit_log', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'by default',
+          sequenceName: sequenceIdentity('audit_log_id_seq'),
+          maxValue: '900',
+          cycle: true,
+        }),
+      }),
+      column('action'),
+    ],
+    primaryKey: { name: 'audit_log_pkey', columns: ['id'] },
+  });
+  const appUsersTarget = table('app_users', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'by default',
+          sequenceName: sequenceIdentity('app_users_id_seq'),
+          increment: '2',
+          minValue: '100',
+          maxValue: '1000',
+          start: '600',
+          cache: '3',
+          cycle: true,
+        }),
+      }),
+      column('name'),
+    ],
+    primaryKey: { name: 'app_users_pkey', columns: ['id'] },
+  });
+  const auditLogTarget = table('audit_log', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'always',
+          sequenceName: sequenceIdentity('audit_log_id_seq'),
+          increment: '3',
+          minValue: '0',
+          maxValue: '1000',
+          start: '20',
+          cache: '7',
+        }),
+      }),
+      column('action'),
+    ],
+    primaryKey: { name: 'audit_log_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'identity-alter',
+    baseline: model(appUsers, auditLog),
+    target: model(appUsersTarget, auditLogTarget),
+    baselineChecks: [
+      { description: 'baseline tables', sql: TABLES, expected: 'app_users,audit_log' },
+      {
+        description: 'baseline app_users.id is GENERATED ALWAYS',
+        sql: attributeIdentity('app_users', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'baseline audit_log.id is GENERATED BY DEFAULT',
+        sql: attributeIdentity('audit_log', 'id'),
+        expected: 'd',
+      },
+      {
+        description: 'baseline app_users_id_seq parameters',
+        sql: sequenceParams('app_users_id_seq'),
+        expected: 'integer|500|1|1000|1|false|1',
+      },
+      {
+        description: 'baseline audit_log_id_seq parameters',
+        sql: sequenceParams('audit_log_id_seq'),
+        expected: 'integer|1|1|900|1|true|1',
+      },
+    ],
+    probes: [
+      `DO $do$
+BEGIN
+    INSERT INTO public.app_users DEFAULT VALUES;
+    INSERT INTO public.app_users DEFAULT VALUES;
+    INSERT INTO public.audit_log DEFAULT VALUES;
+    INSERT INTO public.audit_log DEFAULT VALUES;
+END
+$do$;`,
+    ],
+    checks: [
+      {
+        description: 'app_users.id flipped to GENERATED BY DEFAULT',
+        sql: attributeIdentity('app_users', 'id'),
+        expected: 'd',
+      },
+      {
+        description: 'audit_log.id flipped to GENERATED ALWAYS',
+        sql: attributeIdentity('audit_log', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'app_users_id_seq parameters after the multi-clause SET',
+        sql: sequenceParams('app_users_id_seq'),
+        expected: 'integer|600|100|1000|2|true|3',
+      },
+      {
+        description: 'audit_log_id_seq parameters after the multi-clause SET',
+        sql: sequenceParams('audit_log_id_seq'),
+        expected: 'integer|20|0|1000|3|false|7',
+      },
+      {
+        description: 'app_users_id_seq still depends on app_users.id',
+        sql: identityOwnership('app_users_id_seq'),
+        expected: 'app_users.id',
+      },
+      {
+        description: 'audit_log_id_seq still depends on audit_log.id',
+        sql: identityOwnership('audit_log_id_seq'),
+        expected: 'audit_log.id',
+      },
+      {
+        // `SET START WITH` records a restart value; it does not advance the sequence, so the
+        // first `nextval` still returns the value the baseline was created with and the rest
+        // follow the new increment.
+        description: 'the generated keys after the alters',
+        sql:
+          "select (select string_agg(id::text, ',' order by id) from public.app_users)" +
+          " || '|' || (select string_agg(id::text, ',' order by id) from public.audit_log)",
+        expected: '500,502|1,4',
+      },
+    ],
+  };
+};
+
+const identityDropScene = (): LiveScene => {
+  const churn = table('churn', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { sequenceName: sequenceIdentity('churn_id_seq') }),
+      }),
+      column('note'),
+      column('gone', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'by default',
+          sequenceName: sequenceIdentity('churn_gone_seq'),
+        }),
+      }),
+    ],
+    primaryKey: { name: 'churn_pkey', columns: ['id'] },
+  });
+  const kept = table('kept', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { sequenceName: sequenceIdentity('kept_id_seq') }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 'kept_pkey', columns: ['id'] },
+  });
+  const victim = table('victim', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', { sequenceName: sequenceIdentity('victim_id_seq') }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 'victim_pkey', columns: ['id'] },
+  });
+  const churnTarget = table('churn', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { sequenceName: sequenceIdentity('churn_id_seq') }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 'churn_pkey', columns: ['id'] },
+  });
+  const keptTarget = table('kept', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('note')],
+    primaryKey: { name: 'kept_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'identity-drop',
+    baseline: model(churn, kept, victim),
+    target: model(churnTarget, keptTarget),
+    baselineChecks: [
+      { description: 'baseline tables', sql: TABLES, expected: 'churn,kept,victim' },
+      {
+        description: 'baseline sequences',
+        sql: SEQUENCES,
+        expected: 'churn_gone_seq,churn_id_seq,kept_id_seq,victim_id_seq',
+      },
+      {
+        description: 'baseline kept.id is an identity',
+        sql: attributeIdentity('kept', 'id'),
+        expected: 'a',
+      },
+    ],
+    planChecks: [
+      {
+        description:
+          'drops the identity, its column, and its table without an explicit sequence drop',
+        failure: (steps) => {
+          const drops = steps.filter((step) => step.kind === 'drop-sequence');
+          if (drops.length > 0) return 'the plan emits a drop-sequence step';
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds === 'drop-identity,drop-table,drop-column'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    probes: [
+      `DO $do$
+BEGIN
+    INSERT INTO public.kept (id, note) VALUES (1, 'kept');
+    INSERT INTO public.churn (note) VALUES ('one');
+    INSERT INTO public.churn (note) VALUES ('two');
+END
+$do$;`,
+    ],
+    checks: [
+      { description: 'tables left', sql: TABLES, expected: 'churn,kept' },
+      {
+        description: 'kept.id is no longer an identity',
+        sql: attributeIdentity('kept', 'id'),
+        expected: '',
+      },
+      {
+        description: 'kept.id resolves no serial sequence',
+        sql: serialSequenceOrNone('kept', 'id'),
+        expected: 'none',
+      },
+      {
+        description: 'kept.id is still NOT NULL',
+        sql: columnFact('kept', 'id', 'is_nullable'),
+        expected: 'NO',
+      },
+      {
+        description: 'churn.id keeps its identity',
+        sql: attributeIdentity('churn', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'churn.id still resolves churn_id_seq',
+        sql: serialSequenceIs('churn', 'id', 'churn_id_seq'),
+        expected: 'churn_id_seq|true',
+      },
+      { description: 'sequences left', sql: SEQUENCES, expected: 'churn_id_seq' },
+      {
+        description: 'the cascaded identity sequences are gone',
+        sql:
+          'select count(*) from pg_sequences where sequencename in' +
+          " ('kept_id_seq', 'churn_gone_seq', 'victim_id_seq')",
+        expected: '0',
+      },
+      {
+        description: 'churn columns by ordinal position',
+        sql: columnsByPosition('churn'),
+        expected: 'id,note',
+      },
+      {
+        description: 'the generated and inserted keys',
+        sql:
+          "select (select string_agg(id::text, ',' order by id) from public.churn)" +
+          " || '|' || (select string_agg(id::text, ',' order by id) from public.kept)",
+        expected: '1,2|1',
+      },
+    ],
+  };
+};
+
+const identityToSequenceScene = (): LiveScene => {
+  const t = table('t', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { sequenceName: sequenceIdentity('t_id_seq') }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const tTarget = table('t', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        default: "nextval('public.t_id_seq'::regclass)",
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const tIdSeq = sequence('t_id_seq', {
+    start: '1000',
+    increment: '10',
+    cache: '5',
+    ownedBy: sequenceOwner('t', 'id'),
+  });
+
+  return {
+    name: 'identity-to-sequence',
+    baseline: model(t),
+    target: withSequences([tTarget], [tIdSeq]),
+    baselineChecks: [
+      { description: 'baseline tables', sql: TABLES, expected: 't' },
+      {
+        description: 'baseline t.id is an identity',
+        sql: attributeIdentity('t', 'id'),
+        expected: 'a',
+      },
+      { description: 'baseline sequences', sql: SEQUENCES, expected: 't_id_seq' },
+      {
+        description: 'baseline t.id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('t', 'id', 't_id_seq'),
+        expected: 't_id_seq|true',
+      },
+    ],
+    probes: ["INSERT INTO public.t (note) VALUES ('one'), ('two');"],
+    checks: [
+      {
+        description: 't.id is no longer an identity',
+        sql: attributeIdentity('t', 'id'),
+        expected: '',
+      },
+      {
+        description: 't.id still resolves the same sequence name',
+        sql: serialSequenceIs('t', 'id', 't_id_seq'),
+        expected: 't_id_seq|true',
+      },
+      {
+        description: 't_id_seq is owned by t.id',
+        sql: sequenceOwnership('t_id_seq'),
+        expected: 't.id',
+      },
+      {
+        description: 't_id_seq parameters',
+        sql: sequenceParams('t_id_seq'),
+        expected: 'bigint|1000|1|9223372036854775807|10|false|5',
+      },
+      { description: 'sequences left', sql: SEQUENCES, expected: 't_id_seq' },
+      {
+        description: 't.id is still NOT NULL',
+        sql: columnFact('t', 'id', 'is_nullable'),
+        expected: 'NO',
+      },
+      {
+        description: 'the generated keys',
+        sql: "select string_agg(id::text, ',' order by id) from public.t",
+        expected: '1000,1010',
+      },
+    ],
+  };
+};
+
+const sequenceToIdentityScene = (): LiveScene => {
+  const t = table('t', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        default: "nextval('public.t_id_seq'::regclass)",
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const tTarget = table('t', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', {
+          sequenceName: sequenceIdentity('t_id_seq'),
+          start: '100',
+          increment: '3',
+          cache: '2',
+        }),
+      }),
+      column('note'),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const tIdSeq = sequence('t_id_seq', {
+    start: '100',
+    increment: '3',
+    cache: '2',
+    ownedBy: sequenceOwner('t', 'id'),
+  });
+
+  return {
+    name: 'sequence-to-identity',
+    baseline: withSequences([t], [tIdSeq]),
+    target: model(tTarget),
+    baselineChecks: [
+      { description: 'baseline sequences', sql: SEQUENCES, expected: 't_id_seq' },
+      {
+        description: 'baseline t_id_seq is owned by t.id',
+        sql: sequenceOwnership('t_id_seq'),
+        expected: 't.id',
+      },
+      {
+        description: 'baseline t.id default references t_id_seq',
+        sql: columnFact('t', 'id', "position('t_id_seq' in column_default) > 0"),
+        expected: 't',
+      },
+    ],
+    probes: ["INSERT INTO public.t (note) VALUES ('one'), ('two');"],
+    checks: [
+      {
+        description: 't.id is GENERATED ALWAYS',
+        sql: attributeIdentity('t', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 't.id resolves through pg_get_serial_sequence',
+        sql: serialSequenceIs('t', 'id', 't_id_seq'),
+        expected: 't_id_seq|true',
+      },
+      {
+        description: 't_id_seq is an identity dependency (pg_depend deptype i)',
+        sql: identityOwnership('t_id_seq'),
+        expected: 't.id',
+      },
+      {
+        description: 't.id carries no default of its own',
+        sql: columnFact('t', 'id', "coalesce(column_default, 'none')"),
+        expected: 'none',
+      },
+      {
+        description: 't_id_seq parameters',
+        sql: sequenceParams('t_id_seq'),
+        expected: 'bigint|100|1|9223372036854775807|3|false|2',
+      },
+      { description: 'sequences left', sql: SEQUENCES, expected: 't_id_seq' },
+      {
+        description: 'the generated keys',
+        sql: "select string_agg(id::text, ',' order by id) from public.t",
+        expected: '100,103',
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -1563,4 +2251,9 @@ export const scenes: readonly LiveScene[] = [
   sequenceAlterScene(),
   ownerDropOrderScene(),
   detachedDropScene(),
+  identityCreateScene(),
+  identityAlterScene(),
+  identityDropScene(),
+  identityToSequenceScene(),
+  sequenceToIdentityScene(),
 ];

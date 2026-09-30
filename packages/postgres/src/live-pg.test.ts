@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { promisify } from 'node:util';
 
 import { diff, plan } from '@schemamill/core';
-import type { Diagnostic, Model, ReadResult } from '@schemamill/core';
+import type { Diagnostic, Identity, Model, ReadResult, SequenceIdentity } from '@schemamill/core';
 
 import { importDump, renderSql } from './index.ts';
 import { scenes } from './live-scenes.ts';
@@ -27,11 +27,14 @@ import type { LiveScene, SceneCheck } from './live-scenes.ts';
  * Per scene, sequentially: both databases are created fresh; the baseline database gets the
  * build SQL for the baseline model (the plan from an empty model), the target database the
  * build SQL for the target model; the baseline database then gets `renderSql(plan(baseline,
- * target))`. The scene's catalog checks run against the baseline database after its build,
- * and its probes and checks after the migration. Both databases are dumped with `pg_dump
- * --schema-only --no-owner --no-privileges`, both dumps are imported, neither import may
- * report an error diagnostic, and `diff` between the imported models must be exactly empty.
- * Databases are dropped best-effort, so a failed scene still cleans up after itself.
+ * target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
+ * run against the baseline database after its build, and its probes and remaining checks after
+ * the migration. Both databases are dumped with `pg_dump --schema-only --no-owner
+ * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
+ * the modeled sequences and identity columns must come back exactly (see
+ * `assertSequencesRetained` and `assertIdentitiesRetained`), and `diff` between the imported
+ * models must be exactly empty. Databases are dropped best-effort, so a failed scene still
+ * cleans up after itself.
  */
 
 const execFileAsync = promisify(execFile);
@@ -106,6 +109,7 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     await createDatabase(baseUrl, targetDb);
 
     const files = await writeSceneFiles(workDir, slug, scene);
+    assertPlanChecks(scene);
 
     await applyFile(appliedUrl, files.baselineBuild);
     await assertChecks(appliedUrl, scene.baselineChecks ?? []);
@@ -131,6 +135,12 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       `${targetDb}: imported from the target model's build`,
       scene,
       expected.model,
+    );
+    assertIdentitiesRetained(`${appliedDb}: imported after the migration`, scene, applied);
+    assertIdentitiesRetained(
+      `${targetDb}: imported from the target model's build`,
+      scene,
+      expected,
     );
 
     assert.deepEqual(
@@ -189,6 +199,18 @@ async function assertChecks(url: string, checks: readonly SceneCheck[]): Promise
   }
 }
 
+/** Asserts every plan fact in order against `plan(baseline, target)`. */
+function assertPlanChecks(scene: LiveScene): void {
+  const steps = plan(scene.baseline, scene.target).steps;
+  for (const check of scene.planChecks ?? []) {
+    const failure = check.failure(steps);
+    assert.ok(
+      failure === undefined,
+      `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
+    );
+  }
+}
+
 /** Asserts that neither dump produced a parse error; skips and flags are allowed. */
 function assertNoErrors(what: string, result: ReadResult<Model, Diagnostic>): void {
   const errors = result.diagnostics
@@ -227,6 +249,103 @@ function assertSequencesRetained(what: string, scene: LiveScene, imported: Model
 /** The `schema.name` identities of a model's sequences. */
 function sequenceIdentities(model: Model): ReadonlySet<string> {
   return new Set(model.sequences.map((sequence) => `${sequence.schema}.${sequence.name}`));
+}
+
+/**
+ * Asserts that every identity column the target model declares survived an import with the
+ * same descriptor, compared column by column. The map is keyed by `schema.table.column`, so an
+ * import that drops, moves, or swaps an identity cannot pass by matching descriptors as a set
+ * of values; the descriptor comparison covers the generation mode, the sequence name, and every
+ * option, so a silently changed option fails the scene by column. The nested sequence name
+ * compares exactly when both sides state one, mirroring the model's identity equality. Scenes
+ * whose target has no identity columns pass vacuously.
+ *
+ * Also rejects any import diagnostic that names an identity: an identity that is dropped or
+ * degraded by a flag or skip has to fail the scene by name, not hide behind an empty diff that
+ * both imports would agree on.
+ */
+function assertIdentitiesRetained(
+  what: string,
+  scene: LiveScene,
+  imported: ReadResult<Model, Diagnostic>,
+): void {
+  const declared = identityColumns(scene.target);
+  const found = identityColumns(imported.model);
+  const failures: string[] = [];
+  for (const [column, descriptor] of declared) {
+    const actual = found.get(column);
+    if (actual === undefined) {
+      failures.push(`${column}: dropped (${describeIdentity(descriptor)})`);
+    } else if (!sameIdentityDescriptor(descriptor, actual)) {
+      failures.push(
+        `${column}: ${describeIdentity(descriptor)} became ${describeIdentity(actual)}`,
+      );
+    }
+  }
+  for (const column of found.keys()) {
+    if (!declared.has(column)) {
+      failures.push(`${column}: imported an identity the target model does not declare`);
+    }
+  }
+  assert.deepEqual(failures, [], `${scene.name}: ${what}: identity retention failed`);
+  assert.deepEqual(
+    imported.diagnostics
+      .filter((diagnostic) => diagnostic.message.toLowerCase().includes('identity'))
+      .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`),
+    [],
+    `${scene.name}: ${what}: the import named identity problems`,
+  );
+}
+
+/** Every identity column's `schema.table.column` key and descriptor, as a map. */
+function identityColumns(model: Model): ReadonlyMap<string, Identity> {
+  const columns = new Map<string, Identity>();
+  for (const table of model.tables) {
+    for (const column of table.columns) {
+      if (column.identity === undefined) continue;
+      columns.set(`${table.schema}.${table.name}.${column.name}`, column.identity);
+    }
+  }
+  return columns;
+}
+
+/**
+ * Whether two descriptors state the same identity. The nested sequence name is a don't-care
+ * when either side omits it — a target that does not name the sequence lets PostgreSQL choose
+ * the name — and must match exactly when both sides state one.
+ */
+function sameIdentityDescriptor(left: Identity, right: Identity): boolean {
+  return (
+    left.generated === right.generated &&
+    left.increment === right.increment &&
+    left.minValue === right.minValue &&
+    left.maxValue === right.maxValue &&
+    left.start === right.start &&
+    left.cache === right.cache &&
+    left.cycle === right.cycle &&
+    sameSequenceName(left.sequenceName, right.sequenceName)
+  );
+}
+
+/** Whether two optional identity sequence names state the same name. */
+function sameSequenceName(
+  left: SequenceIdentity | undefined,
+  right: SequenceIdentity | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return true;
+  return left.schema === right.schema && left.name === right.name;
+}
+
+/** One identity descriptor as one line, for a failure message. */
+function describeIdentity(identity: Identity): string {
+  const name =
+    identity.sequenceName === undefined
+      ? 'none'
+      : `${identity.sequenceName.schema}.${identity.sequenceName.name}`;
+  return (
+    `${name} ${identity.generated} increment=${identity.increment} min=${identity.minValue}` +
+    ` max=${identity.maxValue} start=${identity.start} cache=${identity.cache} cycle=${identity.cycle}`
+  );
 }
 
 /** The base connection pointed at `database`, by replacing the URI's database name. */
