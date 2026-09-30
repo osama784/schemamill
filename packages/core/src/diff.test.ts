@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import { diff } from './index.ts';
 import type { Change } from './diff.ts';
+import type { Identity } from './identity.ts';
 import type {
   Column,
   ForeignKey,
@@ -84,6 +85,18 @@ const sequence = (
 const owner = (table: string, column: string, schema = 'public'): SequenceOwner => ({
   table: { schema, name: table },
   column,
+});
+
+/** An identity descriptor: `GENERATED ALWAYS` ascending bigint defaults unless overridden. */
+const columnIdentity = (fields: Partial<Identity> = {}): Identity => ({
+  generated: 'always',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  start: '1',
+  cache: '1',
+  cycle: false,
+  ...fields,
 });
 
 /** A model of the given sequences, with no tables unless they are supplied. */
@@ -329,6 +342,529 @@ test('type and default text compare exactly as stored', () => {
             { field: 'type', before: 'numeric(12, 2)', after: 'numeric(12,2)' },
             { field: 'default', before: 'now()', after: ' now() ' },
           ],
+        },
+      ],
+    },
+  ]);
+});
+
+test('an identity added or removed reports the whole descriptor', () => {
+  const descriptor = columnIdentity({ generated: 'by default', cache: '4' });
+  const plain = model(table('t', { columns: [column('id', { type: 'integer', notNull: true })] }));
+  const identified = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: descriptor })],
+    }),
+  );
+
+  assertDiff(plain, identified, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [],
+          identity: { kind: 'added', identity: descriptor },
+        },
+      ],
+    },
+  ]);
+  assertDiff(identified, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [],
+          identity: { kind: 'removed', identity: descriptor },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a nullable column gaining identity reports the notNull change and the addition', () => {
+  const descriptor = columnIdentity();
+  const baseline = model(table('t', { columns: [column('id', { type: 'integer' })] }));
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: descriptor })],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'notNull', before: false, after: true }],
+          identity: { kind: 'added', identity: descriptor },
+        },
+      ],
+    },
+  ]);
+});
+
+test('an identity addition to a nullable-only pair reports no notNull change', () => {
+  const descriptor = columnIdentity();
+  const baseline = model(table('t', { columns: [column('id', { type: 'integer' })] }));
+  const target = model(
+    table('t', { columns: [column('id', { type: 'integer', identity: descriptor })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [],
+          identity: { kind: 'added', identity: descriptor },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a changed identity reports its options in the fixed order', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'bigint', notNull: true, identity: columnIdentity() })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'bigint',
+          notNull: true,
+          identity: columnIdentity({
+            generated: 'by default',
+            increment: '3',
+            minValue: '2',
+            maxValue: '100',
+            start: '7',
+            cache: '4',
+            cycle: true,
+          }),
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [],
+          identity: {
+            kind: 'changed',
+            fields: [
+              { field: 'generated', before: 'always', after: 'by default' },
+              { field: 'increment', before: '1', after: '3' },
+              { field: 'minValue', before: '1', after: '2' },
+              { field: 'maxValue', before: '9223372036854775807', after: '100' },
+              { field: 'start', before: '1', after: '7' },
+              { field: 'cache', before: '1', after: '4' },
+              { field: 'cycle', before: false, after: true },
+            ],
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a generated mode change in either direction is an ordinary field change', () => {
+  const asDefault = columnIdentity({ generated: 'by default' });
+
+  assertDiff(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: asDefault })],
+      }),
+    ),
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: columnIdentity() })],
+      }),
+    ),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          {
+            kind: 'column-changed',
+            name: 'id',
+            fields: [],
+            identity: {
+              kind: 'changed',
+              fields: [{ field: 'generated', before: 'by default', after: 'always' }],
+            },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('identity sequence names compare only when both sides state one', () => {
+  const named = { schema: 'public', name: 't_id_seq' } as const;
+  const withName = (cache: string): Column =>
+    column('id', {
+      type: 'bigint',
+      notNull: true,
+      identity: columnIdentity({ sequenceName: { ...named }, cache }),
+    });
+  const unnamed = (): Column =>
+    column('id', { type: 'bigint', notNull: true, identity: columnIdentity({ cache: '2' }) });
+
+  // Two stated names that match are not a field; the options still compare.
+  const sameName = model(table('t', { columns: [withName('2')] }));
+  const sameNameChanged = model(table('t', { columns: [withName('4')] }));
+  assertDiff(sameName, sameNameChanged, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [],
+          identity: {
+            kind: 'changed',
+            fields: [{ field: 'cache', before: '2', after: '4' }],
+          },
+        },
+      ],
+    },
+  ]);
+
+  // A name stated on one side only is a don't-care, in either direction.
+  const withoutName = model(table('t', { columns: [unnamed()] }));
+  assertDiff(sameName, withoutName, []);
+  assertDiff(withoutName, sameName, []);
+});
+
+test('a stated identity sequence name mismatch recreates the identity', () => {
+  const baseline = columnIdentity({
+    sequenceName: { schema: 'public', name: 't_id_seq' },
+    cache: '2',
+  });
+  const target = columnIdentity({ sequenceName: { schema: 'public', name: 't_id_seq_v2' } });
+
+  assertDiff(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: baseline })],
+      }),
+    ),
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: target })],
+      }),
+    ),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          {
+            kind: 'column-changed',
+            name: 'id',
+            fields: [],
+            identity: { kind: 'recreated', identity: target },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('a column type change suppresses an identity bound the AS conversion moves', () => {
+  // The integer maximum becomes bigint's own maximum on the conversion, which is also the
+  // target's, so the identity needs no field at all.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: columnIdentity({ maxValue: '2147483647' }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'bigint', notNull: true, identity: columnIdentity() })],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a column type change restates an identity bound the AS conversion would move', () => {
+  // Both sides state the integer maximum, but the conversion rewrites the baseline's to
+  // bigint's, so the target's value is restated and flagged as converted.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: columnIdentity({ maxValue: '2147483647' }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'bigint',
+          notNull: true,
+          identity: columnIdentity({ maxValue: '2147483647' }),
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          identity: {
+            kind: 'changed',
+            fields: [
+              {
+                field: 'maxValue',
+                before: '9223372036854775807',
+                after: '2147483647',
+                converted: true,
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a column type change restates an identity minimum the AS conversion would move', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'smallint',
+          notNull: true,
+          identity: columnIdentity({ minValue: '-32768', maxValue: '100' }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: columnIdentity({ minValue: '-32768', maxValue: '100' }),
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'smallint', after: 'integer' }],
+          identity: {
+            kind: 'changed',
+            fields: [
+              {
+                field: 'minValue',
+                before: '-2147483648',
+                after: '-32768',
+                converted: true,
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('as-written integer aliases do not convert identity bounds', () => {
+  // `int4` and `integer` resolve to the same identity type, so the as-written text difference
+  // is a column type change only: the bound equal to the integer maximum stays as written.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'int4',
+          notNull: true,
+          identity: columnIdentity({ maxValue: '2147483647' }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: columnIdentity({ maxValue: '2147483647' }),
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'int4', after: 'integer' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a removed column or table carries its identity away', () => {
+  const descriptor = columnIdentity({ sequenceName: { schema: 'public', name: 't_id_seq' } });
+  const removedColumn = column('id', { type: 'bigint', notNull: true, identity: descriptor });
+  const removedTable = table('t', { columns: [removedColumn] });
+
+  // The column removal carries the whole column, identity included, and adds nothing else.
+  assertDiff(model(removedTable), model(table('t', { columns: [] })), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'column-removed', column: removedColumn }],
+    },
+  ]);
+  assertDiff(model(removedTable), model(), [{ kind: 'table-removed', table: removedTable }]);
+});
+
+test('identity payloads are independent copies', () => {
+  const descriptor = columnIdentity({ sequenceName: { schema: 'public', name: 't_id_seq' } });
+  const plain = column('id', { type: 'bigint', notNull: true });
+  const identified = column('id', { type: 'bigint', notNull: true, identity: descriptor });
+
+  const added = diff(
+    model(table('t', { columns: [plain] })),
+    model(table('t', { columns: [identified] })),
+  )[0]!;
+  assert.equal(added.kind, 'table-changed');
+  if (added.kind !== 'table-changed') throw new Error('expected a changed table');
+  const addedField = added.changes[0];
+  assert.equal(addedField?.kind, 'column-changed');
+  if (addedField?.kind === 'column-changed') {
+    const change = addedField.identity;
+    assert.equal(change?.kind, 'added');
+    if (change?.kind === 'added') {
+      assert.notEqual(change.identity, descriptor);
+      assert.notEqual(change.identity.sequenceName, descriptor.sequenceName);
+    }
+  }
+
+  const renamed = columnIdentity({ sequenceName: { schema: 'public', name: 't_id_seq_v2' } });
+  const recreated = diff(
+    model(table('t', { columns: [identified] })),
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: renamed })],
+      }),
+    ),
+  )[0]!;
+  assert.equal(recreated.kind, 'table-changed');
+  if (recreated.kind !== 'table-changed') throw new Error('expected a changed table');
+  const recreatedField = recreated.changes[0];
+  assert.equal(recreatedField?.kind, 'column-changed');
+  if (recreatedField?.kind === 'column-changed') {
+    const change = recreatedField.identity;
+    assert.equal(change?.kind, 'recreated');
+    if (change?.kind === 'recreated') {
+      assert.notEqual(change.identity, renamed);
+      assert.notEqual(change.identity.sequenceName, renamed.sequenceName);
+    }
+  }
+});
+
+test('a deep-frozen model with identities can be diffed', () => {
+  const baseline = deepFreeze(
+    model(
+      table('t', {
+        columns: [
+          column('id', {
+            type: 'integer',
+            notNull: true,
+            identity: columnIdentity({ maxValue: '2147483647' }),
+          }),
+        ],
+      }),
+    ),
+  );
+  const target = deepFreeze(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: columnIdentity() })],
+      }),
+    ),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
         },
       ],
     },

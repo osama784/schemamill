@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Change } from '@schemamill/core';
+import type { Change, Identity, IdentityChange } from '@schemamill/core';
 
 import { formatChanges } from './format.ts';
 
@@ -54,5 +54,74 @@ test('an as-written sequence bound prints without the converted mark', () => {
       '    max value 2147483647 → 100',
       '',
     ].join('\n'),
+  );
+});
+
+test('an identity change prints after the column fields, one sub-line per field', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'id',
+          fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          identity: {
+            kind: 'changed',
+            fields: [
+              { field: 'generated', before: 'always', after: 'by default' },
+              {
+                field: 'maxValue',
+                before: '9223372036854775807',
+                after: '2147483647',
+                converted: true,
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    ~ column id: type integer → bigint',
+      '        identity: GENERATED ALWAYS → BY DEFAULT',
+      '        identity: max value 9223372036854775807 (converted) → 2147483647',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('identity additions, removals, and recreations print as marker lines', () => {
+  const descriptor: Identity = {
+    generated: 'always',
+    increment: '1',
+    minValue: '1',
+    maxValue: '9223372036854775807',
+    start: '1',
+    cache: '1',
+    cycle: false,
+  };
+  const change = (identity: IdentityChange): Change => ({
+    kind: 'table-changed',
+    table: { schema: 'public', name: 'users' },
+    changes: [{ kind: 'column-changed', name: 'id', fields: [], identity }],
+  });
+
+  assert.equal(
+    formatChanges([change({ kind: 'added', identity: descriptor })]),
+    ['~ table public.users', '    ~ column id: identity: added', ''].join('\n'),
+  );
+  assert.equal(
+    formatChanges([change({ kind: 'removed', identity: descriptor })]),
+    ['~ table public.users', '    ~ column id: identity: removed', ''].join('\n'),
+  );
+  assert.equal(
+    formatChanges([change({ kind: 'recreated', identity: descriptor })]),
+    ['~ table public.users', '    ~ column id: identity: recreated', ''].join('\n'),
   );
 });

@@ -3,6 +3,9 @@ import type {
   Column,
   ColumnFieldChange,
   ForeignKey,
+  IdentityChange,
+  IdentityFieldChange,
+  IdentityGeneration,
   Plan,
   PrimaryKey,
   Sequence,
@@ -26,12 +29,13 @@ import type {
  * after the conversion, not the as-written baseline value.
  *
  * A diff renders as one block per change, blank-line separated: `+`, `-`, or `~` then
- * `table <schema>.<name>`, followed by four-space-indented member lines; sequences render the
- * same way after the table changes, as `sequence <schema>.<name>` with one option per line. A
- * plan renders as a numbered header and one line per step; a step's kind label is padded to
- * the longest label in the plan so the details align, and a step's details expose every
- * payload field it carries. SQL is not rendered here: the `plan` command appends `renderSql`'s
- * output.
+ * `table <schema>.<name>`, followed by four-space-indented member lines; a changed column
+ * carries its scalar fields on the `~ column` line and one `identity:` sub-line per identity
+ * change after it; sequences render the same way after the table changes, as
+ * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
+ * and one line per step; a step's kind label is padded to the longest label in the plan so
+ * the details align, and a step's details expose every payload field it carries. SQL is not
+ * rendered here: the `plan` command appends `renderSql`'s output.
  */
 
 /** The whole diff as `compare` prints it: `No changes.` or one block per change, in order. */
@@ -100,7 +104,7 @@ function formatTableChange(change: TableChange): string {
     case 'column-removed':
       return `- column ${formatColumn(change.column)}`;
     case 'column-changed':
-      return `~ column ${change.name}: ${formatColumnFields(change.fields)}`;
+      return formatColumnChange(change.name, change.fields, change.identity);
     case 'primary-key-added':
       return `+ ${formatPrimaryKey(change.primaryKey)}`;
     case 'primary-key-removed':
@@ -258,6 +262,72 @@ function formatColumnField(field: ColumnFieldChange): string {
     case 'default':
       return `default ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }
+}
+
+/**
+ * A changed column: the scalar fields on the `~ column` line, then one `identity:` sub-line
+ * per identity change. A column whose only change is its identity carries the first identity
+ * line on the column line instead, so no line dangles after a colon.
+ */
+function formatColumnChange(
+  name: string,
+  fields: readonly ColumnFieldChange[],
+  identity: IdentityChange | undefined,
+): string {
+  const identityLines = identity === undefined ? [] : formatIdentityChange(identity);
+  if (fields.length > 0) {
+    return [
+      `~ column ${name}: ${formatColumnFields(fields)}`,
+      ...identityLines.map(indentSubLine),
+    ].join('\n');
+  }
+  const [first, ...rest] = identityLines;
+  return [`~ column ${name}: ${first ?? ''}`, ...rest.map(indentSubLine)].join('\n');
+}
+
+/** Indents an identity sub-line to sit under the column line it belongs to. */
+function indentSubLine(line: string): string {
+  return `        ${line}`;
+}
+
+/**
+ * One identity difference as its `identity:`-prefixed lines: a marker for an addition,
+ * removal, or recreation, and one line per differing option in the diff's fixed order.
+ */
+function formatIdentityChange(change: IdentityChange): string[] {
+  switch (change.kind) {
+    case 'added':
+    case 'removed':
+    case 'recreated':
+      return [`identity: ${change.kind}`];
+    case 'changed':
+      return change.fields.map((field) => `identity: ${formatIdentityField(field)}`);
+  }
+}
+
+/** One changed identity option; `generated` prints SQL's spelling of the mode. */
+function formatIdentityField(field: IdentityFieldChange): string {
+  switch (field.field) {
+    case 'generated':
+      return `GENERATED ${formatGeneration(field.before)} → ${formatGeneration(field.after)}`;
+    case 'increment':
+      return `increment ${field.before} → ${field.after}`;
+    case 'minValue':
+      return `min value ${formatBoundChange(field.before, field.after, field.converted)}`;
+    case 'maxValue':
+      return `max value ${formatBoundChange(field.before, field.after, field.converted)}`;
+    case 'start':
+      return `start ${field.before} → ${field.after}`;
+    case 'cache':
+      return `cache ${field.before} → ${field.after}`;
+    case 'cycle':
+      return `cycle ${String(field.before)} → ${String(field.after)}`;
+  }
+}
+
+/** The SQL spelling of a generation mode, which the model stores in words. */
+function formatGeneration(generation: IdentityGeneration): string {
+  return generation === 'always' ? 'ALWAYS' : 'BY DEFAULT';
 }
 
 /**
