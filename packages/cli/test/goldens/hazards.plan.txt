@@ -1,0 +1,27 @@
+7 steps:
+ 1. create-sequence  public.bad_cache
+ 2. create-sequence  public.bad_increment
+ 3. create-sequence  public.bad_range
+ 4. create-sequence  public.bad_two
+ 5. create-table     app.bad_identity
+ 6. alter-sequence   public.kept_seq: max value 1000 → 100
+ 7. add-identity     app.bad_identity.id
+
+Hazards:
+  step 1 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
+  step 2 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).
+  step 3 bound-out-of-type-range: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.
+  step 4 bounds-inverted: MINVALUE 200 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.
+  step 4 start-out-of-bounds: START 200 is greater than MAXVALUE 100 — PostgreSQL rejects this at apply.
+  step 6 bound-tightened: max value 1000 → 100 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
+  step 7 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
+
+CREATE SEQUENCE public.bad_cache AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 0 NO CYCLE;
+CREATE SEQUENCE public.bad_increment AS bigint INCREMENT BY 0 MINVALUE -9223372036854775808 MAXVALUE -1 START WITH -1 CACHE 1 NO CYCLE;
+CREATE SEQUENCE public.bad_range AS integer INCREMENT BY 1 MINVALUE 1 MAXVALUE 9999999999 START WITH 1 CACHE 1 NO CYCLE;
+CREATE SEQUENCE public.bad_two AS bigint INCREMENT BY 1 MINVALUE 200 MAXVALUE 100 START WITH 200 CACHE 1 NO CYCLE;
+CREATE TABLE app.bad_identity (
+    id integer NOT NULL
+);
+ALTER SEQUENCE public.kept_seq MAXVALUE 100;
+ALTER TABLE app.bad_identity ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 0 NO CYCLE );
