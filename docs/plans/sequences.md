@@ -1,6 +1,6 @@
 # Sequences — model, plan, render, verify
 
-**Status:** built · **Last updated:** 2026-09-29
+**Status:** built · **Last updated:** 2026-09-30
 
 Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER SEQUENCE` options that map to modeled fields now travel the whole import → diff → plan → render path, and the result was verified against live PostgreSQL. The settled decisions are on [#16](https://github.com/osama784/schemamill/issues/16) (design review rounds 2–3); the feature landed in [#17](https://github.com/osama784/schemamill/pull/17), and the five verification scenes, the dogfood rerun, and this document in [#18](https://github.com/osama784/schemamill/pull/18).
 
@@ -8,7 +8,7 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **In:** standalone and owned sequences with schema-qualified identity like tables; the options `AS` (`smallint`, `integer`, `bigint`), `INCREMENT BY`, `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`; ownership (`OWNED BY`, `OWNED BY NONE`); import of `CREATE SEQUENCE` (inline `OWNED BY` included) and the `ALTER SEQUENCE` options that map to modeled fields; a `sequences` group in `compare`; `create-sequence`, `alter-sequence`, and `drop-sequence` plan steps; canonical full-explicit rendering.
 
-**Out, named in diagnostics — never silent:** identity columns (`GENERATED … AS IDENTITY` is a distinct PostgreSQL object from a sequence-backed default; import flags it); sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence.
+**Out, named in diagnostics — never silent:** sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence. Identity columns, flagged on import when this slice landed, have since been modeled in the [identity slice](./identity.md) as a column property distinct from a sequence-backed default.
 
 **Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards and transaction grouping stay later work.
 
@@ -66,4 +66,4 @@ Three levels pin the slice:
 
 ## Non-goals
 
-Identity columns, sequence state, renames, hazards, and transaction grouping are later slices. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
+Sequence state, renames, hazards, and transaction grouping are later slices. Identity columns, listed here when this slice landed, have since shipped in the [identity slice](./identity.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
