@@ -374,9 +374,12 @@ function sameIdentity(left: TableIdentity, right: TableIdentity): boolean {
   return left.schema === right.schema && left.name === right.name;
 }
 
-/** A copy of `column`, independent of the caller's model. */
+/** A copy of `column`, independent of the caller's model, nested identity included. */
 function copyColumn(column: Column): Column {
-  return { ...column };
+  return {
+    ...column,
+    ...(column.identity === undefined ? {} : { identity: copyIdentity(column.identity) }),
+  };
 }
 
 /** A copy of `primaryKey`, independent of the caller's model. */

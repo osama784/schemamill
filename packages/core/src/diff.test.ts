@@ -10,6 +10,7 @@ import type {
   Model,
   PrimaryKey,
   Sequence,
+  SequenceIdentity,
   SequenceOwner,
   Table,
   TableIdentity,
@@ -113,6 +114,9 @@ const deepFreeze = <T>(value: T): T => {
   }
   return value;
 };
+
+/** A shallowly mutable view of `T`, for exercising copy independence in tests. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 /** Asserts that a table payload shares no object or array with its source table. */
 const assertCopiedTable = (copy: Table, source: Table): void => {
@@ -831,6 +835,68 @@ test('identity payloads are independent copies', () => {
       assert.notEqual(change.identity, renamed);
       assert.notEqual(change.identity.sequenceName, renamed.sequenceName);
     }
+  }
+});
+
+test('payload columns carry their identity as an independent copy', () => {
+  const sourceIdentity = () =>
+    columnIdentity({ sequenceName: { schema: 'public', name: 't_id_seq' } });
+  const gone = column('gone', { type: 'integer', notNull: true, identity: sourceIdentity() });
+  const fresh = column('fresh', { type: 'integer', notNull: true, identity: sourceIdentity() });
+  const goneTableColumn = column('id', {
+    type: 'integer',
+    notNull: true,
+    identity: sourceIdentity(),
+  });
+  const freshTableColumn = column('id', {
+    type: 'integer',
+    notNull: true,
+    identity: sourceIdentity(),
+  });
+
+  const changes = diff(
+    model(table('t', { columns: [gone] }), table('v', { columns: [goneTableColumn] })),
+    model(table('t', { columns: [fresh] }), table('u', { columns: [freshTableColumn] })),
+  );
+
+  const changed = changes[0];
+  assert.equal(changed?.kind, 'table-changed');
+  if (changed?.kind !== 'table-changed') throw new Error('expected a changed table');
+  const addedTable = changes[1];
+  assert.equal(addedTable?.kind, 'table-added');
+  if (addedTable?.kind !== 'table-added') throw new Error('expected a table addition');
+  const removedTable = changes[2];
+  assert.equal(removedTable?.kind, 'table-removed');
+  if (removedTable?.kind !== 'table-removed') throw new Error('expected a table removal');
+
+  const removedColumn = changed.changes[0];
+  assert.equal(removedColumn?.kind, 'column-removed');
+  if (removedColumn?.kind !== 'column-removed') throw new Error('expected a column removal');
+  const addedColumn = changed.changes[1];
+  assert.equal(addedColumn?.kind, 'column-added');
+  if (addedColumn?.kind !== 'column-added') throw new Error('expected a column addition');
+
+  const cases: readonly (readonly [Identity, Identity])[] = [
+    [removedColumn.column.identity!, gone.identity!],
+    [addedColumn.column.identity!, fresh.identity!],
+    [addedTable.table.columns[0]!.identity!, freshTableColumn.identity!],
+    [removedTable.table.columns[0]!.identity!, goneTableColumn.identity!],
+  ];
+
+  for (const [payload, source] of cases) {
+    // Distinct objects at every level, in both directions.
+    assert.notEqual(payload, source);
+    assert.notEqual(payload.sequenceName, source.sequenceName);
+
+    (payload as Mutable<Identity>).increment = '9';
+    (payload.sequenceName as Mutable<SequenceIdentity>).name = 'payload';
+    assert.equal(source.increment, '1');
+    assert.equal(source.sequenceName?.name, 't_id_seq');
+
+    (source as Mutable<Identity>).increment = '7';
+    (source.sequenceName as Mutable<SequenceIdentity>).name = 'model';
+    assert.equal(payload.increment, '9');
+    assert.equal(payload.sequenceName?.name, 'payload');
   }
 });
 

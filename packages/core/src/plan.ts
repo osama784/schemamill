@@ -84,9 +84,9 @@ import type {
  *    a phase-8 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
  *    create-sequence, and a phase-4 `SET DEFAULT`.
  *
- * A drop-identity is suppressed, like a drop-sequence, when the plan also removes its table or
- * column: PostgreSQL drops an identity sequence together with its owner, so the owner's own
- * drop supersedes the explicit one.
+ * A `drop-identity` needs no drop-suppression: an identity reaches the plan as its own removal
+ * only when its column survives — a removed column or table carries its identity away in that
+ * drop — so every collected drop-identity names an owner that still exists.
  *
  * The table phases inside phase 4 are numbered as before (and keep their documented semantics):
  *
@@ -226,7 +226,7 @@ export function plan(baseline: Model, target: Model): Plan {
   const columnAlters: Step[] = [];
   const primaryKeyAdds: Step[] = [];
   const foreignKeyAdds: Step[] = [];
-  const identityDrops: RemovedIdentity[] = [];
+  const identityDrops: Step[] = [];
   const identityAdds: Step[] = [];
   const identityAlters: Step[] = [];
   const sequenceCreates: Step[] = [];
@@ -319,12 +319,14 @@ export function plan(baseline: Model, target: Model): Plan {
                     break;
                   case 'removed':
                     identityDrops.push({
+                      kind: 'drop-identity',
                       table: copyIdentity(change.table),
                       name: tableChange.name,
                     });
                     break;
                   case 'recreated':
                     identityDrops.push({
+                      kind: 'drop-identity',
                       table: copyIdentity(change.table),
                       name: tableChange.name,
                     });
@@ -506,21 +508,9 @@ export function plan(baseline: Model, target: Model): Plan {
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
-  // PostgreSQL drops an identity sequence together with its owning table or column, so the
-  // owner's own drop supersedes an explicit drop-identity; mirror the sequence suppression.
-  const identityDropSteps: Step[] = [];
-  for (const removed of identityDrops) {
-    if (columnRemoved(removed.table, removed.name)) continue;
-    identityDropSteps.push({
-      kind: 'drop-identity',
-      table: copyIdentity(removed.table),
-      name: removed.name,
-    });
-  }
-
   return {
     steps: [
-      ...identityDropSteps,
+      ...identityDrops,
       ...sequenceCreates,
       ...ownershipDetaches,
       ...foreignKeyDrops,
@@ -555,12 +545,6 @@ interface SequenceOwnershipChange {
 interface RemovedSequence {
   readonly identity: SequenceIdentity;
   readonly ownedBy?: SequenceOwner;
-}
-
-/** A removed identity, held until the plan knows whether its owner's drop cascades it. */
-interface RemovedIdentity {
-  readonly table: TableIdentity;
-  readonly name: string;
 }
 
 /** A removed table, held with its canonical payload while phase 2 orders the drops. */
@@ -659,9 +643,12 @@ function copyIdentity(identity: TableIdentity): TableIdentity {
   return { schema: identity.schema, name: identity.name };
 }
 
-/** A copy of `column`, independent of the caller's model. */
+/** A copy of `column`, independent of the caller's model, nested identity included. */
 function copyColumn(column: Column): Column {
-  return { ...column };
+  return {
+    ...column,
+    ...(column.identity === undefined ? {} : { identity: copyColumnIdentity(column.identity) }),
+  };
 }
 
 /** A copy of `primaryKey`, independent of the caller's model. */

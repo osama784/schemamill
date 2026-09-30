@@ -10,6 +10,7 @@ import type {
   Model,
   PrimaryKey,
   Sequence,
+  SequenceIdentity,
   SequenceOwner,
   Table,
   TableIdentity,
@@ -1480,6 +1481,55 @@ test('column payloads keep their exact contents', () => {
       ],
     },
   ]);
+});
+
+test('column payloads in steps carry an independent identity', () => {
+  const sourceIdentity = () => identityColumn({ sequenceName: identity('t_id_seq') });
+  const gone = column('gone', { type: 'integer', notNull: true, identity: sourceIdentity() });
+  const fresh = column('fresh', { type: 'integer', notNull: true, identity: sourceIdentity() });
+  const freshTableColumn = column('id', {
+    type: 'integer',
+    notNull: true,
+    identity: sourceIdentity(),
+  });
+
+  const baseline = model(table('t', { columns: [gone] }));
+  const target = model(
+    table('t', { columns: [fresh] }),
+    table('u', { columns: [freshTableColumn] }),
+  );
+
+  const { steps } = plan(baseline, target);
+  const dropColumn = steps.find((step) => step.kind === 'drop-column');
+  const addColumn = steps.find((step) => step.kind === 'add-column');
+  const createTable = steps.find((step) => step.kind === 'create-table');
+
+  const cases: (readonly [Identity, Identity])[] = [];
+  assert.equal(dropColumn?.kind, 'drop-column');
+  if (dropColumn?.kind === 'drop-column') cases.push([dropColumn.column.identity!, gone.identity!]);
+  assert.equal(addColumn?.kind, 'add-column');
+  if (addColumn?.kind === 'add-column') cases.push([addColumn.column.identity!, fresh.identity!]);
+  assert.equal(createTable?.kind, 'create-table');
+  if (createTable?.kind === 'create-table') {
+    cases.push([createTable.table.columns[0]!.identity!, freshTableColumn.identity!]);
+  }
+  assert.equal(cases.length, 3);
+
+  for (const [payload, source] of cases) {
+    // Distinct objects at every level, in both directions.
+    assert.notEqual(payload, source);
+    assert.notEqual(payload.sequenceName, source.sequenceName);
+
+    (payload as Mutable<Identity>).increment = '9';
+    (payload.sequenceName as Mutable<SequenceIdentity>).name = 'payload';
+    assert.equal(source.increment, '1');
+    assert.equal(source.sequenceName?.name, 't_id_seq');
+
+    (source as Mutable<Identity>).increment = '7';
+    (source.sequenceName as Mutable<SequenceIdentity>).name = 'model';
+    assert.equal(payload.increment, '9');
+    assert.equal(payload.sequenceName?.name, 'payload');
+  }
 });
 
 test('a mixed migration pins the exact step sequence across all nine phases', () => {
