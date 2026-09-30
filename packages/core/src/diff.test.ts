@@ -1305,7 +1305,7 @@ test('a data type change restates a bound the AS conversion would move', () => {
       sequence: identity('s'),
       changes: [
         { field: 'dataType', before: 'integer', after: 'bigint' },
-        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647', converted: true },
       ],
     },
   ]);
@@ -1325,7 +1325,12 @@ test('a data type change restates a minimum the AS conversion would move', () =>
       sequence: identity('s'),
       changes: [
         { field: 'dataType', before: 'integer', after: 'bigint' },
-        { field: 'minValue', before: '-9223372036854775808', after: '-2147483648' },
+        {
+          field: 'minValue',
+          before: '-9223372036854775808',
+          after: '-2147483648',
+          converted: true,
+        },
       ],
     },
   ]);
@@ -1345,8 +1350,13 @@ test('a data type change restates both bounds the AS conversion would move', () 
       sequence: identity('s'),
       changes: [
         { field: 'dataType', before: 'integer', after: 'bigint' },
-        { field: 'minValue', before: '-9223372036854775808', after: '-2147483648' },
-        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+        {
+          field: 'minValue',
+          before: '-9223372036854775808',
+          after: '-2147483648',
+          converted: true,
+        },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647', converted: true },
       ],
     },
   ]);
@@ -1362,7 +1372,7 @@ test('a smallint to integer change restates the smallint maximum', () => {
       sequence: identity('s'),
       changes: [
         { field: 'dataType', before: 'smallint', after: 'integer' },
-        { field: 'maxValue', before: '2147483647', after: '32767' },
+        { field: 'maxValue', before: '2147483647', after: '32767', converted: true },
       ],
     },
   ]);

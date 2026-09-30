@@ -1849,7 +1849,7 @@ test('a data type change keeps a bound the AS conversion would move explicit', (
       sequence: identity('s'),
       fields: [
         { field: 'dataType', before: 'integer', after: 'bigint' },
-        { field: 'maxValue', before: '9223372036854775807', after: '2147483647' },
+        { field: 'maxValue', before: '9223372036854775807', after: '2147483647', converted: true },
       ],
     },
   ]);

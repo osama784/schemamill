@@ -21,7 +21,9 @@ import type {
  * text, with no I/O, no dates, and no environment reads. Model values are emitted exactly as
  * stored — names unquoted, `type` and `default` text untouched, sequence option values as
  * their exact decimal strings, no colour and no TTY detection — and `(none)` stands in for a
- * field a payload omits.
+ * field a payload omits. A bound the engine's type conversion produced prints as its exact
+ * decimal string with a `(converted)` mark, because the diff reports the value in effect
+ * after the conversion, not the as-written baseline value.
  *
  * A diff renders as one block per change, blank-line separated: `+`, `-`, or `~` then
  * `table <schema>.<name>`, followed by four-space-indented member lines; sequences render the
@@ -208,9 +210,9 @@ function formatSequenceField(field: SequenceFieldChange): string {
     case 'increment':
       return `increment ${field.before} → ${field.after}`;
     case 'minValue':
-      return `min value ${field.before} → ${field.after}`;
+      return `min value ${formatBoundChange(field.before, field.after, field.converted)}`;
     case 'maxValue':
-      return `max value ${field.before} → ${field.after}`;
+      return `max value ${formatBoundChange(field.before, field.after, field.converted)}`;
     case 'start':
       return `start ${field.before} → ${field.after}`;
     case 'cache':
@@ -220,6 +222,15 @@ function formatSequenceField(field: SequenceFieldChange): string {
     case 'ownedBy':
       return `owned by ${formatOptionalOwner(field.before)} → ${formatOptionalOwner(field.after)}`;
   }
+}
+
+/**
+ * A `minValue`/`maxValue` change; `(converted)` marks a `before` value the engine's type
+ * conversion produced rather than one the baseline stated, so the line never presents a
+ * converted value as the as-written baseline.
+ */
+function formatBoundChange(before: string, after: string, converted?: boolean): string {
+  return `${before}${converted === true ? ' (converted)' : ''} → ${after}`;
 }
 
 /** A sequence owner as `<schema>.<table>.<column>`, names unquoted. */

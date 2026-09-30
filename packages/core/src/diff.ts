@@ -138,14 +138,15 @@ export type ColumnFieldChange =
  * fixed order `dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`,
  * `ownedBy`. A `minValue`/`maxValue` change reports the value in effect after the step's
  * `dataType` change — the engine rewrites a bound equal to the old type's bound to the new
- * type's — as `before`, so a bound the target restores after that conversion is still
- * reported. An `ownedBy` change omits the side that has no owner.
+ * type's — as `before`, flagged `converted` when the conversion is what produced it, so a
+ * bound the target restores after that conversion is still reported and never reads as an
+ * as-written baseline value. An `ownedBy` change omits the side that has no owner.
  */
 export type SequenceFieldChange =
   | { field: 'dataType'; before: SequenceDataType; after: SequenceDataType }
   | { field: 'increment'; before: string; after: string }
-  | { field: 'minValue'; before: string; after: string }
-  | { field: 'maxValue'; before: string; after: string }
+  | { field: 'minValue'; before: string; after: string; converted?: boolean }
+  | { field: 'maxValue'; before: string; after: string; converted?: boolean }
   | { field: 'start'; before: string; after: string }
   | { field: 'cache'; before: string; after: string }
   | { field: 'cycle'; before: boolean; after: boolean }
@@ -260,15 +261,31 @@ function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceField
   // With a data type change, the bounds the step lands on without explicit clauses are the
   // ones the engine's `AS` conversion leaves, not the baseline's: a bound equal to the old
   // type's bound becomes the new type's. Compare against those so the plan restates a bound
-  // the conversion would otherwise move.
+  // the conversion would otherwise move, and flag a rewritten bound as converted so no output
+  // presents it as the as-written baseline value.
   const converted = dataTypeChanged
     ? sequenceTypeChange(baseline.dataType, baseline.minValue, baseline.maxValue, target.dataType)
-    : { minValue: baseline.minValue, maxValue: baseline.maxValue };
+    : {
+        minValue: baseline.minValue,
+        maxValue: baseline.maxValue,
+        resetMin: false,
+        resetMax: false,
+      };
   if (converted.minValue !== target.minValue) {
-    fields.push({ field: 'minValue', before: converted.minValue, after: target.minValue });
+    fields.push({
+      field: 'minValue',
+      before: converted.minValue,
+      after: target.minValue,
+      ...(converted.resetMin ? { converted: true } : {}),
+    });
   }
   if (converted.maxValue !== target.maxValue) {
-    fields.push({ field: 'maxValue', before: converted.maxValue, after: target.maxValue });
+    fields.push({
+      field: 'maxValue',
+      before: converted.maxValue,
+      after: target.maxValue,
+      ...(converted.resetMax ? { converted: true } : {}),
+    });
   }
   if (baseline.start !== target.start) {
     fields.push({ field: 'start', before: baseline.start, after: target.start });
