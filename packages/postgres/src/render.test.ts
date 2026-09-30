@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { effectiveIdentity, plan } from '@schemamill/core';
+import { effectiveIdentity, plan, sequenceTypeBounds } from '@schemamill/core';
 import type {
   Column,
   ForeignKey,
@@ -68,7 +68,10 @@ const foreignKey = (
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
 
-/** A sequence named `name`: bigint ascending defaults unless overridden. */
+/**
+ * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
+ * default maximum follows `dataType`, so an `integer` sequence gets the integer maximum.
+ */
 const sequence = (
   name: string,
   fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
@@ -79,7 +82,7 @@ const sequence = (
   dataType: 'bigint',
   increment: '1',
   minValue: '1',
-  maxValue: '9223372036854775807',
+  maxValue: sequenceTypeBounds(fields.dataType ?? 'bigint').maxValue,
   start: '1',
   cache: '1',
   cycle: false,
@@ -851,7 +854,7 @@ test('renders both identity conversions in policy order', () => {
     renderSql(plan(identityTarget, serialTarget)),
     [
       'ALTER TABLE public.t ALTER COLUMN id DROP IDENTITY;',
-      'CREATE SEQUENCE public.t_id_seq AS integer INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 1 NO CYCLE;',
+      'CREATE SEQUENCE public.t_id_seq AS integer INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE;',
       "ALTER TABLE public.t ALTER COLUMN id SET DEFAULT nextval('t_id_seq'::regclass);",
       '',
     ].join('\n'),

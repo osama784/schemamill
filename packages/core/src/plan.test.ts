@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { effectiveIdentity, plan } from './index.ts';
+import { effectiveIdentity, plan, sequenceTypeBounds } from './index.ts';
 import type { Identity, IdentityInput } from './identity.ts';
 import type { IdentityFieldChange } from './diff.ts';
 import type {
@@ -88,7 +88,10 @@ const idForeignKey = (from: string, columnName: string, to: string): ForeignKey 
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
 
-/** A sequence named `name`: bigint ascending defaults unless overridden. */
+/**
+ * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
+ * default maximum follows `dataType`, so an `integer` sequence gets the integer maximum.
+ */
 const sequence = (
   name: string,
   fields: Partial<Omit<Sequence, 'schema' | 'name'>> = {},
@@ -99,7 +102,7 @@ const sequence = (
   dataType: 'bigint',
   increment: '1',
   minValue: '1',
-  maxValue: '9223372036854775807',
+  maxValue: sequenceTypeBounds(fields.dataType ?? 'bigint').maxValue,
   start: '1',
   cache: '1',
   cycle: false,
