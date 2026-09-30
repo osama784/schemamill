@@ -161,13 +161,21 @@ function formatIdentity(identity: TableIdentity): string {
   return `${identity.schema}.${identity.name}`;
 }
 
-/** A column as `<name> <type>` plus ` NOT NULL` and ` DEFAULT <default>` when it carries them. */
+/**
+ * A column as `<name> <type>` plus ` NOT NULL`, ` DEFAULT <default>`, and, when it carries one,
+ * a compact `identity: GENERATED …` clause naming the generation mode. The identity descriptor's
+ * sequence name and options are not spelled out here; a changed column's identity options get
+ * their own `identity:` sub-lines.
+ */
 function formatColumn(column: Column): string {
   const nameAndType = [column.name, column.type].filter((part) => part !== '').join(' ');
   const clauses: string[] = [];
   if (column.notNull) clauses.push('NOT NULL');
   if (column.default !== undefined && column.default !== '') {
     clauses.push(`DEFAULT ${column.default}`);
+  }
+  if (column.identity !== undefined) {
+    clauses.push(`identity: GENERATED ${formatGeneration(column.identity.generated)}`);
   }
   return [nameAndType, ...clauses].join(' ');
 }
