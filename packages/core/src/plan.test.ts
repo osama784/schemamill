@@ -21,7 +21,7 @@ import type { Step } from './plan.ts';
  * Tests for the migration plan: the eight global phases with the nine table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
- * drops, additions, alters and conversions with their own suppression, determinism, and a
+ * drops, additions, alters and conversions, determinism, and a
  * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
  * pairs. Builders keep the fixtures small; expected values are complete steps, asserted with
  * `deepStrictEqual`.
@@ -1823,7 +1823,8 @@ test('a removed identity table or column needs no drop-identity step', () => {
   const target = model(table('u', { columns: [column('id', { type: 'integer', notNull: true })] }));
 
   // The plan removes t wholesale and u.gone; PostgreSQL drops each identity sequence with its
-  // owner, so neither column contributes a drop-identity (the sequence suppression, mirrored).
+  // owner, so neither column contributes a drop-identity — there is no drop to suppress,
+  // because the identity never reaches the plan as its own removal.
   assertPlan(baseline, target, [
     { kind: 'drop-table', table: identity('t') },
     {

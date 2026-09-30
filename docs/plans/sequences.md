@@ -1,6 +1,6 @@
 # Sequences — model, plan, render, verify
 
-**Status:** built · **Last updated:** 2026-09-29
+**Status:** built · **Last updated:** 2026-09-30
 
 Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER SEQUENCE` options that map to modeled fields now travel the whole import → diff → plan → render path, and the result was verified against live PostgreSQL. The settled decisions are on [#16](https://github.com/osama784/schemamill/issues/16) (design review rounds 2–3); the feature landed in [#17](https://github.com/osama784/schemamill/pull/17), and the five verification scenes, the dogfood rerun, and this document in [#18](https://github.com/osama784/schemamill/pull/18).
 
@@ -8,7 +8,7 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **In:** standalone and owned sequences with schema-qualified identity like tables; the options `AS` (`smallint`, `integer`, `bigint`), `INCREMENT BY`, `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`; ownership (`OWNED BY`, `OWNED BY NONE`); import of `CREATE SEQUENCE` (inline `OWNED BY` included) and the `ALTER SEQUENCE` options that map to modeled fields; a `sequences` group in `compare`; `create-sequence`, `alter-sequence`, and `drop-sequence` plan steps; canonical full-explicit rendering.
 
-**Out, named in diagnostics — never silent:** identity columns (`GENERATED … AS IDENTITY` is a distinct PostgreSQL object from a sequence-backed default; import flags it); sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence.
+**Out, named in diagnostics — never silent:** sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence. Identity columns, flagged on import when this slice landed, have since been modeled in the [identity slice](./identity.md) as a column property distinct from a sequence-backed default.
 
 **Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards and transaction grouping stay later work.
 
@@ -43,7 +43,7 @@ One statement per field set, rather than one per field, is deliberate: PostgreSQ
 
 Sequence state is not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That makes one class of hand-written target legal in the model but impossible to apply — flipping a sequence's direction, or narrowing a bound below the sequence's stored value, makes PostgreSQL's `ALTER SEQUENCE` cross-check the current value and fail (`START value … cannot be greater than MAXVALUE`, `RESTART value …`). This is deliberate, with the decisions on record: sequence state is out of scope per [#16](https://github.com/osama784/schemamill/issues/16)'s decision 1, a self-inconsistent target fails loudly at apply per decision 8, and state-aware planning belongs to the hazards slice. The verification shapes stay state-independent for the same reason.
 
-One wording follow-up: on an `AS` transition, `compare` reports the converted value (`max value 9223372036854775807 → 2147483647`) rather than the as-written baseline value; the label should say the value is the conversion's result when the wording pass comes.
+The wording follow-up landed with the [identity slice](./identity.md): on an `AS` transition, `compare` now marks the converted baseline bound, so the example prints `max value 9223372036854775807 (converted) → 2147483647` instead of reading as an as-written value. The [changelog](../../CHANGELOG.md) records the fix.
 
 ## Verification
 
@@ -66,4 +66,4 @@ Three levels pin the slice:
 
 ## Non-goals
 
-Identity columns, sequence state, renames, hazards, and transaction grouping are later slices. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
+Sequence state, renames, hazards, and transaction grouping are later slices. Identity columns, listed here when this slice landed, have since shipped in the [identity slice](./identity.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
