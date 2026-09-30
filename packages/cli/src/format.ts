@@ -135,6 +135,13 @@ function formatStep(step: Step): string {
       return `${formatIdentity(step.table)}.${formatColumn(step.column)}`;
     case 'alter-column':
       return `${formatIdentity(step.table)}.${step.name}: ${formatColumnFields(step.fields)}`;
+    case 'add-identity':
+    case 'drop-identity':
+      return `${formatIdentity(step.table)}.${step.name}`;
+    case 'alter-identity':
+      return `${formatIdentity(step.table)}.${step.name}: ${step.fields
+        .map(formatIdentityField)
+        .join(', ')}`;
     case 'add-primary-key':
     case 'drop-primary-key':
       return `${formatIdentity(step.table)}: ${formatPrimaryKey(step.primaryKey)}`;

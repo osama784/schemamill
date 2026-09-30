@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { plan } from './index.ts';
+import { effectiveIdentity, plan } from './index.ts';
+import type { Identity, IdentityInput } from './identity.ts';
+import type { IdentityFieldChange } from './diff.ts';
 import type {
   Column,
   ForeignKey,
@@ -15,10 +17,11 @@ import type {
 import type { Step } from './plan.ts';
 
 /**
- * Tests for the migration plan: the six global phases with the nine table phases at their
+ * Tests for the migration plan: the eight global phases with the nine table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
- * surviving foreign keys aside, sequence ownership detaches and drop suppression, determinism,
- * and a dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
+ * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
+ * drops, additions, alters and conversions with their own suppression, determinism, and a
+ * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
  * pairs. Builders keep the fixtures small; expected values are complete steps, asserted with
  * `deepStrictEqual`.
  */
@@ -108,6 +111,10 @@ const owner = (table: string, column: string, schema = 'public'): SequenceOwner 
   column,
 });
 
+/** An effective identity for an `integer` column, `GENERATED ALWAYS` unless overridden. */
+const identityColumn = (fields: Partial<IdentityInput> = {}): Identity =>
+  effectiveIdentity('integer', { generated: 'always', ...fields });
+
 /** A copy of `value` without its `ownedBy`, the shape `create-sequence` steps carry. */
 const unowned = (value: Sequence): Sequence => ({
   schema: value.schema,
@@ -147,7 +154,10 @@ const deepFreeze = <T>(value: T): T => {
  *
  * - a `drop-table` fails while another live table holds a live foreign key referencing it;
  * - a `drop-primary-key` fails while a live foreign key references one of the key's columns;
- * - a `drop-column` fails while a live foreign key uses the column or references it.
+ * - a `drop-column` fails while a live foreign key uses the column or references it;
+ * - an identity step must name a live column: `drop-identity` and `alter-identity` require a
+ *   live identity, `add-identity` installs the step's descriptor, and `alter-identity` applies
+ *   its field changes.
  *
  * Add and alter steps update the simulated state, so the end state is compared with the target
  * table by table and constraint by constraint. Every removed table must be dropped exactly
@@ -190,6 +200,12 @@ const copyForeignKey = (foreignKey: ForeignKey): Mutable<ForeignKey> => ({
   referencedColumns: [...foreignKey.referencedColumns],
 });
 
+/** A copy of an identity descriptor, independent of the caller's payload. */
+const copyIdentityDescriptor = (identity: Identity): Identity => ({
+  ...identity,
+  ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
+});
+
 /** A structural key for a foreign key, comparing every field including absent ones. */
 const foreignKeyKey = (foreignKey: ForeignKey): string =>
   JSON.stringify([
@@ -222,6 +238,29 @@ const stateOf = (model: Model): SimulatedState => {
 const referencedColumnsOf = (foreignKey: ForeignKey, state: SimulatedState): readonly string[] => {
   if (foreignKey.referencedColumns.length > 0) return foreignKey.referencedColumns;
   return state.tables.get(keyOf(foreignKey.referencedTable))?.primaryKey?.columns ?? [];
+};
+
+/**
+ * Applies one identity field change to `identity`, returning the altered descriptor; the model
+ * type is readonly, so every clause produces a fresh object.
+ */
+const applyIdentityField = (identity: Identity, field: IdentityFieldChange): Identity => {
+  switch (field.field) {
+    case 'generated':
+      return { ...identity, generated: field.after };
+    case 'increment':
+      return { ...identity, increment: field.after };
+    case 'minValue':
+      return { ...identity, minValue: field.after };
+    case 'maxValue':
+      return { ...identity, maxValue: field.after };
+    case 'start':
+      return { ...identity, start: field.after };
+    case 'cache':
+      return { ...identity, cache: field.after };
+    case 'cycle':
+      return { ...identity, cycle: field.after };
+  }
 };
 
 /** Applies one step to `state`, failing the test when the step is illegal there. */
@@ -347,6 +386,40 @@ const applyStep = (state: SimulatedState, step: Step): void => {
             break;
         }
       }
+      return;
+    }
+    case 'add-identity': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-identity on missing table ${key}`);
+      const altered = table.columns.get(step.name);
+      assert.ok(altered !== undefined, `add-identity on missing ${step.name} on ${key}`);
+      altered.identity = copyIdentityDescriptor(step.identity);
+      return;
+    }
+    case 'drop-identity': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-identity on missing table ${key}`);
+      const altered = table.columns.get(step.name);
+      assert.ok(altered !== undefined, `drop-identity on missing ${step.name} on ${key}`);
+      assert.ok(
+        altered.identity !== undefined,
+        `drop-identity on identity-less ${step.name} on ${key}`,
+      );
+      delete altered.identity;
+      return;
+    }
+    case 'alter-identity': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `alter-identity on missing table ${key}`);
+      const altered = table.columns.get(step.name);
+      assert.ok(altered !== undefined, `alter-identity on missing ${step.name} on ${key}`);
+      let identity = altered.identity;
+      assert.ok(identity !== undefined, `alter-identity on identity-less ${step.name} on ${key}`);
+      for (const field of step.fields) identity = applyIdentityField(identity, field);
+      altered.identity = identity;
       return;
     }
     case 'add-primary-key': {
@@ -1536,6 +1609,555 @@ test('a mixed migration pins the exact step sequence across all nine phases', ()
     },
   ]);
   simulate(baseline, target);
+});
+
+test('an identity added to a kept column becomes one trailing add-identity step', () => {
+  const baseline = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+  );
+  const added = identityColumn({ sequenceName: identity('t_id_seq') });
+  const target = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true, identity: added })] }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: added },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an identity add runs after the table phases set the column NOT NULL', () => {
+  const baseline = model(table('t', { columns: [column('id', { type: 'integer' })] }));
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'notNull', before: false, after: true }],
+    },
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: identityColumn() },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a removed identity precedes DROP NOT NULL and SET DEFAULT on its column', () => {
+  const serialDefault = "nextval('t_id_seq'::regclass)";
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+  );
+  const target = {
+    tables: [
+      table('t', {
+        columns: [column('id', { type: 'integer', default: serialDefault })],
+      }),
+    ],
+    sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+  };
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-identity', table: identity('t'), name: 'id' },
+    { kind: 'create-sequence', sequence: sequence('t_id_seq', { dataType: 'integer' }) },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [
+        { field: 'notNull', before: true, after: false },
+        { field: 'default', after: serialDefault },
+      ],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an added identity column adds the column plain and its identity last', () => {
+  const added = column('id', { type: 'integer', notNull: true, identity: identityColumn() });
+  const target = model(table('t', { columns: [added] }));
+
+  assertPlan(model(table('t')), target, [
+    { kind: 'add-column', table: identity('t'), column: added },
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: identityColumn() },
+  ]);
+  simulate(model(table('t')), target);
+});
+
+test("an added table's identity columns add after the table, one step each", () => {
+  const target = table('t', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+      }),
+      column('label'),
+      column('n', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn({ generated: 'by default' }),
+      }),
+    ],
+  });
+
+  assertPlan(model(), model(target), [
+    { kind: 'create-table', table: { ...target, foreignKeys: [] } },
+    {
+      kind: 'add-identity',
+      table: identity('t'),
+      name: 'id',
+      identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+    },
+    {
+      kind: 'add-identity',
+      table: identity('t'),
+      name: 'n',
+      identity: identityColumn({ generated: 'by default' }),
+    },
+  ]);
+  simulate(model(), model(target));
+});
+
+test('a removed identity drops in the first phase, before the rest of the plan', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+    table('u', { columns: [column('x')] }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-identity', table: identity('t'), name: 'id' },
+    {
+      kind: 'create-table',
+      table: {
+        schema: 'public',
+        name: 'u',
+        columns: [column('x')],
+        foreignKeys: [],
+      },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a removed identity table or column needs no drop-identity step', () => {
+  const removed = identityColumn({ sequenceName: identity('removed_seq') });
+  const baseline = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true, identity: removed })] }),
+    table('u', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('gone', { type: 'integer', notNull: true, identity: removed }),
+      ],
+    }),
+  );
+  const target = model(table('u', { columns: [column('id', { type: 'integer', notNull: true })] }));
+
+  // The plan removes t wholesale and u.gone; PostgreSQL drops each identity sequence with its
+  // owner, so neither column contributes a drop-identity (the sequence suppression, mirrored).
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('t') },
+    {
+      kind: 'drop-column',
+      table: identity('u'),
+      column: column('gone', { type: 'integer', notNull: true, identity: removed }),
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a stated sequence-name mismatch drops first and adds the target identity last', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('old_seq') }),
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('new_seq') }),
+        }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-identity', table: identity('t'), name: 'id' },
+    {
+      kind: 'add-identity',
+      table: identity('t'),
+      name: 'id',
+      identity: identityColumn({ sequenceName: identity('new_seq') }),
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an identity option change becomes one alter-identity carrying every changed field', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({
+            generated: 'by default',
+            increment: '5',
+            minValue: '2',
+            maxValue: '100',
+            start: '3',
+            cache: '4',
+            cycle: true,
+          }),
+        }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-identity',
+      table: identity('t'),
+      name: 'id',
+      fields: [
+        { field: 'generated', before: 'always', after: 'by default' },
+        { field: 'increment', before: '1', after: '5' },
+        { field: 'minValue', before: '1', after: '2' },
+        { field: 'maxValue', before: '2147483647', after: '100' },
+        { field: 'start', before: '1', after: '3' },
+        { field: 'cache', before: '1', after: '4' },
+        { field: 'cycle', before: false, after: true },
+      ],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an identity-only column change emits no alter-column step', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ generated: 'by default' }),
+        }),
+      ],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'alter-identity',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'generated', before: 'always', after: 'by default' }],
+    },
+  ]);
+  assert.equal(
+    steps.some((step) => step.kind === 'alter-column'),
+    false,
+  );
+  simulate(baseline, target);
+});
+
+test('serial to identity drops the default, drops the sequence, then adds the identity', () => {
+  const serialDefault = "nextval('t_id_seq'::regclass)";
+  const baseline = {
+    tables: [
+      table('t', {
+        columns: [column('id', { type: 'integer', notNull: true, default: serialDefault })],
+      }),
+    ],
+    sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
+  };
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+        }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'default', before: serialDefault }],
+    },
+    { kind: 'drop-sequence', sequence: identity('t_id_seq') },
+    {
+      kind: 'add-identity',
+      table: identity('t'),
+      name: 'id',
+      identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('identity to serial drops the identity, creates the sequence, then sets the default', () => {
+  const serialDefault = "nextval('t_id_seq'::regclass)";
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('t_id_seq') }),
+        }),
+      ],
+    }),
+  );
+  const target = {
+    tables: [
+      table('t', {
+        columns: [column('id', { type: 'integer', notNull: true, default: serialDefault })],
+      }),
+    ],
+    sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+  };
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-identity', table: identity('t'), name: 'id' },
+    { kind: 'create-sequence', sequence: sequence('t_id_seq', { dataType: 'integer' }) },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'default', after: serialDefault }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('identity steps pin the exact phase order across a mixed migration', () => {
+  const bSerialDefault = "nextval('b_serial_id_seq'::regclass)";
+  const fSerialDefault = "nextval('f_serial_id_seq'::regclass)";
+  const baseline = sequenceModel(
+    [
+      sequence('b_serial_id_seq', { dataType: 'integer', ownedBy: owner('b_serial', 'id') }),
+      sequence('gone_seq', { dataType: 'integer' }),
+    ],
+    table('a_keep', {
+      columns: [
+        column('id', { type: 'integer', notNull: true, identity: identityColumn() }),
+        column('name'),
+      ],
+    }),
+    table('b_serial', {
+      columns: [column('id', { type: 'integer', notNull: true, default: bSerialDefault })],
+    }),
+    table('c_ident', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('old_seq') }),
+        }),
+      ],
+    }),
+    table('d_alter', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+    table('f_serial', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+  );
+  const target = sequenceModel(
+    [sequence('f_serial_id_seq', { dataType: 'integer', ownedBy: owner('f_serial', 'id') })],
+    table('a_keep', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('name'),
+        column('extra', { type: 'integer', notNull: true, identity: identityColumn() }),
+      ],
+    }),
+    table('b_serial', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('b_serial_id_seq') }),
+        }),
+      ],
+    }),
+    table('c_ident', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ sequenceName: identity('new_seq') }),
+        }),
+      ],
+    }),
+    table('d_alter', {
+      columns: [
+        column('id', {
+          type: 'integer',
+          notNull: true,
+          identity: identityColumn({ generated: 'by default' }),
+        }),
+      ],
+    }),
+    table('e_new', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+    }),
+    table('f_serial', {
+      columns: [column('id', { type: 'integer', notNull: true, default: fSerialDefault })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    // Phase 1: identity drops, in diff order.
+    { kind: 'drop-identity', table: identity('a_keep'), name: 'id' },
+    { kind: 'drop-identity', table: identity('c_ident'), name: 'id' },
+    { kind: 'drop-identity', table: identity('f_serial'), name: 'id' },
+    // Phase 2: the conversion's replacement sequence, name-freed by the phase-1 drops.
+    {
+      kind: 'create-sequence',
+      sequence: sequence('f_serial_id_seq', { dataType: 'integer' }),
+    },
+    // Phase 4: the table phases.
+    {
+      kind: 'create-table',
+      table: {
+        schema: 'public',
+        name: 'e_new',
+        columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
+        foreignKeys: [],
+      },
+    },
+    {
+      kind: 'add-column',
+      table: identity('a_keep'),
+      column: column('extra', { type: 'integer', notNull: true, identity: identityColumn() }),
+    },
+    {
+      kind: 'alter-column',
+      table: identity('b_serial'),
+      name: 'id',
+      fields: [{ field: 'default', before: bSerialDefault }],
+    },
+    {
+      kind: 'alter-column',
+      table: identity('f_serial'),
+      name: 'id',
+      fields: [{ field: 'default', after: fSerialDefault }],
+    },
+    // Phase 5: the replacement sequence's ownership.
+    {
+      kind: 'alter-sequence',
+      sequence: identity('f_serial_id_seq'),
+      fields: [{ field: 'ownedBy', after: owner('f_serial', 'id') }],
+    },
+    // Phase 7: sequence drops, after the table phases released them.
+    { kind: 'drop-sequence', sequence: identity('b_serial_id_seq') },
+    { kind: 'drop-sequence', sequence: identity('gone_seq') },
+    // Phase 8: identity additions, then alters.
+    {
+      kind: 'add-identity',
+      table: identity('a_keep'),
+      name: 'extra',
+      identity: identityColumn(),
+    },
+    {
+      kind: 'add-identity',
+      table: identity('b_serial'),
+      name: 'id',
+      identity: identityColumn({ sequenceName: identity('b_serial_id_seq') }),
+    },
+    {
+      kind: 'add-identity',
+      table: identity('c_ident'),
+      name: 'id',
+      identity: identityColumn({ sequenceName: identity('new_seq') }),
+    },
+    { kind: 'add-identity', table: identity('e_new'), name: 'id', identity: identityColumn() },
+    {
+      kind: 'alter-identity',
+      table: identity('d_alter'),
+      name: 'id',
+      fields: [{ field: 'generated', before: 'always', after: 'by default' }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a deep-frozen model with identities can be planned, and identity steps carry copies', () => {
+  const before = identityColumn({ sequenceName: identity('old_seq') });
+  const after = identityColumn({ generated: 'by default', sequenceName: identity('new_seq') });
+  const baseline = deepFreeze(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'integer', notNull: true, identity: before }), column('x')],
+      }),
+    ),
+  );
+  const target = deepFreeze(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'integer', notNull: true, identity: after }), column('x')],
+      }),
+    ),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-identity', table: identity('t'), name: 'id' },
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: after },
+  ]);
+  simulate(baseline, target);
+
+  const [drop, add] = steps;
+  assert.equal(drop?.kind, 'drop-identity');
+  assert.equal(add?.kind, 'add-identity');
+  if (drop?.kind === 'drop-identity') assert.notEqual(drop.table, baseline.tables[0]);
+  if (add?.kind === 'add-identity') {
+    assert.notEqual(add.identity, after);
+    assert.notEqual(add.identity.sequenceName, after.sequenceName);
+  }
 });
 
 test('structurally equal models in any insertion order produce deep-equal plans', () => {

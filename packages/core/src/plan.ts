@@ -1,5 +1,6 @@
 import { diff } from './diff.ts';
-import type { ColumnFieldChange, SequenceFieldChange } from './diff.ts';
+import type { ColumnFieldChange, IdentityFieldChange, SequenceFieldChange } from './diff.ts';
+import type { Identity } from './identity.ts';
 import type {
   Column,
   ForeignKey,
@@ -22,16 +23,24 @@ import type {
  * change engine's ordering pass: the plan carries every payload a renderer needs, and hazards
  * and transaction grouping are later work.
  *
- * A step is one of twelve kinds. A table addition becomes a create-table step carrying the
+ * A step is one of fifteen kinds. A table addition becomes a create-table step carrying the
  * table's columns and primary key as they are, plus one add-foreign-key step per foreign key —
  * the create-table payload is always free of foreign keys, so constraints attach only once
  * every referenced table exists. A table removal becomes a drop-table step. A changed table is
  * mapped member by member: a removed column becomes drop-column, an added column add-column, a
  * changed column alter-column carrying only its differing fields in the fixed order `type`,
- * `notNull`, `default`; a removed, added, or changed primary key becomes a drop-primary-key
- * and/or add-primary-key step; and a removed, added, or changed foreign key becomes a
- * drop-foreign-key and/or add-foreign-key step. A changed primary key or foreign key
- * decomposes into its drop half and its add half.
+ * `notNull`, `default`, plus, when the column's identity differs, identity steps — an identity
+ * addition becomes an add-identity step carrying the target descriptor, a removal a
+ * drop-identity, a change an alter-identity carrying only its differing fields, and a stated
+ * sequence-name mismatch a drop-identity and an add-identity (a recreation); a removed, added,
+ * or changed primary key becomes a drop-primary-key and/or add-primary-key step; and a removed,
+ * added, or changed foreign key becomes a drop-foreign-key and/or add-foreign-key step. A
+ * changed primary key or foreign key decomposes into its drop half and its add half.
+ *
+ * Identity is never inlined into create-table or add-column: an added table or column whose
+ * column carries an identity contributes its own add-identity step, and a column-changed entry
+ * with an empty `fields` list (an identity-only change) contributes no alter-column step. No
+ * step carries an empty change list.
  *
  * A sequence addition becomes a create-sequence step carrying the sequence's effective options
  * but never its ownership, plus, when the target owns the sequence, an attach step in the
@@ -42,27 +51,44 @@ import type {
  * ownership phases, and every other changed field becomes an option alter-sequence step,
  * carrying only the fields that differ.
  *
- * The final sequence is the concatenation of six global phases, in this exact order:
+ * The final sequence is the concatenation of eight global phases, in this exact order:
  *
- * 1. create-sequence — one per added sequence, in sequence identity order;
- * 2. ownership detaches — an ownership alter-sequence step for every kept sequence whose
+ * 1. drop-identity — every removed identity whose column survives, in the diff's column and
+ *    table order. It runs before everything else: it must precede the `DROP NOT NULL` /
+ *    `SET DEFAULT` the table phases put on the same column, and it frees the default sequence
+ *    name for the replacement sequence the identity→serial conversion creates in phase 2 (or
+ *    for the replacement identity's sequence added in phase 8);
+ * 2. create-sequence — one per added sequence, in sequence identity order;
+ * 3. ownership detaches — an ownership alter-sequence step for every kept sequence whose
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 3. table operations — the nine table phases listed below, in their exact order;
- * 4. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
+ * 4. table operations — the nine table phases listed below, in their exact order;
+ * 5. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
- *    removed in phase 2: a new owner after a phase-2 detach, a new owner over a surviving
+ *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
  *    baseline one, or a detach when the target drops ownership but keeps the owner;
- * 5. sequence option alters — one alter-sequence step per changed sequence, carrying its
+ * 6. sequence option alters — one alter-sequence step per changed sequence, carrying its
  *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
  *    statement without passing through an invalid intermediate state;
- * 6. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
- *    identity order. Drops come last, after the table phases, so a column `DROP DEFAULT` has
- *    already released the sequence by the time its drop runs; a surviving default that still
- *    references a dropped sequence is a broken target and fails at apply.
+ * 7. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
+ *    identity order. Drops come after the table phases, so a column `DROP DEFAULT` has already
+ *    released the sequence by the time its drop runs; a surviving default that still
+ *    references a dropped sequence is a broken target and fails at apply;
+ * 8. add-identity, then alter-identity — the identity additions and option alters, in the
+ *    diff's column and table order, adds before alters. They run last because `ADD GENERATED`
+ *    manufactures a fresh sequence: by then the table phases have produced the column, its
+ *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 7 have freed the sequence names
+ *    the added identities replace. This placement alone makes both conversions compositions of
+ *    ordinary steps: serial→identity is a phase-4 `DROP DEFAULT`, a phase-7 sequence drop, and
+ *    a phase-8 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
+ *    create-sequence, and a phase-4 `SET DEFAULT`.
  *
- * The table phases inside phase 3 are numbered as before (and keep their documented semantics):
+ * A drop-identity is suppressed, like a drop-sequence, when the plan also removes its table or
+ * column: PostgreSQL drops an identity sequence together with its owner, so the owner's own
+ * drop supersedes the explicit one.
+ *
+ * The table phases inside phase 4 are numbered as before (and keep their documented semantics):
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -153,6 +179,17 @@ export type Step =
       name: string;
       fields: readonly ColumnFieldChange[];
     }
+  /** The target has an identity on a column the baseline does not; the full effective descriptor. */
+  | { kind: 'add-identity'; table: TableIdentity; name: string; identity: Identity }
+  /** The baseline has an identity on a column the target does not. */
+  | { kind: 'drop-identity'; table: TableIdentity; name: string }
+  /** An identity both sides have with differing options, in the diff's fixed field order. */
+  | {
+      kind: 'alter-identity';
+      table: TableIdentity;
+      name: string;
+      fields: readonly IdentityFieldChange[];
+    }
   /** The target has a primary key the baseline does not. */
   | { kind: 'add-primary-key'; table: TableIdentity; primaryKey: PrimaryKey }
   /** The baseline has a primary key the target does not. */
@@ -189,6 +226,9 @@ export function plan(baseline: Model, target: Model): Plan {
   const columnAlters: Step[] = [];
   const primaryKeyAdds: Step[] = [];
   const foreignKeyAdds: Step[] = [];
+  const identityDrops: RemovedIdentity[] = [];
+  const identityAdds: Step[] = [];
+  const identityAlters: Step[] = [];
   const sequenceCreates: Step[] = [];
   const optionAlters: Step[] = [];
   const ownershipChanges: SequenceOwnershipChange[] = [];
@@ -218,6 +258,15 @@ export function plan(baseline: Model, target: Model): Plan {
             foreignKey: copyForeignKey(foreignKey),
           });
         }
+        for (const column of change.table.columns) {
+          if (column.identity === undefined) continue;
+          identityAdds.push({
+            kind: 'add-identity',
+            table: copyIdentity(change.table),
+            name: column.name,
+            identity: copyColumnIdentity(column.identity),
+          });
+        }
         break;
       }
       case 'table-changed': {
@@ -238,15 +287,66 @@ export function plan(baseline: Model, target: Model): Plan {
                 table: copyIdentity(change.table),
                 column: copyColumn(tableChange.column),
               });
+              if (tableChange.column.identity !== undefined) {
+                identityAdds.push({
+                  kind: 'add-identity',
+                  table: copyIdentity(change.table),
+                  name: tableChange.column.name,
+                  identity: copyColumnIdentity(tableChange.column.identity),
+                });
+              }
               break;
             }
             case 'column-changed': {
-              columnAlters.push({
-                kind: 'alter-column',
-                table: copyIdentity(change.table),
-                name: tableChange.name,
-                fields: tableChange.fields.map(copyFieldChange),
-              });
+              if (tableChange.fields.length > 0) {
+                columnAlters.push({
+                  kind: 'alter-column',
+                  table: copyIdentity(change.table),
+                  name: tableChange.name,
+                  fields: tableChange.fields.map(copyFieldChange),
+                });
+              }
+              const identityChange = tableChange.identity;
+              if (identityChange !== undefined) {
+                switch (identityChange.kind) {
+                  case 'added':
+                    identityAdds.push({
+                      kind: 'add-identity',
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                      identity: copyColumnIdentity(identityChange.identity),
+                    });
+                    break;
+                  case 'removed':
+                    identityDrops.push({
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                    });
+                    break;
+                  case 'recreated':
+                    identityDrops.push({
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                    });
+                    identityAdds.push({
+                      kind: 'add-identity',
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                      identity: copyColumnIdentity(identityChange.identity),
+                    });
+                    break;
+                  case 'changed':
+                    if (identityChange.fields.length > 0) {
+                      identityAlters.push({
+                        kind: 'alter-identity',
+                        table: copyIdentity(change.table),
+                        name: tableChange.name,
+                        fields: identityChange.fields.map(copyIdentityFieldChange),
+                      });
+                    }
+                    break;
+                }
+              }
               break;
             }
             case 'primary-key-removed': {
@@ -364,9 +464,10 @@ export function plan(baseline: Model, target: Model): Plan {
     primaryKeyDrops,
   );
 
-  const ownerRemoved = (owner: SequenceOwner): boolean =>
-    removedTableKeys.has(keyOf(owner.table)) ||
-    removedColumnKeys.has(columnKey(owner.table, owner.column));
+  const columnRemoved = (table: TableIdentity, column: string): boolean =>
+    removedTableKeys.has(keyOf(table)) || removedColumnKeys.has(columnKey(table, column));
+
+  const ownerRemoved = (owner: SequenceOwner): boolean => columnRemoved(owner.table, owner.column);
 
   const ownershipDetaches: Step[] = [];
   const ownershipAttaches: Step[] = [];
@@ -405,8 +506,21 @@ export function plan(baseline: Model, target: Model): Plan {
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
+  // PostgreSQL drops an identity sequence together with its owning table or column, so the
+  // owner's own drop supersedes an explicit drop-identity; mirror the sequence suppression.
+  const identityDropSteps: Step[] = [];
+  for (const removed of identityDrops) {
+    if (columnRemoved(removed.table, removed.name)) continue;
+    identityDropSteps.push({
+      kind: 'drop-identity',
+      table: copyIdentity(removed.table),
+      name: removed.name,
+    });
+  }
+
   return {
     steps: [
+      ...identityDropSteps,
       ...sequenceCreates,
       ...ownershipDetaches,
       ...foreignKeyDrops,
@@ -424,6 +538,8 @@ export function plan(baseline: Model, target: Model): Plan {
       ...ownershipAttaches,
       ...optionAlters,
       ...sequenceDrops,
+      ...identityAdds,
+      ...identityAlters,
     ],
   };
 }
@@ -439,6 +555,12 @@ interface SequenceOwnershipChange {
 interface RemovedSequence {
   readonly identity: SequenceIdentity;
   readonly ownedBy?: SequenceOwner;
+}
+
+/** A removed identity, held until the plan knows whether its owner's drop cascades it. */
+interface RemovedIdentity {
+  readonly table: TableIdentity;
+  readonly name: string;
 }
 
 /** A removed table, held with its canonical payload while phase 2 orders the drops. */
@@ -560,6 +682,26 @@ function copyForeignKey(foreignKey: ForeignKey): ForeignKey {
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
   return { ...field };
+}
+
+/** A copy of one identity field change, independent of the diff's payload. */
+function copyIdentityFieldChange(field: IdentityFieldChange): IdentityFieldChange {
+  return { ...field };
+}
+
+/** A copy of a column's identity descriptor, independent of the caller's model. */
+function copyColumnIdentity(identity: Identity): Identity {
+  return {
+    ...identity,
+    ...(identity.sequenceName === undefined
+      ? {}
+      : {
+          sequenceName: {
+            schema: identity.sequenceName.schema,
+            name: identity.sequenceName.name,
+          },
+        }),
+  };
 }
 
 /** A copy of one sequence field change, independent of the diff's payload. */

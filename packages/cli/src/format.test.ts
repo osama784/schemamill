@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Change, Identity, IdentityChange } from '@schemamill/core';
+import type { Change, Identity, IdentityChange, Plan } from '@schemamill/core';
 
-import { formatChanges } from './format.ts';
+import { formatChanges, formatPlan } from './format.ts';
 
 /**
- * Tests for the `compare` rendering: the converted-bound wording on a sequence or identity
- * type conversion, where the diff reports the value in effect after the engine's conversion
- * rather than the as-written baseline value, and the identity change lines.
+ * Tests for the CLI renderings: the converted-bound wording on a sequence or identity type
+ * conversion, where the diff reports the value in effect after the engine's conversion rather
+ * than the as-written baseline value; the identity change lines; and the identity plan steps.
  */
 
 test('a converted sequence bound prints with the converted mark', () => {
@@ -123,5 +123,45 @@ test('identity additions, removals, and recreations print as marker lines', () =
   assert.equal(
     formatChanges([change({ kind: 'recreated', identity: descriptor })]),
     ['~ table public.users', '    ~ column id: identity: recreated', ''].join('\n'),
+  );
+});
+
+test('identity plan steps print the column and the changed options', () => {
+  const descriptor: Identity = {
+    generated: 'always',
+    increment: '1',
+    minValue: '1',
+    maxValue: '2147483647',
+    start: '1',
+    cache: '1',
+    cycle: false,
+  };
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'add-identity',
+        table: { schema: 'public', name: 'users' },
+        name: 'id',
+        identity: descriptor,
+      },
+      {
+        kind: 'alter-identity',
+        table: { schema: 'public', name: 'users' },
+        name: 'id',
+        fields: [{ field: 'increment', before: '1', after: '2' }],
+      },
+      { kind: 'drop-identity', table: { schema: 'public', name: 'users' }, name: 'id' },
+    ],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '3 steps:',
+      ' 1. add-identity    public.users.id',
+      ' 2. alter-identity  public.users.id: increment 1 → 2',
+      ' 3. drop-identity   public.users.id',
+      '',
+    ].join('\n'),
   );
 });
