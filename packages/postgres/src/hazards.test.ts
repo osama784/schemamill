@@ -107,10 +107,11 @@ test('a target-only sequence reports every definite violation in check order', (
   const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    { kind: 'increment-zero', step, increment: '0' },
+    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '-50000' },
     { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'min', value: '-40000' },
     { kind: 'bounds-inverted', step, minValue: '-40000', maxValue: '-50000' },
     { kind: 'start-out-of-bounds', step, start: '7', minValue: '-40000', maxValue: '-50000' },
-    { kind: 'increment-zero', step, increment: '0' },
     { kind: 'cache-nonpositive', step, cache: '0' },
   ]);
 });
@@ -125,6 +126,46 @@ test('a target-only sequence reports a maximum above its data type', () => {
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
     { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '40000' },
+  ]);
+});
+
+test('a target-only sequence reports a minimum above its data type', () => {
+  const baseline = model();
+  const target = sequenceModel([
+    sequence('s', { dataType: 'integer', minValue: '4000000000', maxValue: '100', start: '100' }),
+  ]);
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
+
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      dataType: 'integer',
+      field: 'min',
+      value: '4000000000',
+    },
+    { kind: 'bounds-inverted', step, minValue: '4000000000', maxValue: '100' },
+    { kind: 'start-out-of-bounds', step, start: '100', minValue: '4000000000', maxValue: '100' },
+  ]);
+});
+
+test('a target-only sequence reports a maximum below its data type', () => {
+  const baseline = model();
+  const target = sequenceModel([sequence('s', { dataType: 'integer', maxValue: '-4000000000' })]);
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
+
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      dataType: 'integer',
+      field: 'max',
+      value: '-4000000000',
+    },
+    { kind: 'bounds-inverted', step, minValue: '1', maxValue: '-4000000000' },
+    { kind: 'start-out-of-bounds', step, start: '1', minValue: '1', maxValue: '-4000000000' },
   ]);
 });
 
@@ -146,10 +187,11 @@ test('a matched sequence reports definite violations on its alter step', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    { kind: 'increment-zero', step, increment: '0' },
+    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '-50000' },
     { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'min', value: '-40000' },
     { kind: 'bounds-inverted', step, minValue: '-40000', maxValue: '-50000' },
     { kind: 'start-out-of-bounds', step, start: '7', minValue: '-40000', maxValue: '-50000' },
-    { kind: 'increment-zero', step, increment: '0' },
     { kind: 'cache-nonpositive', step, cache: '0' },
   ]);
 });

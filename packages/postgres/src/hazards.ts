@@ -26,13 +26,14 @@ import type {
  * nothing; the plan is the only source of step indices.
  *
  * Definite hazards are self-inconsistent targets, rejected at apply regardless of stored state.
- * Each entity is checked in PostgreSQL's order and every violation is reported:
- * `bound-out-of-type-range` for a `MINVALUE` below the type's minimum, then a `MAXVALUE` above
- * its maximum — a sequence reads its own `dataType`, an identity column its canonical integer
- * type (`canonicalIntType`; a column outside that family skips this check and no other) — then
+ * Each entity is checked in PostgreSQL's order and every violation is reported: `increment-zero`
+ * first, then `bound-out-of-type-range` for a `MAXVALUE` and a `MINVALUE` that fall outside the
+ * type's range — each bound checked against both ends, below the type's minimum and above its
+ * maximum; a sequence reads its own `dataType`, an identity column its canonical integer type
+ * (`canonicalIntType`; a column outside that family skips this pair and no other check) — then
  * `bounds-inverted` (`minValue >= maxValue`), `start-out-of-bounds` (`start` outside
- * `[minValue, maxValue]`, both edges inclusive), `increment-zero`, and `cache-nonpositive`.
- * Every comparison is `bigint` over the stored decimal strings, never JavaScript `number`.
+ * `[minValue, maxValue]`, both edges inclusive), and `cache-nonpositive`. Every comparison is
+ * `bigint` over the stored decimal strings, never JavaScript `number`.
  *
  * The one conditional kind is `bound-tightened`: an entity present on both sides whose target
  * `MINVALUE` rose above the baseline's, or whose target `MAXVALUE` fell below it. PostgreSQL
@@ -271,9 +272,11 @@ function findStepIndex(
 }
 
 /**
- * Every definite violation of `options` against `dataType`, in PostgreSQL's check order. An
- * undefined `dataType` — an identity column outside the canonical integer types — skips the
- * type-range pair and no other check.
+ * Every definite violation of `options` against `dataType`, in PostgreSQL's check order:
+ * `INCREMENT BY 0`, then each bound against both ends of the type's range (`MAXVALUE` before
+ * `MINVALUE`), then the inverted bounds, the start, and the cache. An undefined `dataType` — an
+ * identity column outside the canonical integer types — skips the type-range pair and no other
+ * check.
  */
 function definiteHazards(
   dataType: SequenceDataType | undefined,
@@ -281,24 +284,33 @@ function definiteHazards(
   step: number,
 ): Hazard[] {
   const hazards: Hazard[] = [];
+  if (options.increment === '0') {
+    hazards.push({ kind: 'increment-zero', step, increment: options.increment });
+  }
   if (dataType !== undefined) {
     const bounds = sequenceTypeBounds(dataType);
-    if (BigInt(options.minValue) < BigInt(bounds.minValue)) {
-      hazards.push({
-        kind: 'bound-out-of-type-range',
-        step,
-        dataType,
-        field: 'min',
-        value: options.minValue,
-      });
-    }
-    if (BigInt(options.maxValue) > BigInt(bounds.maxValue)) {
+    if (
+      BigInt(options.maxValue) < BigInt(bounds.minValue) ||
+      BigInt(options.maxValue) > BigInt(bounds.maxValue)
+    ) {
       hazards.push({
         kind: 'bound-out-of-type-range',
         step,
         dataType,
         field: 'max',
         value: options.maxValue,
+      });
+    }
+    if (
+      BigInt(options.minValue) < BigInt(bounds.minValue) ||
+      BigInt(options.minValue) > BigInt(bounds.maxValue)
+    ) {
+      hazards.push({
+        kind: 'bound-out-of-type-range',
+        step,
+        dataType,
+        field: 'min',
+        value: options.minValue,
       });
     }
   }
@@ -321,9 +333,6 @@ function definiteHazards(
       minValue: options.minValue,
       maxValue: options.maxValue,
     });
-  }
-  if (options.increment === '0') {
-    hazards.push({ kind: 'increment-zero', step, increment: options.increment });
   }
   if (BigInt(options.cache) <= 0n) {
     hazards.push({ kind: 'cache-nonpositive', step, cache: options.cache });

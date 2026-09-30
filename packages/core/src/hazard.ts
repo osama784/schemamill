@@ -31,7 +31,7 @@ export type Hazard =
       readonly minValue: string;
       readonly maxValue: string;
     }
-  /** A target bound exceeds the sequence's data type range — PostgreSQL rejects it at apply. */
+  /** A target bound falls outside the sequence's data type range — PostgreSQL rejects it at apply. */
   | {
       readonly kind: 'bound-out-of-type-range';
       readonly step: number;
