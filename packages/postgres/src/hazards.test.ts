@@ -459,6 +459,79 @@ test('an identity narrowed bigint to integer attaches the tightening to alter-co
   ]);
 });
 
+test('a converted custom bound outside the new type range reports it on alter-column', () => {
+  const baseline = model(
+    table('t', [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { minValue: '-4000000000', start: '-4000000000' }),
+      }),
+    ]),
+  );
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', { minValue: '-4000000000', start: '-4000000000' }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-column');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      dataType: 'integer',
+      field: 'min',
+      value: '-4000000000',
+    },
+  ]);
+});
+
+test('a converted in-range custom bound reports nothing', () => {
+  const identityOf = (dataType: SequenceDataType): Identity =>
+    identityColumn(dataType, { minValue: '-40000', maxValue: '40000', start: '-40000' });
+  const baseline = model(
+    table('t', [column('id', { type: 'bigint', notNull: true, identity: identityOf('bigint') })]),
+  );
+  const target = model(
+    table('t', [column('id', { type: 'integer', notNull: true, identity: identityOf('integer') })]),
+  );
+  const planned = plan(baseline, target);
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), []);
+});
+
+test('a converted non-integer identity skips the definite checks', () => {
+  const identity = (): Identity =>
+    identityColumn('integer', { minValue: '5', maxValue: '5', start: '5' });
+  const baseline = model(
+    table('t', [column('id', { type: 'text', notNull: true, identity: identity() })]),
+  );
+  const target = model(
+    table('t', [column('id', { type: 'varchar(10)', notNull: true, identity: identity() })]),
+  );
+  const planned = plan(baseline, target);
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), []);
+});
+
 test('a recreated identity reports a definite hazard on its add step', () => {
   const baseline = model(
     table('t', [

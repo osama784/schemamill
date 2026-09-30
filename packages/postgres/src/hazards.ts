@@ -45,11 +45,14 @@ import type {
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
  * whose bounds are applied, or to its first `alter-sequence` step when it has only ownership
  * steps. A target-only identity attaches to its `add-identity` step. A matched identity attaches
- * to its `alter-identity` step; a definite hazard on a recreated identity — the plan drops the
- * old identity and adds a new one — falls back to that `add-identity` step, the statement that
- * would fail, and a recreated identity reports no conditional hazard because its old sequence
- * is dropped rather than cross-checked. A tightening the type conversion moves with no
- * `alter-identity` step attaches to the `alter-column` step carrying the change. Hazards come
+ * to its `alter-identity` step, or, when the plan carries no identity step and the column's
+ * type converts within the integer family, to the `alter-column` step carrying the `type`
+ * change — the statement PostgreSQL converts and validates with. A definite hazard on a
+ * recreated identity — the plan drops the old identity and adds a new one — falls back to that
+ * `add-identity` step, the statement that would fail, and a recreated identity reports no
+ * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
+ * the type conversion moves with no `alter-identity` step attaches to the same `alter-column`
+ * step carrying the change. Hazards come
  * back in plan order — step index ascending, then the entity's fixed check order. Entities are
  * iterated in sorted identity order, so neither model's array order can affect the result.
  * Returned hazards are fresh objects: the models and the plan are never mutated.
@@ -205,8 +208,11 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   }
   const alterIdentity = findIdentityStep(steps, entry, 'alter-identity');
   const addIdentity = findIdentityStep(steps, entry, 'add-identity');
-  // A recreated identity has no alter step: the add step carries the whole target descriptor.
-  const definiteStep = alterIdentity ?? addIdentity;
+  // A recreation has no alter step: the add step carries the whole target descriptor. An
+  // identity whose options survive the column's int-family type conversion has no identity step
+  // either: that alter-column step is the statement whose conversion PostgreSQL validates.
+  const typeStep = dataType === undefined ? undefined : findIdentityTypeStep(steps, entry);
+  const definiteStep = alterIdentity ?? addIdentity ?? typeStep;
   const definite =
     definiteStep === undefined ? [] : definiteHazards(dataType, target, definiteStep);
   if (definite.length > 0) return definite;
@@ -239,6 +245,18 @@ function findIdentityStep(
         return false;
     }
   });
+}
+
+/** The index of the first `alter-column` step for `entry` carrying a `type` change. */
+function findIdentityTypeStep(steps: readonly Step[], entry: IdentityEntry): number | undefined {
+  return findStepIndex(
+    steps,
+    (candidate) =>
+      candidate.kind === 'alter-column' &&
+      sameIdentity(candidate.table, entry.table) &&
+      candidate.name === entry.name &&
+      candidate.fields.some((field) => field.field === 'type'),
+  );
 }
 
 /** The index of the first step satisfying `predicate`, or `undefined` when none does. */
