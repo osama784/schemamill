@@ -423,6 +423,43 @@ test('a matched sequence attaches the tightening to its option step', () => {
   ]);
 });
 
+test('an ownership-only alter reports no definite hazards', () => {
+  const t = table('t', [
+    column('a', { type: 'bigint', notNull: true }),
+    column('b', { type: 'bigint', notNull: true }),
+  ]);
+  const owner = (columnName: string): SequenceOwner => ({
+    table: identity('t'),
+    column: columnName,
+  });
+  const broken = (columnName: string): Sequence =>
+    sequence('s', {
+      increment: '0',
+      minValue: '1',
+      maxValue: '100',
+      start: '1',
+      ownedBy: owner(columnName),
+    });
+  const baseline = sequenceModel([broken('a')], t);
+  const target = sequenceModel([broken('b')], t);
+  const planned = plan(baseline, target);
+
+  assert.deepEqual(planned.steps, [
+    {
+      kind: 'alter-sequence',
+      sequence: { schema: 'public', name: 's' },
+      fields: [
+        {
+          field: 'ownedBy',
+          before: { table: identity('t'), column: 'a' },
+          after: { table: identity('t'), column: 'b' },
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(analyzeHazards(baseline, target, planned), []);
+});
+
 test('both bounds tightened report the minimum before the maximum', () => {
   const baseline = sequenceModel([sequence('s', { minValue: '1', maxValue: '100', start: '1' })]);
   const target = sequenceModel([sequence('s', { minValue: '10', maxValue: '50', start: '10' })]);
@@ -497,6 +534,83 @@ test('an identity narrowed bigint to integer attaches the tightening to alter-co
       field: 'max',
       before: '9223372036854775807',
       after: '2147483647',
+    },
+  ]);
+});
+
+test('a conversion tightening attaches to alter-column beside an option alter', () => {
+  const baseline = model(
+    table('t', [
+      column('id', { type: 'bigint', notNull: true, identity: identityColumn('bigint') }),
+    ]),
+  );
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', { cache: '10' }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const typeStep = stepIndex(
+    planned,
+    (candidate) =>
+      candidate.kind === 'alter-column' && candidate.fields.some((field) => field.field === 'type'),
+  );
+  const identityStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-identity');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column', 'alter-identity'],
+  );
+  assert.deepEqual(planned.steps[identityStep], {
+    kind: 'alter-identity',
+    table: identity('t'),
+    name: 'id',
+    fields: [{ field: 'cache', before: '1', after: '10' }],
+  });
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-tightened',
+      step: typeStep,
+      field: 'max',
+      before: '9223372036854775807',
+      after: '2147483647',
+    },
+  ]);
+});
+
+test('an identity restating a converted bound keeps the tightening on alter-identity', () => {
+  const baseline = model(
+    table('t', [
+      column('id', { type: 'bigint', notNull: true, identity: identityColumn('bigint') }),
+    ]),
+  );
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', { maxValue: '1000', cache: '10' }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const identityStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-identity');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column', 'alter-identity'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-tightened',
+      step: identityStep,
+      field: 'max',
+      before: '9223372036854775807',
+      after: '1000',
     },
   ]);
 });

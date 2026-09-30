@@ -1,4 +1,4 @@
-import { canonicalIntType, sequenceTypeBounds } from '@schemamill/core';
+import { canonicalIntType, sequenceTypeBounds, sequenceTypeChange } from '@schemamill/core';
 import type {
   Column,
   Hazard,
@@ -44,16 +44,18 @@ import type {
  *
  * A target-only sequence attaches to its `create-sequence` step; a matched one to the first
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
- * whose bounds are applied, or to its first `alter-sequence` step when it has only ownership
- * steps. A target-only identity attaches to its `add-identity` step. A matched identity attaches
- * to its `alter-identity` step, or, when the plan carries no identity step and the column's
- * type converts within the integer family, to the `alter-column` step carrying the `type`
- * change — the statement PostgreSQL converts and validates with. A definite hazard on a
- * recreated identity — the plan drops the old identity and adds a new one — falls back to that
+ * whose bounds PostgreSQL applies; an ownership-only alter applies no options at all and so
+ * carries no hazard, and a matched sequence with no option step reports nothing. A target-only
+ * identity attaches to its `add-identity` step. A matched identity attaches to its
+ * `alter-identity` step, or, when the plan carries no identity step and the column's type
+ * converts within the integer family, to the `alter-column` step carrying the `type` change —
+ * the statement PostgreSQL converts and validates with. A definite hazard on a recreated
+ * identity — the plan drops the old identity and adds a new one — falls back to that
  * `add-identity` step, the statement that would fail, and a recreated identity reports no
  * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
- * the type conversion moves with no `alter-identity` step attaches to the same `alter-column`
- * step carrying the change. Hazards come
+ * the column's type conversion moves attaches to the same `alter-column` type step unless the
+ * `alter-identity` step restates that bound as its own field: the restatement is the statement
+ * that applies the final bound, so it keeps the hazard. Hazards come
  * back in plan order — step index ascending, then the entity's fixed check order. Entities are
  * iterated in sorted identity order, so neither model's array order can affect the result.
  * Returned hazards are fresh objects: the models and the plan are never mutated.
@@ -89,6 +91,8 @@ interface IdentityEntry {
   readonly table: TableIdentity;
   readonly name: string;
   baseline?: Identity;
+  /** The baseline column's as-written type; the identity's sequence type always follows it. */
+  baselineType?: string;
   targetColumn?: Column;
 }
 
@@ -152,8 +156,12 @@ function collectIdentities(
         entry = { table: { schema: table.schema, name: table.name }, name: column.name };
         entries.set(key, entry);
       }
-      if (side === 'baseline') entry.baseline = column.identity;
-      else entry.targetColumn = column;
+      if (side === 'baseline') {
+        entry.baseline = column.identity;
+        entry.baselineType = column.type;
+      } else {
+        entry.targetColumn = column;
+      }
     }
   }
 }
@@ -174,26 +182,25 @@ function sequenceHazards(entry: SequenceEntry, steps: readonly Step[]): readonly
   if (step === undefined) return [];
   const definite = definiteHazards(target.dataType, target, step);
   if (definite.length > 0 || entry.baseline === undefined) return definite;
-  return tightenedHazards(entry.baseline, target, step);
+  return tightenedHazards(entry.baseline, target, () => step);
 }
 
 /**
  * The first `alter-sequence` step for `identity` that carries a non-ownership option, because
- * that is the step whose bounds PostgreSQL applies; a sequence whose plan carries only
- * ownership alters falls back to the first of those.
+ * that is the step whose bounds PostgreSQL applies; an ownership-only alter applies no options
+ * and so validates none of them.
  */
 function findSequenceAlterStep(
   steps: readonly Step[],
   identity: SequenceIdentity,
 ): number | undefined {
-  let ownershipOnly: number | undefined;
-  for (let index = 0; index < steps.length; index += 1) {
-    const step = steps[index]!;
-    if (step.kind !== 'alter-sequence' || !sameIdentity(step.sequence, identity)) continue;
-    if (step.fields.some((field) => field.field !== 'ownedBy')) return index;
-    ownershipOnly ??= index;
-  }
-  return ownershipOnly;
+  return findStepIndex(
+    steps,
+    (candidate) =>
+      candidate.kind === 'alter-sequence' &&
+      sameIdentity(candidate.sequence, identity) &&
+      candidate.fields.some((field) => field.field !== 'ownedBy'),
+  );
 }
 
 /** The hazards an identity column carries: definite on either side, plus tightening when matched. */
@@ -207,6 +214,7 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
     if (step === undefined) return [];
     return definiteHazards(dataType, target, step);
   }
+  const baseline = entry.baseline;
   const alterIdentity = findIdentityStep(steps, entry, 'alter-identity');
   const addIdentity = findIdentityStep(steps, entry, 'add-identity');
   // A recreation has no alter step: the add step carries the whole target descriptor. An
@@ -223,7 +231,32 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   // A conversion that moves a default bound is carried by the column's type step instead.
   const conditionalStep = alterIdentity ?? findIdentityStep(steps, entry, 'alter-column');
   if (conditionalStep === undefined) return [];
-  return tightenedHazards(entry.baseline, target, conditionalStep);
+  // The bounds the column's type conversion would leave, per the engine's `AS` rules: a bound
+  // exactly equal to the old type's bound is rewritten to the new type's. A bound the
+  // conversion lowers that the alter-identity step does not restate belongs to the type step.
+  const baselineType =
+    entry.baselineType === undefined ? undefined : canonicalIntType(entry.baselineType);
+  const projection =
+    baselineType !== undefined && dataType !== undefined && baselineType !== dataType
+      ? sequenceTypeChange(baselineType, baseline.minValue, baseline.maxValue, dataType)
+      : undefined;
+  const alterStep = alterIdentity === undefined ? undefined : steps[alterIdentity]!;
+  const restated = (field: 'min' | 'max'): boolean =>
+    alterStep !== undefined &&
+    alterStep.kind === 'alter-identity' &&
+    alterStep.fields.some(
+      (candidate) => candidate.field === (field === 'min' ? 'minValue' : 'maxValue'),
+    );
+  const conversionTightens = (field: 'min' | 'max'): boolean =>
+    projection !== undefined &&
+    (field === 'min'
+      ? BigInt(projection.minValue) > BigInt(baseline.minValue)
+      : BigInt(projection.maxValue) < BigInt(baseline.maxValue));
+  return tightenedHazards(baseline, target, (field) => {
+    if (alterIdentity !== undefined && restated(field)) return alterIdentity;
+    if (conversionTightens(field) && typeStep !== undefined) return typeStep;
+    return conditionalStep;
+  });
 }
 
 /** The index of the first step of `kind` whose table and column name match `entry`. */
@@ -340,13 +373,20 @@ function definiteHazards(
   return hazards;
 }
 
-/** The bounds `after` tightens below `before`, `min` before `max`, with both actual values. */
-function tightenedHazards(before: Options, after: Options, step: number): Hazard[] {
+/**
+ * The bounds `after` tightens below `before`, `min` before `max`, with both actual values; each
+ * bound attaches to the step `stepFor` names for its field.
+ */
+function tightenedHazards(
+  before: Options,
+  after: Options,
+  stepFor: (field: 'min' | 'max') => number,
+): Hazard[] {
   const hazards: Hazard[] = [];
   if (BigInt(after.minValue) > BigInt(before.minValue)) {
     hazards.push({
       kind: 'bound-tightened',
-      step,
+      step: stepFor('min'),
       field: 'min',
       before: before.minValue,
       after: after.minValue,
@@ -355,7 +395,7 @@ function tightenedHazards(before: Options, after: Options, step: number): Hazard
   if (BigInt(after.maxValue) < BigInt(before.maxValue)) {
     hazards.push({
       kind: 'bound-tightened',
-      step,
+      step: stepFor('max'),
       field: 'max',
       before: before.maxValue,
       after: after.maxValue,
