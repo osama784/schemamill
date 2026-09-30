@@ -28,7 +28,11 @@ export interface SqlRenderer<Plan> {
   render(plan: Plan): string;
 }
 
-/** A migration plan → hazard annotations. Hazards belong to the plan. */
-export interface HazardAnalyzer<Plan, Hazard> {
-  analyze(plan: Plan): readonly Hazard[];
+/** Planned changes → hazard annotations. Hazards belong to the plan. */
+export interface HazardAnalyzer<Model, Plan, Hazard> {
+  /**
+   * The baseline and target join the plan because a step carries only its changed fields,
+   * while a hazard is a fact about the target or the change.
+   */
+  analyze(baseline: Model, target: Model, plan: Plan): readonly Hazard[];
 }
