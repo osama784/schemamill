@@ -221,6 +221,11 @@ function canRead(path: string): boolean {
   }
 }
 
+/** Escapes `value` so a RegExp matches its characters literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 test('compare prints the diff, and only the diff, to stdout', async (t) => {
   const dir = await fixtureDir(t);
   const baseline = await writeDump(dir, 'baseline.sql', BASELINE_DUMP);
@@ -456,9 +461,12 @@ test('a directory path is a read failure naming EISDIR, exit 1', async (t) => {
   const result = await runCli('compare', dir, target);
 
   assert.equal(result.stdout, '');
-  assert.equal(
+  // Node 24 ends the message at "read"; Node 26 appends the quoted path.
+  assert.match(
     result.stderr,
-    `schemamill: cannot read ${dir}: EISDIR: illegal operation on a directory, read\n`,
+    new RegExp(
+      `^schemamill: cannot read ${escapeRegExp(dir)}: EISDIR: illegal operation on a directory, read(?: '${escapeRegExp(dir)}')?\\n$`,
+    ),
   );
   assert.equal(result.code, 1);
 });
