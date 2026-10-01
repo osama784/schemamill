@@ -1,0 +1,41 @@
++ table app.bad_identity
+    id integer NOT NULL identity: GENERATED ALWAYS
+
++ sequence public.bad_cache
+    data type bigint
+    increment 1
+    min value 1
+    max value 9223372036854775807
+    start 1
+    cache 0
+    cycle false
+
++ sequence public.bad_increment
+    data type bigint
+    increment 0
+    min value -9223372036854775808
+    max value -1
+    start -1
+    cache 1
+    cycle false
+
++ sequence public.bad_range
+    data type integer
+    increment 1
+    min value 1
+    max value 9999999999
+    start 1
+    cache 1
+    cycle false
+
++ sequence public.bad_two
+    data type bigint
+    increment 1
+    min value 200
+    max value 100
+    start 200
+    cache 1
+    cycle false
+
+~ sequence public.kept_seq
+    max value 1000 → 100

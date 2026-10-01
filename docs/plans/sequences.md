@@ -10,7 +10,7 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **Out, named in diagnostics — never silent:** sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence. Identity columns, flagged on import when this slice landed, have since been modeled in the [identity slice](./identity.md) as a column property distinct from a sequence-backed default.
 
-**Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards and transaction grouping stay later work.
+**Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping stays later work.
 
 ## Plan ordering
 
@@ -41,7 +41,7 @@ One statement per field set, rather than one per field, is deliberate: PostgreSQ
 
 ## The state edge
 
-Sequence state is not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That makes one class of hand-written target legal in the model but impossible to apply — flipping a sequence's direction, or narrowing a bound below the sequence's stored value, makes PostgreSQL's `ALTER SEQUENCE` cross-check the current value and fail (`START value … cannot be greater than MAXVALUE`, `RESTART value …`). This is deliberate, with the decisions on record: sequence state is out of scope per [#16](https://github.com/osama784/schemamill/issues/16)'s decision 1, a self-inconsistent target fails loudly at apply per decision 8, and state-aware planning belongs to the hazards slice. The verification shapes stay state-independent for the same reason.
+Sequence state is not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That makes one class of hand-written target legal in the model but impossible to apply — flipping a sequence's direction, or narrowing a bound below the sequence's stored value, makes PostgreSQL's `ALTER SEQUENCE` cross-check the current value and fail (`START value … cannot be greater than MAXVALUE`, `RESTART value …`). This is deliberate, with the decisions on record: sequence state is out of scope per [#16](https://github.com/osama784/schemamill/issues/16)'s decision 1, a self-inconsistent target fails loudly at apply per decision 8, and state-aware planning, listed here when this slice landed, stays out of scope in the annotation-only [hazards slice](./hazards.md). The verification shapes stay state-independent for the same reason.
 
 The wording follow-up landed with the [identity slice](./identity.md): on an `AS` transition, `compare` now marks the converted baseline bound, so the example prints `max value 9223372036854775807 (converted) → 2147483647` instead of reading as an as-written value. The [changelog](../../CHANGELOG.md) records the fix.
 
@@ -66,4 +66,4 @@ Three levels pin the slice:
 
 ## Non-goals
 
-Sequence state, renames, hazards, and transaction grouping are later slices. Identity columns, listed here when this slice landed, have since shipped in the [identity slice](./identity.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
+Sequence state, renames, and transaction grouping are later slices. Identity columns and hazards, listed here when this slice landed, have since shipped in the [identity slice](./identity.md) and the [hazards slice](./hazards.md) respectively. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.

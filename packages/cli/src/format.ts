@@ -3,6 +3,7 @@ import type {
   Column,
   ColumnFieldChange,
   ForeignKey,
+  Hazard,
   IdentityChange,
   IdentityFieldChange,
   IdentityGeneration,
@@ -34,8 +35,12 @@ import type {
  * change after it; sequences render the same way after the table changes, as
  * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
  * and one line per step; a step's kind label is padded to the longest label in the plan so
- * the details align, and a step's details expose every payload field it carries. SQL is not
- * rendered here: the `plan` command appends `renderSql`'s output.
+ * the details align, and a step's details expose every payload field it carries. A hazards
+ * block renders as a `Hazards:` header and one two-space-indented `step <n> <kind>: <clause>`
+ * line per hazard, numbered by the step it belongs to, in the payload's order; each clause
+ * states the failure PostgreSQL would hit at apply. SQL is not rendered here: the `plan`
+ * command prints the plan, then the hazards block when the analysis finds any, then
+ * `renderSql`'s output, blank-line separated.
  */
 
 /** The whole diff as `compare` prints it: `No changes.` or one block per change, in order. */
@@ -59,7 +64,45 @@ export function formatPlan(plan: Plan): string {
   return `${lines.join('\n')}\n`;
 }
 
-/** One table-level change: the signed table line and its indented member lines. */
+/**
+ * The whole hazards block as `plan` prints it, when the analysis finds any: the `Hazards:`
+ * header and one two-space-indented line per hazard, numbered by the hazard's step, in the
+ * payload's order. An empty array renders the header alone; `plan` skips the block instead.
+ */
+export function formatHazards(hazards: readonly Hazard[]): string {
+  const lines = ['Hazards:'];
+  for (const hazard of hazards) {
+    lines.push(`  step ${hazard.step + 1} ${hazard.kind}: ${formatHazard(hazard)}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/** One hazard's clause: the definite failure PostgreSQL hits at apply, or the conditional one. */
+function formatHazard(hazard: Hazard): string {
+  switch (hazard.kind) {
+    case 'increment-zero':
+      return `INCREMENT ${hazard.increment} — PostgreSQL rejects this at apply (INCREMENT must not be zero).`;
+    case 'cache-nonpositive':
+      return `CACHE ${hazard.cache} — PostgreSQL rejects this at apply (CACHE (${hazard.cache}) must be greater than zero).`;
+    case 'bounds-inverted':
+      return `MINVALUE ${hazard.minValue} must be less than MAXVALUE ${hazard.maxValue} — PostgreSQL rejects this at apply.`;
+    case 'start-out-of-bounds':
+      return BigInt(hazard.start) < BigInt(hazard.minValue)
+        ? `START ${hazard.start} is less than MINVALUE ${hazard.minValue} — PostgreSQL rejects this at apply.`
+        : `START ${hazard.start} is greater than MAXVALUE ${hazard.maxValue} — PostgreSQL rejects this at apply.`;
+    case 'bound-out-of-type-range':
+      return `${formatBoundField(hazard.field)} ${hazard.value} is out of range for sequence data type ${hazard.dataType} — PostgreSQL rejects this at apply.`;
+    case 'bound-tightened':
+      return `${formatBoundField(hazard.field, true)} ${hazard.before} → ${hazard.after} — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.`;
+  }
+}
+
+/** A bound's keyword: `MINVALUE`/`MAXVALUE` in SQL's spelling, or the diff's prose spelling. */
+function formatBoundField(field: 'min' | 'max', prose = false): string {
+  if (prose) return field === 'min' ? 'min value' : 'max value';
+  return field === 'min' ? 'MINVALUE' : 'MAXVALUE';
+}
+
 function formatChange(change: Change): string {
   switch (change.kind) {
     case 'table-added':

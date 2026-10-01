@@ -10,7 +10,7 @@ Identity columns as first-class column properties in the model: the DDL forms a 
 
 **Out, named in diagnostics — never silent:** identity state — `RESTART`, `setval`, and `last_value`; sequence renames and `SET SCHEMA`; `LOGGED`/`UNLOGGED` persistence; `AS` and `OWNED BY` inside identity options; a cross-schema `SEQUENCE NAME` (flagged by name, and the identity is modeled without one); identity on a non-integer column; and partitioned, inheritance, typed, and foreign tables, which stay fenced by the existing table-level flags. An identity action on a column the import did not model as an identity is skipped and named.
 
-**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards and transaction grouping stay later work.
+**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping stays later work.
 
 ## Plan ordering
 
@@ -50,7 +50,7 @@ Import resolves an unqualified `SEQUENCE NAME` to the table's schema — in the 
 
 ## The state edge
 
-Identity state is not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That makes the same class of hand-written target legal in the model but impossible to apply — flipping a direction, or narrowing a bound below the sequence's stored value, makes PostgreSQL's identity `SET` clauses cross-check the sequence's current value and fail (`START value … cannot be greater than MAXVALUE`, `RESTART value …`). This is deliberate, with the decisions on record: state is out of scope per [#20](https://github.com/osama784/schemamill/issues/20), a self-inconsistent target fails loudly at apply ([#16](https://github.com/osama784/schemamill/issues/16) decision 8 extended), and state-aware planning belongs to the hazards slice. The verification shapes stay state-independent for the same reason.
+Identity state is not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That makes the same class of hand-written target legal in the model but impossible to apply — flipping a direction, or narrowing a bound below the sequence's stored value, makes PostgreSQL's identity `SET` clauses cross-check the sequence's current value and fail (`START value … cannot be greater than MAXVALUE`, `RESTART value …`). This is deliberate, with the decisions on record: state is out of scope per [#20](https://github.com/osama784/schemamill/issues/20), a self-inconsistent target fails loudly at apply ([#16](https://github.com/osama784/schemamill/issues/16) decision 8 extended), and state-aware planning, listed here when this slice landed, stays out of scope in the annotation-only [hazards slice](./hazards.md). The verification shapes stay state-independent for the same reason.
 
 ## Verification
 
@@ -76,4 +76,4 @@ On PostgreSQL 16.15 the live suite is 107 tests across 25 scenes, 0 skipped; the
 
 ## Non-goals
 
-Introspection of identity columns from a live catalog; state-aware planning, hazards, and transaction grouping; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
+Introspection of identity columns from a live catalog; state-aware planning and transaction grouping; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
