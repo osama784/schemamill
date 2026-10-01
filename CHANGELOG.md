@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Named `setval` skips** — the import diagnostic for a skipped `setval` call now reports the call as written — `SELECT setval('public.s', 1, false)` — with the sequence as the diagnostic's object, instead of a generic `SELECT`.
+
+### Fixed
+
+- **Per-identity sequence retention in the live harness** — the harness's sequence guard now compares each sequence descriptor by `schema.name`, so symmetric permutations or losses can no longer pass.
+- **Parallel-safe scene databases** — the live-PostgreSQL harness scopes each run's scene databases with a per-run token, so parallel harness runs against one cluster no longer collide.
+- **Pinned, resilient PGDG client install in CI** — `verify-postgres` now runs on `ubuntu-24.04`, its apt source is pinned to `noble-pgdg`, and the key fetch and apt calls retry; a comment names the three PostgreSQL pins to bump together on the next major.
+
+### Documentation
+
+- **README status** — the status line now reflects the shipped core engine and CLI, and `CHANGELOG.md` and `docs/plans/` joined the "Where things live" list.
+- **First-slice plan** — [`docs/plans/first-slice.md`](docs/plans/first-slice.md) is now marked `built (v0.1.0)`, and its hazards non-goal points at the shipped [`hazards.md`](docs/plans/hazards.md).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added
