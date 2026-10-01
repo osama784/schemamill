@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { accessSync, constants } from 'node:fs';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { version } from '@schemamill/core';
+
 /**
  * End-to-end tests for the `schemamill` binary.
  *
- * Every scene spawns the built CLI in `dist/` (the package's test script builds first) with
- * fixture dumps written into a fresh temp directory, and asserts the exact stdout, stderr,
- * and exit code: stdout carries only the artifact, stderr only diagnostics and failures.
+ * Every test spawns the built CLI in `dist/` (the package's test script builds first): the
+ * command scenes pass fixture dumps written into a fresh temp directory, and the usage tests
+ * pass their arguments bare. Each asserts the exact stdout, stderr, and exit code: stdout
+ * carries only the artifact — or the help and version text — while stderr carries only
+ * diagnostics, failures, and usage errors.
  */
 
 const execFileAsync = promisify(execFile);
@@ -129,12 +134,45 @@ const EXPECTED_PARSE_FAILURE_COMPARE = [
   '',
 ].join('\n');
 
+/** The swapped sides of the parse-failure pair: the broken dump is the baseline. */
+const EXPECTED_BASELINE_PARSE_FAILURE_COMPARE = [
+  '~ table public.users',
+  '    ~ column id: type bigint → integer',
+  '',
+].join('\n');
+
 const INDEX_DUMP = [
   'CREATE TABLE public.users (',
   '    id integer NOT NULL',
   ');',
   '',
   'CREATE INDEX idx_users_email ON public.users (id);',
+  '',
+].join('\n');
+
+/** A dump whose column CHECK constraint the importer flags and drops. */
+const FLAG_DUMP = [
+  'CREATE TABLE public.events (',
+  '    id integer NOT NULL CHECK (id > 0),',
+  '    note text',
+  ');',
+  '',
+].join('\n');
+
+/** What `--help` prints to stdout, and what a bare invocation prints to stderr. */
+const USAGE = [
+  'Usage: schemamill [options] [command]',
+  '',
+  'A local-first studio for database schemas.',
+  '',
+  'Options:',
+  '  -V, --version                          output the version number',
+  '  -h, --help                             display help for command',
+  '',
+  'Commands:',
+  '  compare [options] <baseline> <target>  Print the diff between two DDL dumps.',
+  '  plan [options] <baseline> <target>     Print the migration plan and its SQL between two DDL dumps.',
+  '  help [command]                         display help for command',
   '',
 ].join('\n');
 
@@ -171,6 +209,21 @@ async function runCli(...args: readonly string[]): Promise<CliResult> {
     const failure = error as { stdout?: string; stderr?: string; code?: number };
     return { stdout: failure.stdout ?? '', stderr: failure.stderr ?? '', code: failure.code };
   }
+}
+
+/** Whether the current process can read `path`; a mode-000 file stays readable for root. */
+function canRead(path: string): boolean {
+  try {
+    accessSync(path, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Escapes `value` so a RegExp matches its characters literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 test('compare prints the diff, and only the diff, to stdout', async (t) => {
@@ -256,7 +309,25 @@ test('a parse failure is reported on stderr while the diff is still printed', as
   const result = await runCli('compare', baseline, target);
 
   assert.equal(result.stdout, EXPECTED_PARSE_FAILURE_COMPARE);
-  assert.match(result.stderr, /^target: 1 failed\ntarget: \[error\] .+ \(\d+:\d+\)\n$/);
+  assert.equal(
+    result.stderr,
+    'target: 1 failed\ntarget: [error] syntax error at or near ")" (7:2)\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a baseline parse failure is reported on stderr while the diff is still printed', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', PARSE_FAILURE_TARGET);
+  const target = await writeDump(dir, 'target.sql', PARSE_FAILURE_BASELINE);
+
+  const result = await runCli('compare', baseline, target);
+
+  assert.equal(result.stdout, EXPECTED_BASELINE_PARSE_FAILURE_COMPARE);
+  assert.equal(
+    result.stderr,
+    'baseline: 1 failed\nbaseline: [error] syntax error at or near ")" (7:2)\n',
+  );
   assert.equal(result.code, 1);
 });
 
@@ -284,4 +355,139 @@ test('skips print a counts line, and --verbose adds the skip line', async (t) =>
     ].join('\n'),
   );
   assert.equal(verbose.code, 0);
+});
+
+test('flags print a counts line, and --verbose adds the flag line', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'dump.sql', FLAG_DUMP);
+
+  const quiet = await runCli('compare', dump, dump);
+
+  assert.equal(quiet.stdout, 'No changes.\n');
+  assert.equal(quiet.stderr, 'baseline: 1 flagged\ntarget: 1 flagged\n');
+  assert.equal(quiet.code, 0);
+
+  const verbose = await runCli('compare', dump, dump, '--verbose');
+
+  assert.equal(verbose.stdout, 'No changes.\n');
+  assert.equal(
+    verbose.stderr,
+    [
+      'baseline: 1 flagged',
+      'baseline: [flag] dropped check constraint on public.events.id from public.events (1:1)',
+      'target: 1 flagged',
+      'target: [flag] dropped check constraint on public.events.id from public.events (1:1)',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(verbose.code, 0);
+});
+
+test('plan --verbose adds the skip line', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'dump.sql', INDEX_DUMP);
+
+  const result = await runCli('plan', dump, dump, '--verbose');
+
+  assert.equal(result.stdout, 'No changes.\n');
+  assert.equal(
+    result.stderr,
+    [
+      'baseline: 1 skipped',
+      'baseline: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      'target: 1 skipped',
+      'target: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(result.code, 0);
+});
+
+test('--help prints the usage to stdout, exit 0', async () => {
+  const result = await runCli('--help');
+
+  assert.equal(result.stdout, USAGE);
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('--version prints the version to stdout, exit 0', async () => {
+  const result = await runCli('--version');
+
+  assert.equal(result.stdout, `${version}\n`);
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('no command prints the usage to stderr, exit 1', async () => {
+  const result = await runCli();
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, USAGE);
+  assert.equal(result.code, 1);
+});
+
+test('a missing argument is a usage error on stderr, exit 1', async () => {
+  const result = await runCli('compare', 'baseline.sql');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: missing required argument 'target'\n");
+  assert.equal(result.code, 1);
+});
+
+test('an extra argument is a usage error naming every argument, exit 1', async () => {
+  const result = await runCli('compare', 'baseline.sql', 'target.sql', 'extra.sql');
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    "error: too many arguments for 'compare'. Expected 2 arguments but got 3: baseline.sql, target.sql, extra.sql.\n",
+  );
+  assert.equal(result.code, 1);
+});
+
+test('an unknown option is a usage error on stderr, exit 1', async () => {
+  const result = await runCli('compare', 'baseline.sql', 'target.sql', '--bogus');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: unknown option '--bogus'\n");
+  assert.equal(result.code, 1);
+});
+
+test('a directory path is a read failure naming EISDIR, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const target = await writeDump(dir, 'target.sql', BASELINE_DUMP);
+
+  const result = await runCli('compare', dir, target);
+
+  assert.equal(result.stdout, '');
+  // Node 24 ends the message at "read"; Node 26 appends the quoted path.
+  assert.match(
+    result.stderr,
+    new RegExp(
+      `^schemamill: cannot read ${escapeRegExp(dir)}: EISDIR: illegal operation on a directory, read(?: '${escapeRegExp(dir)}')?\\n$`,
+    ),
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a permission-denied file is a read failure naming EACCES, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const target = await writeDump(dir, 'target.sql', BASELINE_DUMP);
+  const locked = await writeDump(dir, 'locked.sql', BASELINE_DUMP);
+  await chmod(locked, 0o000);
+
+  if (canRead(locked)) {
+    t.skip('a mode-000 file is still readable (running as root)');
+    return;
+  }
+
+  const result = await runCli('compare', locked, target);
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    `schemamill: cannot read ${locked}: EACCES: permission denied, open '${locked}'\n`,
+  );
+  assert.equal(result.code, 1);
 });

@@ -30,6 +30,8 @@ import type {
  * under a surviving foreign key (`r1a`-`r1d`), a dropped primary key or column that a removed
  * table still references (`pkdrop-removedref`, `coldrop-removedref`), and unnamed constraints
  * dropped under the conventional names PostgreSQL gives them (`unnamed-drop`, `unnamed-kept`).
+ * Two more close the review's corpus gaps: a column whose only change is its default
+ * (`default-change`) and a kept table gaining a primary key (`primary-key-add`).
  *
  * The sequence scenes cover the shapes the sequences slice was built for, against a live
  * server: a new table with a new owned sequence-backed default whose ownership and generated
@@ -1245,6 +1247,149 @@ const unnamedKeptScene = (): LiveScene => ({
   ],
 });
 
+const defaultChangeScene = (): LiveScene => {
+  const baseline = table('t', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('kept', { default: "'original'" }),
+      column('added'),
+      column('dropped', { default: "'old'" }),
+      column('changed', { default: "'first'" }),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+  const target = table('t', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('kept', { default: "'original'" }),
+      column('added', { default: "'new'" }),
+      column('dropped'),
+      column('changed', { default: "'second'" }),
+    ],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+  });
+
+  return {
+    name: 'default-change',
+    baseline: model(baseline),
+    target: model(target),
+    baselineChecks: [
+      {
+        description: 'baseline added has no default',
+        sql: columnFact('t', 'added', "coalesce(column_default, 'none')"),
+        expected: 'none',
+      },
+      {
+        description: 'baseline dropped default',
+        sql: columnFact('t', 'dropped', 'column_default'),
+        expected: "'old'::text",
+      },
+      {
+        description: 'baseline changed default',
+        sql: columnFact('t', 'changed', 'column_default'),
+        expected: "'first'::text",
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the migration alters only the three differing defaults',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'alter-column,alter-column,alter-column') {
+            return `unexpected steps: ${kinds}`;
+          }
+          const altered = steps.flatMap((step) =>
+            step.kind === 'alter-column'
+              ? step.fields.map((field) => `${step.name}.${field.field}`)
+              : [],
+          );
+          return altered.join(',') === 'added.default,dropped.default,changed.default'
+            ? undefined
+            : `altered: ${altered.join(',')}`;
+        },
+      },
+    ],
+    probes: [`INSERT INTO public.t (id) VALUES (1);`],
+    checks: [
+      {
+        description: 'added default',
+        sql: columnFact('t', 'added', 'column_default'),
+        expected: "'new'::text",
+      },
+      {
+        description: 'changed default',
+        sql: columnFact('t', 'changed', 'column_default'),
+        expected: "'second'::text",
+      },
+      {
+        description: 'kept default',
+        sql: columnFact('t', 'kept', 'column_default'),
+        expected: "'original'::text",
+      },
+      {
+        description: 'dropped default is gone',
+        sql: columnFact('t', 'dropped', "coalesce(column_default, 'none')"),
+        expected: 'none',
+      },
+      {
+        description: 'the inserted row takes the migrated defaults',
+        sql:
+          "select coalesce(kept, 'null') || '|' || coalesce(added, 'null') || '|' ||" +
+          " coalesce(dropped, 'null') || '|' || coalesce(changed, 'null')" +
+          ' from public.t where id = 1',
+        expected: 'original|new|null|second',
+      },
+    ],
+  };
+};
+
+const primaryKeyAddScene = (): LiveScene => ({
+  name: 'primary-key-add',
+  baseline: model(
+    table('t', {
+      columns: [column('id', { type: 'integer' }), column('note')],
+    }),
+  ),
+  target: model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true }), column('note')],
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+    }),
+  ),
+  baselineChecks: [
+    {
+      description: 'baseline t has no primary key',
+      sql: constraintCount('t_pkey', 'p'),
+      expected: '0',
+    },
+    {
+      description: 'baseline t.id is nullable',
+      sql: columnFact('t', 'id', 'is_nullable'),
+      expected: 'YES',
+    },
+  ],
+  planChecks: [
+    {
+      description: 'the migration sets NOT NULL before adding the primary key',
+      failure: (steps) => {
+        const kinds = steps.map((step) => step.kind).join(',');
+        return kinds === 'alter-column,add-primary-key' ? undefined : `unexpected steps: ${kinds}`;
+      },
+    },
+  ],
+  probes: [`INSERT INTO public.t (id, note) VALUES (1, 'kept');`],
+  checks: [
+    { description: 't primary key', sql: constraintName('t', 'p'), expected: 't_pkey' },
+    {
+      description: 't primary-key definition',
+      sql: constraintDef('t_pkey'),
+      expected: 'PRIMARY KEY (id)',
+    },
+    { description: 't.id is NOT NULL', sql: columnFact('t', 'id', 'is_nullable'), expected: 'NO' },
+    { description: 'the inserted row', sql: 'select count(*) from public.t', expected: '1' },
+  ],
+});
+
 const serialCreateScene = (): LiveScene => {
   const users = table('users', {
     columns: [column('id', { type: 'bigint', notNull: true })],
@@ -2246,6 +2391,8 @@ export const scenes: readonly LiveScene[] = [
   smallvictimScene(),
   unnamedDropScene(),
   unnamedKeptScene(),
+  defaultChangeScene(),
+  primaryKeyAddScene(),
   serialCreateScene(),
   sequenceAddDropScene(),
   sequenceAlterScene(),

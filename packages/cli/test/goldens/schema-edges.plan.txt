@@ -1,0 +1,27 @@
+9 steps:
+ 1. drop-table    public.Quoted Target
+ 2. create-table  app.gadgets
+ 3. create-table  public.Quoted Added
+ 4. create-table  public.empty_added
+ 5. add-column    public.MixedCase.Extra text
+ 6. add-column    public.empty.id integer NOT NULL
+ 7. alter-column  app.widgets.id: type integer → bigint
+ 8. alter-column  app.widgets.name: not null false → true
+ 9. alter-column  public.MixedCase.Note: type text → character varying(50)
+
+DROP TABLE public."Quoted Target";
+CREATE TABLE app.gadgets (
+    id integer NOT NULL,
+    CONSTRAINT gadgets_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public."Quoted Added" (
+    "Key" integer NOT NULL,
+    "Value" text,
+    CONSTRAINT "Quoted Added_pkey" PRIMARY KEY ("Key")
+);
+CREATE TABLE public.empty_added ();
+ALTER TABLE public."MixedCase" ADD COLUMN "Extra" text;
+ALTER TABLE public.empty ADD COLUMN id integer NOT NULL;
+ALTER TABLE app.widgets ALTER COLUMN id TYPE bigint;
+ALTER TABLE app.widgets ALTER COLUMN name SET NOT NULL;
+ALTER TABLE public."MixedCase" ALTER COLUMN "Note" TYPE character varying(50);
