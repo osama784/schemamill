@@ -1,5 +1,5 @@
 /** The schemamill version. */
-export const version = '0.4.0';
+export const version = '0.4.1';
 
 export { diff } from './diff.ts';
 export { canonicalIntType, effectiveIdentity } from './identity.ts';
