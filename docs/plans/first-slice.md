@@ -1,6 +1,6 @@
 # First slice — import, compare, plan, render
 
-**Status:** planned, not yet built · **Last updated:** 2026-09-24
+**Status:** built (v0.1.0) · **Last updated:** 2026-10-01
 
 The first end-to-end path through the engine, from the command line: read two PostgreSQL DDL dumps, compare them, and render the migration plan as migration SQL. Generation only — nothing is applied by schemamill, and nothing is persisted ([ADR-0001](../adr/0001-generate-never-apply.md)). The dialect seam this attaches to is described in [`docs/architecture.md`](../architecture.md).
 
@@ -39,4 +39,4 @@ The first end-to-end path through the engine, from the command line: read two Po
 
 ## Non-goals
 
-Everything not listed under Scope — including hazards, snapshots on disk, introspection, and the studio — is a later slice. Direction, not a commitment: this plan can change; the code and the changelog are the record of what actually shipped.
+Everything not listed under Scope — including snapshots on disk, introspection, and the studio — is a later slice; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md). Direction, not a commitment: this plan can change; the code and the changelog are the record of what actually shipped.
