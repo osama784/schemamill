@@ -88,6 +88,7 @@ import type {
   DefElem,
   Node,
   RangeVar,
+  SelectStmt,
 } from 'libpg-query';
 
 import { parseDump, type ParseFailure, type ParsedStatement } from './parse.ts';
@@ -1497,7 +1498,13 @@ function referentialAction(code: string | undefined): ReferentialAction | undefi
   }
 }
 
-function describeStatement(node: Node): { readonly description: string; readonly object: string } {
+/** A skipped statement's description and object, as `describeStatement` returns them. */
+interface StatementDescription {
+  readonly description: string;
+  readonly object: string;
+}
+
+function describeStatement(node: Node): StatementDescription {
   if ('CreateSchemaStmt' in node) {
     const object = node.CreateSchemaStmt.schemaname ?? 'schema';
     return { description: `CREATE SCHEMA ${object}`, object };
@@ -1553,7 +1560,10 @@ function describeStatement(node: Node): { readonly description: string; readonly
     const object = node.VariableSetStmt.name ?? 'setting';
     return { description: `SET ${object}`, object };
   }
-  if ('SelectStmt' in node) return { description: 'SELECT statement', object: 'SELECT' };
+  if ('SelectStmt' in node) {
+    const setval = describeSetval(node.SelectStmt);
+    return setval ?? { description: 'SELECT statement', object: 'SELECT' };
+  }
   if ('GrantStmt' in node) return { description: 'GRANT statement', object: 'GRANT' };
   if ('CreateExtensionStmt' in node) {
     const object = node.CreateExtensionStmt.extname ?? 'extension';
@@ -1566,6 +1576,64 @@ function describeStatement(node: Node): { readonly description: string; readonly
 
   const key = Object.keys(node)[0] ?? 'statement';
   return { description: `${key} statement`, object: key };
+}
+
+/**
+ * Describes a `SELECT` whose sole target is a `setval` (or `pg_catalog.setval`) call with a
+ * string-literal first argument: `SELECT setval('public.s', 1, false)`, with the sequence
+ * literal as the object and the remaining arguments as written. Any other `SELECT` — another
+ * function, a first argument that is not a literal, or an argument this cannot state — returns
+ * `undefined` and keeps the generic description.
+ */
+function describeSetval(stmt: SelectStmt): StatementDescription | undefined {
+  const targets = stmt.targetList;
+  if (targets?.length !== 1) return undefined;
+  const target = targets[0]!;
+  if (!('ResTarget' in target)) return undefined;
+  const value = target.ResTarget.val;
+  if (value === undefined || !('FuncCall' in value)) return undefined;
+  if (!isSetvalCall(value.FuncCall.funcname)) return undefined;
+
+  const args = value.FuncCall.args;
+  if (args === undefined || args.length === 0) return undefined;
+  const first = args[0]!;
+  if (!('A_Const' in first) || first.A_Const.sval === undefined) return undefined;
+
+  const written: string[] = [];
+  for (const arg of args) {
+    const text = constantText(arg);
+    if (text === undefined) return undefined;
+    written.push(text);
+  }
+  return {
+    description: `SELECT setval(${written.join(', ')})`,
+    object: first.A_Const.sval.sval ?? '',
+  };
+}
+
+/** Whether a call's written name is `setval` or `pg_catalog.setval`, and nothing else. */
+function isSetvalCall(funcname: readonly Node[] | undefined): boolean {
+  const names = stringList(funcname);
+  if (names.length === 1) return names[0] === 'setval';
+  return names.length === 2 && names[0] === 'pg_catalog' && names[1] === 'setval';
+}
+
+/**
+ * One constant argument as SQL text: a string literal quoted with `'` and internal quotes
+ * doubled, a number or boolean bare, `NULL` for a null, and a bit string with its `B` prefix.
+ * `undefined` for any other node, so a call with non-constant arguments keeps the generic
+ * description rather than a half-written one.
+ */
+function constantText(node: Node): string | undefined {
+  if (!('A_Const' in node)) return undefined;
+  const constant = node.A_Const;
+  if (constant.sval !== undefined) return `'${(constant.sval.sval ?? '').replaceAll("'", "''")}'`;
+  if (constant.isnull === true) return 'NULL';
+  if (constant.boolval !== undefined) return constant.boolval.boolval === true ? 'true' : 'false';
+  if (constant.ival !== undefined) return BigInt(constant.ival.ival ?? 0).toString();
+  if (constant.fval !== undefined && constant.fval.fval !== undefined) return constant.fval.fval;
+  if (constant.bsval !== undefined) return `B'${constant.bsval.bsval ?? ''}'`;
+  return undefined;
 }
 
 function skipStatement(
