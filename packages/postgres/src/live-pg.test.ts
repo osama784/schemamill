@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 
-import { diff, plan } from '@schemamill/core';
+import { diff, effectiveSequence, plan } from '@schemamill/core';
 import type {
   Diagnostic,
   Identity,
@@ -78,6 +78,63 @@ test(
     }
   },
 );
+
+/**
+ * The guard's state-skip allowance, without a live server. A dump carries the two state-only
+ * statements only when sequence state is dumped (`SELECT setval(…)`) or restated
+ * (`ALTER SEQUENCE … RESTART`); the harness dumps with `--schema-only`, which emits neither, so
+ * this crafted dump is the committed exercise of `isSequenceStateSkip`: the allowance admits
+ * the two state skips, and one structural sequence diagnostic still fails the guard.
+ */
+test('the sequence retention guard allows state-only skips and rejects structural diagnostics', async () => {
+  const dump = [
+    'CREATE SEQUENCE public.state_seq',
+    '    START WITH 1',
+    '    INCREMENT BY 1',
+    '    NO MINVALUE',
+    '    NO MAXVALUE',
+    '    CACHE 1;',
+    "SELECT pg_catalog.setval('public.state_seq', 7, true);",
+    'ALTER SEQUENCE public.state_seq RESTART WITH 3;',
+  ].join('\n');
+  const imported = await importDump(dump);
+  const scene: LiveScene = {
+    name: 'state-only-skips',
+    baseline: { tables: [], sequences: [] },
+    target: {
+      tables: [],
+      sequences: [effectiveSequence({ schema: 'public', name: 'state_seq' })],
+    },
+  };
+
+  assert.deepEqual(
+    imported.diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      "skipped SELECT setval('public.state_seq', 7, true)",
+      'skipped ALTER SEQUENCE public.state_seq (RESTART)',
+    ],
+    'the crafted dump imports as exactly the two state-only skips',
+  );
+
+  // The state-only skips are allowed: the guard must not fail on this dump.
+  assertSequencesRetained('crafted state-only dump', scene, imported);
+
+  const structural: Diagnostic = {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'public.state_seq',
+    message: 'skipped CREATE SEQUENCE public.state_seq (unsupported data type)',
+  };
+  assert.throws(
+    () =>
+      assertSequencesRetained('crafted structural dump', scene, {
+        ...imported,
+        diagnostics: [...imported.diagnostics, structural],
+      }),
+    /the import named structural sequence problems/,
+    'a structural sequence diagnostic must fail the sequence retention guard',
+  );
+});
 
 /** The base URI, checked to be a `postgresql:` URI that names a database. */
 function validateBaseUrl(raw: string): string {
