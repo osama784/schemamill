@@ -7,7 +7,15 @@ import { test } from 'node:test';
 import { promisify } from 'node:util';
 
 import { diff, plan } from '@schemamill/core';
-import type { Diagnostic, Identity, Model, ReadResult, SequenceIdentity } from '@schemamill/core';
+import type {
+  Diagnostic,
+  Identity,
+  Model,
+  ReadResult,
+  Sequence,
+  SequenceIdentity,
+  SequenceOwner,
+} from '@schemamill/core';
 
 import { importDump, renderSql } from './index.ts';
 import { scenes } from './live-scenes.ts';
@@ -130,12 +138,8 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
 
     assertNoErrors(`${appliedDb}: imported after the migration`, applied);
     assertNoErrors(`${targetDb}: imported from the target model's build`, expected);
-    assertSequencesRetained(`${appliedDb}: imported after the migration`, scene, applied.model);
-    assertSequencesRetained(
-      `${targetDb}: imported from the target model's build`,
-      scene,
-      expected.model,
-    );
+    assertSequencesRetained(`${appliedDb}: imported after the migration`, scene, applied);
+    assertSequencesRetained(`${targetDb}: imported from the target model's build`, scene, expected);
     assertIdentitiesRetained(`${appliedDb}: imported after the migration`, scene, applied);
     assertIdentitiesRetained(
       `${targetDb}: imported from the target model's build`,
@@ -220,35 +224,115 @@ function assertNoErrors(what: string, result: ReadResult<Model, Diagnostic>): vo
 }
 
 /**
- * Asserts that the target model's sequences all survived an import, and that the import
- * invented none. Both dumps describe a database that should end in the scene's target state
- * — the target database is built from it, the applied database is migrated to it — so the
- * target's sequence identities must come back exactly. This guards a sequence import gap
- * that loses sequences symmetrically on both sides: `diff` between the two imports would
- * stay empty, while this failure names the scene and the sequence. Baseline-only sequences
- * are exempt, because the migration drops them by design and the diff assertion covers the
- * result. Scenes whose target has no sequences pass vacuously.
+ * Asserts that every sequence the target model declares survived an import with the same
+ * descriptor, compared field by field. The map is keyed by `schema.name`, so an import that
+ * drops, moves, or swaps sequences cannot pass by matching descriptors as a set of values;
+ * the descriptor comparison covers the data type, every option, and the exact ownership —
+ * absent `ownedBy` means unowned and is distinguished from a stated owner. Both dumps describe
+ * a database that should end in the scene's target state — the target database is built from
+ * it, the applied database is migrated to it — so this guards a sequence import gap that loses
+ * or permutes options symmetrically on both sides, where `diff` between the two imports would
+ * stay empty while this failure names the scene and the sequence. Baseline-only sequences are
+ * exempt, because the migration drops them by design and the diff assertion covers the result.
+ * Scenes whose target has no sequences pass vacuously.
+ *
+ * Also rejects any import diagnostic that names a sequence, except the state-only skips that
+ * are expected by design (`setval`, `RESTART`): a sequence dropped or altered by a structural
+ * skip has to fail the scene by name, not hide behind an empty diff that both imports agree on.
  */
-function assertSequencesRetained(what: string, scene: LiveScene, imported: Model): void {
-  const declared = sequenceIdentities(scene.target);
-  const found = sequenceIdentities(imported);
-  const missing = [...declared].filter((identity) => !found.has(identity));
-  const invented = [...found].filter((identity) => !declared.has(identity));
+function assertSequencesRetained(
+  what: string,
+  scene: LiveScene,
+  imported: ReadResult<Model, Diagnostic>,
+): void {
+  const declared = sequenceByName(scene.target);
+  const found = sequenceByName(imported.model);
+  const failures: string[] = [];
+  for (const [name, descriptor] of declared) {
+    const actual = found.get(name);
+    if (actual === undefined) {
+      failures.push(`${name}: dropped (${describeSequence(descriptor)})`);
+    } else if (!sameSequenceDescriptor(descriptor, actual)) {
+      failures.push(`${name}: ${describeSequence(descriptor)} became ${describeSequence(actual)}`);
+    }
+  }
+  for (const name of found.keys()) {
+    if (!declared.has(name)) {
+      failures.push(`${name}: imported a sequence the target model does not declare`);
+    }
+  }
+  assert.deepEqual(failures, [], `${scene.name}: ${what}: sequence retention failed`);
   assert.deepEqual(
-    missing,
+    imported.diagnostics
+      .filter((diagnostic) => namesSequence(diagnostic.message))
+      .filter((diagnostic) => !isSequenceStateSkip(diagnostic.message))
+      .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`),
     [],
-    `${scene.name}: ${what}: the import dropped modeled sequence(s): ${missing.join(', ')}`,
-  );
-  assert.deepEqual(
-    invented,
-    [],
-    `${scene.name}: ${what}: the imported model has sequence(s) the target model does not declare: ${invented.join(', ')}`,
+    `${scene.name}: ${what}: the import named structural sequence problems`,
   );
 }
 
-/** The `schema.name` identities of a model's sequences. */
-function sequenceIdentities(model: Model): ReadonlySet<string> {
-  return new Set(model.sequences.map((sequence) => `${sequence.schema}.${sequence.name}`));
+/** Every sequence's `schema.name` key and descriptor, as a map. */
+function sequenceByName(model: Model): ReadonlyMap<string, Sequence> {
+  return new Map(
+    model.sequences.map((sequence) => [`${sequence.schema}.${sequence.name}`, sequence]),
+  );
+}
+
+/** Whether two descriptors state the same sequence, option by option and ownership exactly. */
+function sameSequenceDescriptor(left: Sequence, right: Sequence): boolean {
+  return (
+    left.dataType === right.dataType &&
+    left.increment === right.increment &&
+    left.minValue === right.minValue &&
+    left.maxValue === right.maxValue &&
+    left.start === right.start &&
+    left.cache === right.cache &&
+    left.cycle === right.cycle &&
+    sameSequenceOwner(left.ownedBy, right.ownedBy)
+  );
+}
+
+/**
+ * Whether two ownership states are the same: both absent (unowned), or the same table and
+ * column. Unlike an identity's optional sequence name, absent ownership is a state rather than
+ * a don't-care, so `undefined` never matches a stated owner.
+ */
+function sameSequenceOwner(
+  left: SequenceOwner | undefined,
+  right: SequenceOwner | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.table.schema === right.table.schema &&
+    left.table.name === right.table.name &&
+    left.column === right.column
+  );
+}
+
+/** One sequence descriptor as one line, for a failure message. */
+function describeSequence(sequence: Sequence): string {
+  const owner =
+    sequence.ownedBy === undefined
+      ? 'none'
+      : `${sequence.ownedBy.table.schema}.${sequence.ownedBy.table.name}.${sequence.ownedBy.column}`;
+  return (
+    `${sequence.dataType} increment=${sequence.increment} min=${sequence.minValue}` +
+    ` max=${sequence.maxValue} start=${sequence.start} cache=${sequence.cache}` +
+    ` cycle=${sequence.cycle} owned=${owner}`
+  );
+}
+
+/** Whether a diagnostic's message names a sequence, structurally or through a `setval` call. */
+function namesSequence(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes('sequence') || text.includes('setval');
+}
+
+/** Whether a sequence diagnostic is state only, which both dumps are allowed to skip. */
+function isSequenceStateSkip(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes('setval') || text.includes('(restart)');
 }
 
 /**
