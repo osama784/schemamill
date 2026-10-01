@@ -1,0 +1,25 @@
++ table app.gadgets
+    id integer NOT NULL
+    primary key gadgets_pkey (id)
+
+~ table app.widgets
+    ~ column id: type integer → bigint
+    ~ column name: not null false → true
+
+~ table public.MixedCase
+    + column Extra text
+    ~ column Note: type text → character varying(50)
+
++ table public.Quoted Added
+    Key integer NOT NULL
+    Value text
+    primary key Quoted Added_pkey (Key)
+
+- table public.Quoted Target
+    id integer NOT NULL
+    primary key Quoted Target_pkey (id)
+
+~ table public.empty
+    + column id integer NOT NULL
+
++ table public.empty_added
