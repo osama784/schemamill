@@ -87,7 +87,7 @@ jobs:
       - name: Install PostgreSQL 18 client tools
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl --retry 3 --retry-delay 2 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo curl --retry 3 --retry-delay 2 --retry-connrefused -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 -y install postgresql-client-18
