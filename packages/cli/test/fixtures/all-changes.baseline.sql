@@ -71,10 +71,10 @@ ALTER TABLE ONLY public.fk_changed
 
 ALTER TABLE ONLY public.fk_columns_changed ADD CONSTRAINT fk_columns_changed_pkey PRIMARY KEY (id);
 
+ALTER TABLE ONLY public.fk_columns_target ADD CONSTRAINT fk_columns_target_pkey PRIMARY KEY (a);
+
 ALTER TABLE ONLY public.fk_columns_changed
     ADD CONSTRAINT fk_columns_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_columns_target(a);
-
-ALTER TABLE ONLY public.fk_columns_target ADD CONSTRAINT fk_columns_target_pkey PRIMARY KEY (a);
 
 ALTER TABLE ONLY public.fk_name_changed ADD CONSTRAINT fk_name_changed_pkey PRIMARY KEY (id);
 
