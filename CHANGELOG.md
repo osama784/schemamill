@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-01
+
 ### Changed
 
 - **Named `setval` skips** — the import diagnostic for a skipped `setval` call reported the call as written — `SELECT setval('public.s', 1, false)` — with the sequence as the diagnostic's object, instead of a generic `SELECT`.
