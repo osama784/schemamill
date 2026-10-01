@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,6 +50,13 @@ const execFileAsync = promisify(execFile);
 
 /** The connection URI from the environment, or `undefined` when unset or empty. */
 const pgUrl = process.env.SCHEMAMILL_TEST_PG_URL || undefined;
+
+/**
+ * Eight hex characters, computed once per run, that suffix every scene database this run
+ * creates. Two harness runs against one cluster then never create or drop each other's
+ * databases, and a crashed run can only leave behind its own token's databases.
+ */
+const runToken = randomBytes(4).toString('hex');
 
 test(
   'live PostgreSQL: build, migrate, dump, import, compare',
@@ -102,10 +110,13 @@ async function assertReachable(baseUrl: string): Promise<void> {
   }
 }
 
-/** One scene's whole round trip, against fresh databases named after the scene. */
+/**
+ * One scene's whole round trip, against fresh databases named after the scene and this run's
+ * token, so concurrent runs against one cluster never touch each other's databases.
+ */
 async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Promise<void> {
   const slug = scene.name.replace(/[^a-z0-9]+/g, '_');
-  const appliedDb = `schemamill_w6_${slug}`;
+  const appliedDb = `schemamill_w6_${slug}_${runToken}`;
   const targetDb = `${appliedDb}_target`;
   const appliedUrl = withDatabase(baseUrl, appliedDb);
   const targetUrl = withDatabase(baseUrl, targetDb);
@@ -447,7 +458,7 @@ async function createDatabase(baseUrl: string, database: string): Promise<void> 
 /**
  * `DROP DATABASE … WITH (FORCE)`, through the base connection, best-effort: a database that
  * cannot be dropped must not mask the scene's own result. The names are derived from scene
- * names (`a-z`, digits, underscores), so interpolating them is safe.
+ * names (`a-z`, digits, underscores) and this run's hex token, so interpolating them is safe.
  */
 async function dropDatabase(baseUrl: string, database: string): Promise<void> {
   try {
