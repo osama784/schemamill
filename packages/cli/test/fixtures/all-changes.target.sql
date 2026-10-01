@@ -17,6 +17,26 @@ CREATE TABLE public.fk_changed (
     target_id integer
 );
 
+CREATE TABLE public.fk_columns_changed (
+    id integer NOT NULL,
+    target_id integer
+);
+
+CREATE TABLE public.fk_columns_target (
+    a integer NOT NULL,
+    b integer NOT NULL
+);
+
+CREATE TABLE public.fk_name_changed (
+    id integer NOT NULL,
+    target_id integer
+);
+
+CREATE TABLE public.fk_on_update_changed (
+    id integer NOT NULL,
+    target_id integer
+);
+
 CREATE TABLE public.fk_removed (
     id integer NOT NULL,
     target_id integer
@@ -54,6 +74,23 @@ ALTER TABLE ONLY public.fk_changed ADD CONSTRAINT fk_changed_pkey PRIMARY KEY (i
 
 ALTER TABLE ONLY public.fk_changed
     ADD CONSTRAINT fk_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_added(id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.fk_columns_changed ADD CONSTRAINT fk_columns_changed_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.fk_columns_changed
+    ADD CONSTRAINT fk_columns_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_columns_target(b);
+
+ALTER TABLE ONLY public.fk_columns_target ADD CONSTRAINT fk_columns_target_pkey PRIMARY KEY (b);
+
+ALTER TABLE ONLY public.fk_name_changed ADD CONSTRAINT fk_name_changed_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.fk_name_changed
+    ADD CONSTRAINT fk_name_changed_target_id_fkey_v2 FOREIGN KEY (target_id) REFERENCES public.fk_added(id);
+
+ALTER TABLE ONLY public.fk_on_update_changed ADD CONSTRAINT fk_on_update_changed_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.fk_on_update_changed
+    ADD CONSTRAINT fk_on_update_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_added(id) ON UPDATE RESTRICT;
 
 ALTER TABLE ONLY public.fk_removed ADD CONSTRAINT fk_removed_pkey PRIMARY KEY (id);
 

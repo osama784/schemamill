@@ -9,6 +9,18 @@
 ~ table public.fk_changed
     ~ foreign key (target_id) → public.fk_added: on delete CASCADE → RESTRICT
 
+~ table public.fk_columns_changed
+    ~ foreign key (target_id) → public.fk_columns_target: referenced columns (a) → (b)
+
+~ table public.fk_columns_target
+    ~ primary key fk_columns_target_pkey (a) → fk_columns_target_pkey (b)
+
+~ table public.fk_name_changed
+    ~ foreign key (target_id) → public.fk_added: name fk_name_changed_target_id_fkey → fk_name_changed_target_id_fkey_v2
+
+~ table public.fk_on_update_changed
+    ~ foreign key (target_id) → public.fk_added: on update CASCADE → RESTRICT
+
 ~ table public.fk_removed
     - foreign key fk_removed_target_id_fkey (target_id) → public.fk_added (id)
 
