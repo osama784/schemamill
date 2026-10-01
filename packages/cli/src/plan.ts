@@ -1,16 +1,17 @@
 import { plan } from '@schemamill/core';
-import { renderSql } from '@schemamill/postgres';
+import { hazardAnalyzer, renderSql } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
-import { formatPlan } from './format.ts';
+import { formatHazards, formatPlan } from './format.ts';
 import { importPair } from './run.ts';
 
 /**
- * The `plan` command: read two DDL dumps and print the migration plan and its SQL.
+ * The `plan` command: read two DDL dumps and print the migration plan, the hazards beside it,
+ * and its SQL.
  *
- * Wiring only — the plan comes from `@schemamill/core` and the migration SQL from
- * `@schemamill/postgres`, with the human wording from `format.ts`. An `error` diagnostic
- * makes the exit code 1, but the plan is still printed.
+ * Wiring only — the plan comes from `@schemamill/core`, and the hazards and migration SQL from
+ * `@schemamill/postgres`, with the human wording from `format.ts`. An `error` diagnostic makes
+ * the exit code 1, but the plan is still printed.
  */
 
 interface PlanOptions {
@@ -32,10 +33,12 @@ export function registerPlan(program: Command): void {
         return;
       }
       const planned = plan(imported.baseline, imported.target);
+      const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+      const hazardsBlock = hazards.length > 0 ? `${formatHazards(hazards)}\n` : '';
       process.stdout.write(
         planned.steps.length === 0
           ? formatPlan(planned)
-          : `${formatPlan(planned)}\n${renderSql(planned)}`,
+          : `${formatPlan(planned)}\n${hazardsBlock}${renderSql(planned)}`,
       );
       process.exitCode = imported.exitCode;
     });

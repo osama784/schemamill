@@ -107,7 +107,7 @@ The SQL rendering of a migration plan — deterministic and reviewable, for the 
 _Avoid_: script, patch, changeset
 
 **Hazard**:
-A risk annotation on a planned change: locks taken, rewrites triggered, downtime risk — what could hurt when the migration runs.
+A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled.
 _Avoid_: warning, danger
 
 **Expand/contract**:

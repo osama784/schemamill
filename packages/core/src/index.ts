@@ -13,6 +13,7 @@ export {
 } from './sequence.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';
+export type * from './hazard.ts';
 export type * from './identity.ts';
 export type * from './model.ts';
 export type * from './plan.ts';
