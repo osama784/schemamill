@@ -50,7 +50,7 @@ jobs:
 
   verify-postgres:
     name: verify-postgres (node 24, postgres 18)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:18
@@ -81,14 +81,16 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # The live-PostgreSQL harness spawns psql and pg_dump from PATH; install the PGDG client
-      # tools so they match the postgres:18 service.
+      # tools so they match the postgres:18 service. On the next PostgreSQL major, bump all
+      # three pins together: the `postgres:18` service image above, the `postgresql-client-18`
+      # package below, and the `/usr/lib/postgresql/18/bin` prefix on the test step's PATH.
       - name: Install PostgreSQL 18 client tools
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
-          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          sudo apt-get update
-          sudo apt-get -y install postgresql-client-18
+          sudo curl --retry 3 --retry-delay 2 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 -y install postgresql-client-18
 
       - name: Build
         run: pnpm build
