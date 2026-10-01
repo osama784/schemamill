@@ -9,6 +9,7 @@ import type {
   Sequence,
   SequenceDataType,
   SequenceIdentity,
+  SequenceTypeChange,
   Step,
   Table,
   TableIdentity,
@@ -49,7 +50,11 @@ import type {
  * identity attaches to its `add-identity` step. A matched identity attaches to its
  * `alter-identity` step, or, when the plan carries no identity step and the column's type
  * converts within the integer family, to the `alter-column` step carrying the `type` change —
- * the statement PostgreSQL converts and validates with. A definite hazard on a recreated
+ * the statement PostgreSQL converts and validates with. When both an `alter-identity` step and
+ * that type step exist, a definite hazard whose kind — and, for `bound-out-of-type-range`,
+ * field — also holds in the baseline options projected through the conversion attaches to the
+ * type step, the statement that fails first; a hazard only the target carries stays on the
+ * `alter-identity` step, the statement that introduces it. A definite hazard on a recreated
  * identity — the plan drops the old identity and adds a new one — falls back to that
  * `add-identity` step, the statement that would fail, and a recreated identity reports no
  * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
@@ -221,9 +226,28 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   // identity whose options survive the column's int-family type conversion has no identity step
   // either: that alter-column step is the statement whose conversion PostgreSQL validates.
   const typeStep = dataType === undefined ? undefined : findIdentityTypeStep(steps, entry);
+  // The bounds the column's type conversion would leave, per the engine's `AS` rules: a bound
+  // exactly equal to the old type's bound is rewritten to the new type's.
+  const baselineType =
+    entry.baselineType === undefined ? undefined : canonicalIntType(entry.baselineType);
+  const projection =
+    baselineType !== undefined && dataType !== undefined && baselineType !== dataType
+      ? sequenceTypeChange(baselineType, baseline.minValue, baseline.maxValue, dataType)
+      : undefined;
   const definiteStep = alterIdentity ?? addIdentity ?? typeStep;
-  const definite =
-    definiteStep === undefined ? [] : definiteHazards(dataType, target, definiteStep);
+  let definite: Hazard[];
+  if (alterIdentity !== undefined && typeStep !== undefined && projection !== undefined) {
+    definite = conversionDefiniteHazards(
+      dataType,
+      target,
+      baseline,
+      projection,
+      alterIdentity,
+      typeStep,
+    );
+  } else {
+    definite = definiteStep === undefined ? [] : definiteHazards(dataType, target, definiteStep);
+  }
   if (definite.length > 0) return definite;
   // A recreation drops the old sequence with its stored value; only a surviving identity's
   // value is cross-checked at apply.
@@ -231,15 +255,8 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   // A conversion that moves a default bound is carried by the column's type step instead.
   const conditionalStep = alterIdentity ?? findIdentityStep(steps, entry, 'alter-column');
   if (conditionalStep === undefined) return [];
-  // The bounds the column's type conversion would leave, per the engine's `AS` rules: a bound
-  // exactly equal to the old type's bound is rewritten to the new type's. A bound the
-  // conversion lowers that the alter-identity step does not restate belongs to the type step.
-  const baselineType =
-    entry.baselineType === undefined ? undefined : canonicalIntType(entry.baselineType);
-  const projection =
-    baselineType !== undefined && dataType !== undefined && baselineType !== dataType
-      ? sequenceTypeChange(baselineType, baseline.minValue, baseline.maxValue, dataType)
-      : undefined;
+  // A bound the conversion lowers that the alter-identity step does not restate belongs to the
+  // type step.
   const alterStep = alterIdentity === undefined ? undefined : steps[alterIdentity]!;
   const restated = (field: 'min' | 'max'): boolean =>
     alterStep !== undefined &&
@@ -257,6 +274,51 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
     if (conversionTightens(field) && typeStep !== undefined) return typeStep;
     return conditionalStep;
   });
+}
+
+/**
+ * The definite hazards of `target` when the plan both converts the column's type and alters the
+ * identity. The projected pre-state — `before`'s options with the bounds the conversion would
+ * leave — decides each hazard's step: a target hazard the projection already carries fails at
+ * the `alter-column` type step, before the `alter-identity` step applies its options, and every
+ * other target hazard stays on the `alter-identity` step. Emitted values remain the target's.
+ */
+function conversionDefiniteHazards(
+  dataType: SequenceDataType | undefined,
+  target: Options,
+  before: Options,
+  projection: SequenceTypeChange,
+  alterStep: number,
+  typeStep: number,
+): Hazard[] {
+  const projected = definiteHazards(
+    dataType,
+    {
+      minValue: projection.minValue,
+      maxValue: projection.maxValue,
+      start: before.start,
+      increment: before.increment,
+      cache: before.cache,
+    },
+    typeStep,
+  );
+  return definiteHazards(dataType, target, alterStep).map((hazard) =>
+    projected.some((candidate) => sameDefiniteHazard(candidate, hazard))
+      ? { ...hazard, step: typeStep }
+      : hazard,
+  );
+}
+
+/**
+ * Whether two definite hazards name the same violation, ignoring their steps: the same kind,
+ * and for `bound-out-of-type-range` the same field.
+ */
+function sameDefiniteHazard(left: Hazard, right: Hazard): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === 'bound-out-of-type-range' && right.kind === 'bound-out-of-type-range') {
+    return left.field === right.field;
+  }
+  return true;
 }
 
 /** The index of the first step of `kind` whose table and column name match `entry`. */

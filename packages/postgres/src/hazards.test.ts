@@ -652,6 +652,105 @@ test('a converted custom bound outside the new type range reports it on alter-co
   ]);
 });
 
+test('a converted out-of-range bound attaches to the type step before an option alter', () => {
+  const baseline = model(
+    table('t', [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { minValue: '-4000000000', start: '-4000000000' }),
+      }),
+    ]),
+  );
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          minValue: '-4000000000',
+          start: '-4000000000',
+          cache: '10',
+        }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const typeStep = stepIndex(
+    planned,
+    (candidate) =>
+      candidate.kind === 'alter-column' && candidate.fields.some((field) => field.field === 'type'),
+  );
+  const identityStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-identity');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column', 'alter-identity'],
+  );
+  assert.deepEqual(planned.steps[identityStep], {
+    kind: 'alter-identity',
+    table: identity('t'),
+    name: 'id',
+    fields: [{ field: 'cache', before: '1', after: '10' }],
+  });
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-out-of-type-range',
+      step: typeStep,
+      dataType: 'integer',
+      field: 'min',
+      value: '-4000000000',
+    },
+  ]);
+});
+
+test('a bound the option alter introduces stays on the alter-identity step', () => {
+  const baseline = model(
+    table('t', [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { minValue: '-40000', start: '-40000' }),
+      }),
+    ]),
+  );
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', { minValue: '-4000000000', cache: '10' }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const identityStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-identity');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-column', 'alter-identity'],
+  );
+  assert.deepEqual(planned.steps[identityStep], {
+    kind: 'alter-identity',
+    table: identity('t'),
+    name: 'id',
+    fields: [
+      { field: 'minValue', before: '-40000', after: '-4000000000' },
+      { field: 'start', before: '-40000', after: '-4000000000' },
+      { field: 'cache', before: '1', after: '10' },
+    ],
+  });
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'bound-out-of-type-range',
+      step: identityStep,
+      dataType: 'integer',
+      field: 'min',
+      value: '-4000000000',
+    },
+  ]);
+});
+
 test('a converted in-range custom bound reports nothing', () => {
   const identityOf = (dataType: SequenceDataType): Identity =>
     identityColumn(dataType, { minValue: '-40000', maxValue: '40000', start: '-40000' });
