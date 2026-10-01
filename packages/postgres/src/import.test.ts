@@ -1067,7 +1067,7 @@ test('skips sequence state, missing sequences, and unmapped options by name', as
     { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
-    { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.bad' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.fractional' },
   ]);
@@ -1080,4 +1080,24 @@ test('skips sequence state, missing sequences, and unmapped options by name', as
   assert.match(messages, /DROP SEQUENCE public\.s/);
   assert.match(messages, /CREATE SEQUENCE public\.bad \(unsupported data type\)/);
   assert.match(messages, /CREATE SEQUENCE public\.fractional \(non-integer cache\)/);
+  assert.match(messages, /SELECT setval\('public\.s', 1, false\)/);
+});
+
+test('names a setval call and keeps non-setval or non-literal select generic', async () => {
+  const dump = [
+    `SELECT setval('public.s', 1, false);`,
+    `SELECT setval('public.' || 's', 1, false);`,
+    `SELECT nextval('public.s');`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.s' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message);
+  assert.equal(messages[0], "skipped SELECT setval('public.s', 1, false)");
+  assert.deepEqual(messages.slice(1), ['skipped SELECT statement', 'skipped SELECT statement']);
 });
