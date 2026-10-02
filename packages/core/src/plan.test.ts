@@ -95,6 +95,25 @@ const idForeignKey = (from: string, columnName: string, to: string): ForeignKey 
     referencedColumns: ['id'],
   });
 
+/** A unique constraint on `columns`: unnamed unless overridden. */
+const uniqueConstraint = (
+  columns: readonly string[],
+  rest: Partial<Omit<UniqueConstraint, 'columns'>> = {},
+): UniqueConstraint => ({ columns, ...rest });
+
+/** A check constraint on `expression`: unnamed unless overridden. */
+const checkConstraint = (
+  expression: string,
+  rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
+): CheckConstraint => ({ expression, ...rest });
+
+/** A non-unique index on `columns`: unnamed unless overridden. */
+const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>> = {}): Index => ({
+  unique: false,
+  columns,
+  ...rest,
+});
+
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
 
@@ -150,8 +169,9 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
 
 /**
  * Asserts that planning `baseline` to `target` yields exactly `expected`, in one transactional
- * group: every current step kind is transactional, and a plan of `expected.length` steps is a
- * single group.
+ * group: every kind the tests that use this helper plan is transactional, and a plan of
+ * `expected.length` steps is a single group. Plans that carry a concurrent index kind assert
+ * their steps and groups directly instead.
  */
 const assertPlan = (baseline: Model, target: Model, expected: readonly Step[]): void => {
   assert.deepStrictEqual(plan(baseline, target), {
@@ -193,6 +213,9 @@ interface SimulatedTable {
   readonly columns: Map<string, Mutable<Column>>;
   primaryKey: Mutable<PrimaryKey> | undefined;
   readonly foreignKeys: Mutable<ForeignKey>[];
+  readonly uniqueConstraints: Mutable<UniqueConstraint>[];
+  readonly checkConstraints: Mutable<CheckConstraint>[];
+  readonly indexes: Mutable<Index>[];
 }
 
 /** The simulated database state: live tables by JSON-encoded identity. */
@@ -221,6 +244,23 @@ const copyForeignKey = (foreignKey: ForeignKey): Mutable<ForeignKey> => ({
   referencedColumns: [...foreignKey.referencedColumns],
 });
 
+/** A copy of `uniqueConstraint`, independent of the caller's payload. */
+const copyUniqueConstraint = (uniqueConstraint: UniqueConstraint): Mutable<UniqueConstraint> => ({
+  ...uniqueConstraint,
+  columns: [...uniqueConstraint.columns],
+});
+
+/** A copy of `checkConstraint`, independent of the caller's payload. */
+const copyCheckConstraint = (checkConstraint: CheckConstraint): Mutable<CheckConstraint> => ({
+  ...checkConstraint,
+});
+
+/** A copy of `entry`, independent of the caller's payload. */
+const copyIndex = (entry: Index): Mutable<Index> => ({
+  ...entry,
+  columns: [...entry.columns],
+});
+
 /** A copy of an identity descriptor, independent of the caller's payload. */
 const copyIdentityDescriptor = (identity: Identity): Identity => ({
   ...identity,
@@ -239,6 +279,18 @@ const foreignKeyKey = (foreignKey: ForeignKey): string =>
     foreignKey.onDelete ?? null,
   ]);
 
+/** A structural key for a unique constraint, comparing name and columns. */
+const uniqueConstraintKey = (uniqueConstraint: UniqueConstraint): string =>
+  JSON.stringify([uniqueConstraint.name ?? null, uniqueConstraint.columns]);
+
+/** A structural key for a check constraint, comparing name and expression. */
+const checkConstraintKey = (checkConstraint: CheckConstraint): string =>
+  JSON.stringify([checkConstraint.name ?? null, checkConstraint.expression]);
+
+/** A structural key for an index; `concurrently` is apply metadata and excluded. */
+const indexKey = (entry: Index): string =>
+  JSON.stringify([entry.name ?? null, entry.unique, entry.columns]);
+
 /** The simulated state of `model`. */
 const stateOf = (model: Model): SimulatedState => {
   const tables = new Map<string, SimulatedTable>();
@@ -247,6 +299,9 @@ const stateOf = (model: Model): SimulatedState => {
       columns: new Map(source.columns.map((entry) => [entry.name, { ...entry }])),
       primaryKey: source.primaryKey === undefined ? undefined : copyPrimaryKey(source.primaryKey),
       foreignKeys: source.foreignKeys.map(copyForeignKey),
+      uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
+      checkConstraints: source.checkConstraints.map(copyCheckConstraint),
+      indexes: source.indexes.map(copyIndex),
     });
   }
   return { tables };
@@ -295,6 +350,9 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         primaryKey:
           step.table.primaryKey === undefined ? undefined : copyPrimaryKey(step.table.primaryKey),
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       });
       return;
     }
@@ -478,6 +536,95 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       table.foreignKeys.push(copyForeignKey(step.foreignKey));
       return;
     }
+    case 'add-unique-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-unique-constraint on missing table ${key}`);
+      for (const name of step.uniqueConstraint.columns) {
+        assert.ok(
+          table.columns.has(name),
+          `add-unique-constraint on ${key} covering missing column ${name}`,
+        );
+      }
+      const constraintKey = uniqueConstraintKey(step.uniqueConstraint);
+      assert.ok(
+        !table.uniqueConstraints.some((entry) => uniqueConstraintKey(entry) === constraintKey),
+        `add-unique-constraint of live ${constraintKey} on ${key}`,
+      );
+      table.uniqueConstraints.push(copyUniqueConstraint(step.uniqueConstraint));
+      return;
+    }
+    case 'drop-unique-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-unique-constraint on missing table ${key}`);
+      const found = table.uniqueConstraints.findIndex(
+        (entry) => uniqueConstraintKey(entry) === uniqueConstraintKey(step.uniqueConstraint),
+      );
+      assert.notEqual(
+        found,
+        -1,
+        `drop-unique-constraint of missing ${uniqueConstraintKey(step.uniqueConstraint)} on ${key}`,
+      );
+      table.uniqueConstraints.splice(found, 1);
+      return;
+    }
+    case 'add-check-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-check-constraint on missing table ${key}`);
+      const constraintKey = checkConstraintKey(step.checkConstraint);
+      assert.ok(
+        !table.checkConstraints.some((entry) => checkConstraintKey(entry) === constraintKey),
+        `add-check-constraint of live ${constraintKey} on ${key}`,
+      );
+      table.checkConstraints.push(copyCheckConstraint(step.checkConstraint));
+      return;
+    }
+    case 'drop-check-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-check-constraint on missing table ${key}`);
+      const found = table.checkConstraints.findIndex(
+        (entry) => checkConstraintKey(entry) === checkConstraintKey(step.checkConstraint),
+      );
+      assert.notEqual(
+        found,
+        -1,
+        `drop-check-constraint of missing ${checkConstraintKey(step.checkConstraint)} on ${key}`,
+      );
+      table.checkConstraints.splice(found, 1);
+      return;
+    }
+    case 'create-index':
+    case 'create-index-concurrently': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
+      for (const name of step.index.columns) {
+        assert.ok(
+          table.columns.has(name),
+          `${step.kind} on ${key} covering missing column ${name}`,
+        );
+      }
+      const entryKey = indexKey(step.index);
+      assert.ok(
+        !table.indexes.some((entry) => indexKey(entry) === entryKey),
+        `${step.kind} of live ${entryKey} on ${key}`,
+      );
+      table.indexes.push(copyIndex(step.index));
+      return;
+    }
+    case 'drop-index':
+    case 'drop-index-concurrently': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
+      const found = table.indexes.findIndex((entry) => indexKey(entry) === indexKey(step.index));
+      assert.notEqual(found, -1, `${step.kind} of missing ${indexKey(step.index)} on ${key}`);
+      table.indexes.splice(found, 1);
+      return;
+    }
   }
 };
 
@@ -509,6 +656,21 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       actual.foreignKeys.map(foreignKeyKey).sort(),
       expected.foreignKeys.map(foreignKeyKey).sort(),
       `foreign keys of ${key}`,
+    );
+    assert.deepStrictEqual(
+      actual.uniqueConstraints.map(uniqueConstraintKey).sort(),
+      expected.uniqueConstraints.map(uniqueConstraintKey).sort(),
+      `unique constraints of ${key}`,
+    );
+    assert.deepStrictEqual(
+      actual.checkConstraints.map(checkConstraintKey).sort(),
+      expected.checkConstraints.map(checkConstraintKey).sort(),
+      `check constraints of ${key}`,
+    );
+    assert.deepStrictEqual(
+      actual.indexes.map(indexKey).sort(),
+      expected.indexes.map(indexKey).sort(),
+      `indexes of ${key}`,
     );
   }
 };
@@ -901,7 +1063,7 @@ test('an empty step list has no transaction groups', () => {
   );
 });
 
-test('every current step kind is classified transactional', () => {
+test('every current step kind is classified, and only the concurrent kinds stand alone', () => {
   const kinds: readonly Step['kind'][] = [
     'create-table',
     'drop-table',
@@ -915,14 +1077,25 @@ test('every current step kind is classified transactional', () => {
     'drop-primary-key',
     'add-foreign-key',
     'drop-foreign-key',
+    'add-unique-constraint',
+    'drop-unique-constraint',
+    'add-check-constraint',
+    'drop-check-constraint',
+    'create-index',
+    'drop-index',
+    'create-index-concurrently',
+    'drop-index-concurrently',
     'create-sequence',
     'drop-sequence',
     'alter-sequence',
   ];
 
-  assert.equal(kinds.length, 15);
+  assert.equal(kinds.length, 23);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
-  for (const kind of kinds) assert.equal(TRANSACTIONAL[kind], true);
+  for (const kind of kinds) {
+    const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
+    assert.equal(TRANSACTIONAL[kind], !standalone, kind);
+  }
 });
 
 test('plan partitions a mixed migration into one transactional group', () => {
@@ -1816,6 +1989,424 @@ test('a mixed migration pins the exact step sequence across all nine phases', ()
     },
   ]);
   simulate(baseline, target);
+});
+
+test('an added table attaches its constraints and indexes in phase order', () => {
+  const unique = uniqueConstraint(['email'], { name: 'users_email_key' });
+  const check = checkConstraint('length(email) > 0', { name: 'users_email_check' });
+  const entry = index(['email'], { name: 'users_email_idx' });
+  const columns = [column('email')];
+  const users = table('users', {
+    columns,
+    uniqueConstraints: [unique],
+    checkConstraints: [check],
+    indexes: [entry],
+  });
+
+  assertPlan(model(), model(users), [
+    {
+      kind: 'create-table',
+      table: {
+        schema: 'public',
+        name: 'users',
+        columns,
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    },
+    { kind: 'add-unique-constraint', table: identity('users'), uniqueConstraint: unique },
+    { kind: 'add-check-constraint', table: identity('users'), checkConstraint: check },
+    { kind: 'create-index', table: identity('users'), index: entry },
+  ]);
+  simulate(model(), model(users));
+});
+
+test('a unique constraint add, change, or drop becomes its own step', () => {
+  const columns = [column('email')];
+  const without = table('users', { columns });
+  const unnamed = table('users', { columns, uniqueConstraints: [uniqueConstraint(['email'])] });
+  const named = table('users', {
+    columns,
+    uniqueConstraints: [uniqueConstraint(['email'], { name: 'users_email_key' })],
+  });
+
+  assertPlan(model(without), model(unnamed), [
+    {
+      kind: 'add-unique-constraint',
+      table: identity('users'),
+      uniqueConstraint: uniqueConstraint(['email']),
+    },
+  ]);
+  assertPlan(model(named), model(without), [
+    {
+      kind: 'drop-unique-constraint',
+      table: identity('users'),
+      uniqueConstraint: uniqueConstraint(['email'], { name: 'users_email_key' }),
+    },
+  ]);
+  assertPlan(model(unnamed), model(named), [
+    {
+      kind: 'drop-unique-constraint',
+      table: identity('users'),
+      uniqueConstraint: uniqueConstraint(['email']),
+    },
+    {
+      kind: 'add-unique-constraint',
+      table: identity('users'),
+      uniqueConstraint: uniqueConstraint(['email'], { name: 'users_email_key' }),
+    },
+  ]);
+  simulate(model(unnamed), model(named));
+});
+
+test('a check constraint add, change, or drop becomes its own step', () => {
+  const columns = [column('price')];
+  const without = table('orders', { columns });
+  const strict = table('orders', { columns, checkConstraints: [checkConstraint('price > 0')] });
+  const loose = table('orders', {
+    columns,
+    checkConstraints: [checkConstraint('price >= 0', { name: 'orders_price_check' })],
+  });
+
+  assertPlan(model(without), model(strict), [
+    {
+      kind: 'add-check-constraint',
+      table: identity('orders'),
+      checkConstraint: checkConstraint('price > 0'),
+    },
+  ]);
+  assertPlan(model(loose), model(without), [
+    {
+      kind: 'drop-check-constraint',
+      table: identity('orders'),
+      checkConstraint: checkConstraint('price >= 0', { name: 'orders_price_check' }),
+    },
+  ]);
+  // A changed expression is a removal and an addition, never a rename.
+  assertPlan(model(strict), model(loose), [
+    {
+      kind: 'drop-check-constraint',
+      table: identity('orders'),
+      checkConstraint: checkConstraint('price > 0'),
+    },
+    {
+      kind: 'add-check-constraint',
+      table: identity('orders'),
+      checkConstraint: checkConstraint('price >= 0', { name: 'orders_price_check' }),
+    },
+  ]);
+  simulate(model(strict), model(loose));
+});
+
+test('an index add or drop becomes its own step', () => {
+  const columns = [column('email')];
+  const entry = index(['email'], { name: 'users_email_idx', unique: true });
+  const without = table('users', { columns });
+  const withIndex = table('users', { columns, indexes: [entry] });
+
+  assertPlan(model(without), model(withIndex), [
+    { kind: 'create-index', table: identity('users'), index: entry },
+  ]);
+  assertPlan(model(withIndex), model(without), [
+    { kind: 'drop-index', table: identity('users'), index: entry },
+  ]);
+  simulate(model(without), model(withIndex));
+  simulate(model(withIndex), model(without));
+});
+
+test('a changed index decomposes into a drop and a create', () => {
+  const columns = [column('a'), column('b')];
+  const before = index(['a'], { name: 't_idx' });
+  const after = index(['a', 'b'], { name: 't_idx', unique: true });
+  const baseline = table('t', { columns, indexes: [before] });
+  const target = table('t', { columns, indexes: [after] });
+
+  assertPlan(model(baseline), model(target), [
+    { kind: 'drop-index', table: identity('t'), index: before },
+    { kind: 'create-index', table: identity('t'), index: after },
+  ]);
+  simulate(model(baseline), model(target));
+});
+
+test('an added concurrent index stands alone after the transactional steps', () => {
+  const columns = [column('email')];
+  const entry = index(['email'], { name: 'users_email_idx', concurrently: true });
+  const users = table('users', { columns, indexes: [entry] });
+
+  const { steps, groups } = plan(model(), model(users));
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'create-table',
+      table: {
+        schema: 'public',
+        name: 'users',
+        columns,
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    },
+    { kind: 'create-index-concurrently', table: identity('users'), index: entry },
+  ]);
+  assert.deepStrictEqual(groups, [
+    { start: 0, end: 1, transactional: true },
+    { start: 1, end: 2, transactional: false },
+  ]);
+  simulate(model(), model(users));
+});
+
+test('a dropped concurrent index is a standalone step', () => {
+  const columns = [column('email')];
+  const entry = index(['email'], { name: 'users_email_idx', concurrently: true });
+  const users = table('users', { columns, indexes: [entry] });
+
+  const { steps, groups } = plan(model(users), model(table('users', { columns })));
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-index-concurrently', table: identity('users'), index: entry },
+  ]);
+  assert.deepStrictEqual(groups, [{ start: 0, end: 1, transactional: false }]);
+  simulate(model(users), model(table('users', { columns })));
+});
+
+test('a changed index takes each flag from its own side', () => {
+  const columns = [column('a'), column('b')];
+  const source = index(['a'], { name: 't_idx' });
+  const sourceConcurrent = index(['a'], { name: 't_idx', concurrently: true });
+  const target = index(['a', 'b'], { name: 't_idx' });
+  const targetConcurrent = index(['a', 'b'], { name: 't_idx', concurrently: true });
+  const lazySource = table('t', { columns, indexes: [source] });
+  const concurrentSource = table('t', { columns, indexes: [sourceConcurrent] });
+  const lazyTarget = table('t', { columns, indexes: [target] });
+  const concurrentTarget = table('t', { columns, indexes: [targetConcurrent] });
+
+  // The baseline's flag drives the drop; the target's flag drives the create.
+  const escalating = plan(model(lazySource), model(concurrentTarget));
+  assert.deepStrictEqual(escalating.steps, [
+    { kind: 'drop-index', table: identity('t'), index: source },
+    { kind: 'create-index-concurrently', table: identity('t'), index: targetConcurrent },
+  ]);
+  assert.deepStrictEqual(escalating.groups, [
+    { start: 0, end: 1, transactional: true },
+    { start: 1, end: 2, transactional: false },
+  ]);
+
+  const settling = plan(model(concurrentSource), model(lazyTarget));
+  assert.deepStrictEqual(settling.steps, [
+    { kind: 'drop-index-concurrently', table: identity('t'), index: sourceConcurrent },
+    { kind: 'create-index', table: identity('t'), index: target },
+  ]);
+  assert.deepStrictEqual(settling.groups, [
+    { start: 0, end: 1, transactional: false },
+    { start: 1, end: 2, transactional: true },
+  ]);
+  simulate(model(concurrentSource), model(lazyTarget));
+});
+
+test('an index flag-only difference produces no plan', () => {
+  const columns = [column('a')];
+  const lazy = table('t', { columns, indexes: [index(['a'], { name: 't_idx' })] });
+  const concurrent = table('t', {
+    columns,
+    indexes: [index(['a'], { name: 't_idx', concurrently: true })],
+  });
+
+  assertPlan(model(lazy), model(concurrent), []);
+  assertPlan(model(concurrent), model(lazy), []);
+});
+
+test('a mixed migration pins the exact step sequence across all fifteen table phases', () => {
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+
+  const goneForeignKey = foreignKey(['parent_id'], identity('parent'), {
+    name: 'gone_parent_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const gone = table('gone', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'gone_pkey', columns: ['id'] },
+    foreignKeys: [goneForeignKey],
+  });
+
+  const obsoleteKey = uniqueConstraint(['obsolete'], { name: 'kept_obsolete_key' });
+  const obsoleteCheck = checkConstraint('obsolete > 0', { name: 'kept_obsolete_check' });
+  const obsoleteIndex = index(['obsolete'], { name: 'kept_obsolete_idx' });
+  const obsoleteForeignKey = foreignKey(['obsolete'], identity('parent'), {
+    name: 'kept_obsolete_fkey',
+    referencedColumns: ['id'],
+  });
+  const keptBefore = table('kept', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('obsolete', { type: 'integer' }),
+      column('note'),
+      column('target_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'kept_pkey', columns: ['id'] },
+    foreignKeys: [obsoleteForeignKey],
+    uniqueConstraints: [obsoleteKey],
+    checkConstraints: [obsoleteCheck],
+    indexes: [obsoleteIndex],
+  });
+
+  const liveForeignKey = foreignKey(['target_id'], identity('parent'), {
+    name: 'kept_target_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const liveKey = uniqueConstraint(['target_id'], { name: 'kept_target_id_key' });
+  const liveCheck = checkConstraint('target_id > 0', { name: 'kept_target_id_check' });
+  const liveIndex = index(['target_id'], { name: 'kept_target_id_idx' });
+  const keptAfter = table('kept', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('note', { type: 'character varying(12)' }),
+      column('target_id', { type: 'integer' }),
+      column('fresh', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'kept_pkey', columns: ['id', 'fresh'] },
+    foreignKeys: [liveForeignKey],
+    uniqueConstraints: [liveKey],
+    checkConstraints: [liveCheck],
+    indexes: [liveIndex],
+  });
+
+  const freshForeignKey = foreignKey(['parent_id'], identity('parent'), {
+    name: 'fresh_parent_id_fkey',
+    referencedColumns: ['id'],
+  });
+  const freshKey = uniqueConstraint(['id'], { name: 'fresh_id_key' });
+  const freshCheck = checkConstraint('id > 0', { name: 'fresh_id_check' });
+  const freshIndex = index(['parent_id'], { name: 'fresh_parent_id_idx' });
+  const fresh = table('fresh', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+    foreignKeys: [freshForeignKey],
+    uniqueConstraints: [freshKey],
+    checkConstraints: [freshCheck],
+    indexes: [freshIndex],
+  });
+
+  const baseline = model(keptBefore, gone, parent);
+  const target = model(keptAfter, fresh, parent);
+
+  assertPlan(baseline, target, [
+    // Phase 1: drop-foreign-key.
+    { kind: 'drop-foreign-key', table: identity('kept'), foreignKey: obsoleteForeignKey },
+    // Phase 2: drop-index.
+    { kind: 'drop-index', table: identity('kept'), index: obsoleteIndex },
+    // Phase 3: drop-check-constraint.
+    { kind: 'drop-check-constraint', table: identity('kept'), checkConstraint: obsoleteCheck },
+    // Phase 4: drop-unique-constraint.
+    { kind: 'drop-unique-constraint', table: identity('kept'), uniqueConstraint: obsoleteKey },
+    // Phase 5: drop-table.
+    { kind: 'drop-table', table: identity('gone') },
+    // Phase 6: drop-primary-key.
+    {
+      kind: 'drop-primary-key',
+      table: identity('kept'),
+      primaryKey: { name: 'kept_pkey', columns: ['id'] },
+    },
+    // Phase 7: drop-column.
+    {
+      kind: 'drop-column',
+      table: identity('kept'),
+      column: column('obsolete', { type: 'integer' }),
+    },
+    // Phase 8: create-table.
+    {
+      kind: 'create-table',
+      table: {
+        schema: 'public',
+        name: 'fresh',
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('parent_id', { type: 'integer' }),
+        ],
+        primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    },
+    // Phase 9: add-column.
+    { kind: 'add-column', table: identity('kept'), column: column('fresh', { type: 'integer' }) },
+    // Phase 10: alter-column.
+    {
+      kind: 'alter-column',
+      table: identity('kept'),
+      name: 'note',
+      fields: [{ field: 'type', before: 'text', after: 'character varying(12)' }],
+    },
+    // Phase 11: add-primary-key.
+    {
+      kind: 'add-primary-key',
+      table: identity('kept'),
+      primaryKey: { name: 'kept_pkey', columns: ['id', 'fresh'] },
+    },
+    // Phase 12: add-unique-constraint, in diff order (fresh before kept).
+    { kind: 'add-unique-constraint', table: identity('fresh'), uniqueConstraint: freshKey },
+    { kind: 'add-unique-constraint', table: identity('kept'), uniqueConstraint: liveKey },
+    // Phase 13: add-check-constraint.
+    { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: freshCheck },
+    { kind: 'add-check-constraint', table: identity('kept'), checkConstraint: liveCheck },
+    // Phase 14: create-index.
+    { kind: 'create-index', table: identity('fresh'), index: freshIndex },
+    { kind: 'create-index', table: identity('kept'), index: liveIndex },
+    // Phase 15: add-foreign-key.
+    { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: freshForeignKey },
+    { kind: 'add-foreign-key', table: identity('kept'), foreignKey: liveForeignKey },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a deep-frozen model with constraints and indexes can be planned, and steps carry copies', () => {
+  const sourceUnique = uniqueConstraint(['email'], { name: 'users_email_key' });
+  const sourceCheck = checkConstraint('length(email) > 0', { name: 'users_email_check' });
+  const sourceIndex = index(['email'], { name: 'users_email_idx' });
+  const baseline = deepFreeze(model(table('users', { columns: [column('email')] })));
+  const target = deepFreeze(
+    model(
+      table('users', {
+        columns: [column('email')],
+        uniqueConstraints: [sourceUnique],
+        checkConstraints: [sourceCheck],
+        indexes: [sourceIndex],
+      }),
+    ),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    { kind: 'add-unique-constraint', table: identity('users'), uniqueConstraint: sourceUnique },
+    { kind: 'add-check-constraint', table: identity('users'), checkConstraint: sourceCheck },
+    { kind: 'create-index', table: identity('users'), index: sourceIndex },
+  ]);
+
+  const uniqueStep = steps[0];
+  if (uniqueStep?.kind !== 'add-unique-constraint') throw new Error('expected a unique add');
+  assert.notEqual(uniqueStep.uniqueConstraint, sourceUnique);
+  assert.notEqual(uniqueStep.uniqueConstraint.columns, sourceUnique.columns);
+
+  const checkStep = steps[1];
+  if (checkStep?.kind !== 'add-check-constraint') throw new Error('expected a check add');
+  assert.notEqual(checkStep.checkConstraint, sourceCheck);
+
+  const indexStep = steps[2];
+  if (indexStep?.kind !== 'create-index') throw new Error('expected an index create');
+  assert.notEqual(indexStep.index, sourceIndex);
+  assert.notEqual(indexStep.index.columns, sourceIndex.columns);
 });
 
 test('an identity added to a kept column becomes one trailing add-identity step', () => {
