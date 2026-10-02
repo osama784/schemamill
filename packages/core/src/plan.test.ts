@@ -15,13 +15,14 @@ import type {
   Table,
   TableIdentity,
 } from './model.ts';
-import type { Step } from './plan.ts';
+import type { Step, TransactionGroup } from './plan.ts';
+import { groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
  * Tests for the migration plan: the eight global phases with the nine table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
- * drops, additions, alters and conversions, determinism, and a
+ * drops, additions, alters and conversions, transaction grouping, determinism, and a
  * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
  * pairs. Builders keep the fixtures small; expected values are complete steps, asserted with
  * `deepStrictEqual`.
@@ -138,9 +139,16 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   sequences,
 });
 
-/** Asserts that planning `baseline` to `target` yields exactly `expected`. */
+/**
+ * Asserts that planning `baseline` to `target` yields exactly `expected`, in one transactional
+ * group: every current step kind is transactional, and a plan of `expected.length` steps is a
+ * single group.
+ */
 const assertPlan = (baseline: Model, target: Model, expected: readonly Step[]): void => {
-  assert.deepStrictEqual(plan(baseline, target), { steps: expected });
+  assert.deepStrictEqual(plan(baseline, target), {
+    steps: expected,
+    groups: expected.length === 0 ? [] : [{ start: 0, end: expected.length, transactional: true }],
+  });
 };
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -799,6 +807,134 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     target: model(...shuffle([...target.values()].map(toTable))),
   };
 };
+
+test('transaction groups coalesce consecutive transactional steps and isolate the rest', () => {
+  const steps: readonly Step[] = [
+    { kind: 'create-table', table: table('a') },
+    { kind: 'create-table', table: table('b') },
+    { kind: 'drop-table', table: identity('c') },
+    { kind: 'create-table', table: table('d') },
+  ];
+
+  assert.deepStrictEqual(
+    groupSteps(steps, (step) => step.kind !== 'drop-table'),
+    [
+      { start: 0, end: 2, transactional: true },
+      { start: 2, end: 3, transactional: false },
+      { start: 3, end: 4, transactional: true },
+    ],
+  );
+});
+
+test('transaction groups are non-empty and tile the step list in order', () => {
+  const steps: readonly Step[] = [
+    { kind: 'drop-table', table: identity('a') },
+    { kind: 'create-table', table: table('b') },
+    { kind: 'add-column', table: identity('b'), column: column('x') },
+    { kind: 'drop-table', table: identity('c') },
+    { kind: 'drop-table', table: identity('d') },
+    { kind: 'create-table', table: table('e') },
+  ];
+  const groups: readonly TransactionGroup[] = groupSteps(
+    steps,
+    (step) => step.kind !== 'drop-table',
+  );
+
+  assert.deepStrictEqual(groups, [
+    { start: 0, end: 1, transactional: false },
+    { start: 1, end: 3, transactional: true },
+    { start: 3, end: 4, transactional: false },
+    { start: 4, end: 5, transactional: false },
+    { start: 5, end: 6, transactional: true },
+  ]);
+
+  let cursor = 0;
+  for (const group of groups) {
+    assert.equal(group.start, cursor, 'each group must start where the previous one ended');
+    assert.ok(group.end > group.start, 'every group must be non-empty');
+    cursor = group.end;
+  }
+  assert.equal(cursor, steps.length, 'the groups must cover every step');
+});
+
+test('an all-transactional step list is one group', () => {
+  const steps: readonly Step[] = [
+    { kind: 'create-table', table: table('a') },
+    { kind: 'drop-table', table: identity('b') },
+    { kind: 'create-table', table: table('c') },
+  ];
+
+  assert.deepStrictEqual(groupSteps(steps), [{ start: 0, end: 3, transactional: true }]);
+});
+
+test('a classification with no transactional step makes one group per step', () => {
+  const steps: readonly Step[] = [
+    { kind: 'create-table', table: table('a') },
+    { kind: 'drop-table', table: identity('b') },
+    { kind: 'create-table', table: table('c') },
+  ];
+
+  assert.deepStrictEqual(
+    groupSteps(steps, () => false),
+    [
+      { start: 0, end: 1, transactional: false },
+      { start: 1, end: 2, transactional: false },
+      { start: 2, end: 3, transactional: false },
+    ],
+  );
+});
+
+test('an empty step list has no transaction groups', () => {
+  assert.deepStrictEqual(groupSteps([]), []);
+  assert.deepStrictEqual(
+    groupSteps([], () => false),
+    [],
+  );
+});
+
+test('every current step kind is classified transactional', () => {
+  const kinds: readonly Step['kind'][] = [
+    'create-table',
+    'drop-table',
+    'add-column',
+    'drop-column',
+    'alter-column',
+    'add-identity',
+    'drop-identity',
+    'alter-identity',
+    'add-primary-key',
+    'drop-primary-key',
+    'add-foreign-key',
+    'drop-foreign-key',
+    'create-sequence',
+    'drop-sequence',
+    'alter-sequence',
+  ];
+
+  assert.equal(kinds.length, 15);
+  assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
+  for (const kind of kinds) assert.equal(TRANSACTIONAL[kind], true);
+});
+
+test('plan partitions a mixed migration into one transactional group', () => {
+  const baseline = model(
+    table('kept', { columns: [column('id'), column('extra')] }),
+    table('gone', { columns: [column('id')] }),
+  );
+  const target = model(
+    table('kept', {
+      columns: [column('id'), column('extra', { type: 'numeric(12,2)', notNull: true })],
+    }),
+    table('fresh', { columns: [column('id')] }),
+  );
+
+  const { steps, groups } = plan(baseline, target);
+  assert.ok(steps.length > 1, 'the mixed migration must carry more than one step');
+  assert.deepStrictEqual(groups, [{ start: 0, end: steps.length, transactional: true }]);
+
+  const empty = plan(model(), model());
+  assert.deepStrictEqual(empty, { steps: [], groups: [] });
+});
 
 test('identical models produce an empty plan', () => {
   const profiles = table('profiles', {

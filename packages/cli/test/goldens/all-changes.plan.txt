@@ -1,4 +1,4 @@
-22 steps:
+22 steps in one transaction:
   1. drop-foreign-key  public.fk_changed: foreign key fk_changed_target_id_fkey (target_id) → public.fk_added (id) on delete CASCADE
   2. drop-foreign-key  public.fk_columns_changed: foreign key fk_columns_changed_target_id_fkey (target_id) → public.fk_columns_target (a)
   3. drop-foreign-key  public.fk_name_changed: foreign key fk_name_changed_target_id_fkey (target_id) → public.fk_added (id)
@@ -22,6 +22,7 @@
  21. add-foreign-key   public.fk_name_changed: foreign key fk_name_changed_target_id_fkey_v2 (target_id) → public.fk_added (id)
  22. add-foreign-key   public.fk_on_update_changed: foreign key fk_on_update_changed_target_id_fkey (target_id) → public.fk_added (id) on update RESTRICT
 
+BEGIN;
 ALTER TABLE public.fk_changed DROP CONSTRAINT fk_changed_target_id_fkey;
 ALTER TABLE public.fk_columns_changed DROP CONSTRAINT fk_columns_changed_target_id_fkey;
 ALTER TABLE public.fk_name_changed DROP CONSTRAINT fk_name_changed_target_id_fkey;
@@ -50,3 +51,4 @@ ALTER TABLE public.fk_changed ADD CONSTRAINT fk_changed_target_id_fkey FOREIGN K
 ALTER TABLE public.fk_columns_changed ADD CONSTRAINT fk_columns_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_columns_target(b);
 ALTER TABLE public.fk_name_changed ADD CONSTRAINT fk_name_changed_target_id_fkey_v2 FOREIGN KEY (target_id) REFERENCES public.fk_added(id);
 ALTER TABLE public.fk_on_update_changed ADD CONSTRAINT fk_on_update_changed_target_id_fkey FOREIGN KEY (target_id) REFERENCES public.fk_added(id) ON UPDATE RESTRICT;
+COMMIT;

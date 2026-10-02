@@ -20,8 +20,9 @@ import type {
  * executable steps, and reorders them so the dependencies the model can express are respected:
  * sequences before the tables that own them, referencing tables before the tables they
  * reference, and constraints before the primary keys and columns they depend on. It is the
- * change engine's ordering pass: the plan carries every payload a renderer needs, and hazards
- * and transaction grouping are later work.
+ * change engine's ordering pass: the plan carries every payload a renderer needs and partitions
+ * its steps into transaction groups, telling a renderer what applies as one unit; hazards are a
+ * separate analysis.
  *
  * A step is one of fifteen kinds. A table addition becomes a create-table step carrying the
  * table's columns and primary key as they are, plus one add-foreign-key step per foreign key —
@@ -156,10 +157,28 @@ import type {
  * inputs.
  */
 
-/** A migration plan: the ordered steps that move a baseline model to its target. */
+/**
+ * A migration plan: the ordered steps that move a baseline model to its target, partitioned
+ * into transaction groups.
+ */
 export interface Plan {
   /** Every step, in execution order. */
   readonly steps: readonly Step[];
+
+  /**
+   * The transaction partition of `steps`: non-empty half-open ranges that tile
+   * `[0, steps.length)` in order, with `transactional: false` marking a standalone group that
+   * applies outside a transaction. Empty when the plan has no steps.
+   */
+  readonly groups: readonly TransactionGroup[];
+}
+
+/** A run of consecutive plan steps that applies as one unit: `[start, end)` indices into `Plan.steps`. */
+export interface TransactionGroup {
+  readonly start: number;
+  readonly end: number;
+  /** `false` means the group applies outside a transaction (no wrapper). Unreachable today. */
+  readonly transactional: boolean;
 }
 
 /** One planned action. */
@@ -208,6 +227,58 @@ export type Step =
       sequence: SequenceIdentity;
       fields: readonly SequenceFieldChange[];
     };
+
+/**
+ * Whether each step kind may run inside a transaction. Every current kind is transactional; the
+ * `Record` is compile-time exhaustive over `Step['kind']`, so a future kind must be classified
+ * before the package compiles. A `false` kind makes `groupSteps` stand its step alone, outside
+ * any wrapper.
+ */
+export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
+  'create-table': true,
+  'drop-table': true,
+  'add-column': true,
+  'drop-column': true,
+  'alter-column': true,
+  'add-identity': true,
+  'drop-identity': true,
+  'alter-identity': true,
+  'add-primary-key': true,
+  'drop-primary-key': true,
+  'add-foreign-key': true,
+  'drop-foreign-key': true,
+  'create-sequence': true,
+  'drop-sequence': true,
+  'alter-sequence': true,
+};
+
+/**
+ * Partitions `steps` into transaction groups: consecutive steps `isTransactional` classifies as
+ * transactional coalesce into one group; a step it classifies as non-transactional becomes a
+ * group of its own, even beside another non-transactional step. Groups are non-empty and tile
+ * `[0, steps.length)` in order; an empty step list yields no groups. `plan` uses the step-kind
+ * classification above; the predicate parameter is a seam that lets tests exercise the
+ * standalone path.
+ */
+export function groupSteps(
+  steps: readonly Step[],
+  isTransactional: (step: Step) => boolean = (step) => TRANSACTIONAL[step.kind],
+): readonly TransactionGroup[] {
+  const groups: TransactionGroup[] = [];
+  let open: { start: number; transactional: boolean } | undefined;
+  for (let index = 0; index < steps.length; index += 1) {
+    const transactional = isTransactional(steps[index]!);
+    if (open !== undefined && open.transactional && transactional) continue;
+    if (open !== undefined) {
+      groups.push({ start: open.start, end: index, transactional: open.transactional });
+    }
+    open = { start: index, transactional };
+  }
+  if (open !== undefined) {
+    groups.push({ start: open.start, end: steps.length, transactional: open.transactional });
+  }
+  return groups;
+}
 
 /**
  * The steps from `baseline` to `target`, in dependency-correct order. Returned payloads are
@@ -508,30 +579,30 @@ export function plan(baseline: Model, target: Model): Plan {
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
-  return {
-    steps: [
-      ...identityDrops,
-      ...sequenceCreates,
-      ...ownershipDetaches,
-      ...foreignKeyDrops,
-      ...dependentKeyDrops,
-      ...breaks,
-      ...tableDrops,
-      ...primaryKeyDrops,
-      ...columnDrops,
-      ...tableCreates,
-      ...columnAdds,
-      ...columnAlters,
-      ...primaryKeyAdds,
-      ...foreignKeyAdds,
-      ...dependentKeyAdds,
-      ...ownershipAttaches,
-      ...optionAlters,
-      ...sequenceDrops,
-      ...identityAdds,
-      ...identityAlters,
-    ],
-  };
+  const steps: Step[] = [
+    ...identityDrops,
+    ...sequenceCreates,
+    ...ownershipDetaches,
+    ...foreignKeyDrops,
+    ...dependentKeyDrops,
+    ...breaks,
+    ...tableDrops,
+    ...primaryKeyDrops,
+    ...columnDrops,
+    ...tableCreates,
+    ...columnAdds,
+    ...columnAlters,
+    ...primaryKeyAdds,
+    ...foreignKeyAdds,
+    ...dependentKeyAdds,
+    ...ownershipAttaches,
+    ...optionAlters,
+    ...sequenceDrops,
+    ...identityAdds,
+    ...identityAlters,
+  ];
+
+  return { steps, groups: groupSteps(steps) };
 }
 
 /** A changed sequence's ownership, held until the plan knows which owners it removes. */

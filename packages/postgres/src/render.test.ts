@@ -105,8 +105,14 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   sequences,
 });
 
-/** A plan of the given steps, for renderer edge cases. */
-const planOf = (...steps: readonly Step[]): Plan => ({ steps });
+/** A plan of the given steps as one transactional group, for renderer edge cases. */
+const planOf = (...steps: readonly Step[]): Plan => ({
+  steps,
+  groups: steps.length === 0 ? [] : [{ start: 0, end: steps.length, transactional: true }],
+});
+
+/** One `drop-table` step, for the partition-guard cases. */
+const dropStep = (name: string): Step => ({ kind: 'drop-table', table: identity(name) });
 
 /** Reads the golden file `test/goldens/<name>.sql`, including its trailing newline. */
 const golden = (name: string): string =>
@@ -221,7 +227,116 @@ const mixedScene = (reversed = false) => {
 
 test('an empty plan renders as the empty string', () => {
   assert.equal(renderSql(plan(model(), model())), '');
-  assert.equal(renderSql({ steps: [] }), '');
+  assert.equal(renderSql({ steps: [], groups: [] }), '');
+});
+
+test('a non-empty plan renders as exactly one wrapped transaction', () => {
+  const sql = renderSql(
+    plan(
+      model(),
+      model(table('t', { columns: [column('id', { type: 'integer', notNull: true })] })),
+    ),
+  );
+
+  assert.ok(sql.startsWith('BEGIN;\n'), 'the plan opens with BEGIN;');
+  assert.ok(sql.endsWith('COMMIT;\n'), 'the plan closes with COMMIT; and one trailing newline');
+  assert.equal(sql.match(/^BEGIN;$/gm)?.length, 1);
+  assert.equal(sql.match(/^COMMIT;$/gm)?.length, 1);
+});
+
+test('wraps each transactional group and leaves a standalone group bare', () => {
+  const synthetic: Plan = {
+    steps: [
+      { kind: 'drop-table', table: identity('a') },
+      { kind: 'drop-table', table: identity('b') },
+      { kind: 'drop-table', table: identity('c') },
+      { kind: 'drop-table', table: identity('d') },
+    ],
+    groups: [
+      { start: 0, end: 2, transactional: true },
+      { start: 2, end: 3, transactional: false },
+      { start: 3, end: 4, transactional: true },
+    ],
+  };
+
+  assert.equal(
+    renderSql(synthetic),
+    [
+      'BEGIN;',
+      'DROP TABLE public.a;',
+      'DROP TABLE public.b;',
+      'COMMIT;',
+      'DROP TABLE public.c;',
+      'BEGIN;',
+      'DROP TABLE public.d;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a non-empty plan with no groups is rejected', () => {
+  assert.throws(
+    () => renderSql({ steps: [dropStep('a')], groups: [] }),
+    /plan\.groups must tile \[0, 1\) in order, but found no groups/,
+  );
+});
+
+test('a partition with a gap is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b'), dropStep('c')],
+        groups: [
+          { start: 0, end: 1, transactional: true },
+          { start: 2, end: 3, transactional: true },
+        ],
+      }),
+    /group 1 starts at 2, expected 1/,
+  );
+});
+
+test('overlapping groups are rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b')],
+        groups: [
+          { start: 0, end: 2, transactional: true },
+          { start: 1, end: 2, transactional: true },
+        ],
+      }),
+    /group 1 starts at 1, expected 2/,
+  );
+});
+
+test('an empty group range is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a')],
+        groups: [{ start: 0, end: 0, transactional: false }],
+      }),
+    /group 0 spans \[0, 0\)/,
+  );
+});
+
+test('a partition that stops before the last step is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b')],
+        groups: [{ start: 0, end: 1, transactional: true }],
+      }),
+    /plan\.groups must tile \[0, 2\), but the groups end at 1/,
+  );
+});
+
+test('groups without steps are rejected', () => {
+  assert.throws(
+    () => renderSql({ steps: [], groups: [{ start: 0, end: 1, transactional: true }] }),
+    /plan\.groups must be empty when plan\.steps is empty, but found groups \[0, 1\)/,
+  );
 });
 
 test('identifiers are quoted only when PostgreSQL needs it', () => {
@@ -243,12 +358,14 @@ test('identifiers are quoted only when PostgreSQL needs it', () => {
       }),
     ),
     [
+      'BEGIN;',
       'CREATE TABLE app."user" (',
       '    "Mixed Case" text,',
       '    "we""ird" text,',
       '    "9lives" text,',
       '    lower_case$1 text',
       ');',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -256,7 +373,7 @@ test('identifiers are quoted only when PostgreSQL needs it', () => {
   // A reserved word is quoted in every position, including the schema.
   assert.equal(
     renderSql(planOf({ kind: 'drop-table', table: { schema: 'user', name: 'select' } })),
-    'DROP TABLE "user"."select";\n',
+    'BEGIN;\nDROP TABLE "user"."select";\nCOMMIT;\n',
   );
 });
 
@@ -269,7 +386,7 @@ test('a foreign key without referenced columns omits the column list', () => {
         foreignKey: foreignKey(['parent_id'], identity('parent'), { name: 't_parent_id_fkey' }),
       }),
     ),
-    'ALTER TABLE public.t ADD CONSTRAINT t_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent;\n',
+    'BEGIN;\nALTER TABLE public.t ADD CONSTRAINT t_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent;\nCOMMIT;\n',
   );
 });
 
@@ -291,9 +408,11 @@ test("unnamed constraints drop under PostgreSQL's conventional names", () => {
       ),
     ),
     [
+      'BEGIN;',
       'ALTER TABLE public.t DROP CONSTRAINT t_pkey;',
       'ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_tenant_id_fkey;',
       'ALTER TABLE public."Mixed Case" DROP CONSTRAINT "Mixed Case_pkey";',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -302,7 +421,14 @@ test("unnamed constraints drop under PostgreSQL's conventional names", () => {
 test('binds the SqlRenderer seam', () => {
   const baseline = model();
   const target = model(table('t', { columns: [column('id', { type: 'integer', notNull: true })] }));
-  const expected = ['CREATE TABLE public.t (', '    id integer NOT NULL', ');', ''].join('\n');
+  const expected = [
+    'BEGIN;',
+    'CREATE TABLE public.t (',
+    '    id integer NOT NULL',
+    ');',
+    'COMMIT;',
+    '',
+  ].join('\n');
 
   assert.equal(renderSql(plan(baseline, target)), expected);
   assert.equal(sqlRenderer.render(plan(baseline, target)), expected);
@@ -563,7 +689,7 @@ test('renders CREATE SEQUENCE with every effective option, exactly', () => {
         }),
       }),
     ),
-    'CREATE SEQUENCE public.s AS bigint INCREMENT BY -2 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 9007199254740993 CACHE 2147483647 CYCLE;\n',
+    'BEGIN;\nCREATE SEQUENCE public.s AS bigint INCREMENT BY -2 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 9007199254740993 CACHE 2147483647 CYCLE;\nCOMMIT;\n',
   );
 });
 
@@ -584,7 +710,7 @@ test('renders one ALTER SEQUENCE statement carrying every changed field, in orde
         ],
       }),
     ),
-    'ALTER SEQUENCE public.s AS integer INCREMENT BY 2 MINVALUE 0 MAXVALUE 200 START WITH 5 CACHE 4 CYCLE;\n',
+    'BEGIN;\nALTER SEQUENCE public.s AS integer INCREMENT BY 2 MINVALUE 0 MAXVALUE 200 START WITH 5 CACHE 4 CYCLE;\nCOMMIT;\n',
   );
 });
 
@@ -596,7 +722,7 @@ test('renders the AS conversion and the bounds it would move in one statement', 
 
   assert.equal(
     renderSql(plan(baseline, target)),
-    'ALTER SEQUENCE public.s AS bigint MAXVALUE 2147483647;\n',
+    'BEGIN;\nALTER SEQUENCE public.s AS bigint MAXVALUE 2147483647;\nCOMMIT;\n',
   );
 });
 
@@ -609,7 +735,7 @@ test('renders ownership changes as OWNED BY and OWNED BY NONE', () => {
         fields: [{ field: 'ownedBy', before: owner('old', 'id'), after: owner('new', 'id') }],
       }),
     ),
-    'ALTER SEQUENCE public.s OWNED BY public.new.id;\n',
+    'BEGIN;\nALTER SEQUENCE public.s OWNED BY public.new.id;\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -619,7 +745,7 @@ test('renders ownership changes as OWNED BY and OWNED BY NONE', () => {
         fields: [{ field: 'ownedBy', before: owner('old', 'id') }],
       }),
     ),
-    'ALTER SEQUENCE public.s OWNED BY NONE;\n',
+    'BEGIN;\nALTER SEQUENCE public.s OWNED BY NONE;\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -629,14 +755,14 @@ test('renders ownership changes as OWNED BY and OWNED BY NONE', () => {
         fields: [{ field: 'ownedBy', after: owner('new', 'id') }],
       }),
     ),
-    'ALTER SEQUENCE public.s OWNED BY public.new.id;\n',
+    'BEGIN;\nALTER SEQUENCE public.s OWNED BY public.new.id;\nCOMMIT;\n',
   );
 });
 
 test('quotes sequence and owner identifiers only when PostgreSQL needs it', () => {
   assert.equal(
     renderSql(planOf({ kind: 'drop-sequence', sequence: { schema: 'user', name: 'select' } })),
-    'DROP SEQUENCE "user"."select";\n',
+    'BEGIN;\nDROP SEQUENCE "user"."select";\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -646,7 +772,7 @@ test('quotes sequence and owner identifiers only when PostgreSQL needs it', () =
         fields: [{ field: 'ownedBy', after: owner('Order', 'we"ird') }],
       }),
     ),
-    'ALTER SEQUENCE public."Mixed Case" OWNED BY public."Order"."we""ird";\n',
+    'BEGIN;\nALTER SEQUENCE public."Mixed Case" OWNED BY public."Order"."we""ird";\nCOMMIT;\n',
   );
 });
 
@@ -663,9 +789,11 @@ test('golden: a sequence lifecycle renders create, attach, alter, re-own, and dr
   assert.equal(
     renderSql(plan(baseline, target)),
     [
+      'BEGIN;',
       'ALTER SEQUENCE public.s OWNED BY public.t.x;',
       'ALTER SEQUENCE public.s INCREMENT BY 5;',
       'DROP SEQUENCE public.gone;',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -703,7 +831,7 @@ test('renders ADD GENERATED in full-explicit form, with the name only when model
         }),
       }),
     ),
-    'ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME public.t_id_seq INCREMENT BY 2 MINVALUE 1 MAXVALUE 2147483647 START WITH 5 CACHE 10 CYCLE );\n',
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME public.t_id_seq INCREMENT BY 2 MINVALUE 1 MAXVALUE 2147483647 START WITH 5 CACHE 10 CYCLE );\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -714,7 +842,7 @@ test('renders ADD GENERATED in full-explicit form, with the name only when model
         identity: identityColumn({ generated: 'by default' }),
       }),
     ),
-    'ALTER TABLE public.t ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY ( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );\n',
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY ( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );\nCOMMIT;\n',
   );
 });
 
@@ -736,14 +864,14 @@ test('renders one ALTER identity statement carrying every changed field, in orde
         ],
       }),
     ),
-    'ALTER TABLE public.t ALTER COLUMN id SET GENERATED ALWAYS SET INCREMENT BY 5 SET MINVALUE 2 SET MAXVALUE 200 SET START WITH 3 SET CACHE 4 SET NO CYCLE;\n',
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN id SET GENERATED ALWAYS SET INCREMENT BY 5 SET MINVALUE 2 SET MAXVALUE 200 SET START WITH 3 SET CACHE 4 SET NO CYCLE;\nCOMMIT;\n',
   );
 });
 
 test('renders DROP IDENTITY and quotes identity identifiers only when needed', () => {
   assert.equal(
     renderSql(planOf({ kind: 'drop-identity', table: identity('t'), name: 'id' })),
-    'ALTER TABLE public.t ALTER COLUMN id DROP IDENTITY;\n',
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN id DROP IDENTITY;\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -757,7 +885,7 @@ test('renders DROP IDENTITY and quotes identity identifiers only when needed', (
         }),
       }),
     ),
-    'ALTER TABLE "user"."select" ALTER COLUMN "Mixed Case" ADD GENERATED BY DEFAULT AS IDENTITY ( SEQUENCE NAME "user"."select" INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );\n',
+    'BEGIN;\nALTER TABLE "user"."select" ALTER COLUMN "Mixed Case" ADD GENERATED BY DEFAULT AS IDENTITY ( SEQUENCE NAME "user"."select" INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );\nCOMMIT;\n',
   );
   assert.equal(
     renderSql(
@@ -768,7 +896,7 @@ test('renders DROP IDENTITY and quotes identity identifiers only when needed', (
         fields: [{ field: 'increment', before: '1', after: '2' }],
       }),
     ),
-    'ALTER TABLE "user"."select" ALTER COLUMN "we""ird" SET INCREMENT BY 2;\n',
+    'BEGIN;\nALTER TABLE "user"."select" ALTER COLUMN "we""ird" SET INCREMENT BY 2;\nCOMMIT;\n',
   );
 });
 
@@ -783,10 +911,12 @@ test('identity columns render plain and their identity arrives in its own statem
   assert.equal(
     renderSql(plan(model(), target)),
     [
+      'BEGIN;',
       'CREATE TABLE public.t (',
       '    id integer NOT NULL',
       ');',
       'ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME public.t_id_seq INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -802,8 +932,10 @@ test('identity columns render plain and their identity arrives in its own statem
       ),
     ),
     [
+      'BEGIN;',
       'ALTER TABLE public.t ADD COLUMN id integer NOT NULL;',
       'ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME public.t_id_seq INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -834,9 +966,11 @@ test('renders both identity conversions in policy order', () => {
   assert.equal(
     renderSql(plan(serial, identityTarget)),
     [
+      'BEGIN;',
       'ALTER TABLE public.t ALTER COLUMN id DROP DEFAULT;',
       'DROP SEQUENCE public.t_id_seq;',
       'ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME public.t_id_seq INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE );',
+      'COMMIT;',
       '',
     ].join('\n'),
   );
@@ -853,9 +987,11 @@ test('renders both identity conversions in policy order', () => {
   assert.equal(
     renderSql(plan(identityTarget, serialTarget)),
     [
+      'BEGIN;',
       'ALTER TABLE public.t ALTER COLUMN id DROP IDENTITY;',
       'CREATE SEQUENCE public.t_id_seq AS integer INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1 NO CYCLE;',
       "ALTER TABLE public.t ALTER COLUMN id SET DEFAULT nextval('t_id_seq'::regclass);",
+      'COMMIT;',
       '',
     ].join('\n'),
   );

@@ -4,6 +4,7 @@ export const version = '0.4.1';
 export { diff } from './diff.ts';
 export { canonicalIntType, effectiveIdentity } from './identity.ts';
 export { plan } from './plan.ts';
+export type { TransactionGroup } from './plan.ts';
 export {
   defaultSequenceMax,
   defaultSequenceMin,
