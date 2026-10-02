@@ -5,8 +5,10 @@ import { effectiveIdentity, plan, sequenceTypeBounds } from './index.ts';
 import type { Identity, IdentityInput } from './identity.ts';
 import type { IdentityFieldChange } from './diff.ts';
 import type {
+  CheckConstraint,
   Column,
   ForeignKey,
+  Index,
   Model,
   PrimaryKey,
   Sequence,
@@ -14,6 +16,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from './model.ts';
 import type { Step, TransactionGroup } from './plan.ts';
 import { groupSteps, TRANSACTIONAL } from './plan.ts';
@@ -44,6 +47,9 @@ interface TableParts {
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
+  uniqueConstraints?: readonly UniqueConstraint[];
+  checkConstraints?: readonly CheckConstraint[];
+  indexes?: readonly Index[];
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -53,6 +59,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
+  uniqueConstraints: parts.uniqueConstraints ?? [],
+  checkConstraints: parts.checkConstraints ?? [],
+  indexes: parts.indexes ?? [],
 });
 
 /** A table with an `integer` primary key column `id` and the given extra members. */
@@ -989,6 +998,9 @@ test('an added table becomes a create-table step and trailing foreign-key steps'
         ],
         primaryKey: { columns: ['id'] },
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
     {
@@ -999,6 +1011,9 @@ test('an added table becomes a create-table step and trailing foreign-key steps'
         columns: [column('id', { type: 'bigint', notNull: true })],
         primaryKey: { name: 'users_pkey', columns: ['id'] },
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
     { kind: 'add-foreign-key', table: identity('orders'), foreignKey: ordersForeignKey },
@@ -1772,6 +1787,9 @@ test('a mixed migration pins the exact step sequence across all nine phases', ()
         columns: [column('id'), column('user_id')],
         primaryKey: { name: 'sessions_pkey', columns: ['id'] },
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
     { kind: 'add-column', table: identity('users'), column: column('email') },
@@ -1939,6 +1957,9 @@ test('a removed identity drops in the first phase, before the rest of the plan',
         name: 'u',
         columns: [column('x')],
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
   ]);
@@ -2257,6 +2278,9 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
         name: 'e_new',
         columns: [column('id', { type: 'integer', notNull: true, identity: identityColumn() })],
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
     {

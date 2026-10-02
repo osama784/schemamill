@@ -5,8 +5,10 @@ import { diff } from './index.ts';
 import type { Change } from './diff.ts';
 import type { Identity } from './identity.ts';
 import type {
+  CheckConstraint,
   Column,
   ForeignKey,
+  Index,
   Model,
   PrimaryKey,
   Sequence,
@@ -14,6 +16,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from './model.ts';
 
 /**
@@ -38,6 +41,9 @@ interface TableParts {
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
+  uniqueConstraints?: readonly UniqueConstraint[];
+  checkConstraints?: readonly CheckConstraint[];
+  indexes?: readonly Index[];
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -47,6 +53,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
+  uniqueConstraints: parts.uniqueConstraints ?? [],
+  checkConstraints: parts.checkConstraints ?? [],
+  indexes: parts.indexes ?? [],
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */

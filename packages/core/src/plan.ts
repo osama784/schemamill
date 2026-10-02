@@ -813,6 +813,9 @@ function copyTableWithoutForeignKeys(table: Table): Table {
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
     foreignKeys: [],
+    uniqueConstraints: [],
+    checkConstraints: [],
+    indexes: [],
   };
 }
 
