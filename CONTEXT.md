@@ -26,6 +26,22 @@ _Avoid_: field, attribute
 A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one.
 _Avoid_: pk, key
 
+**Unique constraint**:
+A table constraint requiring an ordered list of its columns to be unique together, named in the source or left unnamed. A unique constraint is never modeled as, or accompanied by, an index.
+_Avoid_: unique index, key
+
+**Check constraint**:
+A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed.
+_Avoid_: validation rule, predicate
+
+**Index**:
+A standalone access path over a table's columns, identified by its name. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own.
+_Avoid_: key, access method
+
+**Concurrent index**:
+An index declared `CONCURRENTLY`: apply metadata that steers how its create or drop applies, excluded from structural identity, and stood outside any transaction. The target's declaration drives a create; the baseline's drives a drop.
+_Avoid_: online index, non-blocking index
+
 **Relationship**:
 A link between two tables in the model — what the canvas draws and the plan creates or drops. In v1, every relationship comes from a foreign key.
 _Avoid_: connection, edge, link
@@ -95,7 +111,7 @@ _Avoid_: run, execute, deploy
 ### The change engine
 
 **Change**:
-One atom of a diff — a table, column, primary key, or foreign key added, removed, or changed between a baseline and a target.
+One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, or index added, removed, or changed between a baseline and a target.
 _Avoid_: edit, modification, alteration
 
 **Migration plan**:
@@ -107,11 +123,11 @@ The SQL rendering of a migration plan — deterministic and reviewable, for the 
 _Avoid_: script, patch, changeset
 
 **Transaction group**:
-A run of consecutive migration-plan steps that applies as one unit. Transaction-safe steps coalesce into one group; a step PostgreSQL cannot run inside a transaction stands alone. Boundaries are derived from step semantics, never configured by the user.
+A run of consecutive migration-plan steps that applies as one unit. Transaction-safe steps coalesce into one group; a step PostgreSQL cannot run inside a transaction stands alone. Boundaries are derived from step semantics, never configured by the user. A plan with more than one group displays the group count with one section per group, and its SQL separates the groups with a blank line.
 _Avoid_: batch, transaction block, commit point
 
 **Non-transactional step**:
-A migration-plan step whose statement PostgreSQL refuses to run inside a transaction. It stands alone, unwrapped. No step kind is non-transactional today.
+A migration-plan step whose statement PostgreSQL refuses to run inside a transaction. It stands alone, unwrapped; the concurrent index builds — `create-index-concurrently` and `drop-index-concurrently` — are the only such kinds.
 _Avoid_: unsafe step, autocommit step
 
 **Hazard**:
