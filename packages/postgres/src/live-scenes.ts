@@ -1,11 +1,16 @@
 import { effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
+  CheckConstraint,
   Column,
+  Diagnostic,
   ForeignKey,
   Identity,
   IdentityInput,
+  Index,
   Model,
+  Plan,
   PrimaryKey,
+  ReadResult,
   Sequence,
   SequenceDataType,
   SequenceIdentity,
@@ -13,6 +18,7 @@ import type {
   Step,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from '@schemamill/core';
 
 /**
@@ -50,6 +56,12 @@ import type {
  * (`identity-drop`) — and both conversions between an identity and an owned `nextval` default
  * reusing the same sequence name (`identity-to-sequence`, `sequence-to-identity`).
  *
+ * The constraint and index scenes cover this slice's shapes: named and unnamed unique and
+ * check constraints on a new table (`constraint-create`), a plain and a unique standalone
+ * index beside a partial and an expression index the model cannot declare (`index-create`),
+ * and a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
+ * transactional steps (`index-concurrently`).
+ *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
  * in place — a model that says otherwise would make the migrated database legitimately differ
@@ -72,6 +84,9 @@ interface TableParts {
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
+  uniqueConstraints?: readonly UniqueConstraint[];
+  checkConstraints?: readonly CheckConstraint[];
+  indexes?: readonly Index[];
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -81,9 +96,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
-  uniqueConstraints: [],
-  checkConstraints: [],
-  indexes: [],
+  uniqueConstraints: parts.uniqueConstraints ?? [],
+  checkConstraints: parts.checkConstraints ?? [],
+  indexes: parts.indexes ?? [],
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
@@ -141,14 +156,31 @@ export interface SceneCheck {
 }
 
 /**
- * One plan fact: `failure` reads the migration plan's steps and returns what is wrong, or
- * `undefined` when the plan is right. Plan facts are asserted before any SQL runs — they pin
- * what the plan does, which the live round trip alone cannot name, such as a step the plan
- * must not emit because a cascade would make it redundant.
+ * One plan fact: `failure` reads the migration plan's steps — and the plan itself, for facts
+ * about its transaction groups — and returns what is wrong, or `undefined` when the plan is
+ * right. Plan facts are asserted before any SQL runs — they pin what the plan does, which the
+ * live round trip alone cannot name, such as a step the plan must not emit because a cascade
+ * would make it redundant, or the standalone group a concurrent statement must stand in.
  */
 export interface ScenePlanCheck {
   readonly description: string;
-  readonly failure: (steps: readonly Step[]) => string | undefined;
+  readonly failure: (steps: readonly Step[], plan: Plan) => string | undefined;
+}
+
+/**
+ * One import fact: `failure` reads an import's model and diagnostics — and which database's
+ * dump it came from — and returns what is wrong, or `undefined` when the import is right.
+ * Import facts are asserted after both dumps are imported. They pin what the live round trip
+ * alone cannot name: facts about the model an import produces, such as a constraint-backed
+ * index that must not be double-modeled as a standalone `Index`, or a skip the import must
+ * report by name.
+ */
+export interface SceneImportCheck {
+  readonly description: string;
+  readonly failure: (
+    imported: ReadResult<Model, Diagnostic>,
+    source: 'applied' | 'target',
+  ) => string | undefined;
 }
 
 /** One scene of the live-PostgreSQL harness. */
@@ -159,6 +191,12 @@ export interface LiveScene {
   readonly baseline: Model;
   /** The model the target database is built from and the migration aims at. */
   readonly target: Model;
+  /**
+   * Raw SQL appended to the target database's build, for objects the model cannot declare,
+   * such as a partial or expression index. The plan, built from the model, never renders them;
+   * the target dump carries them, and the scene's `importChecks` pin the skip that names them.
+   */
+  readonly targetExtraSql?: string;
   /** Catalog facts to assert after the baseline build, before the migration. */
   readonly baselineChecks?: readonly SceneCheck[];
   /** Plan facts to assert on `plan(baseline, target)`, before any SQL runs. */
@@ -167,6 +205,8 @@ export interface LiveScene {
   readonly probes?: readonly string[];
   /** Catalog facts to assert after the migration and the probes. */
   readonly checks?: readonly SceneCheck[];
+  /** Import facts to assert on both dumps' imports, after the round trip. */
+  readonly importChecks?: readonly SceneImportCheck[];
 }
 
 /** `public` tables in name order, or the empty string when there are none. */
@@ -197,6 +237,34 @@ const constraintName = (tableName: string, contype: string): string =>
 /** The definition of the constraint named `conname`. */
 const constraintDef = (conname: string): string =>
   `select pg_get_constraintdef(oid) from pg_constraint where conname = '${conname}'`;
+
+/** The names of `tableName`'s constraints of the given type, in name order. */
+const constraintNames = (tableName: string, contype: string): string =>
+  `select string_agg(conname, ',' order by conname) from pg_constraint` +
+  ` where conrelid = 'public.${tableName}'::regclass and contype = '${contype}'`;
+
+/**
+ * Whether the unique constraint `conname` is backed by an index of the same name, as
+ * PostgreSQL creates for `ADD CONSTRAINT … UNIQUE`: `t` or `f`.
+ */
+const constraintBackedByIndex = (conname: string): string =>
+  `select count(*) = 1 from pg_constraint constraint_row` +
+  ` join pg_class index_row on index_row.oid = constraint_row.conindid` +
+  ` where constraint_row.conname = '${conname}' and constraint_row.contype = 'u'` +
+  ` and index_row.relname = '${conname}'`;
+
+/** The index names of `tableName` in name order, or the empty string when there are none. */
+const indexesOf = (tableName: string, schema = 'public'): string =>
+  `select coalesce(string_agg(indexname, ',' order by indexname), '') from pg_indexes` +
+  ` where schemaname = '${schema}' and tablename = '${tableName}'`;
+
+/** Whether the index named `name` is unique: `t` or `f`, via `pg_index`. */
+const indexIsUnique = (name: string, schema = 'public'): string =>
+  `select indisunique from pg_index where indexrelid = '${schema}.${name}'::regclass`;
+
+/** Whether the index named `name` is valid: `t` or `f`, via `pg_index`. */
+const indexIsValid = (name: string, schema = 'public'): string =>
+  `select indisvalid from pg_index where indexrelid = '${schema}.${name}'::regclass`;
 
 /** A named table is present: `name|0` or `name|1`, pinned as one text fact. */
 const tableExists = (tableName: string): string =>
@@ -2380,6 +2448,351 @@ const sequenceToIdentityScene = (): LiveScene => {
   };
 };
 
+/**
+ * The constraint round trip: a target whose unique and check constraints span named and
+ * unnamed declarations, single- and multi-column. The model canonicalizes every declaration to
+ * table level — PostgreSQL does not record whether a constraint was declared on a column or on
+ * the table — so the scene proves the canonical shape renders, applies under `ON_ERROR_STOP=1`,
+ * dumps, and imports back with the constraints intact: `pg_constraint` spot-checks the
+ * PostgreSQL-assigned names, and the import check proves the constraint-backed indexes are not
+ * modeled as standalone `Index` entries.
+ */
+const constraintCreateScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('email', { notNull: true }),
+      column('tenant', { notNull: true }),
+      column('name', { notNull: true }),
+      column('age', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+    uniqueConstraints: [
+      { name: 'accounts_email_key', columns: ['email'] },
+      { columns: ['tenant', 'name'] },
+    ],
+    checkConstraints: [
+      { name: 'accounts_age_check', expression: 'age >= 0' },
+      { expression: 'age >= 0 AND char_length(name) > 0' },
+      { expression: 'char_length(email) > 0' },
+    ],
+  });
+
+  return {
+    name: 'constraint-create',
+    baseline: model(),
+    target: model(accounts),
+    baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],
+    planChecks: [
+      {
+        description: 'the constraints render as constraint steps, never as standalone indexes',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds ===
+            'create-table,add-unique-constraint,add-unique-constraint,' +
+              'add-check-constraint,add-check-constraint,add-check-constraint'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    importChecks: [
+      {
+        description: 'the import models every constraint and no constraint-backed index',
+        failure: (imported) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
+          if (table === undefined) return 'accounts is not imported';
+          const indexes = table.indexes.map((index) => index.name ?? '<unnamed>');
+          if (indexes.length > 0) return `standalone indexes imported: ${indexes.join(',')}`;
+          const unique = table.uniqueConstraints
+            .map(
+              (constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}`,
+            )
+            .join(' ');
+          if (unique !== 'accounts_email_key:email accounts_tenant_name_key:tenant,name') {
+            return `unique constraints: ${unique}`;
+          }
+          const checks = table.checkConstraints
+            .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
+            .join(' ');
+          const expectedChecks =
+            'accounts_check:((age >= 0) AND(char_length(name) > 0))' +
+            ' accounts_age_check:(age >= 0) accounts_email_check:(char_length(email) > 0)';
+          if (checks !== expectedChecks) return `check constraints: ${checks}`;
+          return undefined;
+        },
+      },
+    ],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'accounts' },
+      {
+        description: 'unique constraint names',
+        sql: constraintNames('accounts', 'u'),
+        expected: 'accounts_email_key,accounts_tenant_name_key',
+      },
+      {
+        description: 'check constraint names, assigned by PostgreSQL',
+        sql: constraintNames('accounts', 'c'),
+        expected: 'accounts_age_check,accounts_check,accounts_email_check',
+      },
+      {
+        description: 'the unnamed unique constraint definition',
+        sql: constraintDef('accounts_tenant_name_key'),
+        expected: 'UNIQUE (tenant, name)',
+      },
+      {
+        description: 'the named check definition',
+        sql: constraintDef('accounts_age_check'),
+        expected: 'CHECK ((age >= 0))',
+      },
+      {
+        description: 'the unnamed single-column check definition',
+        sql: constraintDef('accounts_email_check'),
+        expected: 'CHECK ((char_length(email) > 0))',
+      },
+      {
+        description: 'the unnamed multi-column check definition',
+        sql: constraintDef('accounts_check'),
+        expected: 'CHECK (((age >= 0) AND (char_length(name) > 0)))',
+      },
+      {
+        description: 'the unique constraint owns its backing index',
+        sql: constraintBackedByIndex('accounts_email_key'),
+        expected: 't',
+      },
+      {
+        description: 'the table carries only its three constraint-backed indexes',
+        sql: `select count(*) from pg_indexes where schemaname = 'public' and tablename = 'accounts'`,
+        expected: '3',
+      },
+    ],
+  };
+};
+
+/**
+ * The standalone-index round trip: a target adding a plain and a unique index, plus raw target
+ * SQL declaring a partial and an expression index the model cannot represent. The plan renders
+ * only the two modeled indexes; the target dump carries all four, and the import skips the two
+ * unmodelable ones whole and by name, so the migrated and target imports still agree exactly.
+ */
+const indexCreateScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('email', { notNull: true }),
+      column('name', { notNull: true }),
+      column('age', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+  });
+  const target = table('accounts', {
+    columns: accounts.columns,
+    primaryKey: accounts.primaryKey,
+    indexes: [
+      { name: 'accounts_age_idx', unique: false, columns: ['age'] },
+      { name: 'accounts_email_idx', unique: true, columns: ['email'] },
+    ],
+  });
+
+  return {
+    name: 'index-create',
+    baseline: model(accounts),
+    target: model(target),
+    targetExtraSql:
+      'CREATE INDEX accounts_partial_idx ON public.accounts USING btree (age) WHERE (age >= 18);\n' +
+      'CREATE INDEX accounts_lower_name_idx ON public.accounts USING btree (lower(name));',
+    baselineChecks: [
+      {
+        description: 'baseline accounts has only its primary-key index',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan renders only the two modeled indexes',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'create-index,create-index') return `unexpected steps: ${kinds}`;
+          const created = steps.map((step) =>
+            step.kind === 'create-index' ? (step.index.name ?? '<unnamed>') : '',
+          );
+          return created.join(',') === 'accounts_age_idx,accounts_email_idx'
+            ? undefined
+            : `created: ${created.join(',')}`;
+        },
+      },
+    ],
+    importChecks: [
+      {
+        description: 'the modeled indexes round-trip and the unmodelable ones are skipped by name',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
+          if (table === undefined) return 'accounts is not imported';
+          const indexes = table.indexes
+            .map(
+              (index) =>
+                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`,
+            )
+            .join('; ');
+          if (indexes !== 'accounts_age_idx|plain|age; accounts_email_idx|unique|email') {
+            return `modeled indexes: ${indexes}`;
+          }
+          const skips = imported.diagnostics
+            .filter((diagnostic) => diagnostic.kind === 'skip')
+            .filter(
+              (diagnostic) =>
+                diagnostic.object === 'accounts_partial_idx' ||
+                diagnostic.object === 'accounts_lower_name_idx',
+            );
+          if (source === 'applied') {
+            return skips.length === 0
+              ? undefined
+              : `the migrated database carries unmodelable indexes: ${skips
+                  .map((diagnostic) => diagnostic.object)
+                  .join(',')}`;
+          }
+          const partial = skips.find((diagnostic) => diagnostic.object === 'accounts_partial_idx');
+          if (partial === undefined || !partial.message.includes('(partial WHERE)')) {
+            return 'the partial index was not skipped and named';
+          }
+          const expression = skips.find(
+            (diagnostic) => diagnostic.object === 'accounts_lower_name_idx',
+          );
+          if (expression === undefined || !expression.message.includes('(expression element)')) {
+            return 'the expression index was not skipped and named';
+          }
+          return undefined;
+        },
+      },
+    ],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'accounts' },
+      {
+        description: 'indexes after the migration',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_age_idx,accounts_email_idx,accounts_pkey',
+      },
+      {
+        description: 'the standalone unique index is unique',
+        sql: indexIsUnique('accounts_email_idx'),
+        expected: 't',
+      },
+      {
+        description: 'the standalone plain index is not unique',
+        sql: indexIsUnique('accounts_age_idx'),
+        expected: 'f',
+      },
+      {
+        description: 'the unmodelable indexes were never planned',
+        sql:
+          "select count(*) from pg_indexes where schemaname = 'public' and tablename = 'accounts'" +
+          " and indexname in ('accounts_partial_idx', 'accounts_lower_name_idx')",
+        expected: '0',
+      },
+    ],
+  };
+};
+
+/**
+ * The multi-group round trip: a target mixing a transactional column add, a standalone
+ * `CREATE INDEX CONCURRENTLY`, and a second transactional index create. The plan partitions the
+ * three steps into three groups — transactional, standalone, transactional — and the migration
+ * applies under `ON_ERROR_STOP=1` only because the concurrent statement is bare; the catalog
+ * check proves the built index valid, and the imports prove `CONCURRENTLY` is apply metadata a
+ * dump never carries.
+ */
+const indexConcurrentlyScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('email', { notNull: true })],
+    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+  });
+  const target = table('accounts', {
+    columns: [...accounts.columns, column('note')],
+    primaryKey: accounts.primaryKey,
+    indexes: [
+      { name: 'accounts_email_idx', unique: false, columns: ['email'], concurrently: true },
+      { name: 'accounts_note_idx', unique: false, columns: ['note'] },
+    ],
+  });
+
+  return {
+    name: 'index-concurrently',
+    baseline: model(accounts),
+    target: model(target),
+    baselineChecks: [
+      {
+        description: 'baseline accounts columns by ordinal position',
+        sql: columnsByPosition('accounts'),
+        expected: 'id,email',
+      },
+      {
+        description: 'baseline accounts has only its primary-key index',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description:
+          'the concurrent create stands in a standalone group between transactional ones',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'add-column,create-index-concurrently,create-index') {
+            return `unexpected steps: ${kinds}`;
+          }
+          const groups = plan.groups
+            .map(
+              (group) =>
+                `${group.transactional ? 'wrapped' : 'standalone'}[${group.start},${group.end})`,
+            )
+            .join(' ');
+          return groups === 'wrapped[0,1) standalone[1,2) wrapped[2,3)'
+            ? undefined
+            : `unexpected groups: ${groups}`;
+        },
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry the indexes as ordinary, CONCURRENTLY never dumped',
+        failure: (imported) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
+          if (table === undefined) return 'accounts is not imported';
+          const indexes = table.indexes
+            .map(
+              (index) =>
+                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|` +
+                `${index.columns.join(',')}|${index.concurrently === true ? 'concurrently' : 'ordinary'}`,
+            )
+            .join('; ');
+          return indexes ===
+            'accounts_email_idx|plain|email|ordinary; accounts_note_idx|plain|note|ordinary'
+            ? undefined
+            : `indexes: ${indexes}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'accounts columns by ordinal position',
+        sql: columnsByPosition('accounts'),
+        expected: 'id,email,note',
+      },
+      {
+        description: 'indexes after the migration',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_email_idx,accounts_note_idx,accounts_pkey',
+      },
+      {
+        description: 'the concurrently built index is valid',
+        sql: indexIsValid('accounts_email_idx'),
+        expected: 't',
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -2406,4 +2819,7 @@ export const scenes: readonly LiveScene[] = [
   identityDropScene(),
   identityToSequenceScene(),
   sequenceToIdentityScene(),
+  constraintCreateScene(),
+  indexCreateScene(),
+  indexConcurrentlyScene(),
 ];

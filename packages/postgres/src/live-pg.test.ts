@@ -35,13 +35,15 @@ import type { LiveScene, SceneCheck } from './live-scenes.ts';
  *
  * Per scene, sequentially: both databases are created fresh; the baseline database gets the
  * build SQL for the baseline model (the plan from an empty model), the target database the
- * build SQL for the target model; the baseline database then gets `renderSql(plan(baseline,
+ * build SQL for the target model plus any raw `targetExtraSql` the scene declares for objects
+ * the model cannot represent; the baseline database then gets `renderSql(plan(baseline,
  * target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
  * run against the baseline database after its build, and its probes and remaining checks after
  * the migration. Both databases are dumped with `pg_dump --schema-only --no-owner
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
  * the modeled sequences and identity columns must come back exactly (see
- * `assertSequencesRetained` and `assertIdentitiesRetained`), and `diff` between the imported
+ * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
+ * against both imported models (see `assertImportChecks`), and `diff` between the imported
  * models must be exactly empty. Databases are dropped best-effort, so a failed scene still
  * cleans up after itself.
  */
@@ -83,6 +85,12 @@ test(
         'falsification: without the wrappers a failed statement leaves partial effect',
         async () => {
           await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir);
+        },
+      );
+      await t.test(
+        'falsification: wrapping the standalone concurrent build is refused',
+        async () => {
+          await assertConcurrentBuildRejectsWrapping(baseUrl, workDir);
         },
       );
     } finally {
@@ -226,6 +234,13 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       scene,
       expected,
     );
+    assertImportChecks(`${appliedDb}: imported after the migration`, scene, applied, 'applied');
+    assertImportChecks(
+      `${targetDb}: imported from the target model's build`,
+      scene,
+      expected,
+      'target',
+    );
 
     assert.deepEqual(
       diff(applied.model, expected.model),
@@ -249,6 +264,18 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
 function transactionScene(): LiveScene {
   const scene = scenes.find((candidate) => candidate.name === 'primary-key-add');
   assert.ok(scene !== undefined, 'the primary-key-add scene is part of the live corpus');
+  return scene;
+}
+
+/**
+ * The scene the concurrent falsification wraps. `index-concurrently`'s migration is the
+ * corpus's only multi-group render — a transactional column add, a standalone
+ * `CREATE INDEX CONCURRENTLY`, then a transactional index create — so wrapping the concurrent
+ * line changes exactly the wrapper lines around one statement.
+ */
+function concurrentScene(): LiveScene {
+  const scene = scenes.find((candidate) => candidate.name === 'index-concurrently');
+  assert.ok(scene !== undefined, 'the index-concurrently scene is part of the live corpus');
   return scene;
 }
 
@@ -427,6 +454,89 @@ async function assertStrippedWrappersLeavePartialEffect(
   }
 }
 
+/**
+ * The concurrent falsification: apply `index-concurrently`'s concurrent statement wrapped in
+ * `BEGIN;`/`COMMIT;` to a freshly built baseline and require real PostgreSQL to refuse the run
+ * — `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block — then apply the same
+ * statement bare and require the index to become valid. The two runs differ only in the
+ * wrapper lines, so the scene's bare render is load-bearing: without the standalone group the
+ * concurrent build cannot apply at all. The rendered line is pinned first, including the blank
+ * lines that make it a group of its own, so a renderer change cannot quietly turn the proof
+ * into a no-op.
+ */
+async function assertConcurrentBuildRejectsWrapping(
+  baseUrl: string,
+  workDir: string,
+): Promise<void> {
+  const scene = concurrentScene();
+  const database = `schemamill_w6_concurrent_wrapped_${runToken}`;
+  const url = withDatabase(baseUrl, database);
+
+  try {
+    await dropDatabase(baseUrl, database);
+    await createDatabase(baseUrl, database);
+
+    const baselineFile = join(workDir, 'concurrent.baseline.sql');
+    await writeFile(
+      baselineFile,
+      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      'utf8',
+    );
+    await applyFile(url, baselineFile);
+
+    const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+    const concurrent = lines.filter((line) => line.startsWith('CREATE INDEX CONCURRENTLY '));
+    assert.equal(concurrent.length, 1, `${scene.name}: exactly one concurrent statement renders`);
+    const statement = concurrent[0]!;
+    const position = lines.indexOf(statement);
+    assert.ok(position > 0, `${scene.name}: the concurrent statement is not the first line`);
+    assert.equal(
+      lines[position - 1],
+      '',
+      `${scene.name}: the concurrent statement opens a group of its own`,
+    );
+    assert.equal(
+      lines[position + 1],
+      '',
+      `${scene.name}: the concurrent statement closes a group of its own`,
+    );
+
+    const wrappedFile = join(workDir, 'concurrent.wrapped.sql');
+    await writeFile(wrappedFile, `BEGIN;\n${statement}\nCOMMIT;\n`, 'utf8');
+    const failure = await applyExpectingFailure(url, wrappedFile);
+    assert.ok(
+      failure.startsWith('psql failed (exit '),
+      `${database}: psql must exit non-zero for the wrapped build: ${failure}`,
+    );
+    assert.ok(
+      failure.includes('cannot run inside a transaction block'),
+      `${database}: the wrapped build failed for the wrong reason: ${failure}`,
+    );
+    assert.equal(
+      await query(
+        url,
+        "select count(*) from pg_class where relname = 'accounts_email_idx' and relkind = 'i'",
+      ),
+      '0',
+      `${database}: the refused build must not leave an index behind`,
+    );
+
+    const bareFile = join(workDir, 'concurrent.bare.sql');
+    await writeFile(bareFile, `${statement}\n`, 'utf8');
+    await applyFile(url, bareFile);
+    assert.equal(
+      await query(
+        url,
+        "select indisvalid from pg_index where indexrelid = 'public.accounts_email_idx'::regclass",
+      ),
+      't',
+      `${database}: the same statement without wrappers must build a valid index`,
+    );
+  } finally {
+    await dropDatabase(baseUrl, database);
+  }
+}
+
 /** The SQL files one scene runs through, and where its dumps land for inspection. */
 interface SceneFiles {
   readonly baselineBuild: string;
@@ -450,11 +560,9 @@ async function writeSceneFiles(
     renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
     'utf8',
   );
-  await writeFile(
-    targetBuild,
-    renderSql(plan({ tables: [], sequences: [] }, scene.target)),
-    'utf8',
-  );
+  const targetSql = renderSql(plan({ tables: [], sequences: [] }, scene.target));
+  const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
+  await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
   await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
   return {
     baselineBuild,
@@ -474,12 +582,32 @@ async function assertChecks(url: string, checks: readonly SceneCheck[]): Promise
 
 /** Asserts every plan fact in order against `plan(baseline, target)`. */
 function assertPlanChecks(scene: LiveScene): void {
-  const steps = plan(scene.baseline, scene.target).steps;
+  const migration = plan(scene.baseline, scene.target);
   for (const check of scene.planChecks ?? []) {
-    const failure = check.failure(steps);
+    const failure = check.failure(migration.steps, migration);
     assert.ok(
       failure === undefined,
       `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
+    );
+  }
+}
+
+/**
+ * Asserts every import fact in order against one dump's import. The check also sees which
+ * database the dump came from, so a fact that holds on one side only — a skip the target
+ * carries but the migrated database must not — can still be pinned exactly.
+ */
+function assertImportChecks(
+  what: string,
+  scene: LiveScene,
+  imported: ReadResult<Model, Diagnostic>,
+  source: 'applied' | 'target',
+): void {
+  for (const check of scene.importChecks ?? []) {
+    const failure = check.failure(imported, source);
+    assert.ok(
+      failure === undefined,
+      `${scene.name}: ${what}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
     );
   }
 }
