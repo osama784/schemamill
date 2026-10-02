@@ -111,6 +111,9 @@ const planOf = (...steps: readonly Step[]): Plan => ({
   groups: steps.length === 0 ? [] : [{ start: 0, end: steps.length, transactional: true }],
 });
 
+/** One `drop-table` step, for the partition-guard cases. */
+const dropStep = (name: string): Step => ({ kind: 'drop-table', table: identity(name) });
+
 /** Reads the golden file `test/goldens/<name>.sql`, including its trailing newline. */
 const golden = (name: string): string =>
   readFileSync(new URL(`../test/goldens/${name}.sql`, import.meta.url), 'utf8');
@@ -269,6 +272,70 @@ test('wraps each transactional group and leaves a standalone group bare', () => 
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('a non-empty plan with no groups is rejected', () => {
+  assert.throws(
+    () => renderSql({ steps: [dropStep('a')], groups: [] }),
+    /plan\.groups must tile \[0, 1\) in order, but found no groups/,
+  );
+});
+
+test('a partition with a gap is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b'), dropStep('c')],
+        groups: [
+          { start: 0, end: 1, transactional: true },
+          { start: 2, end: 3, transactional: true },
+        ],
+      }),
+    /group 1 starts at 2, expected 1/,
+  );
+});
+
+test('overlapping groups are rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b')],
+        groups: [
+          { start: 0, end: 2, transactional: true },
+          { start: 1, end: 2, transactional: true },
+        ],
+      }),
+    /group 1 starts at 1, expected 2/,
+  );
+});
+
+test('an empty group range is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a')],
+        groups: [{ start: 0, end: 0, transactional: false }],
+      }),
+    /group 0 spans \[0, 0\)/,
+  );
+});
+
+test('a partition that stops before the last step is rejected', () => {
+  assert.throws(
+    () =>
+      renderSql({
+        steps: [dropStep('a'), dropStep('b')],
+        groups: [{ start: 0, end: 1, transactional: true }],
+      }),
+    /plan\.groups must tile \[0, 2\), but the groups end at 1/,
+  );
+});
+
+test('groups without steps are rejected', () => {
+  assert.throws(
+    () => renderSql({ steps: [], groups: [{ start: 0, end: 1, transactional: true }] }),
+    /plan\.groups must be empty when plan\.steps is empty, but found groups \[0, 1\)/,
   );
 });
 
