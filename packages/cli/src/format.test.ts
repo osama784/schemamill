@@ -8,8 +8,8 @@ import { formatChanges, formatHazards, formatPlan } from './format.ts';
 /**
  * Tests for the CLI renderings: the converted-bound wording on a sequence or identity type
  * conversion, where the diff reports the value in effect after the engine's conversion rather
- * than the as-written baseline value; the identity change lines; the identity plan steps; and
- * the hazard clauses.
+ * than the as-written baseline value; the identity change lines; the identity plan steps and
+ * the plan header's one-transaction wording; and the hazard clauses.
  */
 
 test('a converted sequence bound prints with the converted mark', () => {
@@ -153,17 +153,52 @@ test('identity plan steps print the column and the changed options', () => {
       },
       { kind: 'drop-identity', table: { schema: 'public', name: 'users' }, name: 'id' },
     ],
+    groups: [{ start: 0, end: 3, transactional: true }],
   };
 
   assert.equal(
     formatPlan(plan),
     [
-      '3 steps:',
+      '3 steps in one transaction:',
       ' 1. add-identity    public.users.id',
       ' 2. alter-identity  public.users.id: increment 1 → 2',
       ' 3. drop-identity   public.users.id',
       '',
     ].join('\n'),
+  );
+});
+
+test('a one-step plan names its single transaction in the singular', () => {
+  const plan: Plan = {
+    steps: [{ kind: 'drop-table', table: { schema: 'public', name: 'gone' } }],
+    groups: [{ start: 0, end: 1, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    ['1 step in one transaction:', ' 1. drop-table  public.gone', ''].join('\n'),
+  );
+});
+
+test('an empty plan still says there are no changes', () => {
+  assert.equal(formatPlan({ steps: [], groups: [] }), 'No changes.\n');
+});
+
+test('a multi-group plan keeps the plain header until multi-group wording lands', () => {
+  const plan: Plan = {
+    steps: [
+      { kind: 'drop-table', table: { schema: 'public', name: 'a' } },
+      { kind: 'drop-table', table: { schema: 'public', name: 'b' } },
+    ],
+    groups: [
+      { start: 0, end: 1, transactional: true },
+      { start: 1, end: 2, transactional: false },
+    ],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    ['2 steps:', ' 1. drop-table  public.a', ' 2. drop-table  public.b', ''].join('\n'),
   );
 });
 

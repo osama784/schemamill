@@ -1,4 +1,4 @@
-9 steps:
+9 steps in one transaction:
  1. drop-table    public.Quoted Target
  2. create-table  app.gadgets
  3. create-table  public.Quoted Added
@@ -9,6 +9,7 @@
  8. alter-column  app.widgets.name: not null false → true
  9. alter-column  public.MixedCase.Note: type text → character varying(50)
 
+BEGIN;
 DROP TABLE public."Quoted Target";
 CREATE TABLE app.gadgets (
     id integer NOT NULL,
@@ -25,3 +26,4 @@ ALTER TABLE public.empty ADD COLUMN id integer NOT NULL;
 ALTER TABLE app.widgets ALTER COLUMN id TYPE bigint;
 ALTER TABLE app.widgets ALTER COLUMN name SET NOT NULL;
 ALTER TABLE public."MixedCase" ALTER COLUMN "Note" TYPE character varying(50);
+COMMIT;

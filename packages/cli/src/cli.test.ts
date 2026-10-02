@@ -89,7 +89,7 @@ const EXPECTED_COMPARE = [
 ].join('\n');
 
 const EXPECTED_PLAN = [
-  '6 steps:',
+  '6 steps in one transaction:',
   ' 1. drop-foreign-key  public.accounts: foreign key accounts_org_id_fkey (org_id) → public.orgs (id) on delete RESTRICT',
   ' 2. drop-table        public.legacy',
   ' 3. create-table      public.projects',
@@ -97,6 +97,7 @@ const EXPECTED_PLAN = [
   ' 5. alter-column      public.accounts.email: type character varying(255) → text',
   ' 6. add-foreign-key   public.accounts: foreign key accounts_org_id_fkey (org_id) → public.orgs (id) on delete CASCADE',
   '',
+  'BEGIN;',
   'ALTER TABLE public.accounts DROP CONSTRAINT accounts_org_id_fkey;',
   'DROP TABLE public.legacy;',
   'CREATE TABLE public.projects (',
@@ -107,6 +108,7 @@ const EXPECTED_PLAN = [
   'ALTER TABLE public.accounts ADD COLUMN created_at timestamptz NOT NULL DEFAULT now();',
   'ALTER TABLE public.accounts ALTER COLUMN email TYPE text;',
   'ALTER TABLE public.accounts ADD CONSTRAINT accounts_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;',
+  'COMMIT;',
   '',
 ].join('\n');
 

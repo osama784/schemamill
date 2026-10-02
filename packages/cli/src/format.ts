@@ -34,7 +34,10 @@ import type {
  * carries its scalar fields on the `~ column` line and one `identity:` sub-line per identity
  * change after it; sequences render the same way after the table changes, as
  * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
- * and one line per step; a step's kind label is padded to the longest label in the plan so
+ * and one line per step: a plan that is a single transactional group covering every step
+ * reads `N steps in one transaction:` (singular `1 step in one transaction:`), while any other
+ * plan reads the plain `N steps:` header — multi-group wording is deferred until a standalone
+ * step kind exists. A step's kind label is padded to the longest label in the plan so
  * the details align, and a step's details expose every payload field it carries. A hazards
  * block renders as a `Hazards:` header and one two-space-indented `step <n> <kind>: <clause>`
  * line per hazard, numbered by the step it belongs to, in the payload's order; each clause
@@ -49,14 +52,27 @@ export function formatChanges(changes: readonly Change[]): string {
   return `${changes.map(formatChange).join('\n\n')}\n`;
 }
 
-/** The whole plan as `plan` prints it, before the migration SQL. */
+/**
+ * The whole plan as `plan` prints it, before the migration SQL: the numbered header, then one
+ * line per step. A plan whose only group is transactional and covers every step names the
+ * transaction in the header; the plain header is the fallback for the deferred multi-group
+ * wording.
+ */
 export function formatPlan(plan: Plan): string {
   if (plan.steps.length === 0) return 'No changes.\n';
 
   const count = plan.steps.length;
   const numberWidth = String(count).length;
   const kindWidth = plan.steps.reduce((width, step) => Math.max(width, step.kind.length), 0);
-  const lines = [`${count} ${count === 1 ? 'step' : 'steps'}:`];
+  const [group] = plan.groups;
+  const inOneTransaction =
+    group !== undefined &&
+    plan.groups.length === 1 &&
+    group.transactional &&
+    group.start === 0 &&
+    group.end === count;
+  const noun = `${count} ${count === 1 ? 'step' : 'steps'}`;
+  const lines = [`${noun}${inOneTransaction ? ' in one transaction' : ''}:`];
   plan.steps.forEach((step, index) => {
     const number = String(index + 1).padStart(numberWidth);
     lines.push(` ${number}. ${step.kind.padEnd(kindWidth)}  ${formatStep(step)}`);
