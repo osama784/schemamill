@@ -180,6 +180,15 @@ test('a one-step plan names its single transaction in the singular', () => {
   );
 });
 
+test('a standalone-only plan keeps the plain header', () => {
+  const plan: Plan = {
+    steps: [{ kind: 'drop-table', table: { schema: 'public', name: 'a' } }],
+    groups: [{ start: 0, end: 1, transactional: false }],
+  };
+
+  assert.equal(formatPlan(plan), ['1 step:', ' 1. drop-table  public.a', ''].join('\n'));
+});
+
 test('an empty plan still says there are no changes', () => {
   assert.equal(formatPlan({ steps: [], groups: [] }), 'No changes.\n');
 });
