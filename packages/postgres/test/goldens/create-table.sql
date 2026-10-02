@@ -1,3 +1,4 @@
+BEGIN;
 CREATE TABLE public.accounts (
     id bigint NOT NULL,
     balance numeric(12,2) NOT NULL DEFAULT 0,
@@ -15,3 +16,4 @@ CREATE TABLE public.users (
     CONSTRAINT users_pkey PRIMARY KEY (id)
 );
 ALTER TABLE public.orders ADD CONSTRAINT orders_user_fkey FOREIGN KEY ("user") REFERENCES public.users(id) ON DELETE CASCADE;
+COMMIT;

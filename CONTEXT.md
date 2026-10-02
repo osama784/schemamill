@@ -99,12 +99,20 @@ One atom of a diff — a table, column, primary key, or foreign key added, remov
 _Avoid_: edit, modification, alteration
 
 **Migration plan**:
-The engine's analysis of a diff: the ordered changes that move a baseline to a target, with hazard annotations.
+The engine's analysis of a diff: the ordered changes that move a baseline to a target, partitioned into transaction groups and annotated with hazards.
 _Avoid_: changeset, script
 
 **Migration SQL**:
 The SQL rendering of a migration plan — deterministic and reviewable, for the user to apply.
 _Avoid_: script, patch, changeset
+
+**Transaction group**:
+A run of consecutive migration-plan steps that applies as one unit. Transaction-safe steps coalesce into one group; a step PostgreSQL cannot run inside a transaction stands alone. Boundaries are derived from step semantics, never configured by the user.
+_Avoid_: batch, transaction block, commit point
+
+**Non-transactional step**:
+A migration-plan step whose statement PostgreSQL refuses to run inside a transaction. It stands alone, unwrapped. No step kind is non-transactional today.
+_Avoid_: unsafe step, autocommit step
 
 **Hazard**:
 A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled.

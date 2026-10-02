@@ -10,7 +10,7 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **Out, named in diagnostics — never silent:** sequence state — `RESTART`, `setval`, `last_value`, and dump-side `DROP SEQUENCE`; `serial`/`bigserial` sugar — the renderer never rewrites an as-written type, and a `nextval(…)` default stays opaque text; sequence renames, `SET SCHEMA`, and unlogged or temporary persistence. Identity columns, flagged on import when this slice landed, have since been modeled in the [identity slice](./identity.md) as a column property distinct from a sequence-backed default.
 
-**Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping stays later work.
+**Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
 ## Plan ordering
 
@@ -66,4 +66,4 @@ Three levels pin the slice:
 
 ## Non-goals
 
-Sequence state, renames, and transaction grouping are later slices. Identity columns and hazards, listed here when this slice landed, have since shipped in the [identity slice](./identity.md) and the [hazards slice](./hazards.md) respectively. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
+Sequence state and renames are later slices; transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). Identity columns and hazards, listed here when this slice landed, have since shipped in the [identity slice](./identity.md) and the [hazards slice](./hazards.md) respectively. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.

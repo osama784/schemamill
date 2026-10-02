@@ -1,4 +1,4 @@
-7 steps:
+7 steps in one transaction:
  1. create-sequence  public.bad_cache
  2. create-sequence  public.bad_increment
  3. create-sequence  public.bad_range
@@ -16,6 +16,7 @@ Hazards:
   step 6 bound-tightened: max value 1000 → 100 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
   step 7 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
 
+BEGIN;
 CREATE SEQUENCE public.bad_cache AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 0 NO CYCLE;
 CREATE SEQUENCE public.bad_increment AS bigint INCREMENT BY 0 MINVALUE -9223372036854775808 MAXVALUE -1 START WITH -1 CACHE 1 NO CYCLE;
 CREATE SEQUENCE public.bad_range AS integer INCREMENT BY 1 MINVALUE 1 MAXVALUE 9999999999 START WITH 1 CACHE 1 NO CYCLE;
@@ -25,3 +26,4 @@ CREATE TABLE app.bad_identity (
 );
 ALTER SEQUENCE public.kept_seq MAXVALUE 100;
 ALTER TABLE app.bad_identity ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 0 NO CYCLE );
+COMMIT;

@@ -1,3 +1,4 @@
+BEGIN;
 ALTER TABLE public.orders DROP CONSTRAINT orders_legacy_id_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_obsolete_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_group_id_fkey;
@@ -16,3 +17,4 @@ ALTER TABLE public.users ALTER COLUMN name TYPE text;
 ALTER TABLE public.users ADD PRIMARY KEY (id);
 ALTER TABLE public.sessions ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
 ALTER TABLE public.users ADD CONSTRAINT users_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.groups(id) ON DELETE CASCADE;
+COMMIT;

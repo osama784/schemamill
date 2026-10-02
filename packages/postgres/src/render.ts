@@ -22,9 +22,15 @@ import type {
  * `renderSql` is a pure function of the plan — the plan carries every payload the SQL needs,
  * and the same plan always renders the same text. One statement per line, terminated with a
  * semicolon, and a single trailing newline at the end of the output; an empty plan renders as
- * the empty string. `create-table` is the one multi-line statement: its columns go one per
- * line, indented four spaces, and its primary key, when present, is the trailing line. A table
- * with neither columns nor a primary key renders on one line as `CREATE TABLE <q> ();`.
+ * the empty string. The plan's groups must partition its steps — non-empty half-open ranges
+ * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
+ * guarantees this contract, and a malformed partition throws before any SQL is rendered,
+ * naming the violated invariant and the offending indices. `renderSql` walks the plan's
+ * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
+ * a standalone group renders its statements bare. `create-table` is the one multi-line
+ * statement: its columns go one per line, indented four spaces, and its primary key, when
+ * present, is the trailing line. A table with neither columns nor a primary key renders on one
+ * line as `CREATE TABLE <q> ();`.
  *
  * `create-sequence` renders the canonical full-explicit form — `AS`, `INCREMENT BY`,
  * `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`/`NO CYCLE` — with the plan's
@@ -57,8 +63,8 @@ import type {
  * numbered suffixes on name collisions, which cannot be known offline, and pg_dump output
  * always carries real constraint names, so unnamed constraints are the unusual case.
  *
- * Hazards and transaction grouping are later work: this module emits no comments and no
- * BEGIN/COMMIT. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
+ * Group separators and other decoration beyond the wrappers are still out of scope, and this
+ * module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
  */
 
 /**
@@ -176,10 +182,61 @@ export const RESERVED_KEYWORDS: ReadonlySet<string> = new Set([
 /** The shape of an identifier PostgreSQL accepts without double quotes. */
 const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 
-/** The migration SQL for `plan`, deterministic. */
+/**
+ * The migration SQL for `plan`, deterministic. `plan.groups` must tile `[0, plan.steps.length)`;
+ * a malformed partition throws before anything renders.
+ */
 export function renderSql(plan: Plan): string {
+  assertGroupsTileSteps(plan);
   if (plan.steps.length === 0) return '';
-  return `${plan.steps.map((step) => renderStep(step)).join('\n')}\n`;
+  const lines: string[] = [];
+  for (const group of plan.groups) {
+    if (group.transactional) lines.push('BEGIN;');
+    for (let index = group.start; index < group.end; index += 1) {
+      lines.push(renderStep(plan.steps[index]!));
+    }
+    if (group.transactional) lines.push('COMMIT;');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Rejects a malformed partition: `plan.groups` must be non-empty half-open ranges that tile
+ * `[0, plan.steps.length)` in order, and an empty step list must carry no groups. `plan()`
+ * guarantees this; a violation throws naming the invariant and the offending indices.
+ */
+function assertGroupsTileSteps(plan: Plan): void {
+  const stepCount = plan.steps.length;
+  if (stepCount === 0) {
+    if (plan.groups.length > 0) {
+      const spans = plan.groups.map((group) => `[${group.start}, ${group.end})`).join(', ');
+      throw new Error(
+        `plan.groups must be empty when plan.steps is empty, but found groups ${spans}`,
+      );
+    }
+    return;
+  }
+  if (plan.groups.length === 0) {
+    throw new Error(`plan.groups must tile [0, ${stepCount}) in order, but found no groups`);
+  }
+  let expected = 0;
+  for (let index = 0; index < plan.groups.length; index += 1) {
+    const group = plan.groups[index]!;
+    if (group.start !== expected) {
+      throw new Error(
+        `plan.groups must tile [0, ${stepCount}) in order, but group ${index} starts at ${group.start}, expected ${expected}`,
+      );
+    }
+    if (group.end <= group.start) {
+      throw new Error(
+        `plan.groups must be non-empty, but group ${index} spans [${group.start}, ${group.end})`,
+      );
+    }
+    expected = group.end;
+  }
+  if (expected !== stepCount) {
+    throw new Error(`plan.groups must tile [0, ${stepCount}), but the groups end at ${expected}`);
+  }
 }
 
 /** Binds `renderSql` to the `SqlRenderer` seam. */

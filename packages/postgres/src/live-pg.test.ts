@@ -73,6 +73,18 @@ test(
           await runScene(baseUrl, workDir, scene);
         });
       }
+      await t.test(
+        'transaction rollback: a failed statement leaves no partial effect',
+        async () => {
+          await assertRollbackLeavesNoPartialEffect(baseUrl, workDir);
+        },
+      );
+      await t.test(
+        'falsification: without the wrappers a failed statement leaves partial effect',
+        async () => {
+          await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir);
+        },
+      );
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }
@@ -223,6 +235,195 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
   } finally {
     await dropDatabase(baseUrl, appliedDb);
     await dropDatabase(baseUrl, targetDb);
+  }
+}
+
+/**
+ * The scene the two transaction tests corrupt. `primary-key-add`'s plan is the smallest
+ * corruptible shape in the corpus: exactly two steps, `alter-column` (`SET NOT NULL`) then
+ * `add-primary-key`, so retargeting the second statement at a missing relation fails only after
+ * a real catalog effect has succeeded. The ordinary scene run pins the same two kinds through
+ * its plan check; the transaction tests re-pin them so a planner change cannot quietly turn the
+ * corruption into a no-op.
+ */
+function transactionScene(): LiveScene {
+  const scene = scenes.find((candidate) => candidate.name === 'primary-key-add');
+  assert.ok(scene !== undefined, 'the primary-key-add scene is part of the live corpus');
+  return scene;
+}
+
+/** The rendered migration for `scene` with exactly one statement corrupted. */
+interface CorruptedMigration {
+  /** The migration SQL, one statement retargeted at `missing`. */
+  readonly sql: string;
+  /** The relation the corrupted statement names, which never exists. */
+  readonly missing: string;
+}
+
+/**
+ * The relation the transaction tests retarget the scene's last statement at. A fresh baseline
+ * database never contains it, so the statement fails deterministically with SQLSTATE 42P01
+ * (`relation "…" does not exist`) after every earlier statement in the file has succeeded.
+ */
+const MISSING_RELATION = 'public.t_missing';
+
+/**
+ * Renders `scene`'s migration and corrupts exactly its last statement: the table reference is
+ * replaced with `missing`, a relation that does not exist, so PostgreSQL fails the statement
+ * with `relation "…" does not exist`. The plan is pinned first — two steps, `alter-column` then
+ * `add-primary-key` — and the corruption is pinned to change exactly one rendered line, so the
+ * failure is attributable to the retargeted statement and nothing else.
+ */
+function corruptLastStatement(scene: LiveScene, missing: string): CorruptedMigration {
+  const steps = plan(scene.baseline, scene.target).steps;
+  assert.deepEqual(
+    steps.map((step) => step.kind),
+    ['alter-column', 'add-primary-key'],
+    `${scene.name}: the transaction tests require the two-step shape`,
+  );
+
+  const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+  const commit = lines.lastIndexOf('COMMIT;');
+  assert.ok(commit > 0, `${scene.name}: the rendered migration must end with COMMIT;`);
+  const statement = lines[commit - 1]!;
+  const match = /^ALTER TABLE (\S+) (.*)$/.exec(statement);
+  assert.ok(match !== null, `${scene.name}: the last statement must retarget a table`);
+  assert.equal(match[1], 'public.t', `${scene.name}: the last statement targets public.t`);
+
+  const corrupted = [...lines];
+  corrupted[commit - 1] = `ALTER TABLE ${missing} ${match[2]!}`;
+  let differing = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index] !== corrupted[index]) differing += 1;
+  }
+  assert.equal(differing, 1, `${scene.name}: exactly one statement may be corrupted`);
+  return { sql: corrupted.join('\n'), missing };
+}
+
+/** Applies `path` with `ON_ERROR_STOP=1`, expecting `psql` to refuse it; returns the failure. */
+async function applyExpectingFailure(url: string, path: string): Promise<string> {
+  try {
+    await applyFile(url, path);
+  } catch (error) {
+    return reason(error);
+  }
+  throw new Error(`psql applied ${path}, but the corrupted migration must fail`);
+}
+
+/**
+ * The rollback proof: build a fresh database from the scene's baseline, dump and import it as
+ * the reference, apply the corrupted migration, require the failure to name the missing
+ * relation, then re-dump, import, and require an empty diff against the baseline. The file
+ * opened a transaction and never reached `COMMIT;`, so the connection close must have rolled
+ * back the statement that succeeded before the failure — zero partial effect.
+ */
+async function assertRollbackLeavesNoPartialEffect(
+  baseUrl: string,
+  workDir: string,
+): Promise<void> {
+  const scene = transactionScene();
+  const database = `schemamill_w6_txn_rollback_${runToken}`;
+  const url = withDatabase(baseUrl, database);
+
+  try {
+    await dropDatabase(baseUrl, database);
+    await createDatabase(baseUrl, database);
+
+    const baselineFile = join(workDir, 'rollback.baseline.sql');
+    await writeFile(
+      baselineFile,
+      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      'utf8',
+    );
+    await applyFile(url, baselineFile);
+    const baseline = await importDump(await dump(url));
+    assertNoErrors(`${database}: the baseline before the corrupted migration`, baseline);
+
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const migrationFile = join(workDir, 'rollback.corrupted.sql');
+    await writeFile(migrationFile, corrupted.sql, 'utf8');
+    const failure = await applyExpectingFailure(url, migrationFile);
+    assert.ok(
+      failure.includes(`relation "${corrupted.missing}" does not exist`),
+      `${database}: the apply failed for the wrong reason: ${failure}`,
+    );
+
+    const after = await importDump(await dump(url));
+    assertNoErrors(`${database}: the redump after the failed migration`, after);
+    assert.deepEqual(
+      diff(baseline.model, after.model),
+      [],
+      `${database}: the failed migration left partial state behind`,
+    );
+  } finally {
+    await dropDatabase(baseUrl, database);
+  }
+}
+
+/**
+ * The falsification: apply the same corrupted migration to a freshly rebuilt baseline database
+ * with every line exactly equal to `BEGIN;` or `COMMIT;` stripped. The same missing relation
+ * must fail the run, and the earlier statement's effect must still be readable from the
+ * catalog — `public.t.id` is NOT NULL — while the failing statement added no primary key. The
+ * two runs differ only in the wrapper lines, so the rollback proof's empty diff is attributable
+ * to them; without them the failure leaves partial state behind.
+ */
+async function assertStrippedWrappersLeavePartialEffect(
+  baseUrl: string,
+  workDir: string,
+): Promise<void> {
+  const scene = transactionScene();
+  const database = `schemamill_w6_txn_stripped_${runToken}`;
+  const url = withDatabase(baseUrl, database);
+
+  try {
+    await dropDatabase(baseUrl, database);
+    await createDatabase(baseUrl, database);
+
+    const baselineFile = join(workDir, 'stripped.baseline.sql');
+    await writeFile(
+      baselineFile,
+      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      'utf8',
+    );
+    await applyFile(url, baselineFile);
+
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const allLines = corrupted.sql.split('\n');
+    assert.deepEqual(
+      allLines.filter((line) => line === 'BEGIN;' || line === 'COMMIT;'),
+      ['BEGIN;', 'COMMIT;'],
+      `${database}: the corrupted migration carries exactly one wrapper pair`,
+    );
+    const stripped = allLines.filter((line) => line !== 'BEGIN;' && line !== 'COMMIT;').join('\n');
+    const migrationFile = join(workDir, 'stripped.corrupted.sql');
+    await writeFile(migrationFile, stripped, 'utf8');
+
+    const failure = await applyExpectingFailure(url, migrationFile);
+    assert.ok(
+      failure.includes(`relation "${corrupted.missing}" does not exist`),
+      `${database}: the apply failed for the wrong reason: ${failure}`,
+    );
+    assert.equal(
+      await query(
+        url,
+        "select is_nullable from information_schema.columns where table_schema = 'public'" +
+          " and table_name = 't' and column_name = 'id'",
+      ),
+      'NO',
+      `${database}: the statement before the failure must have persisted`,
+    );
+    assert.equal(
+      await query(
+        url,
+        'select count(*) from pg_constraint' +
+          " where conrelid = 'public.t'::regclass and contype = 'p'",
+      ),
+      '0',
+      `${database}: the failing statement itself must not have applied`,
+    );
+  } finally {
+    await dropDatabase(baseUrl, database);
   }
 }
 

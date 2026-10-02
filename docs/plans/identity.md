@@ -10,7 +10,7 @@ Identity columns as first-class column properties in the model: the DDL forms a 
 
 **Out, named in diagnostics — never silent:** identity state — `RESTART`, `setval`, and `last_value`; sequence renames and `SET SCHEMA`; `LOGGED`/`UNLOGGED` persistence; `AS` and `OWNED BY` inside identity options; a cross-schema `SEQUENCE NAME` (flagged by name, and the identity is modeled without one); identity on a non-integer column; and partitioned, inheritance, typed, and foreign tables, which stay fenced by the existing table-level flags. An identity action on a column the import did not model as an identity is skipped and named.
 
-**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping stays later work.
+**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
 ## Plan ordering
 
@@ -76,4 +76,4 @@ On PostgreSQL 16.15 the live suite is 107 tests across 25 scenes, 0 skipped; the
 
 ## Non-goals
 
-Introspection of identity columns from a live catalog; state-aware planning and transaction grouping; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
+Introspection of identity columns from a live catalog; state-aware planning; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md); hazards, likewise listed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
