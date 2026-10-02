@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-02
+
 ### Added
 
 - **Atomic transaction groups** — `@schemamill/core`'s `Plan` gained `groups: readonly TransactionGroup[]`: `TransactionGroup` is `{ start, end, transactional }` with half-open indices into `steps`, non-empty groups tiling the step list in order and `transactional: false` marking a standalone group that applies outside any wrapper, and a compile-time exhaustive `TRANSACTIONAL: Record<Step['kind'], boolean>` classification — all fifteen step kinds transactional today — feeds `groupSteps`, which coalesces consecutive transaction-safe steps and isolates a non-transactional step, with `plan()` computing the partition once. `@schemamill/postgres`'s `renderSql` walked `plan.groups` and wrapped each transactional group in `BEGIN;`/`COMMIT;`, a standalone group bare, with no blank lines and the empty plan still the empty string. `@schemamill/cli`'s `plan` header read `N steps in one transaction:` (singular `1 step in one transaction:`) for the single-group plans `plan()` produces today, the plain `N steps:` header staying the fallback for the deferred multi-group wording, and the empty plan `No changes.`. The gated live-PostgreSQL suite gained two always-on tests: a rollback proof — a mid-plan statement corrupted to name a missing relation, applied with `psql` `ON_ERROR_STOP=1`, re-dumped, imported, and required to diff empty against the baseline — and its falsification, the same corrupted SQL with the wrapper lines stripped leaving the earlier statement's effect behind; the existing scenes stayed green under the wrapped SQL ([#30](https://github.com/osama784/schemamill/issues/30)).
