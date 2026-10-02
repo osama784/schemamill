@@ -8,7 +8,7 @@ Hazards as annotations on a migration plan: `plan` now reads the baseline and ta
 
 **In:** the hazard channel and exactly the state-edge families — the five definite checks and the state-dependent `bound-tightened`; sequences matched by schema-qualified name and identity columns by table and column; the `plan` command surface, which prints a `Hazards:` section between the step list and the SQL; analysis only — `compare`, the rendered SQL, and exit codes are untouched.
 
-**Out, named — never silent:** relation-level families — rewrites, locks, and downtime — which need type semantics the model deliberately lacks; transaction grouping; SQL comments; compare-side hazards; sequence state (`last_value`, `is_called`, `RESTART`, `setval`); and auto-remediation — the analyzer never repairs a target or emits a clause.
+**Out, named — never silent:** relation-level families — rewrites, locks, and downtime — which need type semantics the model deliberately lacks; SQL comments; compare-side hazards; sequence state (`last_value`, `is_called`, `RESTART`, `setval`); and auto-remediation — the analyzer never repairs a target or emits a clause. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md).
 
 **Deliberately shallow for now:** the analyzer is a pure read of the two models and the plan — no catalog, no execution, no version detection; a definite hazard is reported, never fixed.
 
@@ -60,4 +60,4 @@ Two levels and the live evidence pin the slice:
 
 ## Non-goals
 
-Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful rewrite analysis needs type semantics the model deliberately lacks. Transaction grouping, SQL comments, compare-side hazards, sequence-state modeling, and auto-remediation stay out; the analyzer never changes a step, emits no new SQL clause, and adds no flag.
+Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful rewrite analysis needs type semantics the model deliberately lacks. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). SQL comments, compare-side hazards, sequence-state modeling, and auto-remediation stay out; the analyzer never changes a step, emits no new SQL clause, and adds no flag.
