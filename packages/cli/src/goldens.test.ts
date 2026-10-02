@@ -21,7 +21,14 @@ const execFileAsync = promisify(execFile);
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 /** Every golden scene, by fixture base name. */
-const SCENES = ['all-changes', 'hazards', 'identity', 'schema-edges', 'sequences'] as const;
+const SCENES = [
+  'all-changes',
+  'constraints-indexes',
+  'hazards',
+  'identity',
+  'schema-edges',
+  'sequences',
+] as const;
 
 /** Every command whose stdout a golden pins. */
 const COMMANDS = ['compare', 'plan'] as const;
