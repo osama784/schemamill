@@ -5,18 +5,30 @@
  * `importDump` composes the parse leg (`parseDump`) and translates each statement:
  *
  * - `CREATE TABLE` becomes a `Table`: columns in source order, the primary key (inline,
- *   table-level, or a later `ALTER TABLE`), and foreign keys. Types and DEFAULT expressions
- *   are sliced from the source text — the AST normalizes types (`int` becomes `int4`), so the
- *   model keeps the written spelling, whitespace-normalized. A column declared
- *   `GENERATED … AS IDENTITY` becomes the column's effective identity descriptor (see
- *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
- *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
- *   schema-qualified identity replaces the table wholesale, clearing its foreign keys.
+ *   table-level, or a later `ALTER TABLE`), unique and check constraints, standalone indexes,
+ *   and foreign keys. Types and DEFAULT expressions are sliced from the source text — the AST
+ *   normalizes types (`int` becomes `int4`), so the model keeps the written spelling,
+ *   whitespace-normalized; a check expression is the text between the parentheses after
+ *   `CHECK`, normalized the same way. A column declared `GENERATED … AS IDENTITY` becomes the
+ *   column's effective identity descriptor (see `identity.ts`): a type PostgreSQL does not
+ *   accept for identity columns, and every option the model cannot carry, is flagged by name.
+ *   A repeated `CREATE TABLE` for the same schema-qualified identity replaces the table
+ *   wholesale, clearing its foreign keys, unique constraints, check constraints, and indexes.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
- *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key or primary key to
- *   an already imported table. Any other action is skipped and named, as is an identity action
- *   on a column that is not a modeled identity.
+ *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key, primary key,
+ *   unique constraint, or check constraint to an already imported table. A unique constraint
+ *   stated `USING INDEX` consumes the named standalone index when it is a plain column-list
+ *   unique index, and the whole constraint is skipped and named otherwise. Any other action
+ *   is skipped and named, as is an identity action on a column that is not a modeled identity.
+ * - `CREATE [UNIQUE] INDEX` becomes an `Index` with its name (optional), `unique`, ordered
+ *   columns, and `concurrently`. A statement outside the minimal envelope — an expression
+ *   element, partial `WHERE`, `INCLUDE (…)`, a non-btree access method, a non-default
+ *   ordering, operator class, collation, or NULLS ordering, a tablespace, storage parameters,
+ *   or `NULLS NOT DISTINCT` — is skipped and named whole; an index is never partially
+ *   imported. A constraint-backed index is never a standalone `Index`: inline and
+ *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
+ *   consumes the index it names.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -27,26 +39,32 @@
  *   sequence, in the order the engine processes them, and are skipped and named when the
  *   sequence was not imported. `RESTART` (sequence state), renames, `SET SCHEMA`, and
  *   `setval` calls are skipped and named; so is a dump-side `DROP SEQUENCE`.
- * - Everything outside the imported subset (schemas, indexes, views, functions, comments,
- *   grants, settings, …) is skipped and named.
+ * - Everything outside the imported subset (schemas, views, functions, comments, grants,
+ *   settings, …) is skipped and named.
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
  * behaviour, tablespace, access method, storage parameters, unlogged or temporary
- * persistence, and column-level UNIQUE, CHECK, EXCLUDE, GENERATED, COLLATE, compression, and
- * storage. The one exception is a partition (`partbound`): a plain-table representation would
- * be a different object, so the whole statement is skipped and named. `ALTER TABLE` on
- * anything but a plain table is skipped the same way.
+ * persistence, and column-level EXCLUDE, GENERATED, COLLATE, compression, and storage. A
+ * unique or check constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
+ * `INCLUDE (…)`, `NO INHERIT`, `NOT VALID`, deferrability, `NOT ENFORCED`) is still
+ * imported, and each unrepresentable attribute is flagged and dropped, following the
+ * foreign-key precedent. The one statement-level exception is a partition (`partbound`): a
+ * plain-table representation would be a different object, so the whole statement is skipped
+ * and named. `ALTER TABLE` on anything but a plain table is skipped the same way.
  *
  * Diagnostics come back in dump order (by source offset). The model obeys the ordering in
  * `model.ts`: tables by schema then name, columns in source order, foreign keys by
- * referencing columns, then referenced table, then constraint name (unnamed first).
+ * referencing columns, then referenced table, then constraint name (unnamed first), unique
+ * constraints by ordered columns then name (unnamed first), check constraints by expression
+ * then name (unnamed first), and indexes by name (unnamed first).
  *
  * This module is internal to the package; `index.ts` re-exports `importDump` and
  * `ddlImporter` as the seam binding.
  */
 
 import type {
+  CheckConstraint,
   Column,
   DdlImporter,
   Diagnostic,
@@ -55,6 +73,7 @@ import type {
   IdentityGeneration,
   IdentityInput,
   IdentityOptions,
+  Index,
   Model,
   PrimaryKey,
   ReadResult,
@@ -67,6 +86,7 @@ import type {
   SkipDiagnosticCode,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from '@schemamill/core';
 import {
   canonicalIntType,
@@ -86,6 +106,8 @@ import type {
   CreateSeqStmt,
   CreateStmt,
   DefElem,
+  IndexElem,
+  IndexStmt,
   Node,
   RangeVar,
   SelectStmt,
@@ -104,6 +126,9 @@ interface TableDraft {
   columns: readonly Column[];
   primaryKey?: PrimaryKey;
   readonly foreignKeys: ForeignKey[];
+  readonly uniqueConstraints: UniqueConstraint[];
+  readonly checkConstraints: CheckConstraint[];
+  readonly indexes: Index[];
 }
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
@@ -232,6 +257,10 @@ function translateStatement(
     translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics);
     return;
   }
+  if ('IndexStmt' in node) {
+    translateCreateIndex(statement, node.IndexStmt, tables, diagnostics);
+    return;
+  }
 
   const { description, object } = describeStatement(node);
   diagnostics.push(skipStatement(statement, description, object));
@@ -263,9 +292,13 @@ function translateCreateTable(
   const elements = create.tableElts ?? [];
 
   const columns: Column[] = [];
-  // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys.
+  // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys,
+  // unique constraints, check constraints, and indexes.
   draft.primaryKey = undefined;
   draft.foreignKeys.length = 0;
+  draft.uniqueConstraints.length = 0;
+  draft.checkConstraints.length = 0;
+  draft.indexes.length = 0;
 
   for (const element of elements) {
     const boundaries = clauseBoundaries(element);
@@ -284,6 +317,12 @@ function translateCreateTable(
       }
       for (const foreignKey of translated.foreignKeys) {
         attachForeignKey(draft, foreignKey);
+      }
+      for (const uniqueConstraint of translated.uniqueConstraints) {
+        attachUniqueConstraint(draft, uniqueConstraint);
+      }
+      for (const checkConstraint of translated.checkConstraints) {
+        attachCheckConstraint(draft, checkConstraint);
       }
       continue;
     }
@@ -311,7 +350,13 @@ function translateColumn(
   schema: string,
   identity: string,
   diagnostics: PositionedDiagnostic[],
-): { column: Column; primaryKey?: PrimaryKey; foreignKeys: readonly ForeignKey[] } {
+): {
+  column: Column;
+  primaryKey?: PrimaryKey;
+  foreignKeys: readonly ForeignKey[];
+  uniqueConstraints: readonly UniqueConstraint[];
+  checkConstraints: readonly CheckConstraint[];
+} {
   const name = column.colname ?? '';
   const place = `${identity}.${name}`;
   const constraints = (column.constraints ?? [])
@@ -347,9 +392,17 @@ function translateColumn(
         constraint.contype === 'CONSTR_NOTNULL' || constraint.contype === 'CONSTR_IDENTITY',
     );
 
-  const translated: { column: Column; primaryKey?: PrimaryKey; foreignKeys: ForeignKey[] } = {
+  const translated: {
+    column: Column;
+    primaryKey?: PrimaryKey;
+    foreignKeys: ForeignKey[];
+    uniqueConstraints: UniqueConstraint[];
+    checkConstraints: CheckConstraint[];
+  } = {
     column: { name, type, notNull },
     foreignKeys: [],
+    uniqueConstraints: [],
+    checkConstraints: [],
   };
 
   const defaultConstraint = constraints.find(
@@ -375,7 +428,20 @@ function translateColumn(
         );
         break;
       case 'CONSTR_UNIQUE':
-      case 'CONSTR_CHECK':
+        translated.uniqueConstraints.push(
+          uniqueConstraintFromConstraint(statement, constraint, [name], identity, diagnostics),
+        );
+        break;
+      case 'CONSTR_CHECK': {
+        const checkConstraint = checkConstraintFromConstraint(
+          statement,
+          constraint,
+          identity,
+          diagnostics,
+        );
+        if (checkConstraint !== undefined) translated.checkConstraints.push(checkConstraint);
+        break;
+      }
       case 'CONSTR_EXCLUSION':
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
@@ -451,6 +517,22 @@ function translateTableConstraint(
         ),
       );
       return;
+    case 'CONSTR_UNIQUE':
+      attachUniqueConstraint(
+        draft,
+        uniqueConstraintFromConstraint(statement, constraint, [], identity, diagnostics),
+      );
+      return;
+    case 'CONSTR_CHECK': {
+      const checkConstraint = checkConstraintFromConstraint(
+        statement,
+        constraint,
+        identity,
+        diagnostics,
+      );
+      if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
+      return;
+    }
     default:
       diagnostics.push(flagAttribute(statement, identity, `${constraintLabel(constraint)}`));
   }
@@ -1108,6 +1190,20 @@ function translateAlterTableCommand(
       );
       return;
     }
+    if (constraint.contype === 'CONSTR_UNIQUE') {
+      attachAlteredUniqueConstraint(statement, constraint, identity, draft, diagnostics);
+      return;
+    }
+    if (constraint.contype === 'CONSTR_CHECK') {
+      const checkConstraint = checkConstraintFromConstraint(
+        statement,
+        constraint,
+        identity,
+        diagnostics,
+      );
+      if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
+      return;
+    }
     diagnostics.push(
       skipStatement(
         statement,
@@ -1154,6 +1250,119 @@ function translateAlterTableCommand(
       identity,
     ),
   );
+}
+
+/**
+ * Imports a standalone `CREATE [UNIQUE] INDEX` onto an already imported table, or skips and
+ * names the whole statement when any part of it falls outside the minimal envelope. The
+ * envelope is a plain btree column list: no expression element, partial `WHERE`, `INCLUDE`,
+ * tablespace, storage parameters, `NULLS NOT DISTINCT`, non-btree access method, or
+ * non-default ordering, operator class, collation, or NULLS ordering. An index is never
+ * partially imported.
+ */
+function translateCreateIndex(
+  statement: ParsedStatement,
+  create: IndexStmt,
+  tables: Map<string, TableDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const schema = create.relation?.schemaname ?? 'public';
+  const name = create.relation?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const object = create.idxname ?? identity;
+
+  const draft = tables.get(tableKey(schema, name));
+  if (draft === undefined) {
+    diagnostics.push(
+      skipStatement(statement, `CREATE INDEX ${object} (table not imported)`, object),
+    );
+    return;
+  }
+
+  const skip = (description: string): void => {
+    diagnostics.push(skipStatement(statement, `CREATE INDEX ${object} (${description})`, object));
+  };
+
+  if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
+    skip(`access method ${create.accessMethod}`);
+    return;
+  }
+  if ((create.indexIncludingParams ?? []).length > 0) {
+    skip('INCLUDE');
+    return;
+  }
+  if (create.whereClause !== undefined) {
+    skip('partial WHERE');
+    return;
+  }
+  if ((create.options ?? []).length > 0) {
+    skip('storage parameters');
+    return;
+  }
+  if (create.tableSpace !== undefined) {
+    skip('tablespace');
+    return;
+  }
+  if (create.nulls_not_distinct === true) {
+    skip('NULLS NOT DISTINCT');
+    return;
+  }
+  if ((create.excludeOpNames ?? []).length > 0) {
+    skip('exclusion operators');
+    return;
+  }
+
+  const columns: string[] = [];
+  for (const element of create.indexParams ?? []) {
+    if (!('IndexElem' in element)) {
+      skip('unrecognized index element');
+      return;
+    }
+    const column = indexColumn(element.IndexElem);
+    if (column === undefined) {
+      skip(indexElementDescription(element.IndexElem));
+      return;
+    }
+    columns.push(column);
+  }
+  if (columns.length === 0) {
+    skip('no index columns');
+    return;
+  }
+
+  const index: Mutable<Index> = { unique: create.unique === true, columns };
+  if (create.idxname !== undefined) index.name = create.idxname;
+  if (create.concurrent === true) index.concurrently = true;
+  attachIndex(draft, index);
+}
+
+/**
+ * The column an `IndexElem` indexes, or `undefined` when the element is not a plain column
+ * reference; `indexElementDescription` then names what is out of the envelope.
+ */
+function indexColumn(element: IndexElem): string | undefined {
+  if (element.expr !== undefined || element.name === undefined) return undefined;
+  if ((element.collation ?? []).length > 0) return undefined;
+  if ((element.opclass ?? []).length > 0) return undefined;
+  if ((element.opclassopts ?? []).length > 0) return undefined;
+  if (element.ordering !== undefined && element.ordering !== 'SORTBY_DEFAULT') return undefined;
+  if (element.nulls_ordering !== undefined && element.nulls_ordering !== 'SORTBY_NULLS_DEFAULT') {
+    return undefined;
+  }
+  return element.name;
+}
+
+/** What makes an `IndexElem` fall outside the minimal envelope, for a skip description. */
+function indexElementDescription(element: IndexElem): string {
+  if (element.expr !== undefined) return 'expression element';
+  if (element.name === undefined) return 'unrecognized index element';
+  if ((element.collation ?? []).length > 0) return 'collation';
+  if ((element.opclass ?? []).length > 0) return 'operator class';
+  if ((element.opclassopts ?? []).length > 0) return 'operator class options';
+  if (element.ordering !== undefined && element.ordering !== 'SORTBY_DEFAULT') {
+    return 'non-default ordering';
+  }
+  return 'non-default NULLS ordering';
 }
 
 /**
@@ -1251,6 +1460,12 @@ function attachColumn(
   }
   for (const foreignKey of translated.foreignKeys) {
     attachForeignKey(draft, foreignKey);
+  }
+  for (const uniqueConstraint of translated.uniqueConstraints) {
+    attachUniqueConstraint(draft, uniqueConstraint);
+  }
+  for (const checkConstraint of translated.checkConstraints) {
+    attachCheckConstraint(draft, checkConstraint);
   }
 }
 
@@ -1433,6 +1648,27 @@ function attachForeignKey(draft: TableDraft, foreignKey: ForeignKey): void {
   draft.foreignKeys.push(foreignKey);
 }
 
+function attachUniqueConstraint(draft: TableDraft, uniqueConstraint: UniqueConstraint): void {
+  if (
+    draft.uniqueConstraints.some((existing) => sameUniqueConstraint(existing, uniqueConstraint))
+  ) {
+    return;
+  }
+  draft.uniqueConstraints.push(uniqueConstraint);
+}
+
+function attachCheckConstraint(draft: TableDraft, checkConstraint: CheckConstraint): void {
+  if (draft.checkConstraints.some((existing) => sameCheckConstraint(existing, checkConstraint))) {
+    return;
+  }
+  draft.checkConstraints.push(checkConstraint);
+}
+
+function attachIndex(draft: TableDraft, index: Index): void {
+  if (draft.indexes.some((existing) => sameIndex(existing, index))) return;
+  draft.indexes.push(index);
+}
+
 function primaryKeyFromConstraint(
   constraint: Constraint,
   fallbackColumns: readonly string[],
@@ -1482,6 +1718,167 @@ function foreignKeyFromConstraint(
   return foreignKey;
 }
 
+function uniqueConstraintFromConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  fallbackColumns: readonly string[],
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): UniqueConstraint {
+  const keys = stringList(constraint.keys);
+  const uniqueConstraint: Mutable<UniqueConstraint> = {
+    columns: keys.length > 0 ? keys : fallbackColumns,
+  };
+  if (constraint.conname !== undefined) uniqueConstraint.name = constraint.conname;
+  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  return uniqueConstraint;
+}
+
+/**
+ * The check constraint a `CHECK` clause states: its name when written and the expression text
+ * between the parentheses after `CHECK`, whitespace-normalized like a type or DEFAULT. A
+ * constraint whose source gives no usable location cannot be modeled; it is flagged and
+ * skipped whole.
+ */
+function checkConstraintFromConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): CheckConstraint | undefined {
+  const expression = checkExpressionText(statement, constraint);
+  if (expression === undefined) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `check expression on ${constraintLabel(constraint)}`),
+    );
+    return undefined;
+  }
+  const checkConstraint: Mutable<CheckConstraint> = { expression };
+  if (constraint.conname !== undefined) checkConstraint.name = constraint.conname;
+  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  return checkConstraint;
+}
+
+/**
+ * The text between the parentheses after a constraint's `CHECK` keyword, whitespace-normalized
+ * and without the outer parentheses, so rendering `CHECK (<expression>)` round-trips. The
+ * constraint's location is the `CHECK` keyword for an inline constraint and the `CONSTRAINT`
+ * keyword for an `ALTER TABLE … ADD CONSTRAINT`, so the scan starts there and finds the
+ * keyword by name, skipping quoted spans and comments.
+ */
+function checkExpressionText(
+  statement: ParsedStatement,
+  constraint: Constraint,
+): string | undefined {
+  const location = constraint.location;
+  if (location === undefined || location < 0) return undefined;
+  const start = findCheckExpressionStart(statement.sql, byteOffsetToUtf16(statement.sql, location));
+  if (start === null) return undefined;
+  return extractSourceText(statement.sql, start, []);
+}
+
+/** Index just past the `(` after the first `CHECK` keyword at or after `from`, or `null`. */
+function findCheckExpressionStart(sql: string, from: number): number | null {
+  let index = from;
+  while (index < sql.length) {
+    const character = sql[index]!;
+
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(sql, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(sql, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && sql[index + 1] === '-') {
+      index = lineCommentEnd(sql, index);
+      continue;
+    }
+    if (character === '/' && sql[index + 1] === '*') {
+      index = blockCommentEnd(sql, index);
+      continue;
+    }
+    if (isKeywordAt(sql, index, 'CHECK')) {
+      const open = skipTrivia(sql, index + 'CHECK'.length);
+      return sql[open] === '(' ? open + 1 : null;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+/**
+ * Flags every attribute of a unique or check constraint that the model cannot carry, following
+ * the foreign-key precedent: the constraint still imports with its representable identity, and
+ * each dropped attribute is named.
+ */
+function flagConstraintAttributes(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const flag = (description: string): void => {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${description} on ${constraintLabel(constraint)}`),
+    );
+  };
+  if (constraint.nulls_not_distinct === true) flag('NULLS NOT DISTINCT');
+  if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.is_no_inherit === true) flag('NO INHERIT');
+  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
+  if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    flag('NOT VALID');
+  }
+  if (constraint.is_enforced === false) flag('NOT ENFORCED');
+}
+
+/**
+ * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
+ * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
+ * column-list unique index; otherwise the whole constraint is skipped and named.
+ */
+function attachAlteredUniqueConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const indexname = constraint.indexname;
+  if (indexname === undefined) {
+    attachUniqueConstraint(
+      draft,
+      uniqueConstraintFromConstraint(statement, constraint, [], identity, diagnostics),
+    );
+    return;
+  }
+
+  const position = draft.indexes.findIndex((index) => index.name === indexname && index.unique);
+  const index = position === -1 ? undefined : draft.indexes[position]!;
+  if (index === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `${constraintLabel(constraint)} on ${identity} (USING INDEX ${indexname})`,
+        constraint.conname ?? indexname,
+      ),
+    );
+    return;
+  }
+
+  draft.indexes.splice(position, 1);
+  const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
+  const name = constraint.conname ?? index.name;
+  if (name !== undefined) uniqueConstraint.name = name;
+  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  attachUniqueConstraint(draft, uniqueConstraint);
+}
+
 /** Maps PostgreSQL's single-letter action codes; `NO ACTION` (the default) is absent. */
 function referentialAction(code: string | undefined): ReferentialAction | undefined {
   switch (code) {
@@ -1508,10 +1905,6 @@ function describeStatement(node: Node): StatementDescription {
   if ('CreateSchemaStmt' in node) {
     const object = node.CreateSchemaStmt.schemaname ?? 'schema';
     return { description: `CREATE SCHEMA ${object}`, object };
-  }
-  if ('IndexStmt' in node) {
-    const object = node.IndexStmt.idxname ?? rangeVarName(node.IndexStmt.relation) ?? 'index';
-    return { description: `CREATE INDEX ${object}`, object };
   }
   if ('DropStmt' in node && node.DropStmt.removeType === 'OBJECT_SEQUENCE') {
     const object = listObjectName(node.DropStmt.objects?.[0]) ?? 'sequence';
@@ -1678,7 +2071,15 @@ function getOrCreateTable(
   const key = tableKey(schema, name);
   const existing = tables.get(key);
   if (existing !== undefined) return existing;
-  const draft: TableDraft = { schema, name, columns: [], foreignKeys: [] };
+  const draft: TableDraft = {
+    schema,
+    name,
+    columns: [],
+    foreignKeys: [],
+    uniqueConstraints: [],
+    checkConstraints: [],
+    indexes: [],
+  };
   tables.set(key, draft);
   return draft;
 }
@@ -1689,6 +2090,9 @@ function finalizeTable(draft: TableDraft): Table {
     name: draft.name,
     columns: draft.columns,
     foreignKeys: [...draft.foreignKeys].sort(compareForeignKeys),
+    uniqueConstraints: [...draft.uniqueConstraints].sort(compareUniqueConstraints),
+    checkConstraints: [...draft.checkConstraints].sort(compareCheckConstraints),
+    indexes: [...draft.indexes].sort(compareIndexes),
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
   return table;
@@ -1782,6 +2186,23 @@ function sameForeignKey(left: ForeignKey, right: ForeignKey): boolean {
   );
 }
 
+function sameUniqueConstraint(left: UniqueConstraint, right: UniqueConstraint): boolean {
+  return left.name === right.name && sameStringArray(left.columns, right.columns);
+}
+
+function sameCheckConstraint(left: CheckConstraint, right: CheckConstraint): boolean {
+  return left.name === right.name && left.expression === right.expression;
+}
+
+/** Whether two indexes are structurally equal; `concurrently` is apply metadata, excluded. */
+function sameIndex(left: Index, right: Index): boolean {
+  return (
+    left.name === right.name &&
+    left.unique === right.unique &&
+    sameStringArray(left.columns, right.columns)
+  );
+}
+
 function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -1801,6 +2222,24 @@ function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {
     compareStrings(left.referencedTable.name, right.referencedTable.name) ||
     compareStrings(left.name ?? '', right.name ?? '')
   );
+}
+
+function compareUniqueConstraints(left: UniqueConstraint, right: UniqueConstraint): number {
+  return (
+    compareStringArrays(left.columns, right.columns) ||
+    compareStrings(left.name ?? '', right.name ?? '')
+  );
+}
+
+function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint): number {
+  return (
+    compareStrings(left.expression, right.expression) ||
+    compareStrings(left.name ?? '', right.name ?? '')
+  );
+}
+
+function compareIndexes(left: Index, right: Index): number {
+  return compareStrings(left.name ?? '', right.name ?? '');
 }
 
 function compareStrings(left: string, right: string): number {
