@@ -1,3 +1,4 @@
+BEGIN;
 ALTER TABLE public.users DROP CONSTRAINT users_name_id_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_mail_id_fkey;
 ALTER TABLE public.users DROP CONSTRAINT users_pkey;
@@ -11,3 +12,4 @@ ALTER TABLE public.users ALTER COLUMN email TYPE character varying(24);
 ALTER TABLE public.users ADD PRIMARY KEY (id);
 ALTER TABLE public.users ADD CONSTRAINT users_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.events(id);
 ALTER TABLE public.users ADD CONSTRAINT users_mail_id_fkey FOREIGN KEY (mail_id) REFERENCES public.mail(id) ON DELETE CASCADE;
+COMMIT;

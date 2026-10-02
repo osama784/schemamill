@@ -22,7 +22,9 @@ import type {
  * `renderSql` is a pure function of the plan — the plan carries every payload the SQL needs,
  * and the same plan always renders the same text. One statement per line, terminated with a
  * semicolon, and a single trailing newline at the end of the output; an empty plan renders as
- * the empty string. `create-table` is the one multi-line statement: its columns go one per
+ * the empty string. `renderSql` walks the plan's transaction groups in order: a transactional
+ * group is wrapped in `BEGIN;` and `COMMIT;`, and a standalone group renders its statements
+ * bare. `create-table` is the one multi-line statement: its columns go one per
  * line, indented four spaces, and its primary key, when present, is the trailing line. A table
  * with neither columns nor a primary key renders on one line as `CREATE TABLE <q> ();`.
  *
@@ -57,8 +59,8 @@ import type {
  * numbered suffixes on name collisions, which cannot be known offline, and pg_dump output
  * always carries real constraint names, so unnamed constraints are the unusual case.
  *
- * Hazards and transaction grouping are later work: this module emits no comments and no
- * BEGIN/COMMIT. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
+ * Group separators and other decoration beyond the wrappers are still out of scope, and this
+ * module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
  */
 
 /**
@@ -179,7 +181,15 @@ const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 /** The migration SQL for `plan`, deterministic. */
 export function renderSql(plan: Plan): string {
   if (plan.steps.length === 0) return '';
-  return `${plan.steps.map((step) => renderStep(step)).join('\n')}\n`;
+  const lines: string[] = [];
+  for (const group of plan.groups) {
+    if (group.transactional) lines.push('BEGIN;');
+    for (let index = group.start; index < group.end; index += 1) {
+      lines.push(renderStep(plan.steps[index]!));
+    }
+    if (group.transactional) lines.push('COMMIT;');
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 /** Binds `renderSql` to the `SqlRenderer` seam. */

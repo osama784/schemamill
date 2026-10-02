@@ -1,3 +1,4 @@
+BEGIN;
 ALTER TABLE public.e DROP CONSTRAINT e_c_id_fkey;
 ALTER TABLE public.f DROP CONSTRAINT f_c_id_fkey;
 ALTER TABLE public.q DROP CONSTRAINT q_p_fkey;
@@ -12,3 +13,4 @@ ALTER TABLE public.e ADD CONSTRAINT e_c_id_fkey FOREIGN KEY (c_id) REFERENCES pu
 ALTER TABLE public.f ADD CONSTRAINT f_c_id_fkey FOREIGN KEY (c_id) REFERENCES public.c;
 ALTER TABLE public.q ADD CONSTRAINT q_p_fkey FOREIGN KEY (pa, pb) REFERENCES public.p(a, b);
 ALTER TABLE public.t ADD CONSTRAINT t_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.t(id);
+COMMIT;
