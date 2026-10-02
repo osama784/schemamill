@@ -81,6 +81,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
+  uniqueConstraints: [],
+  checkConstraints: [],
+  indexes: [],
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */

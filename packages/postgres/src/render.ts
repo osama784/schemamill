@@ -1,9 +1,11 @@
 import type {
+  CheckConstraint,
   Column,
   ColumnFieldChange,
   ForeignKey,
   Identity,
   IdentityFieldChange,
+  Index,
   Plan,
   PrimaryKey,
   Sequence,
@@ -13,6 +15,7 @@ import type {
   Step,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from '@schemamill/core';
 
 /**
@@ -27,10 +30,11 @@ import type {
  * guarantees this contract, and a malformed partition throws before any SQL is rendered,
  * naming the violated invariant and the offending indices. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
- * a standalone group renders its statements bare. `create-table` is the one multi-line
- * statement: its columns go one per line, indented four spaces, and its primary key, when
- * present, is the trailing line. A table with neither columns nor a primary key renders on one
- * line as `CREATE TABLE <q> ();`.
+ * a standalone group renders its statements bare. A plan with more than one group separates
+ * them with one blank line; single-group output is unchanged. `create-table` is the one
+ * multi-line statement: its columns go one per line, indented four spaces, and its primary
+ * key, when present, is the trailing line. A table with neither columns nor a primary key
+ * renders on one line as `CREATE TABLE <q> ();`.
  *
  * `create-sequence` renders the canonical full-explicit form — `AS`, `INCREMENT BY`,
  * `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`/`NO CYCLE` — with the plan's
@@ -48,23 +52,33 @@ import type {
  * as a whole. `drop-identity` renders `DROP IDENTITY`. A column's identity never renders
  * inline in `create-table` or `add-column`: the plan adds it with its own step.
  *
+ * `add-unique-constraint` renders `ALTER TABLE … ADD [CONSTRAINT name] UNIQUE (cols)`,
+ * `add-check-constraint` renders `… ADD [CONSTRAINT name] CHECK (expr)` with the expression
+ * exactly as the model stores it, and `create-index` renders
+ * `CREATE [UNIQUE] INDEX [name] ON schema.table USING btree (cols)`, omitting the name when
+ * the model has none, mirroring primary-key and foreign-key rendering. The concurrent index
+ * kinds render the same statements with `CONCURRENTLY`; the plan stands them in standalone
+ * groups, so they render bare.
+ *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
- * table, sequence, column, or constraint name — is emitted bare only when it is a lowercase,
- * unquoted-identifier shape (`/^[a-z_][a-z0-9_$]*$/`) and not a reserved key word; otherwise
- * it is double-quoted, with embedded quotes doubled. `RESERVED_KEYWORDS` holds the words that
- * rule covers. Column types and DEFAULT expressions are emitted exactly as the model stores
- * them: core never lexes or normalizes SQL, so rendering never rewrites a type or an
+ * table, sequence, column, constraint, or index name — is emitted bare only when it is a
+ * lowercase, unquoted-identifier shape (`/^[a-z_][a-z0-9_$]*$/`) and not a reserved key word;
+ * otherwise it is double-quoted, with embedded quotes doubled. `RESERVED_KEYWORDS` holds the
+ * words that rule covers. Column types and DEFAULT expressions are emitted exactly as the model
+ * stores them: core never lexes or normalizes SQL, so rendering never rewrites a type or an
  * expression. Sequence option values are emitted exactly as the model stores them: canonical
  * decimal strings, never JavaScript numbers, so 64-bit values render exactly.
  *
  * A constraint drop must name its constraint, but the model permits unnamed constraints.
  * Rendering then synthesizes PostgreSQL's conventional name — `<table>_pkey` for a primary
- * key, `<table>_<column>_…_fkey` for a foreign key. This is best-effort: PostgreSQL appends
- * numbered suffixes on name collisions, which cannot be known offline, and pg_dump output
- * always carries real constraint names, so unnamed constraints are the unusual case.
+ * key, `<table>_<column>_…_fkey` for a foreign key, `<table>_<column>_…_key` for a unique
+ * constraint, and `<table>_<column>_check` for a check constraint whose expression references
+ * one column (`<table>_check` otherwise) — and `<table>_<column>_…_idx` for an unnamed index
+ * drop. This is best-effort: PostgreSQL appends numbered suffixes on name collisions, which
+ * cannot be known offline, and pg_dump output always carries real constraint names, so
+ * unnamed constraints are the unusual case.
  *
- * Group separators and other decoration beyond the wrappers are still out of scope, and this
- * module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
+ * This module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
  */
 
 /**
@@ -189,15 +203,17 @@ const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 export function renderSql(plan: Plan): string {
   assertGroupsTileSteps(plan);
   if (plan.steps.length === 0) return '';
-  const lines: string[] = [];
+  const groups: string[] = [];
   for (const group of plan.groups) {
+    const lines: string[] = [];
     if (group.transactional) lines.push('BEGIN;');
     for (let index = group.start; index < group.end; index += 1) {
       lines.push(renderStep(plan.steps[index]!));
     }
     if (group.transactional) lines.push('COMMIT;');
+    groups.push(lines.join('\n'));
   }
-  return `${lines.join('\n')}\n`;
+  return `${groups.join('\n\n')}\n`;
 }
 
 /**
@@ -283,6 +299,32 @@ function renderStep(step: Step): string {
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
         step.foreignKey.name ?? synthesizedForeignKeyName(step.table, step.foreignKey),
       )};`;
+    case 'add-unique-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} ADD ${renderUniqueConstraint(
+        step.uniqueConstraint,
+      )};`;
+    case 'drop-unique-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
+        step.uniqueConstraint.name ??
+          synthesizedUniqueConstraintName(step.table, step.uniqueConstraint),
+      )};`;
+    case 'add-check-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} ADD ${renderCheckConstraint(
+        step.checkConstraint,
+      )};`;
+    case 'drop-check-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
+        step.checkConstraint.name ??
+          synthesizedCheckConstraintName(step.table, step.checkConstraint),
+      )};`;
+    case 'create-index':
+      return renderCreateIndex(step.table, step.index, false);
+    case 'create-index-concurrently':
+      return renderCreateIndex(step.table, step.index, true);
+    case 'drop-index':
+      return renderDropIndex(step.table, step.index, false);
+    case 'drop-index-concurrently':
+      return renderDropIndex(step.table, step.index, true);
     case 'create-sequence':
       return renderCreateSequence(step.sequence);
     case 'drop-sequence':
@@ -346,6 +388,237 @@ function renderReferentialActions(foreignKey: ForeignKey): string {
 /** PostgreSQL's conventional foreign-key name for an unnamed constraint. */
 function synthesizedForeignKeyName(table: TableIdentity, foreignKey: ForeignKey): string {
   return `${table.name}${foreignKey.columns.map((column) => `_${column}`).join('')}_fkey`;
+}
+
+/** A unique-constraint clause, with its name when it has one. */
+function renderUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
+  const name =
+    uniqueConstraint.name === undefined
+      ? ''
+      : `CONSTRAINT ${quoteIdentifier(uniqueConstraint.name)} `;
+  const columns = uniqueConstraint.columns.map((column) => quoteIdentifier(column)).join(', ');
+  return `${name}UNIQUE (${columns})`;
+}
+
+/** A check-constraint clause, with its name when it has one; the expression is opaque text. */
+function renderCheckConstraint(checkConstraint: CheckConstraint): string {
+  const name =
+    checkConstraint.name === undefined
+      ? ''
+      : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
+  return `${name}CHECK (${checkConstraint.expression})`;
+}
+
+/** PostgreSQL's conventional unique-constraint name for an unnamed constraint. */
+function synthesizedUniqueConstraintName(
+  table: TableIdentity,
+  uniqueConstraint: UniqueConstraint,
+): string {
+  return `${table.name}${uniqueConstraint.columns.map((column) => `_${column}`).join('')}_key`;
+}
+
+/**
+ * PostgreSQL's conventional check-constraint name for an unnamed constraint: the single
+ * column the expression references when it references exactly one, the table alone otherwise.
+ */
+function synthesizedCheckConstraintName(
+  table: TableIdentity,
+  checkConstraint: CheckConstraint,
+): string {
+  const column = checkExpressionColumn(checkConstraint.expression);
+  return column === undefined ? `${table.name}_check` : `${table.name}_${column}_check`;
+}
+
+/** PostgreSQL's conventional index name for an unnamed index. */
+function synthesizedIndexName(table: TableIdentity, index: Index): string {
+  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+}
+
+/** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */
+function renderCreateIndex(table: TableIdentity, index: Index, concurrently: boolean): string {
+  const unique = index.unique ? 'UNIQUE ' : '';
+  const concurrent = concurrently ? 'CONCURRENTLY ' : '';
+  const name = index.name === undefined ? '' : `${quoteIdentifier(index.name)} `;
+  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
+  return `CREATE ${unique}INDEX ${concurrent}${name}ON ${renderTable(
+    table,
+  )} USING btree (${columns});`;
+}
+
+/** `DROP INDEX [CONCURRENTLY] <name>`, synthesizing the conventional name when absent. */
+function renderDropIndex(table: TableIdentity, index: Index, concurrently: boolean): string {
+  const concurrent = concurrently ? 'CONCURRENTLY ' : '';
+  return `DROP INDEX ${concurrent}${quoteIdentifier(
+    index.name ?? synthesizedIndexName(table, index),
+  )};`;
+}
+
+/**
+ * The words a check expression can carry that are never a column reference, for the
+ * best-effort conventional-name scan. Function-like words (`COALESCE`, `NULLIF`, …) are
+ * already excluded by their call parentheses.
+ */
+const CHECK_KEYWORDS: ReadonlySet<string> = new Set([
+  'all',
+  'and',
+  'any',
+  'array',
+  'as',
+  'between',
+  'case',
+  'cast',
+  'collate',
+  'current_catalog',
+  'current_date',
+  'current_role',
+  'current_schema',
+  'current_time',
+  'current_timestamp',
+  'current_user',
+  'default',
+  'distinct',
+  'else',
+  'end',
+  'escape',
+  'exists',
+  'false',
+  'from',
+  'ilike',
+  'in',
+  'interval',
+  'is',
+  'isnull',
+  'like',
+  'localtime',
+  'localtimestamp',
+  'not',
+  'notnull',
+  'null',
+  'or',
+  'overlaps',
+  'row',
+  'session_user',
+  'similar',
+  'some',
+  'then',
+  'to',
+  'true',
+  'unknown',
+  'user',
+  'when',
+]);
+
+/** The shape of an identifier's first character and its continuation. */
+const IDENTIFIER_START = /[A-Za-z_\u0080-\uffff]/;
+const IDENTIFIER_CONTINUATION = /[A-Za-z0-9_$\u0080-\uffff]/;
+
+/** Matches a dollar-quote delimiter, mirroring the importer's scanner. */
+const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
+
+/**
+ * The column a check expression references, when it references exactly one, for PostgreSQL's
+ * conventional constraint name. The scan is lexical and best-effort: it counts bare and quoted
+ * identifiers that are not function names, type names after `::`, `CAST` aliases, or key
+ * words. `undefined` when the expression references zero or several columns.
+ */
+function checkExpressionColumn(expression: string): string | undefined {
+  const columns = new Set<string>();
+  let index = 0;
+  while (index < expression.length) {
+    const character = expression[index]!;
+
+    if (character === "'") {
+      index = quotedSpanEnd(expression, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(expression, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '"') {
+      const end = quotedSpanEnd(expression, index);
+      if (isColumnReference(expression, index, end)) {
+        columns.add(expression.slice(index + 1, end - 1).replaceAll('""', '"'));
+      }
+      index = end;
+      continue;
+    }
+    if (IDENTIFIER_START.test(character)) {
+      let end = index + 1;
+      while (end < expression.length && IDENTIFIER_CONTINUATION.test(expression[end]!)) end += 1;
+      const word = expression.slice(index, end);
+      if (isColumnReference(expression, index, end) && !CHECK_KEYWORDS.has(word.toLowerCase())) {
+        columns.add(word);
+      }
+      index = end;
+      continue;
+    }
+    index += 1;
+  }
+  return columns.size === 1 ? [...columns][0] : undefined;
+}
+
+/** Whether the identifier spanning `[start, end)` reads as a column reference. */
+function isColumnReference(text: string, start: number, end: number): boolean {
+  return !isFunctionName(text, end) && !isCastType(text, start) && !isCastAlias(text, start);
+}
+
+/** Whether the token ending at `end` is a function name: the next non-space character is `(`. */
+function isFunctionName(text: string, end: number): boolean {
+  let index = end;
+  while (index < text.length && isWhitespace(text[index]!)) index += 1;
+  return text[index] === '(';
+}
+
+/** Whether the token starting at `start` is a type name: it follows `::`. */
+function isCastType(text: string, start: number): boolean {
+  let index = start - 1;
+  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
+  return index >= 1 && text[index] === ':' && text[index - 1] === ':';
+}
+
+/** Whether the token starting at `start` is a `CAST` alias: it follows the word `AS`. */
+function isCastAlias(text: string, start: number): boolean {
+  let index = start - 1;
+  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
+  if (index < 0) return false;
+  const end = index + 1;
+  while (index >= 0 && IDENTIFIER_CONTINUATION.test(text[index]!)) index -= 1;
+  return text.slice(index + 1, end).toLowerCase() === 'as';
+}
+
+/** Index just past the quoted span starting at `index` (a `'` or `"`), or the end of text. */
+function quotedSpanEnd(text: string, index: number): number {
+  const quote = text[index];
+  let cursor = index + 1;
+  while (cursor < text.length) {
+    const character = text[cursor]!;
+    if (character === quote) {
+      if (text[cursor + 1] === quote) {
+        cursor += 2;
+        continue;
+      }
+      return cursor + 1;
+    }
+    cursor += 1;
+  }
+  return text.length;
+}
+
+/** Index just past a dollar-quoted span starting at `index`, or `null` when none starts there. */
+function dollarQuotedEnd(text: string, index: number): number | null {
+  DOLLAR_QUOTE.lastIndex = index;
+  const delimiter = DOLLAR_QUOTE.exec(text)?.[0] ?? null;
+  if (delimiter === null) return null;
+  const close = text.indexOf(delimiter, index + delimiter.length);
+  return close === -1 ? text.length : close + delimiter.length;
+}
+
+function isWhitespace(character: string): boolean {
+  return /\s/.test(character);
 }
 
 /** One `ALTER COLUMN` statement for one differing field. */
