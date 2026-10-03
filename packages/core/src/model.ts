@@ -11,9 +11,10 @@ import type { Identity } from './identity.ts';
  * Identity:
  * - A table is identified by its schema and its name together, e.g. `public.users`.
  * - A column is identified by its name within its table.
- * - A primary key, unique constraint, or foreign key is identified by the columns it covers,
- *   and a check constraint by its expression; a constraint `name` travels with it when the
- *   source has one but is not part of its identity. An index is identified by its name.
+ * - A primary key or unique constraint is identified by the columns it covers, a check
+ *   constraint by its expression, and a foreign key by its referencing columns and the table
+ *   it references; a constraint `name` travels with it when the source has one but is not part
+ *   of its identity. An index is identified by its name.
  * - A sequence is identified by its schema and its name together, like a table.
  *
  * Ordering — deterministic, so two models of the same schema compare structurally:

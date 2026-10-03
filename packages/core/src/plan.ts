@@ -143,16 +143,16 @@ import type {
  * T's dropped primary-key columns — an empty `referencedColumns` resolves to T's baseline
  * primary key — and whose payload the target still carries unchanged (same owning table, same
  * identity, equal fields) gets a drop-foreign-key step with the baseline payload in table
- * phase 1 and an add-foreign-key step with the target payload in table phase 9. The diff's own
+ * phase 1 and an add-foreign-key step with the target payload in table phase 15. The diff's own
  * drops and adds are never duplicated: only the occurrences the diff's identical-pair
  * cancellation leaves in place are synthesized, so a foreign key the diff removes or replaces
- * needs nothing here, and a removed table's constraints are already gone when table phase 2
+ * needs nothing here, and a removed table's constraints are already gone when table phase 5
  * finishes. The synthesized drops follow the diff-derived drops and precede the cycle-breaking
  * drops; the synthesized adds follow the diff-derived adds. Primary-key drops are walked in
  * diff order, and for each drop its dependents come in owning-table identity order, then in
  * canonical foreign-key order.
  *
- * Table phase 2 is dependency-ordered. When a removed table references another removed table, the
+ * Table phase 5 is dependency-ordered. When a removed table references another removed table, the
  * referencing table must be dropped first, or the referenced table's constraint would still
  * be in the way. The order is a deterministic Kahn's algorithm:
  *
@@ -765,14 +765,14 @@ interface RemovedSequence {
   readonly ownedBy?: SequenceOwner;
 }
 
-/** A removed table, held with its canonical payload while phase 2 orders the drops. */
+/** A removed table, held with its canonical payload while table phase 5 orders the drops. */
 interface RemovedTable {
   readonly identity: TableIdentity;
   readonly table: Table;
 }
 
 /**
- * Phase 2: orders the removed tables' drops so a table is dropped only once no remaining
+ * Phase 5: orders the removed tables' drops so a table is dropped only once no remaining
  * removed table references it, breaking reference cycles with explicit drop-foreign-key
  * steps aimed at the table about to be dropped. Returns the drops in execution order and the
  * cycle-breaking steps in discovery order.
@@ -1030,7 +1030,7 @@ function dependentForeignKeySteps(
 
     for (const owner of owners) {
       const targetOwner = targetTables.get(keyOf(owner));
-      if (targetOwner === undefined) continue; // Removed tables are gone before phase 3.
+      if (targetOwner === undefined) continue; // Removed tables are gone before table phase 6.
 
       const baselineCounts = countForeignKeys(owner.foreignKeys);
       const targetCounts = countForeignKeys(targetOwner.foreignKeys);

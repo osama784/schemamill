@@ -47,9 +47,11 @@
  * behaviour, tablespace, access method, storage parameters, unlogged or temporary
  * persistence, and column-level EXCLUDE, GENERATED, COLLATE, compression, and storage. A
  * unique or check constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
- * `INCLUDE (…)`, `NO INHERIT`, `NOT VALID`, deferrability, `NOT ENFORCED`) is still
- * imported, and each unrepresentable attribute is flagged and dropped, following the
- * foreign-key precedent. The one statement-level exception is a partition (`partbound`): a
+ * `INCLUDE (…)`, `NO INHERIT`, `NOT VALID`, deferrability) is still imported, and each
+ * unrepresentable attribute is flagged and dropped, following the foreign-key precedent;
+ * `NOT ENFORCED` is flagged under the `NOT VALID` wording, because the parser delivers it
+ * through the same `skip_validation` channel — the foreign-key path behaves the same. The one
+ * statement-level exception is a partition (`partbound`): a
  * plain-table representation would be a different object, so the whole statement is skipped
  * and named. `ALTER TABLE` on anything but a plain table is skipped the same way.
  *
@@ -1832,9 +1834,11 @@ function flagConstraintAttributes(
   if (constraint.is_no_inherit === true) flag('NO INHERIT');
   if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    // `NOT ENFORCED` arrives through the parser's same `skip_validation` channel as
+    // `NOT VALID`, with `is_enforced` omitted rather than false, so it is flagged under the
+    // `NOT VALID` wording — exactly as the pre-existing foreign-key path does.
     flag('NOT VALID');
   }
-  if (constraint.is_enforced === false) flag('NOT ENFORCED');
 }
 
 /**
