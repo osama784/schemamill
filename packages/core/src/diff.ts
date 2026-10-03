@@ -1151,10 +1151,11 @@ function compareIndexesCanonically(left: Index, right: Index): number {
 }
 
 /**
- * The pairing order for unmatched duplicates, each ordered by presence — absent first — and
- * then by value. Structurally identical entries have already cancelled, so this decides which
- * remaining baseline entry pairs with which remaining target entry: unique constraints and
- * check constraints by name, indexes by name, then `unique`, then columns.
+ * The pairing order for unmatched duplicates. Structurally identical entries have already
+ * cancelled, so this decides which remaining baseline entry pairs with which remaining target
+ * entry: unique constraints and check constraints by name — ordered by presence, absent first,
+ * then by value — and indexes by `unique`, then columns, since grouping already made their
+ * names equal.
  */
 function compareUniqueConstraintPairing(left: UniqueConstraint, right: UniqueConstraint): number {
   return compareOptionalStrings(left.name, right.name);
@@ -1166,7 +1167,6 @@ function compareCheckConstraintPairing(left: CheckConstraint, right: CheckConstr
 
 function compareIndexPairing(left: Index, right: Index): number {
   return (
-    compareOptionalStrings(left.name, right.name) ||
     (left.unique === right.unique ? 0 : left.unique ? 1 : -1) ||
     compareStringArrays(left.columns, right.columns)
   );
