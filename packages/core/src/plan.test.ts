@@ -22,7 +22,7 @@ import type { Step, TransactionGroup } from './plan.ts';
 import { groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eight global phases with the nine table phases at their
+ * Tests for the migration plan: the eight global phases with the fifteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -1743,7 +1743,7 @@ test('a primary-key change splits into a drop before column work and an add afte
   ]);
 });
 
-test('a changed foreign key drops in phase 1 and adds in phase 9, around column work', () => {
+test('a changed foreign key drops in phase 1 and adds in phase 15, around column work', () => {
   const parent = identity('parent');
   const before = foreignKey(['parent_id'], parent, {
     name: 't_parent_id_fkey',
@@ -1859,7 +1859,7 @@ test('column payloads in steps carry an independent identity', () => {
   }
 });
 
-test('a mixed migration pins the exact step sequence across all nine phases', () => {
+test('a mixed migration pins the exact step sequence across the nine original table phases', () => {
   const audit = table('audit', { columns: [column('id')] });
   const legacy = table('legacy', {
     columns: [column('id', { type: 'integer', notNull: true })],
@@ -2021,6 +2021,21 @@ test('an added table attaches its constraints and indexes in phase order', () =>
     { kind: 'create-index', table: identity('users'), index: entry },
   ]);
   simulate(model(), model(users));
+});
+
+test('a removed table carries its constraints and indexes away without member drops', () => {
+  const columns = [column('a'), column('b')];
+  const gone = table('gone', {
+    columns,
+    uniqueConstraints: [uniqueConstraint(['a'], { name: 'gone_a_key' })],
+    checkConstraints: [checkConstraint('a > 0', { name: 'gone_a_check' })],
+    indexes: [index(['b'], { name: 'gone_b_idx' })],
+  });
+
+  // The table drop cascades its members, so the plan emits exactly one step: per-member drops
+  // would fail after the table is gone.
+  assertPlan(model(gone), model(), [{ kind: 'drop-table', table: identity('gone') }]);
+  simulate(model(gone), model());
 });
 
 test('a unique constraint add, change, or drop becomes its own step', () => {

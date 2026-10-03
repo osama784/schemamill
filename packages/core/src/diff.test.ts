@@ -1925,6 +1925,43 @@ test('a unique constraint name change is a change', () => {
   ]);
 });
 
+test("a unique constraint's absent name and empty name are distinct", () => {
+  const columns = [column('a')];
+  const unnamed = model(table('t', { columns, uniqueConstraints: [uniqueConstraint(['a'])] }));
+  const empty = model(
+    table('t', { columns, uniqueConstraints: [uniqueConstraint(['a'], { name: '' })] }),
+  );
+
+  // Within one identity — the same ordered columns — a name difference is a change, never a
+  // silent collapse; absent and empty stay distinct even though both render no name otherwise.
+  assertDiff(unnamed, empty, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a']),
+          after: uniqueConstraint(['a'], { name: '' }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(empty, unnamed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a'], { name: '' }),
+          after: uniqueConstraint(['a']),
+        },
+      ],
+    },
+  ]);
+});
+
 test('a unique constraint column list change removes then adds', () => {
   const baseline = model(
     table('t', {
@@ -1946,6 +1983,27 @@ test('a unique constraint column list change removes then adds', () => {
       changes: [
         { kind: 'unique-constraint-removed', uniqueConstraint: uniqueConstraint(['a']) },
         { kind: 'unique-constraint-added', uniqueConstraint: uniqueConstraint(['a', 'b']) },
+      ],
+    },
+  ]);
+});
+
+test('a unique constraint column reorder removes then adds', () => {
+  const columns = [column('a'), column('b')];
+  const baseline = model(
+    table('t', { columns, uniqueConstraints: [uniqueConstraint(['a', 'b'])] }),
+  );
+  const target = model(table('t', { columns, uniqueConstraints: [uniqueConstraint(['b', 'a'])] }));
+
+  // The ordered column list is the identity, so a reorder is a different constraint: a
+  // removal and an addition, never a changed pair.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'unique-constraint-removed', uniqueConstraint: uniqueConstraint(['a', 'b']) },
+        { kind: 'unique-constraint-added', uniqueConstraint: uniqueConstraint(['b', 'a']) },
       ],
     },
   ]);
@@ -2013,6 +2071,43 @@ test('a check constraint name change is a change', () => {
           kind: 'check-constraint-changed',
           before: checkConstraint('price > 0'),
           after: checkConstraint('price > 0', { name: 'orders_price_check' }),
+        },
+      ],
+    },
+  ]);
+});
+
+test("a check constraint's absent name and empty name are distinct", () => {
+  const columns = [column('price')];
+  const unnamed = model(table('t', { columns, checkConstraints: [checkConstraint('price > 0')] }));
+  const empty = model(
+    table('t', { columns, checkConstraints: [checkConstraint('price > 0', { name: '' })] }),
+  );
+
+  // The expression is the identity; within it, an absent name and the empty string differ, so
+  // the pair is a change rather than a cancellation.
+  assertDiff(unnamed, empty, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('price > 0'),
+          after: checkConstraint('price > 0', { name: '' }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(empty, unnamed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('price > 0', { name: '' }),
+          after: checkConstraint('price > 0'),
         },
       ],
     },
@@ -2138,6 +2233,49 @@ test('a same-name index difference reports before and after', () => {
   assertDiff(reorder.baseline, reorder.target, [
     { kind: 'table-changed', table: identity('t'), changes: [reorder.expected] },
   ]);
+});
+
+test('duplicate index names pair identical indexes first, then by unique and columns', () => {
+  const columns = [column('a'), column('b')];
+  const plainA = index(['a'], { name: 't_idx' });
+  const uniqueA = index(['a'], { name: 't_idx', unique: true });
+  const uniqueB = index(['b'], { name: 't_idx', unique: true });
+
+  // One identity — the shared name — so identical indexes cancel first: the plain (a) copy
+  // cancels, and what remains pairs positionally in the pairing order. A uniform (b) is an
+  // addition, not a replacement for either unique index.
+  const targetCancelled = index(['a'], { name: 't_idx' });
+  const targetPlainB = index(['b'], { name: 't_idx' });
+  const targetUniqueAB = index(['a', 'b'], { name: 't_idx', unique: true });
+
+  const expected: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'index-changed', before: uniqueA, after: targetPlainB },
+        { kind: 'index-changed', before: uniqueB, after: targetUniqueAB },
+      ],
+    },
+  ];
+
+  // Every insertion order on both sides produces the same pairing: the non-unique leftover
+  // sorts before the unique one, and the unique leftovers sort by columns, so the tie-breakers
+  // decide, never the arrays.
+  const baselineForward = model(table('t', { columns, indexes: [plainA, uniqueA, uniqueB] }));
+  const baselineReversed = model(table('t', { columns, indexes: [uniqueB, plainA, uniqueA] }));
+  const targetForward = model(
+    table('t', { columns, indexes: [targetCancelled, targetPlainB, targetUniqueAB] }),
+  );
+  const targetReversed = model(
+    table('t', { columns, indexes: [targetUniqueAB, targetCancelled, targetPlainB] }),
+  );
+
+  for (const baseline of [baselineForward, baselineReversed]) {
+    for (const target of [targetForward, targetReversed]) {
+      assertDiff(baseline, target, expected);
+    }
+  }
 });
 
 test('a concurrently-only index difference is not a change', () => {
