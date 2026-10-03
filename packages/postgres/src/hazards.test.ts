@@ -43,6 +43,9 @@ const table = (name: string, columns: readonly Column[] = [], schema = 'public')
   name,
   columns,
   foreignKeys: [],
+  uniqueConstraints: [],
+  checkConstraints: [],
+  indexes: [],
 });
 
 /** A model of the given tables. */

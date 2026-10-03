@@ -11,18 +11,30 @@ import type { Identity } from './identity.ts';
  * Identity:
  * - A table is identified by its schema and its name together, e.g. `public.users`.
  * - A column is identified by its name within its table.
- * - A primary key or foreign key is identified by the columns it covers; a constraint
- *   `name` travels with it when the source has one but is not part of its identity.
+ * - A primary key or unique constraint is identified by the columns it covers, a check
+ *   constraint by its expression, and a foreign key by its referencing columns and the table
+ *   it references; a constraint `name` travels with it when the source has one but is not part
+ *   of its identity. An index is identified by its name.
  * - A sequence is identified by its schema and its name together, like a table.
  *
  * Ordering — deterministic, so two models of the same schema compare structurally:
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
  * - `columns` keep source order: ordinal position is part of a table's shape.
- * - `primaryKey.columns` and `foreignKey.columns` keep the constraint's column order.
+ * - `primaryKey.columns`, `uniqueConstraint.columns`, `index.columns`, and `foreignKey.columns`
+ *   keep the constraint's or index's column order.
  * - `foreignKeys` are sorted by referencing columns (element-wise lexicographic), then
  *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
  *   first).
+ * - `uniqueConstraints` are sorted by their columns (element-wise lexicographic), then
+ *   constraint name (`name ?? ''`, so unnamed first).
+ * - `checkConstraints` are sorted by expression, then constraint name (`name ?? ''`, so
+ *   unnamed first).
+ * - `indexes` are sorted by name (`name ?? ''`, so unnamed first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
+ *
+ * `Index.concurrently` is apply metadata, not structure: it is excluded from structural
+ * identity and equality, and only steers how a create or drop is applied — the target index's
+ * flag drives a create, the baseline index's flag drives a drop.
  *
  * `GENERATED … AS IDENTITY` is a column property, not a sequence entity: an identity column
  * carries its effective descriptor on the column (`Column.identity`) and never among
@@ -55,6 +67,12 @@ export interface Table extends TableIdentity {
   readonly primaryKey?: PrimaryKey;
   /** Foreign keys declared on the table, in the model's deterministic order. */
   readonly foreignKeys: readonly ForeignKey[];
+  /** Unique constraints declared on the table, in the model's deterministic order. */
+  readonly uniqueConstraints: readonly UniqueConstraint[];
+  /** Check constraints declared on the table, in the model's deterministic order. */
+  readonly checkConstraints: readonly CheckConstraint[];
+  /** Standalone indexes on the table, in the model's deterministic order. */
+  readonly indexes: readonly Index[];
 }
 
 /** A column of a table. */
@@ -82,6 +100,22 @@ export interface PrimaryKey {
   readonly columns: readonly string[];
 }
 
+/** A unique constraint: the listed columns must be unique together. */
+export interface UniqueConstraint {
+  /** Constraint name as written, when the source names it. */
+  readonly name?: string;
+  /** Key columns, in the constraint's order. */
+  readonly columns: readonly string[];
+}
+
+/** A check constraint: every row must satisfy the expression. */
+export interface CheckConstraint {
+  /** Constraint name as written, when the source names it. */
+  readonly name?: string;
+  /** The check expression as written, whitespace-normalized; opaque to the model. */
+  readonly expression: string;
+}
+
 /** A foreign key constraint: columns on this table pointing at columns of another table. */
 export interface ForeignKey {
   /** Constraint name as written, when the source names it. */
@@ -96,6 +130,26 @@ export interface ForeignKey {
   readonly onUpdate?: ReferentialAction;
   /** The `ON DELETE` action when the source states a non-default one. */
   readonly onDelete?: ReferentialAction;
+}
+
+/**
+ * A standalone index: a named access path on the table's columns, not backing a constraint. A
+ * unique constraint is never modeled as, or accompanied by, an index, and the index's name
+ * identifies it.
+ */
+export interface Index {
+  /** Index name as written, when the source names it. */
+  readonly name?: string;
+  /** Whether the index is declared `UNIQUE`. */
+  readonly unique: boolean;
+  /** Indexed columns, in the index's order. */
+  readonly columns: readonly string[];
+  /**
+   * Whether a create or drop applies `CONCURRENTLY`; apply metadata, not structure, excluded
+   * from identity and equality. The target's flag drives a create, the baseline's drives a
+   * drop.
+   */
+  readonly concurrently?: boolean;
 }
 
 /**

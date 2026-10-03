@@ -180,34 +180,60 @@ test('a one-step plan names its single transaction in the singular', () => {
   );
 });
 
-test('a standalone-only plan keeps the plain header', () => {
+test('a single standalone step says it runs outside a transaction', () => {
   const plan: Plan = {
     steps: [{ kind: 'drop-table', table: { schema: 'public', name: 'a' } }],
     groups: [{ start: 0, end: 1, transactional: false }],
   };
 
-  assert.equal(formatPlan(plan), ['1 step:', ' 1. drop-table  public.a', ''].join('\n'));
+  assert.equal(
+    formatPlan(plan),
+    ['1 step outside a transaction:', ' 1. drop-table  public.a', ''].join('\n'),
+  );
 });
 
 test('an empty plan still says there are no changes', () => {
   assert.equal(formatPlan({ steps: [], groups: [] }), 'No changes.\n');
 });
 
-test('a multi-group plan keeps the plain header until multi-group wording lands', () => {
+test('a multi-group plan names each group and numbers its steps continuously', () => {
   const plan: Plan = {
     steps: [
       { kind: 'drop-table', table: { schema: 'public', name: 'a' } },
+      {
+        kind: 'drop-index-concurrently',
+        table: { schema: 'public', name: 'a' },
+        index: { name: 'a_id_idx', unique: false, columns: ['id'] },
+      },
       { kind: 'drop-table', table: { schema: 'public', name: 'b' } },
+      {
+        kind: 'create-index-concurrently',
+        table: { schema: 'public', name: 'b' },
+        index: { name: 'b_id_idx', unique: false, columns: ['id'] },
+      },
     ],
     groups: [
       { start: 0, end: 1, transactional: true },
       { start: 1, end: 2, transactional: false },
+      { start: 2, end: 3, transactional: true },
+      { start: 3, end: 4, transactional: false },
     ],
   };
 
   assert.equal(
     formatPlan(plan),
-    ['2 steps:', ' 1. drop-table  public.a', ' 2. drop-table  public.b', ''].join('\n'),
+    [
+      '4 steps in 4 groups:',
+      '  group 1 of 4:',
+      '    1. drop-table                 public.a',
+      '  group 2 of 4 (standalone):',
+      '    2. drop-index-concurrently    public.a: index a_id_idx (id)',
+      '  group 3 of 4:',
+      '    3. drop-table                 public.b',
+      '  group 4 of 4 (standalone):',
+      '    4. create-index-concurrently  public.b: index b_id_idx (id)',
+      '',
+    ].join('\n'),
   );
 });
 
@@ -231,6 +257,9 @@ test('added and removed columns and added tables surface an identity column', ()
         name: 'added',
         columns: [{ name: 'id', type: 'integer', notNull: true, identity: byDefault }],
         foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
       },
     },
     {
@@ -258,6 +287,193 @@ test('added and removed columns and added tables surface an identity column', ()
       '~ table public.kept',
       '    + column fresh integer NOT NULL identity: GENERATED ALWAYS',
       '    - column gone integer NOT NULL identity: GENERATED ALWAYS',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('constraint and index plan steps print the table and the constrained member', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'drop-index',
+        table: { schema: 'public', name: 'users' },
+        index: { name: 'users_email_idx', unique: false, columns: ['email'] },
+      },
+      {
+        kind: 'drop-index-concurrently',
+        table: { schema: 'public', name: 'users' },
+        index: { name: 'users_age_idx', unique: false, columns: ['age'] },
+      },
+      {
+        kind: 'drop-check-constraint',
+        table: { schema: 'public', name: 'users' },
+        checkConstraint: { name: 'users_age_check', expression: 'age >= 18' },
+      },
+      {
+        kind: 'drop-unique-constraint',
+        table: { schema: 'public', name: 'users' },
+        uniqueConstraint: { name: 'users_email_key', columns: ['email'] },
+      },
+      {
+        kind: 'add-unique-constraint',
+        table: { schema: 'public', name: 'users' },
+        uniqueConstraint: { columns: ['nickname'] },
+      },
+      {
+        kind: 'add-check-constraint',
+        table: { schema: 'public', name: 'users' },
+        checkConstraint: { expression: 'age >= 0' },
+      },
+      {
+        kind: 'create-index',
+        table: { schema: 'public', name: 'users' },
+        index: { name: 'users_name_idx', unique: false, columns: ['name'] },
+      },
+      {
+        kind: 'create-index-concurrently',
+        table: { schema: 'public', name: 'users' },
+        index: { name: 'users_name_idx_v2', unique: true, columns: ['name'] },
+      },
+    ],
+    groups: [
+      { start: 0, end: 1, transactional: true },
+      { start: 1, end: 2, transactional: false },
+      { start: 2, end: 7, transactional: true },
+      { start: 7, end: 8, transactional: false },
+    ],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '8 steps in 4 groups:',
+      '  group 1 of 4:',
+      '    1. drop-index                 public.users: index users_email_idx (email)',
+      '  group 2 of 4 (standalone):',
+      '    2. drop-index-concurrently    public.users: index users_age_idx (age)',
+      '  group 3 of 4:',
+      '    3. drop-check-constraint      public.users: check constraint users_age_check CHECK (age >= 18)',
+      '    4. drop-unique-constraint     public.users: unique constraint users_email_key (email)',
+      '    5. add-unique-constraint      public.users: unique constraint (nickname)',
+      '    6. add-check-constraint       public.users: check constraint CHECK (age >= 0)',
+      '    7. create-index               public.users: index users_name_idx (name)',
+      '  group 4 of 4 (standalone):',
+      '    8. create-index-concurrently  public.users: unique index users_name_idx_v2 (name)',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('constraint and index member changes print in the diff vocabulary', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'unique-constraint-removed',
+          uniqueConstraint: { name: 'users_email_key', columns: ['email'] },
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: { columns: ['nickname'] },
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: { name: 'users_name_key', columns: ['name'] },
+          after: { name: 'users_name_key_v2', columns: ['name'] },
+        },
+        {
+          kind: 'check-constraint-removed',
+          checkConstraint: { name: 'users_age_check', expression: 'age >= 18' },
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: { expression: 'age >= 0' },
+        },
+        {
+          kind: 'check-constraint-changed',
+          before: { name: 'users_note_check', expression: "note <> ''" },
+          after: { expression: "note <> ''" },
+        },
+        {
+          kind: 'index-removed',
+          index: { name: 'users_age_idx', unique: false, columns: ['age'] },
+        },
+        {
+          kind: 'index-added',
+          index: { unique: true, columns: ['nickname'] },
+        },
+        {
+          kind: 'index-changed',
+          before: { name: 'users_email_idx', unique: false, columns: ['email'] },
+          after: { name: 'users_email_idx', unique: true, columns: ['email', 'id'] },
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    - unique constraint users_email_key (email)',
+      '    + unique constraint (nickname)',
+      '    ~ unique constraint (name): name users_name_key → users_name_key_v2',
+      '    - check constraint users_age_check CHECK (age >= 18)',
+      '    + check constraint CHECK (age >= 0)',
+      "    ~ check constraint (note <> ''): name users_note_check → (none)",
+      '    - index users_age_idx (age)',
+      '    + unique index (nickname)',
+      '    ~ index users_email_idx: unique false → true, columns (email) → (email, id)',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('added and removed tables list their constraints and indexes', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-added',
+      table: {
+        schema: 'public',
+        name: 'added',
+        columns: [{ name: 'id', type: 'integer', notNull: true }],
+        primaryKey: { name: 'added_pkey', columns: ['id'] },
+        foreignKeys: [],
+        uniqueConstraints: [{ name: 'added_code_key', columns: ['code'] }],
+        checkConstraints: [{ name: 'added_code_check', expression: "code <> ''" }],
+        indexes: [{ name: 'added_code_idx', unique: true, columns: ['code'] }],
+      },
+    },
+    {
+      kind: 'table-removed',
+      table: {
+        schema: 'public',
+        name: 'gone',
+        columns: [{ name: 'id', type: 'integer', notNull: true }],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [{ name: 'gone_id_idx', unique: false, columns: ['id'] }],
+      },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '+ table public.added',
+      '    id integer NOT NULL',
+      '    primary key added_pkey (id)',
+      '    unique constraint added_code_key (code)',
+      "    check constraint added_code_check CHECK (code <> '')",
+      '    unique index added_code_idx (code)',
+      '',
+      '- table public.gone',
+      '    id integer NOT NULL',
+      '    index gone_id_idx (id)',
       '',
     ].join('\n'),
   );

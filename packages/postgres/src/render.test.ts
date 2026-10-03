@@ -4,10 +4,12 @@ import { test } from 'node:test';
 
 import { effectiveIdentity, plan, sequenceTypeBounds } from '@schemamill/core';
 import type {
+  CheckConstraint,
   Column,
   ForeignKey,
   Identity,
   IdentityInput,
+  Index,
   Model,
   Plan,
   PrimaryKey,
@@ -16,13 +18,14 @@ import type {
   Step,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from '@schemamill/core';
 
 import { renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin six whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin ten whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -42,6 +45,9 @@ interface TableParts {
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
+  uniqueConstraints?: readonly UniqueConstraint[];
+  checkConstraints?: readonly CheckConstraint[];
+  indexes?: readonly Index[];
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -51,7 +57,28 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
+  uniqueConstraints: parts.uniqueConstraints ?? [],
+  checkConstraints: parts.checkConstraints ?? [],
+  indexes: parts.indexes ?? [],
 });
+
+/** A unique constraint on `columns`: unnamed unless overridden. */
+const uniqueConstraint = (
+  columns: readonly string[],
+  rest: Partial<Omit<UniqueConstraint, 'columns'>> = {},
+): UniqueConstraint => ({ columns, ...rest });
+
+/** A check constraint with `expression`: unnamed unless overridden. */
+const checkConstraint = (
+  expression: string,
+  rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
+): CheckConstraint => ({ expression, ...rest });
+
+/** A non-unique index on `columns`: unnamed and non-concurrent unless overridden. */
+const tableIndex = (
+  columns: readonly string[],
+  rest: Partial<Omit<Index, 'columns'>> = {},
+): Index => ({ unique: false, columns, ...rest });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
 const foreignKey = (
@@ -259,6 +286,7 @@ test('wraps each transactional group and leaves a standalone group bare', () => 
     ],
   };
 
+  // A multi-group plan separates its groups with one blank line.
   assert.equal(
     renderSql(synthetic),
     [
@@ -266,7 +294,9 @@ test('wraps each transactional group and leaves a standalone group bare', () => 
       'DROP TABLE public.a;',
       'DROP TABLE public.b;',
       'COMMIT;',
+      '',
       'DROP TABLE public.c;',
+      '',
       'BEGIN;',
       'DROP TABLE public.d;',
       'COMMIT;',
@@ -354,6 +384,9 @@ test('identifiers are quoted only when PostgreSQL needs it', () => {
             { name: 'lower_case$1', type: 'text', notNull: false },
           ],
           foreignKeys: [],
+          uniqueConstraints: [],
+          checkConstraints: [],
+          indexes: [],
         },
       }),
     ),
@@ -415,6 +448,216 @@ test("unnamed constraints drop under PostgreSQL's conventional names", () => {
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('renders unique and check constraint adds and drops, naming only when stated', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a'], { name: 't_a_key' }),
+        },
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a', 'b']),
+        },
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('(age >= 0) AND(age < 150)', { name: 't_age_check' }),
+        },
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint("name <> ''"),
+        },
+        {
+          kind: 'drop-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a']),
+        },
+        {
+          kind: 'drop-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('a > b'),
+        },
+        {
+          kind: 'drop-unique-constraint',
+          table: { schema: 'app', name: 'Order' },
+          uniqueConstraint: uniqueConstraint(['Mixed Case'], { name: 'we"ird' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a);',
+      'ALTER TABLE public.t ADD UNIQUE (a, b);',
+      'ALTER TABLE public.t ADD CONSTRAINT t_age_check CHECK ((age >= 0) AND(age < 150));',
+      "ALTER TABLE public.t ADD CHECK (name <> '');",
+      'ALTER TABLE public.t DROP CONSTRAINT t_a_key;',
+      'ALTER TABLE public.t DROP CONSTRAINT t_check;',
+      'ALTER TABLE app."Order" DROP CONSTRAINT "we""ird";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test("unnamed check drops synthesize PostgreSQL's conventional column name", () => {
+  // PostgreSQL names a check constraint <table>_<column>_check when the expression references
+  // exactly one distinct column, whatever else the expression contains; the scan here is
+  // lexical and best-effort, so function names, cast types, and key words never count.
+  const cases: readonly (readonly [string, string])[] = [
+    ['age >= 0', 't_age_check'],
+    ['(age >= 0)', 't_age_check'],
+    ['age IS NOT NULL', 't_age_check'],
+    ['age > 0 AND age < 150', 't_age_check'],
+    ['length(email) > 3', 't_email_check'],
+    ["upper(name) = 'X'", 't_name_check'],
+    ['COALESCE(age, 0) > 0', 't_age_check'],
+    ["age::text <> ''", 't_age_check'],
+    ['CAST(age AS integer) > 0', 't_age_check'],
+    ['age <> $tag$note$tag$', 't_age_check'],
+    ['a > b', 't_check'],
+    ['age > 0 AND score > 0', 't_check'],
+    ['"Mixed Case" > 0', '"t_Mixed Case_check"'],
+  ];
+
+  for (const [expression, name] of cases) {
+    assert.equal(
+      renderSql(
+        planOf({
+          kind: 'drop-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint(expression),
+        }),
+      ),
+      `BEGIN;\nALTER TABLE public.t DROP CONSTRAINT ${name};\nCOMMIT;\n`,
+      expression,
+    );
+  }
+});
+
+test('renders index creates and drops, named or unnamed, unique or not', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'create-index',
+          table: identity('t'),
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+        {
+          kind: 'create-index',
+          table: identity('t'),
+          index: tableIndex(['a', 'b'], { unique: true }),
+        },
+        {
+          kind: 'drop-index',
+          table: identity('t'),
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+        {
+          kind: 'drop-index',
+          table: identity('t'),
+          index: tableIndex(['a', 'b']),
+        },
+        {
+          kind: 'create-index',
+          table: { schema: 'app', name: 'Order' },
+          index: tableIndex(['Mixed Case'], { name: 'we"ird' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (a);',
+      'CREATE UNIQUE INDEX ON public.t USING btree (a, b);',
+      'DROP INDEX public.t_a_idx;',
+      'DROP INDEX public.t_a_b_idx;',
+      'CREATE INDEX "we""ird" ON app."Order" USING btree ("Mixed Case");',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('index drops are schema-qualified, named or synthesized, both kinds', () => {
+  // A bare `DROP INDEX` name resolves through `search_path`, so an index on a non-public
+  // table must be dropped as `<schema>.<name>`; the name is synthesized when absent, exactly
+  // as `CREATE INDEX` would have PostgreSQL name it.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-index',
+          table: { schema: 'app', name: 'probe' },
+          index: tableIndex(['c'], { name: 'probe_new_idx' }),
+        },
+        {
+          kind: 'drop-index',
+          table: { schema: 'app', name: 'probe' },
+          index: tableIndex(['a', 'b']),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'DROP INDEX app.probe_new_idx;',
+      'DROP INDEX app.probe_a_b_idx;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The concurrent kind carries the same qualification and renders bare in its standalone
+  // group; the table's schema and the index name are quoted when their shape requires it.
+  assert.equal(
+    renderSql({
+      steps: [
+        {
+          kind: 'drop-index-concurrently',
+          table: { schema: 'App', name: 'Probe' },
+          index: tableIndex(['c'], { name: 'we"ird', concurrently: true }),
+        },
+      ],
+      groups: [{ start: 0, end: 1, transactional: false }],
+    }),
+    'DROP INDEX CONCURRENTLY "App"."we""ird";\n',
+  );
+});
+
+test('renders concurrent index kinds bare, one standalone group each', () => {
+  const concurrentDrop: Step = {
+    kind: 'drop-index-concurrently',
+    table: identity('t'),
+    index: tableIndex(['a'], { name: 't_old_idx', concurrently: true }),
+  };
+  const concurrentCreate: Step = {
+    kind: 'create-index-concurrently',
+    table: identity('t'),
+    index: tableIndex(['a', 'b'], { unique: true, name: 't_new_idx', concurrently: true }),
+  };
+
+  // A single standalone group stays one bare statement, with no separator.
+  assert.equal(
+    renderSql({ steps: [concurrentCreate], groups: [{ start: 0, end: 1, transactional: false }] }),
+    'CREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
+  );
+  // Two standalone groups are separated by a blank line, like any other group pair.
+  assert.equal(
+    renderSql({
+      steps: [concurrentDrop, concurrentCreate],
+      groups: [
+        { start: 0, end: 1, transactional: false },
+        { start: 1, end: 2, transactional: false },
+      ],
+    }),
+    'DROP INDEX CONCURRENTLY public.t_old_idx;\n\nCREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
   );
 });
 
@@ -1046,4 +1289,119 @@ test('golden: adds, alters, and drops identities beside plain column DDL', () =>
   });
 
   assertGolden('identity', model(users), model(orders, usersTarget));
+});
+
+test('golden: drops and adds unique and check constraints', () => {
+  const columns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('email'),
+    column('name'),
+    column('age', { type: 'integer' }),
+  ];
+  const baseline = model(
+    table('users', {
+      columns,
+      uniqueConstraints: [
+        uniqueConstraint(['age']),
+        uniqueConstraint(['email'], { name: 'users_email_key' }),
+      ],
+      checkConstraints: [
+        checkConstraint('age >= 0', { name: 'users_age_check' }),
+        checkConstraint('age <= 150'),
+      ],
+    }),
+  );
+  const target = model(
+    table('users', {
+      columns,
+      uniqueConstraints: [
+        uniqueConstraint(['email'], { name: 'users_email_key' }),
+        uniqueConstraint(['name'], { name: 'users_name_key' }),
+      ],
+      checkConstraints: [
+        checkConstraint('age >= 18', { name: 'users_age_check' }),
+        checkConstraint('age <= 150'),
+      ],
+    }),
+  );
+
+  assertGolden('constraints', baseline, target);
+});
+
+test('golden: creates, changes, and drops standalone indexes', () => {
+  const columns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('email'),
+    column('name'),
+    column('age', { type: 'integer' }),
+    column('created_at', { type: 'timestamp with time zone' }),
+  ];
+  const baseline = model(
+    table('users', {
+      columns,
+      indexes: [
+        tableIndex(['email'], { name: 'users_email_idx' }),
+        tableIndex(['age'], { name: 'users_age_idx' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('users', {
+      columns,
+      indexes: [
+        tableIndex(['email'], { name: 'users_email_idx', unique: true }),
+        tableIndex(['name'], { name: 'users_name_idx' }),
+        tableIndex(['created_at']),
+      ],
+    }),
+  );
+
+  assertGolden('indexes', baseline, target);
+});
+
+test('golden: a concurrent index rebuild renders as bare standalone groups', () => {
+  const columns = [column('id', { type: 'integer', notNull: true }), column('age')];
+  const baseline = model(
+    table('users', {
+      columns,
+      indexes: [tableIndex(['age'], { name: 'users_age_idx', concurrently: true })],
+    }),
+  );
+  const target = model(
+    table('users', {
+      columns,
+      indexes: [tableIndex(['age'], { name: 'users_age_idx_v2', concurrently: true })],
+    }),
+  );
+
+  assertGolden('index-concurrent', baseline, target);
+});
+
+test('golden: a mixed multi-group plan separates its groups with blank lines', () => {
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const child = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    indexes: [tableIndex(['parent_id'], { name: 'child_old_idx' })],
+  });
+  const childTarget = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [
+      foreignKey(['parent_id'], identity('parent'), {
+        name: 'child_parent_id_fkey',
+        referencedColumns: ['id'],
+      }),
+    ],
+    indexes: [tableIndex(['parent_id'], { name: 'child_new_idx', concurrently: true })],
+  });
+
+  assertGolden('multi-group', model(parent, child), model(parent, childTarget));
 });

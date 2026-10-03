@@ -1,6 +1,6 @@
 # First slice — import, compare, plan, render
 
-**Status:** built (v0.1.0) · **Last updated:** 2026-10-01
+**Status:** built (v0.1.0) · **Last updated:** 2026-10-03
 
 The first end-to-end path through the engine, from the command line: read two PostgreSQL DDL dumps, compare them, and render the migration plan as migration SQL. Generation only — nothing is applied by schemamill, and nothing is persisted ([ADR-0001](../adr/0001-generate-never-apply.md)). The dialect seam this attaches to is described in [`docs/architecture.md`](../architecture.md).
 
@@ -8,7 +8,7 @@ The first end-to-end path through the engine, from the command line: read two Po
 
 **In:** tables, columns (name, type, `NOT NULL`, `DEFAULT`), primary keys, foreign keys; the PostgreSQL schema (namespace) is part of table identity.
 
-**Out, named in diagnostics — never silent:** unique, check, and exclude constraints; every index; sequences and identity semantics (a `serial` column's `nextval(…)` default survives as default text); views; triggers; functions; enum, domain, and composite definitions; extensions; comments; grants; row-level security; partitioning; inheritance; tablespaces.
+**Out, named in diagnostics — never silent:** unique and check constraints and standalone indexes, listed here when this slice landed, have since shipped in the [constraints and indexes slice](./constraints-indexes.md); sequences and identity semantics, likewise listed, have since shipped in the [sequences](./sequences.md) and [identity](./identity.md) slices — a `serial` column's `nextval(…)` default still survives as opaque default text, beside its own `Sequence` entity. Remaining out: exclusion constraints; expression, partial, and covering indexes; views; triggers; functions; enum, domain, and composite definitions; extensions; comments; grants; row-level security; partitioning; inheritance; tablespaces.
 
 **Deliberately shallow for now:** column types are stored as written (whitespace-normalized text) — semantic equivalence such as `int` vs `integer` needs catalog knowledge and lands later. Renames read as remove + add; hazard annotations, persistence, introspection, and the studio arrive in later slices.
 
@@ -39,4 +39,4 @@ The first end-to-end path through the engine, from the command line: read two Po
 
 ## Non-goals
 
-Everything not listed under Scope — including snapshots on disk, introspection, and the studio — is a later slice; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md). Direction, not a commitment: this plan can change; the code and the changelog are the record of what actually shipped.
+Everything not listed under Scope — including snapshots on disk, introspection, and the studio — is a later slice; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md); unique and check constraints and standalone indexes in the [constraints and indexes slice](./constraints-indexes.md); and sequences and identity in the [sequences](./sequences.md) and [identity](./identity.md) slices. Direction, not a commitment: this plan can change; the code and the changelog are the record of what actually shipped.

@@ -143,21 +143,37 @@ const EXPECTED_BASELINE_PARSE_FAILURE_COMPARE = [
   '',
 ].join('\n');
 
-const INDEX_DUMP = [
+/** A dump whose partial index the importer skips whole and names. */
+const PARTIAL_INDEX_DUMP = [
   'CREATE TABLE public.users (',
   '    id integer NOT NULL',
   ');',
   '',
-  'CREATE INDEX idx_users_email ON public.users (id);',
+  'CREATE INDEX idx_users_email ON public.users (id) WHERE id > 0;',
   '',
 ].join('\n');
 
-/** A dump whose column CHECK constraint the importer flags and drops. */
+/** A dump whose unique constraint carries an attribute the importer flags and drops. */
 const FLAG_DUMP = [
-  'CREATE TABLE public.events (',
-  '    id integer NOT NULL CHECK (id > 0),',
-  '    note text',
+  'CREATE TABLE public.users (',
+  '    id integer NOT NULL,',
+  '    email text',
   ');',
+  '',
+  'ALTER TABLE ONLY public.users ADD CONSTRAINT users_email_key UNIQUE NULLS NOT DISTINCT (email);',
+  '',
+].join('\n');
+
+/** A dump whose unique constraint, check constraint, and plain index all import whole. */
+const IMPORTABLE_DUMP = [
+  'CREATE TABLE public.users (',
+  '    id integer NOT NULL,',
+  '    email text,',
+  '    CONSTRAINT users_email_key UNIQUE (email),',
+  '    CONSTRAINT users_id_check CHECK (id > 0)',
+  ');',
+  '',
+  'CREATE INDEX idx_users_email ON public.users USING btree (email);',
   '',
 ].join('\n');
 
@@ -335,7 +351,7 @@ test('a baseline parse failure is reported on stderr while the diff is still pri
 
 test('skips print a counts line, and --verbose adds the skip line', async (t) => {
   const dir = await fixtureDir(t);
-  const dump = await writeDump(dir, 'dump.sql', INDEX_DUMP);
+  const dump = await writeDump(dir, 'dump.sql', PARTIAL_INDEX_DUMP);
 
   const quiet = await runCli('compare', dump, dump);
 
@@ -350,13 +366,24 @@ test('skips print a counts line, and --verbose adds the skip line', async (t) =>
     verbose.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      'baseline: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
       '',
     ].join('\n'),
   );
   assert.equal(verbose.code, 0);
+});
+
+test('check constraints, unique constraints, and plain indexes import without diagnostics', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'dump.sql', IMPORTABLE_DUMP);
+
+  const result = await runCli('compare', dump, dump, '--verbose');
+
+  assert.equal(result.stdout, 'No changes.\n');
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
 });
 
 test('flags print a counts line, and --verbose adds the flag line', async (t) => {
@@ -376,9 +403,9 @@ test('flags print a counts line, and --verbose adds the flag line', async (t) =>
     verbose.stderr,
     [
       'baseline: 1 flagged',
-      'baseline: [flag] dropped check constraint on public.events.id from public.events (1:1)',
+      'baseline: [flag] dropped NULLS NOT DISTINCT on unique constraint users_email_key from public.users (6:1)',
       'target: 1 flagged',
-      'target: [flag] dropped check constraint on public.events.id from public.events (1:1)',
+      'target: [flag] dropped NULLS NOT DISTINCT on unique constraint users_email_key from public.users (6:1)',
       '',
     ].join('\n'),
   );
@@ -387,7 +414,7 @@ test('flags print a counts line, and --verbose adds the flag line', async (t) =>
 
 test('plan --verbose adds the skip line', async (t) => {
   const dir = await fixtureDir(t);
-  const dump = await writeDump(dir, 'dump.sql', INDEX_DUMP);
+  const dump = await writeDump(dir, 'dump.sql', PARTIAL_INDEX_DUMP);
 
   const result = await runCli('plan', dump, dump, '--verbose');
 
@@ -396,9 +423,9 @@ test('plan --verbose adds the skip line', async (t) => {
     result.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      'baseline: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX idx_users_email (5:1)',
+      'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
       '',
     ].join('\n'),
   );

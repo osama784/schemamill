@@ -2,8 +2,10 @@ import { diff } from './diff.ts';
 import type { ColumnFieldChange, IdentityFieldChange, SequenceFieldChange } from './diff.ts';
 import type { Identity } from './identity.ts';
 import type {
+  CheckConstraint,
   Column,
   ForeignKey,
+  Index,
   Model,
   PrimaryKey,
   Sequence,
@@ -11,6 +13,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from './model.ts';
 
 /**
@@ -24,19 +27,31 @@ import type {
  * its steps into transaction groups, telling a renderer what applies as one unit; hazards are a
  * separate analysis.
  *
- * A step is one of fifteen kinds. A table addition becomes a create-table step carrying the
- * table's columns and primary key as they are, plus one add-foreign-key step per foreign key —
- * the create-table payload is always free of foreign keys, so constraints attach only once
- * every referenced table exists. A table removal becomes a drop-table step. A changed table is
- * mapped member by member: a removed column becomes drop-column, an added column add-column, a
- * changed column alter-column carrying only its differing fields in the fixed order `type`,
- * `notNull`, `default`, plus, when the column's identity differs, identity steps — an identity
- * addition becomes an add-identity step carrying the target descriptor, a removal a
- * drop-identity, a change an alter-identity carrying only its differing fields, and a stated
- * sequence-name mismatch a drop-identity and an add-identity (a recreation); a removed, added,
- * or changed primary key becomes a drop-primary-key and/or add-primary-key step; and a removed,
- * added, or changed foreign key becomes a drop-foreign-key and/or add-foreign-key step. A
- * changed primary key or foreign key decomposes into its drop half and its add half.
+ * A step is one of twenty-three kinds. A table addition becomes a create-table step carrying
+ * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
+ * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
+ * check constraint, and one create-index step per index — the create-table payload is always
+ * free of foreign keys, unique constraints, check constraints, and indexes, so each attaches
+ * with its own step and constraints attach only once every referenced table exists. A table
+ * removal becomes a drop-table step. A changed table is mapped member by member: a removed
+ * column becomes drop-column, an added column add-column, a changed column alter-column
+ * carrying only its differing fields in the fixed order `type`, `notNull`, `default`, plus,
+ * when the column's identity differs, identity steps — an identity addition becomes an
+ * add-identity step carrying the target descriptor, a removal a drop-identity, a change an
+ * alter-identity carrying only its differing fields, and a stated sequence-name mismatch a
+ * drop-identity and an add-identity (a recreation); a removed, added, or changed primary key
+ * becomes a drop-primary-key and/or add-primary-key step; a removed, added, or changed foreign
+ * key becomes a drop-foreign-key and/or add-foreign-key step; a removed, added, or changed
+ * unique constraint becomes a drop-unique-constraint and/or add-unique-constraint step; a
+ * removed, added, or changed check constraint becomes a drop-check-constraint and/or
+ * add-check-constraint step; and a removed, added, or changed index becomes a drop-index and/or
+ * create-index step. A changed primary key, foreign key, unique constraint, check constraint,
+ * or index decomposes into its drop half and its add half.
+ *
+ * The concurrent index kinds are the plan's only non-transactional steps. A create step is
+ * `create-index-concurrently` exactly when the target index states `concurrently: true`; a
+ * drop step is `drop-index-concurrently` exactly when the baseline index does. The flag never
+ * reaches the diff's equality, so a flag-only difference produces no step at all.
  *
  * Identity is never inlined into create-table or add-column: an added table or column whose
  * column carries an identity contributes its own add-identity step, and a column-changed entry
@@ -64,7 +79,7 @@ import type {
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 4. table operations — the nine table phases listed below, in their exact order;
+ * 4. table operations — the fifteen table phases listed below, in their exact order;
  * 5. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
  *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
@@ -93,25 +108,33 @@ import type {
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
- * 2. drop-table — dependency-ordered among themselves, see below. Removed tables go before the
+ * 2. drop-index — the diff-derived drops, before the table and column drops that would take
+ *    their columns away;
+ * 3. drop-check-constraint — likewise, before the table and column drops;
+ * 4. drop-unique-constraint — likewise, before the table and column drops;
+ * 5. drop-table — dependency-ordered among themselves, see below. Removed tables go before the
  *    primary-key and column drops, so a constraint a removed table still holds on a kept
  *    table's primary key or column is gone with that table before the primary key or column is
  *    dropped;
- * 3. drop-primary-key — after the tables that may reference it are gone and the foreign keys
+ * 6. drop-primary-key — after the tables that may reference it are gone and the foreign keys
  *    that survive it are set aside, and before the columns it covers are dropped;
- * 4. drop-column;
- * 5. create-table;
- * 6. add-column;
- * 7. alter-column;
- * 8. add-primary-key — after its columns exist;
- * 9. add-foreign-key — last, once both the table and the referenced table exist, with the
- *    synthesized primary-key dependents after the diff-derived adds.
+ * 7. drop-column;
+ * 8. create-table;
+ * 9. add-column;
+ * 10. alter-column;
+ * 11. add-primary-key — after its columns exist;
+ * 12. add-unique-constraint — after its columns exist;
+ * 13. add-check-constraint — after its columns exist;
+ * 14. create-index — after its columns exist; the concurrent variant stands alone;
+ * 15. add-foreign-key — last, once both the table and the referenced table exist, with the
+ *     synthesized primary-key dependents after the diff-derived adds.
  *
  * Within a phase, steps keep the relative order the diff produced: table and sequence changes
  * in identity order, and inside a changed table the diff's documented member order. A table
- * addition contributes its foreign-key steps to table phase 9 in the added table's canonical
- * foreign-key order. The steps synthesized for primary-key changes are ordered as described
- * below, and the cycle-breaking drop-foreign-key steps close table phase 1.
+ * addition contributes its unique-constraint, check-constraint, and index steps to table phases
+ * 12–14 and its foreign-key steps to table phase 15, each in the added table's canonical order.
+ * The steps synthesized for primary-key changes are ordered as described below, and the
+ * cycle-breaking drop-foreign-key steps close table phase 1.
  *
  * A surviving foreign key can depend on a primary key that changes. Dropping a key while a
  * live foreign key still references it fails, whatever engine runs the plan, so the ordering
@@ -120,16 +143,16 @@ import type {
  * T's dropped primary-key columns — an empty `referencedColumns` resolves to T's baseline
  * primary key — and whose payload the target still carries unchanged (same owning table, same
  * identity, equal fields) gets a drop-foreign-key step with the baseline payload in table
- * phase 1 and an add-foreign-key step with the target payload in table phase 9. The diff's own
+ * phase 1 and an add-foreign-key step with the target payload in table phase 15. The diff's own
  * drops and adds are never duplicated: only the occurrences the diff's identical-pair
  * cancellation leaves in place are synthesized, so a foreign key the diff removes or replaces
- * needs nothing here, and a removed table's constraints are already gone when table phase 2
+ * needs nothing here, and a removed table's constraints are already gone when table phase 5
  * finishes. The synthesized drops follow the diff-derived drops and precede the cycle-breaking
  * drops; the synthesized adds follow the diff-derived adds. Primary-key drops are walked in
  * diff order, and for each drop its dependents come in owning-table identity order, then in
  * canonical foreign-key order.
  *
- * Table phase 2 is dependency-ordered. When a removed table references another removed table, the
+ * Table phase 5 is dependency-ordered. When a removed table references another removed table, the
  * referencing table must be dropped first, or the referenced table's constraint would still
  * be in the way. The order is a deterministic Kahn's algorithm:
  *
@@ -177,7 +200,7 @@ export interface Plan {
 export interface TransactionGroup {
   readonly start: number;
   readonly end: number;
-  /** `false` means the group applies outside a transaction (no wrapper). Unreachable today. */
+  /** `false` means the group applies outside a transaction (no wrapper). */
   readonly transactional: boolean;
 }
 
@@ -217,6 +240,22 @@ export type Step =
   | { kind: 'add-foreign-key'; table: TableIdentity; foreignKey: ForeignKey }
   /** The baseline has a foreign key the target does not. */
   | { kind: 'drop-foreign-key'; table: TableIdentity; foreignKey: ForeignKey }
+  /** The target has a unique constraint the baseline does not. */
+  | { kind: 'add-unique-constraint'; table: TableIdentity; uniqueConstraint: UniqueConstraint }
+  /** The baseline has a unique constraint the target does not. */
+  | { kind: 'drop-unique-constraint'; table: TableIdentity; uniqueConstraint: UniqueConstraint }
+  /** The target has a check constraint the baseline does not. */
+  | { kind: 'add-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
+  /** The baseline has a check constraint the target does not. */
+  | { kind: 'drop-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
+  /** The target has a standalone index the baseline does not. */
+  | { kind: 'create-index'; table: TableIdentity; index: Index }
+  /** The baseline has a standalone index the target does not. */
+  | { kind: 'drop-index'; table: TableIdentity; index: Index }
+  /** Like `create-index`, applied `CONCURRENTLY`, outside a transaction. */
+  | { kind: 'create-index-concurrently'; table: TableIdentity; index: Index }
+  /** Like `drop-index`, applied `CONCURRENTLY`, outside a transaction. */
+  | { kind: 'drop-index-concurrently'; table: TableIdentity; index: Index }
   /** The target has a sequence the baseline does not; a copy without its ownership. */
   | { kind: 'create-sequence'; sequence: Sequence }
   /** The baseline has a sequence the target does not. */
@@ -229,10 +268,10 @@ export type Step =
     };
 
 /**
- * Whether each step kind may run inside a transaction. Every current kind is transactional; the
- * `Record` is compile-time exhaustive over `Step['kind']`, so a future kind must be classified
- * before the package compiles. A `false` kind makes `groupSteps` stand its step alone, outside
- * any wrapper.
+ * Whether each step kind may run inside a transaction. Every kind but the two concurrent index
+ * kinds is transactional; the `Record` is compile-time exhaustive over `Step['kind']`, so a
+ * future kind must be classified before the package compiles. A `false` kind makes `groupSteps`
+ * stand its step alone, outside any wrapper.
  */
 export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-table': true,
@@ -247,6 +286,14 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'drop-primary-key': true,
   'add-foreign-key': true,
   'drop-foreign-key': true,
+  'add-unique-constraint': true,
+  'drop-unique-constraint': true,
+  'add-check-constraint': true,
+  'drop-check-constraint': true,
+  'create-index': true,
+  'drop-index': true,
+  'create-index-concurrently': false,
+  'drop-index-concurrently': false,
   'create-sequence': true,
   'drop-sequence': true,
   'alter-sequence': true,
@@ -297,6 +344,12 @@ export function plan(baseline: Model, target: Model): Plan {
   const columnAlters: Step[] = [];
   const primaryKeyAdds: Step[] = [];
   const foreignKeyAdds: Step[] = [];
+  const uniqueConstraintDrops: Step[] = [];
+  const uniqueConstraintAdds: Step[] = [];
+  const checkConstraintDrops: Step[] = [];
+  const checkConstraintAdds: Step[] = [];
+  const indexDrops: Step[] = [];
+  const indexCreates: Step[] = [];
   const identityDrops: Step[] = [];
   const identityAdds: Step[] = [];
   const identityAlters: Step[] = [];
@@ -320,7 +373,7 @@ export function plan(baseline: Model, target: Model): Plan {
       case 'table-added': {
         tableCreates.push({
           kind: 'create-table',
-          table: copyTableWithoutForeignKeys(change.table),
+          table: copyTableForCreate(change.table),
         });
         for (const foreignKey of change.table.foreignKeys) {
           foreignKeyAdds.push({
@@ -328,6 +381,23 @@ export function plan(baseline: Model, target: Model): Plan {
             table: copyIdentity(change.table),
             foreignKey: copyForeignKey(foreignKey),
           });
+        }
+        for (const uniqueConstraint of change.table.uniqueConstraints) {
+          uniqueConstraintAdds.push({
+            kind: 'add-unique-constraint',
+            table: copyIdentity(change.table),
+            uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
+          });
+        }
+        for (const checkConstraint of change.table.checkConstraints) {
+          checkConstraintAdds.push({
+            kind: 'add-check-constraint',
+            table: copyIdentity(change.table),
+            checkConstraint: copyCheckConstraint(checkConstraint),
+          });
+        }
+        for (const index of change.table.indexes) {
+          indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
         }
         for (const column of change.table.columns) {
           if (column.identity === undefined) continue;
@@ -480,6 +550,77 @@ export function plan(baseline: Model, target: Model): Plan {
               });
               break;
             }
+            case 'unique-constraint-removed': {
+              uniqueConstraintDrops.push({
+                kind: 'drop-unique-constraint',
+                table: copyIdentity(change.table),
+                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+              });
+              break;
+            }
+            case 'unique-constraint-added': {
+              uniqueConstraintAdds.push({
+                kind: 'add-unique-constraint',
+                table: copyIdentity(change.table),
+                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+              });
+              break;
+            }
+            case 'unique-constraint-changed': {
+              uniqueConstraintDrops.push({
+                kind: 'drop-unique-constraint',
+                table: copyIdentity(change.table),
+                uniqueConstraint: copyUniqueConstraint(tableChange.before),
+              });
+              uniqueConstraintAdds.push({
+                kind: 'add-unique-constraint',
+                table: copyIdentity(change.table),
+                uniqueConstraint: copyUniqueConstraint(tableChange.after),
+              });
+              break;
+            }
+            case 'check-constraint-removed': {
+              checkConstraintDrops.push({
+                kind: 'drop-check-constraint',
+                table: copyIdentity(change.table),
+                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+              });
+              break;
+            }
+            case 'check-constraint-added': {
+              checkConstraintAdds.push({
+                kind: 'add-check-constraint',
+                table: copyIdentity(change.table),
+                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+              });
+              break;
+            }
+            case 'check-constraint-changed': {
+              checkConstraintDrops.push({
+                kind: 'drop-check-constraint',
+                table: copyIdentity(change.table),
+                checkConstraint: copyCheckConstraint(tableChange.before),
+              });
+              checkConstraintAdds.push({
+                kind: 'add-check-constraint',
+                table: copyIdentity(change.table),
+                checkConstraint: copyCheckConstraint(tableChange.after),
+              });
+              break;
+            }
+            case 'index-removed': {
+              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.index));
+              break;
+            }
+            case 'index-added': {
+              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.index));
+              break;
+            }
+            case 'index-changed': {
+              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.before));
+              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.after));
+              break;
+            }
           }
         }
         break;
@@ -586,6 +727,9 @@ export function plan(baseline: Model, target: Model): Plan {
     ...foreignKeyDrops,
     ...dependentKeyDrops,
     ...breaks,
+    ...indexDrops,
+    ...checkConstraintDrops,
+    ...uniqueConstraintDrops,
     ...tableDrops,
     ...primaryKeyDrops,
     ...columnDrops,
@@ -593,6 +737,9 @@ export function plan(baseline: Model, target: Model): Plan {
     ...columnAdds,
     ...columnAlters,
     ...primaryKeyAdds,
+    ...uniqueConstraintAdds,
+    ...checkConstraintAdds,
+    ...indexCreates,
     ...foreignKeyAdds,
     ...dependentKeyAdds,
     ...ownershipAttaches,
@@ -618,14 +765,14 @@ interface RemovedSequence {
   readonly ownedBy?: SequenceOwner;
 }
 
-/** A removed table, held with its canonical payload while phase 2 orders the drops. */
+/** A removed table, held with its canonical payload while table phase 5 orders the drops. */
 interface RemovedTable {
   readonly identity: TableIdentity;
   readonly table: Table;
 }
 
 /**
- * Phase 2: orders the removed tables' drops so a table is dropped only once no remaining
+ * Phase 5: orders the removed tables' drops so a table is dropped only once no remaining
  * removed table references it, breaking reference cycles with explicit drop-foreign-key
  * steps aimed at the table about to be dropped. Returns the drops in execution order and the
  * cycle-breaking steps in discovery order.
@@ -737,6 +884,39 @@ function copyForeignKey(foreignKey: ForeignKey): ForeignKey {
   };
 }
 
+/** A copy of `uniqueConstraint`, independent of the caller's model. */
+function copyUniqueConstraint(uniqueConstraint: UniqueConstraint): UniqueConstraint {
+  return { ...uniqueConstraint, columns: [...uniqueConstraint.columns] };
+}
+
+/** A copy of `checkConstraint`, independent of the caller's model. */
+function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint {
+  return { ...checkConstraint };
+}
+
+/** A copy of `index`, independent of the caller's model. */
+function copyIndex(index: Index): Index {
+  return { ...index, columns: [...index.columns] };
+}
+
+/** The create step for `index`: concurrent exactly when the index states `concurrently`. */
+function indexCreateStep(table: TableIdentity, index: Index): Step {
+  return {
+    kind: index.concurrently === true ? 'create-index-concurrently' : 'create-index',
+    table,
+    index: copyIndex(index),
+  };
+}
+
+/** The drop step for `index`: concurrent exactly when the index states `concurrently`. */
+function indexDropStep(table: TableIdentity, index: Index): Step {
+  return {
+    kind: index.concurrently === true ? 'drop-index-concurrently' : 'drop-index',
+    table,
+    index: copyIndex(index),
+  };
+}
+
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
   return { ...field };
@@ -800,19 +980,29 @@ function copySequenceWithoutOwner(sequence: Sequence): Sequence {
 /** A copy of `table`, independent of the caller's model. */
 function copyTable(table: Table): Table {
   return {
-    ...copyTableWithoutForeignKeys(table),
+    ...copyTableForCreate(table),
     foreignKeys: table.foreignKeys.map(copyForeignKey),
+    uniqueConstraints: table.uniqueConstraints.map(copyUniqueConstraint),
+    checkConstraints: table.checkConstraints.map(copyCheckConstraint),
+    indexes: table.indexes.map(copyIndex),
   };
 }
 
-/** A copy of `table`, independent of the caller's model, without its foreign keys. */
-function copyTableWithoutForeignKeys(table: Table): Table {
+/**
+ * A copy of `table` for a create-table step: columns and primary key as they are, and empty
+ * foreign keys, unique constraints, check constraints, and indexes, each of which attaches with
+ * its own step.
+ */
+function copyTableForCreate(table: Table): Table {
   return {
     schema: table.schema,
     name: table.name,
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
     foreignKeys: [],
+    uniqueConstraints: [],
+    checkConstraints: [],
+    indexes: [],
   };
 }
 
@@ -840,7 +1030,7 @@ function dependentForeignKeySteps(
 
     for (const owner of owners) {
       const targetOwner = targetTables.get(keyOf(owner));
-      if (targetOwner === undefined) continue; // Removed tables are gone before phase 3.
+      if (targetOwner === undefined) continue; // Removed tables are gone before table phase 6.
 
       const baselineCounts = countForeignKeys(owner.foreignKeys);
       const targetCounts = countForeignKeys(targetOwner.foreignKeys);
