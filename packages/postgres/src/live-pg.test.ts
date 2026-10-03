@@ -33,11 +33,12 @@ import type { LiveScene, SceneCheck } from './live-scenes.ts';
  * rather than skipping. The harness spawns `psql` and `pg_dump` from `PATH` and adds no client
  * dependency of its own; the server must be PostgreSQL 13 or newer (`DROP DATABASE … FORCE`).
  *
- * Per scene, sequentially: both databases are created fresh; the baseline database gets the
- * build SQL for the baseline model (the plan from an empty model), the target database the
- * build SQL for the target model plus any raw `targetExtraSql` the scene declares for objects
- * the model cannot represent; the baseline database then gets `renderSql(plan(baseline,
- * target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
+ * Per scene, sequentially: both databases are created fresh and any raw `setupSql` the scene
+ * declares is applied to both, for ambient state like a non-public schema; the baseline
+ * database gets the build SQL for the baseline model (the plan from an empty model), the
+ * target database the build SQL for the target model plus any raw `targetExtraSql` the scene
+ * declares for objects the model cannot represent; the baseline database then gets
+ * `renderSql(plan(baseline, target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
  * run against the baseline database after its build, and its probes and remaining checks after
  * the migration. Both databases are dumped with `pg_dump --schema-only --no-owner
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
@@ -207,6 +208,10 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     const files = await writeSceneFiles(workDir, slug, scene);
     assertPlanChecks(scene);
 
+    if (files.setup !== undefined) {
+      await applyFile(appliedUrl, files.setup);
+      await applyFile(targetUrl, files.setup);
+    }
     await applyFile(appliedUrl, files.baselineBuild);
     await assertChecks(appliedUrl, scene.baselineChecks ?? []);
     await applyFile(targetUrl, files.targetBuild);
@@ -539,6 +544,8 @@ async function assertConcurrentBuildRejectsWrapping(
 
 /** The SQL files one scene runs through, and where its dumps land for inspection. */
 interface SceneFiles {
+  /** Raw setup SQL applied to both databases before their builds, when the scene declares it. */
+  readonly setup?: string;
   readonly baselineBuild: string;
   readonly targetBuild: string;
   readonly migration: string;
@@ -546,12 +553,14 @@ interface SceneFiles {
   readonly targetDump: string;
 }
 
-/** Writes the scene's three SQL files into `workDir` and returns every path. */
+/** Writes the scene's SQL files into `workDir` and returns every path. */
 async function writeSceneFiles(
   workDir: string,
   slug: string,
   scene: LiveScene,
 ): Promise<SceneFiles> {
+  const setup = scene.setupSql === undefined ? undefined : join(workDir, `${slug}.setup.sql`);
+  if (setup !== undefined) await writeFile(setup, `${scene.setupSql}\n`, 'utf8');
   const baselineBuild = join(workDir, `${slug}.baseline.build.sql`);
   const targetBuild = join(workDir, `${slug}.target.build.sql`);
   const migration = join(workDir, `${slug}.migrate.sql`);
@@ -565,6 +574,7 @@ async function writeSceneFiles(
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
   await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
   return {
+    ...(setup === undefined ? {} : { setup }),
     baselineBuild,
     targetBuild,
     migration,

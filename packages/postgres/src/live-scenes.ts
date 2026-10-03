@@ -59,8 +59,10 @@ import type {
  * The constraint and index scenes cover this slice's shapes: named and unnamed unique and
  * check constraints on a new table (`constraint-create`), a plain and a unique standalone
  * index beside a partial and an expression index the model cannot declare (`index-create`),
- * and a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
- * transactional steps (`index-concurrently`).
+ * a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
+ * transactional steps (`index-concurrently`), and a non-public-schema index drop whose
+ * schema qualification is real only because the scene's setup SQL creates the `app` schema
+ * (`non-public-index-drop`).
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -191,6 +193,12 @@ export interface LiveScene {
   readonly baseline: Model;
   /** The model the target database is built from and the migration aims at. */
   readonly target: Model;
+  /**
+   * Raw SQL applied to both databases right after they are created and before their builds,
+   * for ambient state a model cannot declare, such as the non-public schema whose tables a
+   * scene qualifies.
+   */
+  readonly setupSql?: string;
   /**
    * Raw SQL appended to the target database's build, for objects the model cannot declare,
    * such as a partial or expression index. The plan, built from the model, never renders them;
@@ -2793,6 +2801,86 @@ const indexConcurrentlyScene = (): LiveScene => {
   };
 };
 
+/**
+ * The non-public-schema drop round trip: an `app.probe` table carrying a named and an unnamed
+ * index, both removed by the target. PostgreSQL builds the unnamed index as `probe_id_idx`,
+ * so the migration proves both the explicit and the synthesized form drop under
+ * `<schema>.<name>`; a bare name would not resolve through `search_path`.
+ */
+const nonPublicIndexDropScene = (): LiveScene => {
+  const columns = [column('id', { type: 'bigint', notNull: true }), column('c')];
+  const baseline = model(
+    table('probe', {
+      schema: 'app',
+      columns,
+      indexes: [
+        { name: 'probe_new_idx', unique: false, columns: ['c'] },
+        { unique: false, columns: ['id'] },
+      ],
+    }),
+  );
+  const target = model(table('probe', { schema: 'app', columns }));
+
+  return {
+    name: 'non-public-index-drop',
+    setupSql: 'CREATE SCHEMA app;',
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'app.probe carries the named and the server-named index',
+        sql: indexesOf('probe', 'app'),
+        expected: 'probe_id_idx,probe_new_idx',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'both drops are plain and transactional, the unnamed one first',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'drop-index,drop-index') return `unexpected steps: ${kinds}`;
+          const names = steps
+            .map((step) => (step.kind === 'drop-index' ? (step.index.name ?? '<unnamed>') : ''))
+            .join(',');
+          if (names !== '<unnamed>,probe_new_idx') return `dropped: ${names}`;
+          const groups = plan.groups
+            .map(
+              (group) =>
+                `${group.transactional ? 'wrapped' : 'standalone'}[${group.start},${group.end})`,
+            )
+            .join(' ');
+          return groups === 'wrapped[0,2)' ? undefined : `unexpected groups: ${groups}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'both indexes are gone from app.probe',
+        sql: indexesOf('probe', 'app'),
+        expected: '',
+      },
+      {
+        description: 'app.probe survives the drops',
+        sql: "select count(*) from pg_tables where schemaname = 'app' and tablename = 'probe'",
+        expected: '1',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'the imported table lives in app and carries no indexes',
+        failure: (imported) => {
+          const table = imported.model.tables.find(
+            (candidate) => candidate.schema === 'app' && candidate.name === 'probe',
+          );
+          if (table === undefined) return 'app.probe is not imported';
+          const indexes = table.indexes.map((index) => index.name ?? '<unnamed>').join(',');
+          return indexes === '' ? undefined : `indexes: ${indexes}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -2822,4 +2910,5 @@ export const scenes: readonly LiveScene[] = [
   constraintCreateScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
+  nonPublicIndexDropScene(),
 ];
