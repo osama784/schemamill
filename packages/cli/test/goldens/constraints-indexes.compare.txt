@@ -1,0 +1,24 @@
++ table public.added
+    id integer NOT NULL
+    code text
+    primary key added_pkey (id)
+    unique constraint added_code_key (code)
+    check constraint added_code_check CHECK (code <> '')
+    unique index added_code_idx (code)
+
+- table public.gone
+    id integer NOT NULL
+    email text
+    age integer
+    primary key gone_pkey (id)
+    unique constraint gone_email_key (email)
+    check constraint gone_age_check CHECK (age >= 0)
+    index gone_email_idx (email)
+
+~ table public.users
+    ~ unique constraint (nickname): name users_nickname_key → users_nickname_key_v2
+    - check constraint users_age_check CHECK (age >= 18)
+    + check constraint users_age_check CHECK (age >= 0)
+    - index users_age_idx (age)
+    + index users_age_idx_v2 (age)
+    ~ index users_email_idx: unique false → true

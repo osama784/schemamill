@@ -1,6 +1,6 @@
 # Plan hazards — definite and state-dependent annotations
 
-**Status:** built · **Last updated:** 2026-10-01
+**Status:** built · **Last updated:** 2026-10-03
 
 Hazards as annotations on a migration plan: `plan` now reads the baseline and target models beside the plan and reports what PostgreSQL would reject at apply — the five definite checks on self-inconsistent sequence and identity targets — and what may fail because a sequence's stored value is not modeled — the state-dependent `bound-tightened`. The analysis never changes a step or the SQL; hazards sit beside the plan as facts. `@schemamill/core` owns the `Hazard` union and the widened `HazardAnalyzer<Model, Plan, Hazard>` seam, `@schemamill/postgres` binds `hazardAnalyzer`, and the CLI formats the prose. The settled decisions are on [#24](https://github.com/osama784/schemamill/issues/24) (design review rounds 1–3 and the approved brief), the slice's ledger, which also carries the reviewer's live PostgreSQL evidence.
 
@@ -40,6 +40,15 @@ The rules mirror the engine, pinned by a live matrix on PostgreSQL 16.15: valida
 
 Sequence and identity state are not modeled: `last_value`, `is_called`, `RESTART`, and `setval` stay outside the model, skip-and-named on import. That is exactly why `bound-tightened` cannot be resolved — PostgreSQL cross-checks the sequence's current value against the tightened bound at apply, and the model cannot say whether the migration fails. The two earlier plans name the same edge in [sequences](./sequences.md#the-state-edge) and [identity](./identity.md#the-state-edge); state-aware planning stays out of scope, and the analyzer annotates without emitting `RESTART` or touching the target. The slice's live evidence lives on [#24](https://github.com/osama784/schemamill/issues/24).
 
+## Deferred gaps
+
+Two apply-time gaps stay outside the analyzer, named here and deferred:
+
+- **Constraint validation on populated tables** — adding a unique or check constraint to a table holding rows can fail when an existing row violates it, the same data-dependent property `add-foreign-key` already has today, unflagged. The analyzer reads two models and a plan, never data, so it cannot decide it.
+- **`INVALID` indexes** — a failed `CREATE INDEX CONCURRENTLY` leaves an invalid index behind, an apply-history fact PostgreSQL records in its catalog but the model does not carry; the analyzer cannot see it, and the generated plan cannot repair it.
+
+Both arrived with the [constraints and indexes slice](./constraints-indexes.md) ([#33](https://github.com/osama784/schemamill/issues/33)).
+
 ## Output shape
 
 `plan` prints the numbered step list, then the `Hazards:` section, then the migration SQL — the section only when the analysis finds anything, so a clean plan's stdout is unchanged. Each hazard is one two-space-indented `step <n> <kind>: <clause>` line, numbered 1-based by the step it belongs to; a definite clause states the failure PostgreSQL will raise at apply, and the `bound-tightened` clause says it may fail and names the unmodeled state. There is no flag and no change to `compare`, the SQL, or exit codes. The `hazards` golden scene pins all six kinds across `create-sequence`, `alter-sequence`, and `add-identity`; `identity.plan.txt` is re-pinned to carry its one conditional line.
@@ -60,4 +69,4 @@ Two levels and the live evidence pin the slice:
 
 ## Non-goals
 
-Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful rewrite analysis needs type semantics the model deliberately lacks. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). SQL comments, compare-side hazards, sequence-state modeling, and auto-remediation stay out; the analyzer never changes a step, emits no new SQL clause, and adds no flag.
+Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful rewrite analysis needs type semantics the model deliberately lacks. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). SQL comments, compare-side hazards, sequence-state modeling, and auto-remediation stay out; and the two gaps the constraints and indexes slice surfaced — validation of a unique or check constraint against existing rows, and the `INVALID` index a failed `CONCURRENTLY` build leaves behind — are named under [Deferred gaps](#deferred-gaps). The analyzer never changes a step, emits no new SQL clause, and adds no flag.

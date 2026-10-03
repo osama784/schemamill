@@ -1,5 +1,6 @@
 import type {
   Change,
+  CheckConstraint,
   Column,
   ColumnFieldChange,
   ForeignKey,
@@ -7,6 +8,7 @@ import type {
   IdentityChange,
   IdentityFieldChange,
   IdentityGeneration,
+  Index,
   Plan,
   PrimaryKey,
   Sequence,
@@ -16,6 +18,7 @@ import type {
   Table,
   TableChange,
   TableIdentity,
+  UniqueConstraint,
 } from '@schemamill/core';
 
 /**
@@ -35,9 +38,11 @@ import type {
  * change after it; sequences render the same way after the table changes, as
  * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
  * and one line per step: a plan that is a single transactional group covering every step
- * reads `N steps in one transaction:` (singular `1 step in one transaction:`), while any other
- * plan reads the plain `N steps:` header — multi-group wording is deferred until a standalone
- * step kind exists. A step's kind label is padded to the longest label in the plan so
+ * reads `N steps in one transaction:` (singular `1 step in one transaction:`); a plan whose
+ * only group is non-transactional reads `N steps outside a transaction:`; a multi-group plan
+ * reads `N steps in M groups:` with a `group k of M:` or `group k of M (standalone):` section
+ * per group, its steps indented four spaces and numbered continuously; and an empty plan
+ * reads `No changes.`. A step's kind label is padded to the longest label in the plan so
  * the details align, and a step's details expose every payload field it carries. A hazards
  * block renders as a `Hazards:` header and one two-space-indented `step <n> <kind>: <clause>`
  * line per hazard, numbered by the step it belongs to, in the payload's order; each clause
@@ -54,9 +59,9 @@ export function formatChanges(changes: readonly Change[]): string {
 
 /**
  * The whole plan as `plan` prints it, before the migration SQL: the numbered header, then one
- * line per step. A plan whose only group is transactional and covers every step names the
- * transaction in the header; the plain header is the fallback for the deferred multi-group
- * wording.
+ * line per step. A plan that is a single group names the group's transaction scope in the
+ * header — `in one transaction` for a transactional group, `outside a transaction` otherwise;
+ * a multi-group plan names the group count and opens one section per group.
  */
 export function formatPlan(plan: Plan): string {
   if (plan.steps.length === 0) return 'No changes.\n';
@@ -64,20 +69,51 @@ export function formatPlan(plan: Plan): string {
   const count = plan.steps.length;
   const numberWidth = String(count).length;
   const kindWidth = plan.steps.reduce((width, step) => Math.max(width, step.kind.length), 0);
-  const [group] = plan.groups;
-  const inOneTransaction =
-    group !== undefined &&
-    plan.groups.length === 1 &&
-    group.transactional &&
-    group.start === 0 &&
-    group.end === count;
   const noun = `${count} ${count === 1 ? 'step' : 'steps'}`;
-  const lines = [`${noun}${inOneTransaction ? ' in one transaction' : ''}:`];
-  plan.steps.forEach((step, index) => {
-    const number = String(index + 1).padStart(numberWidth);
-    lines.push(` ${number}. ${step.kind.padEnd(kindWidth)}  ${formatStep(step)}`);
+  const groupCount = plan.groups.length;
+  const [group] = plan.groups;
+
+  if (groupCount === 0) {
+    // A step list with no groups is malformed; the plain header invents no transaction.
+    const lines = [`${noun}:`];
+    plan.steps.forEach((step, index) => {
+      lines.push(formatStepLine(step, index + 1, numberWidth, kindWidth, ' '));
+    });
+    return `${lines.join('\n')}\n`;
+  }
+
+  if (group !== undefined && groupCount === 1) {
+    const scope = group.transactional ? 'in one transaction' : 'outside a transaction';
+    const lines = [`${noun} ${scope}:`];
+    plan.steps.forEach((step, index) => {
+      lines.push(formatStepLine(step, index + 1, numberWidth, kindWidth, ' '));
+    });
+    return `${lines.join('\n')}\n`;
+  }
+
+  const lines = [`${noun} in ${groupCount} groups:`];
+  plan.groups.forEach((group, index) => {
+    const standalone = group.transactional ? '' : ' (standalone)';
+    lines.push(`  group ${index + 1} of ${groupCount}${standalone}:`);
+    for (let stepIndex = group.start; stepIndex < group.end; stepIndex += 1) {
+      lines.push(
+        formatStepLine(plan.steps[stepIndex]!, stepIndex + 1, numberWidth, kindWidth, '    '),
+      );
+    }
   });
   return `${lines.join('\n')}\n`;
+}
+
+/** One numbered step line, indented for its context; kinds align across the whole plan. */
+function formatStepLine(
+  step: Step,
+  number: number,
+  numberWidth: number,
+  kindWidth: number,
+  indent: string,
+): string {
+  const label = String(number).padStart(numberWidth);
+  return `${indent}${label}. ${step.kind.padEnd(kindWidth)}  ${formatStep(step)}`;
 }
 
 /**
@@ -146,12 +182,22 @@ function formatChange(change: Change): string {
   }
 }
 
-/** A table line and its members: columns in stored order, then primary key, then foreign keys. */
+/**
+ * A table line and its members: columns in stored order, then primary key, foreign keys,
+ * unique constraints, check constraints, and indexes, each in the model's order.
+ */
 function formatTable(sign: string, table: Table): string {
   const lines = [`${sign} table ${formatIdentity(table)}`];
   for (const column of table.columns) lines.push(`    ${formatColumn(column)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${formatPrimaryKey(table.primaryKey)}`);
   for (const foreignKey of table.foreignKeys) lines.push(`    ${formatForeignKey(foreignKey)}`);
+  for (const uniqueConstraint of table.uniqueConstraints) {
+    lines.push(`    ${formatUniqueConstraint(uniqueConstraint)}`);
+  }
+  for (const checkConstraint of table.checkConstraints) {
+    lines.push(`    ${formatCheckConstraint(checkConstraint)}`);
+  }
+  for (const index of table.indexes) lines.push(`    ${formatIndex(index)}`);
   return lines.join('\n');
 }
 
@@ -180,6 +226,31 @@ function formatTableChange(change: TableChange): string {
       return `~ foreign key (${change.before.columns.join(', ')}) → ${formatIdentity(
         change.before.referencedTable,
       )}: ${formatForeignKeyChanges(change.before, change.after)}`;
+    case 'unique-constraint-added':
+      return `+ ${formatUniqueConstraint(change.uniqueConstraint)}`;
+    case 'unique-constraint-removed':
+      return `- ${formatUniqueConstraint(change.uniqueConstraint)}`;
+    case 'unique-constraint-changed':
+      return `~ unique constraint (${change.before.columns.join(
+        ', ',
+      )}): name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`;
+    case 'check-constraint-added':
+      return `+ ${formatCheckConstraint(change.checkConstraint)}`;
+    case 'check-constraint-removed':
+      return `- ${formatCheckConstraint(change.checkConstraint)}`;
+    case 'check-constraint-changed':
+      return `~ check constraint (${change.before.expression}): name ${formatOptional(
+        change.before.name,
+      )} → ${formatOptional(change.after.name)}`;
+    case 'index-added':
+      return `+ ${formatIndex(change.index)}`;
+    case 'index-removed':
+      return `- ${formatIndex(change.index)}`;
+    case 'index-changed':
+      return `~ index ${formatOptional(change.before.name)}: ${formatIndexChanges(
+        change.before,
+        change.after,
+      )}`;
   }
 }
 
@@ -207,6 +278,17 @@ function formatStep(step: Step): string {
     case 'add-foreign-key':
     case 'drop-foreign-key':
       return `${formatIdentity(step.table)}: ${formatForeignKey(step.foreignKey)}`;
+    case 'add-unique-constraint':
+    case 'drop-unique-constraint':
+      return `${formatIdentity(step.table)}: ${formatUniqueConstraint(step.uniqueConstraint)}`;
+    case 'add-check-constraint':
+    case 'drop-check-constraint':
+      return `${formatIdentity(step.table)}: ${formatCheckConstraint(step.checkConstraint)}`;
+    case 'create-index':
+    case 'drop-index':
+    case 'create-index-concurrently':
+    case 'drop-index-concurrently':
+      return `${formatIdentity(step.table)}: ${formatIndex(step.index)}`;
     case 'create-sequence':
     case 'drop-sequence':
       return formatIdentity(step.sequence);
@@ -264,6 +346,25 @@ function formatForeignKey(foreignKey: ForeignKey): string {
   if (foreignKey.onUpdate !== undefined) text += ` on update ${foreignKey.onUpdate}`;
   if (foreignKey.onDelete !== undefined) text += ` on delete ${foreignKey.onDelete}`;
   return text;
+}
+
+/** A unique-constraint line: its name when the payload names it, then its ordered columns. */
+function formatUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
+  const name = uniqueConstraint.name === undefined ? '' : `${uniqueConstraint.name} `;
+  return `unique constraint ${name}(${uniqueConstraint.columns.join(', ')})`;
+}
+
+/** A check-constraint line: its name when the payload names it, then its opaque expression. */
+function formatCheckConstraint(checkConstraint: CheckConstraint): string {
+  const name = checkConstraint.name === undefined ? '' : `${checkConstraint.name} `;
+  return `check constraint ${name}CHECK (${checkConstraint.expression})`;
+}
+
+/** An index line: `unique` when it is, its name when present, then its ordered columns. */
+function formatIndex(index: Index): string {
+  const unique = index.unique ? 'unique ' : '';
+  const name = index.name === undefined ? '' : `${index.name} `;
+  return `${unique}index ${name}(${index.columns.join(', ')})`;
 }
 
 /** A sequence line and its options: the signed identity, then every option one per line. */
@@ -426,6 +527,22 @@ function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string 
   }
   if (before.onDelete !== after.onDelete) {
     fields.push(`on delete ${formatOptional(before.onDelete)} → ${formatOptional(after.onDelete)}`);
+  }
+  return fields.join(', ');
+}
+
+/**
+ * A changed index pair's differing fields — `unique`, then `columns`, in that order, joined
+ * `, `. The pairing identity (the name) anchors the line and is never repeated here;
+ * `concurrently` is apply metadata and never a difference.
+ */
+function formatIndexChanges(before: Index, after: Index): string {
+  const fields: string[] = [];
+  if (before.unique !== after.unique) {
+    fields.push(`unique ${String(before.unique)} → ${String(after.unique)}`);
+  }
+  if (!sameStrings(before.columns, after.columns)) {
+    fields.push(`columns (${before.columns.join(', ')}) → (${after.columns.join(', ')})`);
   }
   return fields.join(', ');
 }

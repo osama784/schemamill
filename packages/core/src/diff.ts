@@ -1,8 +1,10 @@
 import { canonicalIntType } from './identity.ts';
 import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
+  CheckConstraint,
   Column,
   ForeignKey,
+  Index,
   Model,
   PrimaryKey,
   Sequence,
@@ -11,6 +13,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  UniqueConstraint,
 } from './model.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
@@ -18,16 +21,27 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * The diff: what changed between a baseline model and a target model.
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
- * column, primary key, foreign key, or sequence. It never guesses a rename: a table or column
- * under a new name is a removal and an addition, a primary key with a different column list is
- * a primary-key change, and a foreign key pointing at a different table is a removal and an
- * addition.
+ * column, primary key, foreign key, unique constraint, check constraint, index, or sequence.
+ * It never guesses a rename: a table or column under a new name is a removal and an addition,
+ * a primary key with a different column list is a primary-key change, a foreign key pointing
+ * at a different table is a removal and an addition, and so are a unique constraint with a
+ * different column list, a check constraint with a different expression, and an index under a
+ * different name.
  *
  * Identity is the model's identity. A table is its schema and name; a column is its name
  * within its table; a table has at most one primary key, compared by its name and its column
  * list; two foreign keys belong together when their referencing columns (order-sensitive) and
  * their referenced table are the same, and any other difference — name, referenced columns,
- * actions — reads as a change to that pair; a sequence is its schema and name, like a table.
+ * actions — reads as a change to that pair; two unique constraints belong together when their
+ * ordered column lists are the same and two check constraints when their expressions are the
+ * same, with any other difference — a name, for either — reading as a change to that pair; an
+ * index is its name, so a renamed index is a removal and an addition; a sequence is its schema
+ * and name, like a table.
+ *
+ * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
+ * whose only stated difference is its flag is not a change, and an added or removed index
+ * payload carries its flag as stored, so a create step follows the target's flag and a drop
+ * step follows the baseline's.
  *
  * Text is compared exactly as stored. Core never normalizes or lexes SQL: import
  * whitespace-normalizes at the boundary, so even a difference in whitespace is a change.
@@ -63,18 +77,23 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    name (plain JavaScript string comparison, not locale collation). A baseline-only
  *    identity is a removal, a target-only identity an addition, and an identity present in
  *    both is compared; when nothing differs, it produces no entry. An added or removed table
- *    is reported as a canonical copy of the table whose foreign keys are in the model's
- *    foreign-key order, so the caller's array order never leaks into the result.
+ *    is reported as a canonical copy of the table whose foreign keys, unique constraints,
+ *    check constraints, and indexes are in the model's order, so the caller's array order
+ *    never leaks into the result.
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
  *    order, with only the scalar fields that differ, in the fixed order `type`, `notNull`,
  *    `default`, plus the column's identity change when it has one); then at most one
- *    primary-key addition, removal, or change; then foreign keys
- *    removed, added, and changed, each sorted in the model's foreign-key order (referencing
- *    columns element-wise, referenced table schema then name, then name, absent first — an
- *    absent name sorts before any present one, including the empty string, which remains a
- *    distinct, later entry). Changed pairs are ordered by their baseline foreign key in that
- *    order, then by their target foreign key the same way.
+ *    primary-key addition, removal, or change; then foreign keys removed, added, and changed,
+ *    each sorted in the model's foreign-key order (referencing columns element-wise, referenced
+ *    table schema then name, then name, absent first — an absent name sorts before any present
+ *    one, including the empty string, which remains a distinct, later entry); then unique
+ *    constraints removed, added, and changed, each sorted in the model's unique-constraint
+ *    order (columns element-wise, then name, absent first the same way); then check constraints
+ *    removed, added, and changed, each sorted in the model's check-constraint order
+ *    (expression, then name, absent first); then indexes removed, added, and changed, each
+ *    sorted by name, absent first. Changed pairs are ordered by their baseline member in that
+ *    member's order, then by their target member the same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
  *    come from, as point 2 describes, and no entry states a column's position. A table with no
  *    reported changes is therefore not necessarily structurally identical to its counterpart:
@@ -88,13 +107,16 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    would leave, so a bound that only differs from the target after the conversion is still
  *    reported.
  *
- * Duplicate foreign-key identities — several constraints with the same referencing columns
- * and referenced table — pair structurally identical foreign keys first, then pair the rest
- * after sorting each side by referenced columns (element-wise), then by name, `onUpdate`, and
- * `onDelete`, each presence-aware: absent sorts first, then present values compare as strings,
- * so an absent name precedes the empty string, which remains a distinct, later entry.
- * Leftovers are reported as removals and additions. Structurally equal models therefore
- * produce identical output no matter how their arrays were built.
+ * Duplicate identities — several foreign keys with the same referencing columns and referenced
+ * table, unique constraints with the same columns, check constraints with the same expression,
+ * or indexes with the same name — cancel structurally identical entries first, then pair the
+ * rest positionally after sorting each side, every order total so the caller's array order
+ * never decides: foreign keys by referenced columns (element-wise), then `name`, `onUpdate`,
+ * and `onDelete`; unique constraints and check constraints by `name`; indexes by `name`, then
+ * `unique`, then columns. Each name is presence-aware: absent first, then present values
+ * compare as strings, so an absent name precedes the empty string, which remains a distinct,
+ * later entry. Leftovers are reported as removals and additions. Structurally equal models
+ * therefore produce identical output no matter how their arrays were built.
  *
  * Returned payloads are independent copies: mutating a payload never affects the caller's
  * models, and `diff` never mutates its inputs.
@@ -146,7 +168,29 @@ export type TableChange =
   /** A foreign key only the baseline has. */
   | { kind: 'foreign-key-removed'; foreignKey: ForeignKey }
   /** A matched foreign key pair with any difference. */
-  | { kind: 'foreign-key-changed'; before: ForeignKey; after: ForeignKey };
+  | { kind: 'foreign-key-changed'; before: ForeignKey; after: ForeignKey }
+  /** A unique constraint only the target has. */
+  | { kind: 'unique-constraint-added'; uniqueConstraint: UniqueConstraint }
+  /** A unique constraint only the baseline has. */
+  | { kind: 'unique-constraint-removed'; uniqueConstraint: UniqueConstraint }
+  /** A matched unique constraint pair with any difference. */
+  | {
+      kind: 'unique-constraint-changed';
+      before: UniqueConstraint;
+      after: UniqueConstraint;
+    }
+  /** A check constraint only the target has. */
+  | { kind: 'check-constraint-added'; checkConstraint: CheckConstraint }
+  /** A check constraint only the baseline has. */
+  | { kind: 'check-constraint-removed'; checkConstraint: CheckConstraint }
+  /** A matched check constraint pair with any difference. */
+  | { kind: 'check-constraint-changed'; before: CheckConstraint; after: CheckConstraint }
+  /** An index only the target has. */
+  | { kind: 'index-added'; index: Index }
+  /** An index only the baseline has. */
+  | { kind: 'index-removed'; index: Index }
+  /** A matched index pair with any structural difference. */
+  | { kind: 'index-changed'; before: Index; after: Index };
 
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
@@ -397,6 +441,21 @@ function copyForeignKey(foreignKey: ForeignKey): ForeignKey {
   };
 }
 
+/** A copy of `uniqueConstraint`, independent of the caller's model. */
+function copyUniqueConstraint(uniqueConstraint: UniqueConstraint): UniqueConstraint {
+  return { ...uniqueConstraint, columns: [...uniqueConstraint.columns] };
+}
+
+/** A copy of `checkConstraint`, independent of the caller's model. */
+function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint {
+  return { ...checkConstraint };
+}
+
+/** A copy of `index`, independent of the caller's model. */
+function copyIndex(index: Index): Index {
+  return { ...index, columns: [...index.columns] };
+}
+
 /** A copy of `owner`, independent of the caller's model. */
 function copyOwner(owner: SequenceOwner): SequenceOwner {
   return { table: { ...owner.table }, column: owner.column };
@@ -411,10 +470,10 @@ function copySequence(sequence: Sequence): Sequence {
 }
 
 /**
- * A copy of `table`, independent of the caller's model, whose foreign keys are in canonical
- * order: the model's foreign-key order, ties on it broken by the duplicate-pairing order.
- * Added and removed tables are reported this way, so the caller's `foreignKeys` array order
- * cannot leak into the result.
+ * A copy of `table`, independent of the caller's model, whose foreign keys, unique
+ * constraints, check constraints, and indexes are in canonical order: the model's order,
+ * ties on it broken by the duplicate-pairing order. Added and removed tables are reported
+ * this way, so the caller's array order cannot leak into the result.
  */
 function copyTable(table: Table): Table {
   return {
@@ -422,6 +481,13 @@ function copyTable(table: Table): Table {
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
     foreignKeys: [...table.foreignKeys].sort(compareForeignKeysCanonically).map(copyForeignKey),
+    uniqueConstraints: [...table.uniqueConstraints]
+      .sort(compareUniqueConstraintsCanonically)
+      .map(copyUniqueConstraint),
+    checkConstraints: [...table.checkConstraints]
+      .sort(compareCheckConstraintsCanonically)
+      .map(copyCheckConstraint),
+    indexes: [...table.indexes].sort(compareIndexesCanonically).map(copyIndex),
   };
 }
 
@@ -436,6 +502,9 @@ function diffTable(baseline: Table, target: Table): TableChange[] {
   const primaryKey = diffPrimaryKey(baseline.primaryKey, target.primaryKey);
   if (primaryKey !== undefined) changes.push(primaryKey);
   changes.push(...diffForeignKeys(baseline.foreignKeys, target.foreignKeys));
+  changes.push(...diffUniqueConstraints(baseline.uniqueConstraints, target.uniqueConstraints));
+  changes.push(...diffCheckConstraints(baseline.checkConstraints, target.checkConstraints));
+  changes.push(...diffIndexes(baseline.indexes, target.indexes));
   return changes;
 }
 
@@ -671,6 +740,202 @@ function diffForeignKeys(
   ];
 }
 
+/** One matched unique-constraint pair, remembered with both sides for a change entry. */
+interface UniqueConstraintPair {
+  readonly before: UniqueConstraint;
+  readonly after: UniqueConstraint;
+}
+
+/** One matched check-constraint pair, remembered with both sides for a change entry. */
+interface CheckConstraintPair {
+  readonly before: CheckConstraint;
+  readonly after: CheckConstraint;
+}
+
+/** One matched index pair, remembered with both sides for a change entry. */
+interface IndexPair {
+  readonly before: Index;
+  readonly after: Index;
+}
+
+/**
+ * Unique constraints pair like foreign keys: identity is the ordered column list, structurally
+ * identical constraints cancel, the rest pairs positionally in name order, and different
+ * identities are removals and additions. Emitted removals, additions, and changed pairs are
+ * each in deterministic order.
+ */
+function diffUniqueConstraints(
+  baseline: readonly UniqueConstraint[],
+  target: readonly UniqueConstraint[],
+): TableChange[] {
+  const baselineGroups = groupUniqueConstraints(baseline);
+  const targetGroups = groupUniqueConstraints(target);
+
+  const removed: UniqueConstraint[] = [];
+  const added: UniqueConstraint[] = [];
+  const changed: UniqueConstraintPair[] = [];
+
+  const identities = new Set([...baselineGroups.keys(), ...targetGroups.keys()]);
+  for (const identity of identities) {
+    const remainingBaseline = [...(baselineGroups.get(identity) ?? [])];
+    const remainingTarget: UniqueConstraint[] = [];
+
+    // Structurally identical constraints cancel; only the rest is paired by order.
+    for (const after of targetGroups.get(identity) ?? []) {
+      const match = remainingBaseline.findIndex((before) => uniqueConstraintsEqual(before, after));
+      if (match === -1) remainingTarget.push(after);
+      else remainingBaseline.splice(match, 1);
+    }
+
+    // What remains pairs positionally, ordered so the caller's array order never decides.
+    remainingBaseline.sort(compareUniqueConstraintPairing);
+    remainingTarget.sort(compareUniqueConstraintPairing);
+    const paired = Math.min(remainingBaseline.length, remainingTarget.length);
+    for (let index = 0; index < paired; index += 1) {
+      changed.push({ before: remainingBaseline[index]!, after: remainingTarget[index]! });
+    }
+    removed.push(...remainingBaseline.slice(paired));
+    added.push(...remainingTarget.slice(paired));
+  }
+
+  removed.sort(compareUniqueConstraints);
+  added.sort(compareUniqueConstraints);
+  changed.sort(compareUniqueConstraintChanges);
+
+  return [
+    ...removed.map((uniqueConstraint): TableChange => ({
+      kind: 'unique-constraint-removed',
+      uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
+    })),
+    ...added.map((uniqueConstraint): TableChange => ({
+      kind: 'unique-constraint-added',
+      uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
+    })),
+    ...changed.map((pair): TableChange => ({
+      kind: 'unique-constraint-changed',
+      before: copyUniqueConstraint(pair.before),
+      after: copyUniqueConstraint(pair.after),
+    })),
+  ];
+}
+
+/**
+ * Check constraints pair like unique constraints with the normalized expression as identity:
+ * structurally identical constraints cancel, the rest pairs positionally in name order, and
+ * different expressions are removals and additions.
+ */
+function diffCheckConstraints(
+  baseline: readonly CheckConstraint[],
+  target: readonly CheckConstraint[],
+): TableChange[] {
+  const baselineGroups = groupCheckConstraints(baseline);
+  const targetGroups = groupCheckConstraints(target);
+
+  const removed: CheckConstraint[] = [];
+  const added: CheckConstraint[] = [];
+  const changed: CheckConstraintPair[] = [];
+
+  const identities = new Set([...baselineGroups.keys(), ...targetGroups.keys()]);
+  for (const identity of identities) {
+    const remainingBaseline = [...(baselineGroups.get(identity) ?? [])];
+    const remainingTarget: CheckConstraint[] = [];
+
+    // Structurally identical constraints cancel; only the rest is paired by order.
+    for (const after of targetGroups.get(identity) ?? []) {
+      const match = remainingBaseline.findIndex((before) => checkConstraintsEqual(before, after));
+      if (match === -1) remainingTarget.push(after);
+      else remainingBaseline.splice(match, 1);
+    }
+
+    // What remains pairs positionally, ordered so the caller's array order never decides.
+    remainingBaseline.sort(compareCheckConstraintPairing);
+    remainingTarget.sort(compareCheckConstraintPairing);
+    const paired = Math.min(remainingBaseline.length, remainingTarget.length);
+    for (let index = 0; index < paired; index += 1) {
+      changed.push({ before: remainingBaseline[index]!, after: remainingTarget[index]! });
+    }
+    removed.push(...remainingBaseline.slice(paired));
+    added.push(...remainingTarget.slice(paired));
+  }
+
+  removed.sort(compareCheckConstraints);
+  added.sort(compareCheckConstraints);
+  changed.sort(compareCheckConstraintChanges);
+
+  return [
+    ...removed.map((checkConstraint): TableChange => ({
+      kind: 'check-constraint-removed',
+      checkConstraint: copyCheckConstraint(checkConstraint),
+    })),
+    ...added.map((checkConstraint): TableChange => ({
+      kind: 'check-constraint-added',
+      checkConstraint: copyCheckConstraint(checkConstraint),
+    })),
+    ...changed.map((pair): TableChange => ({
+      kind: 'check-constraint-changed',
+      before: copyCheckConstraint(pair.before),
+      after: copyCheckConstraint(pair.after),
+    })),
+  ];
+}
+
+/**
+ * Indexes pair like tables and sequences: identity is the name, so a rename is a removal and
+ * an addition, and two indexes with the same name differ by `unique` or `columns`. `concurrently`
+ * is apply metadata and never makes a difference.
+ */
+function diffIndexes(baseline: readonly Index[], target: readonly Index[]): TableChange[] {
+  const baselineGroups = groupIndexes(baseline);
+  const targetGroups = groupIndexes(target);
+
+  const removed: Index[] = [];
+  const added: Index[] = [];
+  const changed: IndexPair[] = [];
+
+  const identities = new Set([...baselineGroups.keys(), ...targetGroups.keys()]);
+  for (const identity of identities) {
+    const remainingBaseline = [...(baselineGroups.get(identity) ?? [])];
+    const remainingTarget: Index[] = [];
+
+    // Structurally identical indexes cancel; only the rest is paired by order.
+    for (const after of targetGroups.get(identity) ?? []) {
+      const match = remainingBaseline.findIndex((before) => indexesEqual(before, after));
+      if (match === -1) remainingTarget.push(after);
+      else remainingBaseline.splice(match, 1);
+    }
+
+    // What remains pairs positionally, ordered so the caller's array order never decides.
+    remainingBaseline.sort(compareIndexPairing);
+    remainingTarget.sort(compareIndexPairing);
+    const paired = Math.min(remainingBaseline.length, remainingTarget.length);
+    for (let index = 0; index < paired; index += 1) {
+      changed.push({ before: remainingBaseline[index]!, after: remainingTarget[index]! });
+    }
+    removed.push(...remainingBaseline.slice(paired));
+    added.push(...remainingTarget.slice(paired));
+  }
+
+  removed.sort(compareIndexes);
+  added.sort(compareIndexes);
+  changed.sort(compareIndexChanges);
+
+  return [
+    ...removed.map((index): TableChange => ({
+      kind: 'index-removed',
+      index: copyIndex(index),
+    })),
+    ...added.map((index): TableChange => ({
+      kind: 'index-added',
+      index: copyIndex(index),
+    })),
+    ...changed.map((pair): TableChange => ({
+      kind: 'index-changed',
+      before: copyIndex(pair.before),
+      after: copyIndex(pair.after),
+    })),
+  ];
+}
+
 function indexColumns(columns: readonly Column[]): Map<string, Column> {
   const index = new Map<string, Column>();
   for (const column of columns) index.set(column.name, column);
@@ -709,6 +974,78 @@ function foreignKeysEqual(left: ForeignKey, right: ForeignKey): boolean {
     sameStrings(left.referencedColumns, right.referencedColumns) &&
     left.onUpdate === right.onUpdate &&
     left.onDelete === right.onDelete
+  );
+}
+
+function groupUniqueConstraints(
+  uniqueConstraints: readonly UniqueConstraint[],
+): Map<string, UniqueConstraint[]> {
+  const groups = new Map<string, UniqueConstraint[]>();
+  for (const uniqueConstraint of [...uniqueConstraints].sort(compareUniqueConstraints)) {
+    const identity = uniqueConstraintIdentity(uniqueConstraint);
+    const group = groups.get(identity);
+    if (group === undefined) groups.set(identity, [uniqueConstraint]);
+    else group.push(uniqueConstraint);
+  }
+  return groups;
+}
+
+/** The matching key of a unique constraint: its ordered column list. */
+function uniqueConstraintIdentity(uniqueConstraint: UniqueConstraint): string {
+  return JSON.stringify(uniqueConstraint.columns);
+}
+
+function uniqueConstraintsEqual(left: UniqueConstraint, right: UniqueConstraint): boolean {
+  return left.name === right.name && sameStrings(left.columns, right.columns);
+}
+
+function groupCheckConstraints(
+  checkConstraints: readonly CheckConstraint[],
+): Map<string, CheckConstraint[]> {
+  const groups = new Map<string, CheckConstraint[]>();
+  for (const checkConstraint of [...checkConstraints].sort(compareCheckConstraints)) {
+    const identity = checkConstraintIdentity(checkConstraint);
+    const group = groups.get(identity);
+    if (group === undefined) groups.set(identity, [checkConstraint]);
+    else group.push(checkConstraint);
+  }
+  return groups;
+}
+
+/** The matching key of a check constraint: its normalized expression. */
+function checkConstraintIdentity(checkConstraint: CheckConstraint): string {
+  return JSON.stringify(checkConstraint.expression);
+}
+
+function checkConstraintsEqual(left: CheckConstraint, right: CheckConstraint): boolean {
+  return left.name === right.name && left.expression === right.expression;
+}
+
+function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {
+  const groups = new Map<string, Index[]>();
+  for (const index of [...indexes].sort(compareIndexes)) {
+    const identity = indexIdentity(index);
+    const group = groups.get(identity);
+    if (group === undefined) groups.set(identity, [index]);
+    else group.push(index);
+  }
+  return groups;
+}
+
+/**
+ * The matching key of an index: its name, with absence distinct from the empty string. JSON
+ * encodes the optional name so the two never collapse.
+ */
+function indexIdentity(index: Index): string {
+  return JSON.stringify([index.name]);
+}
+
+/** Whether two indexes are structurally equal; `concurrently` is apply metadata and excluded. */
+function indexesEqual(left: Index, right: Index): boolean {
+  return (
+    left.name === right.name &&
+    left.unique === right.unique &&
+    sameStrings(left.columns, right.columns)
   );
 }
 
@@ -766,6 +1103,102 @@ function compareForeignKeyChanges(left: ForeignKeyPair, right: ForeignKeyPair): 
   return (
     compareForeignKeys(left.before, right.before) || compareForeignKeys(left.after, right.after)
   );
+}
+
+function compareUniqueConstraints(left: UniqueConstraint, right: UniqueConstraint): number {
+  return (
+    compareStringArrays(left.columns, right.columns) ||
+    compareOptionalStrings(left.name, right.name)
+  );
+}
+
+function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint): number {
+  return (
+    compareStrings(left.expression, right.expression) ||
+    compareOptionalStrings(left.name, right.name)
+  );
+}
+
+function compareIndexes(left: Index, right: Index): number {
+  return compareOptionalStrings(left.name, right.name);
+}
+
+/**
+ * The canonical order of a copied `uniqueConstraints` array: the model's unique-constraint
+ * order, ties on it broken by the duplicate-pairing order.
+ */
+function compareUniqueConstraintsCanonically(
+  left: UniqueConstraint,
+  right: UniqueConstraint,
+): number {
+  return compareUniqueConstraints(left, right) || compareUniqueConstraintPairing(left, right);
+}
+
+/**
+ * The canonical order of a copied `checkConstraints` array: the model's check-constraint order,
+ * ties on it broken by the duplicate-pairing order.
+ */
+function compareCheckConstraintsCanonically(left: CheckConstraint, right: CheckConstraint): number {
+  return compareCheckConstraints(left, right) || compareCheckConstraintPairing(left, right);
+}
+
+/**
+ * The canonical order of a copied `indexes` array: the model's index order, ties on it broken
+ * by the duplicate-pairing order.
+ */
+function compareIndexesCanonically(left: Index, right: Index): number {
+  return compareIndexes(left, right) || compareIndexPairing(left, right);
+}
+
+/**
+ * The pairing order for unmatched duplicates. Structurally identical entries have already
+ * cancelled, so this decides which remaining baseline entry pairs with which remaining target
+ * entry: unique constraints and check constraints by name — ordered by presence, absent first,
+ * then by value — and indexes by `unique`, then columns, since grouping already made their
+ * names equal.
+ */
+function compareUniqueConstraintPairing(left: UniqueConstraint, right: UniqueConstraint): number {
+  return compareOptionalStrings(left.name, right.name);
+}
+
+function compareCheckConstraintPairing(left: CheckConstraint, right: CheckConstraint): number {
+  return compareOptionalStrings(left.name, right.name);
+}
+
+function compareIndexPairing(left: Index, right: Index): number {
+  return (
+    (left.unique === right.unique ? 0 : left.unique ? 1 : -1) ||
+    compareStringArrays(left.columns, right.columns)
+  );
+}
+
+/**
+ * Orders changed pairs by their baseline member in the model's order, then by their target
+ * member the same way, so each pair has one deterministic position even when its two sides
+ * would order differently.
+ */
+function compareUniqueConstraintChanges(
+  left: UniqueConstraintPair,
+  right: UniqueConstraintPair,
+): number {
+  return (
+    compareUniqueConstraints(left.before, right.before) ||
+    compareUniqueConstraints(left.after, right.after)
+  );
+}
+
+function compareCheckConstraintChanges(
+  left: CheckConstraintPair,
+  right: CheckConstraintPair,
+): number {
+  return (
+    compareCheckConstraints(left.before, right.before) ||
+    compareCheckConstraints(left.after, right.after)
+  );
+}
+
+function compareIndexChanges(left: IndexPair, right: IndexPair): number {
+  return compareIndexes(left.before, right.before) || compareIndexes(left.after, right.after);
 }
 
 function compareStrings(left: string, right: string): number {
