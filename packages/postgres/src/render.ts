@@ -74,7 +74,9 @@ import type {
  * key, `<table>_<column>_…_fkey` for a foreign key, `<table>_<column>_…_key` for a unique
  * constraint, and `<table>_<column>_check` for a check constraint whose expression references
  * one column (`<table>_check` otherwise) — and `<table>_<column>_…_idx` for an unnamed index
- * drop. This is best-effort: PostgreSQL appends numbered suffixes on name collisions, which
+ * drop. Index drops are schema-qualified (`DROP INDEX <schema>.<name>`): a bare index name
+ * resolves through `search_path`, while `CREATE INDEX` places the index in its table's schema.
+ * This is best-effort: PostgreSQL appends numbered suffixes on name collisions, which
  * cannot be known offline, and pg_dump output always carries real constraint names, so
  * unnamed constraints are the unusual case.
  *
@@ -445,12 +447,16 @@ function renderCreateIndex(table: TableIdentity, index: Index, concurrently: boo
   )} USING btree (${columns});`;
 }
 
-/** `DROP INDEX [CONCURRENTLY] <name>`, synthesizing the conventional name when absent. */
+/**
+ * `DROP INDEX [CONCURRENTLY] <schema>.<name>`, synthesizing the conventional name when
+ * absent. Unlike `CREATE INDEX`, whose name lands in the table's schema, a `DROP INDEX` with
+ * a bare name resolves through `search_path`, so the index must be qualified with the schema
+ * of the table it belongs to.
+ */
 function renderDropIndex(table: TableIdentity, index: Index, concurrently: boolean): string {
   const concurrent = concurrently ? 'CONCURRENTLY ' : '';
-  return `DROP INDEX ${concurrent}${quoteIdentifier(
-    index.name ?? synthesizedIndexName(table, index),
-  )};`;
+  const name = index.name ?? synthesizedIndexName(table, index);
+  return `DROP INDEX ${concurrent}${quoteIdentifier(table.schema)}.${quoteIdentifier(name)};`;
 }
 
 /**

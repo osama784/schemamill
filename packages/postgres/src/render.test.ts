@@ -577,12 +577,57 @@ test('renders index creates and drops, named or unnamed, unique or not', () => {
       'BEGIN;',
       'CREATE INDEX t_a_idx ON public.t USING btree (a);',
       'CREATE UNIQUE INDEX ON public.t USING btree (a, b);',
-      'DROP INDEX t_a_idx;',
-      'DROP INDEX t_a_b_idx;',
+      'DROP INDEX public.t_a_idx;',
+      'DROP INDEX public.t_a_b_idx;',
       'CREATE INDEX "we""ird" ON app."Order" USING btree ("Mixed Case");',
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('index drops are schema-qualified, named or synthesized, both kinds', () => {
+  // A bare `DROP INDEX` name resolves through `search_path`, so an index on a non-public
+  // table must be dropped as `<schema>.<name>`; the name is synthesized when absent, exactly
+  // as `CREATE INDEX` would have PostgreSQL name it.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-index',
+          table: { schema: 'app', name: 'probe' },
+          index: tableIndex(['c'], { name: 'probe_new_idx' }),
+        },
+        {
+          kind: 'drop-index',
+          table: { schema: 'app', name: 'probe' },
+          index: tableIndex(['a', 'b']),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'DROP INDEX app.probe_new_idx;',
+      'DROP INDEX app.probe_a_b_idx;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The concurrent kind carries the same qualification and renders bare in its standalone
+  // group; the table's schema and the index name are quoted when their shape requires it.
+  assert.equal(
+    renderSql({
+      steps: [
+        {
+          kind: 'drop-index-concurrently',
+          table: { schema: 'App', name: 'Probe' },
+          index: tableIndex(['c'], { name: 'we"ird', concurrently: true }),
+        },
+      ],
+      groups: [{ start: 0, end: 1, transactional: false }],
+    }),
+    'DROP INDEX CONCURRENTLY "App"."we""ird";\n',
   );
 });
 
@@ -612,7 +657,7 @@ test('renders concurrent index kinds bare, one standalone group each', () => {
         { start: 1, end: 2, transactional: false },
       ],
     }),
-    'DROP INDEX CONCURRENTLY t_old_idx;\n\nCREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
+    'DROP INDEX CONCURRENTLY public.t_old_idx;\n\nCREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
   );
 });
 

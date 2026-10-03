@@ -17,10 +17,10 @@
   group 4 of 4:
     13. create-index               public.users: unique index users_email_idx (email)
 
-DROP INDEX CONCURRENTLY users_age_idx;
+DROP INDEX CONCURRENTLY public.users_age_idx;
 
 BEGIN;
-DROP INDEX users_email_idx;
+DROP INDEX public.users_email_idx;
 ALTER TABLE public.users DROP CONSTRAINT users_age_check;
 ALTER TABLE public.users DROP CONSTRAINT users_nickname_key;
 DROP TABLE public.gone;

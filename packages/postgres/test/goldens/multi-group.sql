@@ -1,5 +1,5 @@
 BEGIN;
-DROP INDEX child_old_idx;
+DROP INDEX public.child_old_idx;
 COMMIT;
 
 CREATE INDEX CONCURRENTLY child_new_idx ON public.child USING btree (parent_id);
