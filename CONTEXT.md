@@ -35,7 +35,7 @@ A table constraint requiring every row to satisfy an expression, stored as opaqu
 _Avoid_: validation rule, predicate
 
 **Index**:
-A standalone access path over a table's columns, identified by its name. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own.
+A standalone access path over a table's columns. A named index is identified by its name; an unnamed index by its structure — `unique` and ordered columns, with a missing name itself distinct in a diff. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
 _Avoid_: key, access method
 
 **Concurrent index**:
