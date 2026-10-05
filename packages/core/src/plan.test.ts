@@ -362,6 +362,8 @@ const applyIdentityField = (identity: Identity, field: IdentityFieldChange): Ide
       return { ...identity, cache: field.after };
     case 'cycle':
       return { ...identity, cycle: field.after };
+    default:
+      return assertNever(field, 'identity field');
   }
 };
 
@@ -545,6 +547,10 @@ const applyStep = (state: SimulatedState, step: Step): void => {
             if (field.after === undefined) delete altered.default;
             else altered.default = field.after;
             break;
+          default:
+            // `case 'default':` above is the column field named 'default'; this `default:` is
+            // the exhaustiveness guard and neither shadows the other.
+            assertNever(field, 'column field');
         }
       }
       return;
@@ -766,13 +772,15 @@ const applyStep = (state: SimulatedState, step: Step): void => {
           case 'cycle':
             altered.cycle = field.after;
             break;
+          default:
+            assertNever(field, 'sequence field');
         }
       }
       return;
     }
     default:
       // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
-      assertNever(step);
+      assertNever(step, 'step kind');
   }
 };
 
@@ -1800,6 +1808,45 @@ test('an unknown step kind is rejected by the exhaustiveness guard', () => {
   assert.throws(
     () => applyStep(state, { kind: 'frobnicate' } as unknown as Step),
     /Unhandled step kind: frobnicate/,
+  );
+});
+
+test('an unknown identity field is rejected by the exhaustiveness guard', () => {
+  assert.throws(
+    () =>
+      applyIdentityField(identityColumn(), {
+        field: 'frobnicate',
+      } as unknown as IdentityFieldChange),
+    /Unhandled identity field: frobnicate/,
+  );
+});
+
+test('an unknown column field is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(model(table('t', { columns: [column('id')] })));
+
+  assert.throws(
+    () =>
+      applyStep(state, {
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'id',
+        fields: [{ field: 'frobnicate' }],
+      } as unknown as Step),
+    /Unhandled column field: frobnicate/,
+  );
+});
+
+test('an unknown sequence field is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(sequenceModel([sequence('sq')]));
+
+  assert.throws(
+    () =>
+      applyStep(state, {
+        kind: 'alter-sequence',
+        sequence: { schema: 'public', name: 'sq' },
+        fields: [{ field: 'frobnicate' }],
+      } as unknown as Step),
+    /Unhandled sequence field: frobnicate/,
   );
 });
 
