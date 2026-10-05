@@ -3,6 +3,8 @@ dist/
 build/
 coverage/
 pnpm-lock.yaml
+# The factory workbench: local-only, excluded via .git/info/exclude; never committed.
+.factory/
 
 # Prose the maintainers own; not formatted by Prettier.
 docs/
