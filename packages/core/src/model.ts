@@ -133,9 +133,10 @@ export interface ForeignKey {
 }
 
 /**
- * A standalone index: a named access path on the table's columns, not backing a constraint. A
- * unique constraint is never modeled as, or accompanied by, an index, and the index's name
- * identifies it.
+ * A standalone index: an access path on the table's columns, not backing a constraint. A named
+ * index is identified by its name; an unnamed index by its structure — `unique` and ordered
+ * columns — with a missing name itself distinct in a diff. A unique constraint is never
+ * modeled as, or accompanied by, an index.
  */
 export interface Index {
   /** Index name as written, when the source names it. */

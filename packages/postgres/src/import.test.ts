@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { diff } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
 import { ddlImporter, importDump } from './index.ts';
@@ -469,13 +470,77 @@ test('imports standalone indexes, unique and concurrent, in name order', async (
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // Unnamed sorts first; `concurrently` is stored only when the statement states it.
+  // The conventional `t_b_idx` is canonicalized to unnamed and sorts with the other unnamed
+  // entry by insertion order; `concurrently` is stored only when the statement states it.
   assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['b'] },
     { unique: true, columns: ['b'] },
     { name: 't_ab_idx', unique: false, columns: ['a', 'b'], concurrently: true },
-    { name: 't_b_idx', unique: false, columns: ['b'] },
   ]);
   assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional index name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE INDEX t_ab_idx ON public.t USING btree (a, b);`,
+    `CREATE INDEX t_b_idx1 ON public.t USING btree (b);`,
+    `CREATE INDEX t_a_b_idx ON public.t USING btree (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The prediction joins columns with `_`, so `t_ab_idx` is not the conventional name for
+  // `(a, b)` and is kept; a collision suffix (`t_b_idx1`) is beyond the offline prediction and
+  // is kept too. The two exact predictions become unnamed and sort first by insertion order.
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['b'] },
+    { unique: false, columns: ['a', 'b'] },
+    { name: 't_ab_idx', unique: false, columns: ['a', 'b'] },
+    { name: 't_b_idx1', unique: false, columns: ['b'] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a conventional name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE INDEX ON public.t USING btree (b);`,
+  ];
+  const expected = [
+    { unique: false, columns: ['b'] },
+    { name: 't_b_idx', unique: false, columns: ['b'] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer, b integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the conventional entry: exactly one unnamed structural
+    // entry survives in either order, and the result array is identical.
+    assert.deepEqual(table.indexes, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('a conventional name round-trips against an unnamed declaration with an empty diff', async () => {
+  const named = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX ON public.t USING btree (b);`,
+  ].join('\n');
+
+  const { model: baseline } = await importDump(named);
+  const { model: target } = await importDump(unnamed);
+  assert.deepEqual(diff(baseline, target), []);
 });
 
 test('skips whole indexes with elements or clauses outside the minimal envelope', async () => {
@@ -590,10 +655,11 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The non-unique index stays standalone; the expression index was skipped whole, and every
-  // USING INDEX constraint that cannot consume a plain unique index is skipped and named.
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
+  // skipped whole, and every USING INDEX constraint that cannot consume a plain unique index is
+  // skipped and named.
   assert.deepEqual(table.uniqueConstraints, []);
-  assert.deepEqual(table.indexes, [{ name: 't_a_idx', unique: false, columns: ['a'] }]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(summarize), [
     { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
     { kind: 'skip', code: 'unsupported-statement', object: 't_a_key' },

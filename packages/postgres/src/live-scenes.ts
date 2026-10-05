@@ -60,7 +60,9 @@ import type {
  * check constraints on a new table (`constraint-create`), a plain and a unique standalone
  * index beside a partial and an expression index the model cannot declare (`index-create`),
  * a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
- * transactional steps (`index-concurrently`), and a non-public-schema index drop whose
+ * transactional steps (`index-concurrently`), a target whose unnamed single-column,
+ * multi-column, and concurrent indexes are server-named on apply and canonicalized back to
+ * unnamed on import (`unnamed-index-round-trip`), and a non-public-schema index drop whose
  * schema qualification is real only because the scene's setup SQL creates the `app` schema
  * (`non-public-index-drop`).
  *
@@ -2643,7 +2645,7 @@ const indexCreateScene = (): LiveScene => {
                 `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`,
             )
             .join('; ');
-          if (indexes !== 'accounts_age_idx|plain|age; accounts_email_idx|unique|email') {
+          if (indexes !== '<unnamed>|plain|age; <unnamed>|unique|email') {
             return `modeled indexes: ${indexes}`;
           }
           const skips = imported.diagnostics
@@ -2774,8 +2776,7 @@ const indexConcurrentlyScene = (): LiveScene => {
                 `${index.columns.join(',')}|${index.concurrently === true ? 'concurrently' : 'ordinary'}`,
             )
             .join('; ');
-          return indexes ===
-            'accounts_email_idx|plain|email|ordinary; accounts_note_idx|plain|note|ordinary'
+          return indexes === '<unnamed>|plain|email|ordinary; <unnamed>|plain|note|ordinary'
             ? undefined
             : `indexes: ${indexes}`;
         },
@@ -2796,6 +2797,101 @@ const indexConcurrentlyScene = (): LiveScene => {
         description: 'the concurrently built index is valid',
         sql: indexIsValid('accounts_email_idx'),
         expected: 't',
+      },
+    ],
+  };
+};
+
+/**
+ * The unnamed-index round trip: a target declaring three standalone indexes without names —
+ * a single-column one, a multi-column one, and one built `CONCURRENTLY`. PostgreSQL names them
+ * on apply (`t_age_idx`, `t_a_b_idx`, `t_note_idx`); the dump import canonicalizes those
+ * server-generated names back to unnamed, so the catalog check pins the generated names and
+ * the import checks pin that every imported index is unnamed in both dumps. A dump never
+ * carries `CONCURRENTLY`, so the concurrent index is ordinary on both imported sides.
+ */
+const unnamedIndexRoundTripScene = (): LiveScene => {
+  const columns = [
+    column('a', { type: 'integer' }),
+    column('b', { type: 'integer' }),
+    column('age', { type: 'integer' }),
+    column('note'),
+  ];
+  const target = table('t', {
+    columns,
+    indexes: [
+      { unique: false, columns: ['age'] },
+      { unique: false, columns: ['a', 'b'] },
+      { unique: false, columns: ['note'], concurrently: true },
+    ],
+  });
+
+  return {
+    name: 'unnamed-index-round-trip',
+    baseline: model(table('t', { columns })),
+    target: model(target),
+    planChecks: [
+      {
+        description:
+          'the plan creates the two plain indexes transactionally and the concurrent one bare',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'create-index,create-index,create-index-concurrently') {
+            return `unexpected steps: ${kinds}`;
+          }
+          const columnsCreated = steps
+            .map((step) =>
+              step.kind === 'create-index' || step.kind === 'create-index-concurrently'
+                ? step.index.columns.join('+')
+                : '<other>',
+            )
+            .join(',');
+          if (columnsCreated !== 'a+b,age,note') {
+            return `unexpected index columns: ${columnsCreated}`;
+          }
+          const groups = plan.groups
+            .map(
+              (group) =>
+                `${group.transactional ? 'wrapped' : 'standalone'}[${group.start},${group.end})`,
+            )
+            .join(' ');
+          return groups === 'wrapped[0,2) standalone[2,3)'
+            ? undefined
+            : `unexpected groups: ${groups}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the catalog carries the three server-generated names',
+        sql: indexesOf('t'),
+        expected: 't_a_b_idx,t_age_idx,t_note_idx',
+      },
+      {
+        description: 'the concurrently built index is valid',
+        sql: indexIsValid('t_note_idx'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry every index unnamed, with its structure intact',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (table === undefined) return 't is not imported';
+          const named = table.indexes.filter((index) => index.name !== undefined);
+          if (named.length > 0) {
+            return `${source}: server-generated names survived: ${named
+              .map((index) => index.name)
+              .join(',')}`;
+          }
+          const structures = table.indexes
+            .map((index) => `${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`)
+            .join('; ');
+          return structures === 'plain|a,b; plain|age; plain|note'
+            ? undefined
+            : `${source}: structures: ${structures}`;
+        },
       },
     ],
   };
@@ -2910,5 +3006,6 @@ export const scenes: readonly LiveScene[] = [
   constraintCreateScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
+  unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
 ];

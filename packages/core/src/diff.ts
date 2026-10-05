@@ -34,9 +34,10 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * their referenced table are the same, and any other difference — name, referenced columns,
  * actions — reads as a change to that pair; two unique constraints belong together when their
  * ordered column lists are the same and two check constraints when their expressions are the
- * same, with any other difference — a name, for either — reading as a change to that pair; an
- * index is its name, so a renamed index is a removal and an addition; a sequence is its schema
- * and name, like a table.
+ * same, with any other difference — a name, for either — reading as a change to that pair; a
+ * named index is identified by its name, so a rename is a removal and an addition, and an
+ * unnamed index by its structure — `unique` and ordered columns — with a missing name itself
+ * distinct in a diff; a sequence is its schema and name, like a table.
  *
  * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
  * whose only stated difference is its flag is not a change, and an added or removed index
@@ -880,9 +881,10 @@ function diffCheckConstraints(
 }
 
 /**
- * Indexes pair like tables and sequences: identity is the name, so a rename is a removal and
- * an addition, and two indexes with the same name differ by `unique` or `columns`. `concurrently`
- * is apply metadata and never makes a difference.
+ * Indexes pair like tables and sequences: a named index's identity is its name, so a rename is
+ * a removal and an addition, and two indexes with the same name differ by `unique` or
+ * `columns`; every unnamed index groups by absence and pairs by structure (`unique`, then
+ * columns). `concurrently` is apply metadata and never makes a difference.
  */
 function diffIndexes(baseline: readonly Index[], target: readonly Index[]): TableChange[] {
   const baselineGroups = groupIndexes(baseline);
@@ -1034,7 +1036,8 @@ function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {
 
 /**
  * The matching key of an index: its name, with absence distinct from the empty string. JSON
- * encodes the optional name so the two never collapse.
+ * encodes the optional name so the two never collapse; every unnamed index shares the absent
+ * key, and the positional pairing then separates them by structure.
  */
 function indexIdentity(index: Index): string {
   return JSON.stringify([index.name]);
