@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Index-name canonicalization on import** — `@schemamill/postgres` now canonicalizes a dump's PostgreSQL-generated index name back to unnamed when it is exactly the conventional `<table>_<cols>_idx` for the index's structure, so an index the model declares unnamed (a hand-written `CREATE INDEX ON t (c)`) round-trips through build → dump → import → diff with no spurious drop + add. The pass runs in `finalizeTable` after every statement is translated and before the canonical sort, so the result is independent of statement order, and it keeps the conventional name when an unnamed index of the same structure already exists rather than manufacturing a duplicate unnamed entry. The prediction formula is shared with render's synthesized unnamed drops and moved to `packages/postgres/src/names.ts`. Names outside the formula — truncated at 63 bytes or collision-suffixed (`_idx1`, …) — stay named and still read as remove + add, and constraint conventional names are untouched. Compare and plan output now reads unnamed where a dump carried a derivable name, updating the `constraints-indexes` CLI goldens and the live `index-create`/`index-concurrently` import checks, with a new gated `unnamed-index-round-trip` scene pinning the generated catalog names and the unnamed import ([#38](https://github.com/osama784/schemamill/issues/38)).
 
+### Fixed
+
+- **Factory workbench excluded from `format:check`** — `pnpm format:check` no longer flagged the local-only factory workbench; `.factory/` was listed in `.prettierignore` ([#42](https://github.com/osama784/schemamill/issues/42)).
+
 ## [0.6.0] - 2026-10-03
 
 ### Added
