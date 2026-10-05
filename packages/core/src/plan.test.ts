@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { effectiveIdentity, plan, sequenceTypeBounds } from './index.ts';
+import {
+  canonicalIntType,
+  effectiveIdentity,
+  effectiveSequence,
+  plan,
+  sequenceTypeBounds,
+  sequenceTypeChange,
+} from './index.ts';
 import type { Identity, IdentityInput } from './identity.ts';
 import type { IdentityFieldChange } from './diff.ts';
+import type { SequenceOptions } from './sequence.ts';
 import type {
   CheckConstraint,
   Column,
@@ -199,10 +207,17 @@ const deepFreeze = <T>(value: T): T => {
  * - an identity step must name a live column: `drop-identity` and `alter-identity` require a
  *   live identity, `add-identity` installs the step's descriptor, and `alter-identity` applies
  *   its field changes.
+ * - a sequence step must name a live sequence: `create-sequence` requires it absent and
+ *   ownerless, `drop-sequence` requires it present, and `alter-sequence` applies its field
+ *   changes, checking a detach against the step's `before` owner and an attach target against
+ *   a live table and column.
+ * - `drop-table` and `drop-column` drop every live sequence still owned by the removed owner,
+ *   mirroring the engine's ownership cascade.
  *
  * Add and alter steps update the simulated state, so the end state is compared with the target
- * table by table and constraint by constraint. Every removed table must be dropped exactly
- * once and every added table created exactly once.
+ * table by table, constraint by constraint, and sequence by sequence. Every removed table must
+ * be dropped exactly once, every added table created exactly once, and every added or removed
+ * sequence created or dropped exactly once unless the owner's removal cascades it.
  */
 
 /** The mutable shape of a model payload: the model types are readonly, the state is not. */
@@ -218,9 +233,10 @@ interface SimulatedTable {
   readonly indexes: Mutable<Index>[];
 }
 
-/** The simulated database state: live tables by JSON-encoded identity. */
+/** The simulated database state: live tables by JSON-encoded identity, plus sequences. */
 interface SimulatedState {
   readonly tables: Map<string, SimulatedTable>;
+  readonly sequences: Map<string, Mutable<Sequence>>;
 }
 
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
@@ -267,6 +283,14 @@ const copyIdentityDescriptor = (identity: Identity): Identity => ({
   ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
 });
 
+/** A copy of `sequence`, independent of the caller's payload, including its owner. */
+const copySequenceState = (sequence: Sequence): Mutable<Sequence> => ({
+  ...sequence,
+  ...(sequence.ownedBy === undefined
+    ? {}
+    : { ownedBy: { table: { ...sequence.ownedBy.table }, column: sequence.ownedBy.column } }),
+});
+
 /** A structural key for a foreign key, comparing every field including absent ones. */
 const foreignKeyKey = (foreignKey: ForeignKey): string =>
   JSON.stringify([
@@ -304,7 +328,9 @@ const stateOf = (model: Model): SimulatedState => {
       indexes: source.indexes.map(copyIndex),
     });
   }
-  return { tables };
+  const sequences = new Map<string, Mutable<Sequence>>();
+  for (const source of model.sequences) sequences.set(keyOf(source), copySequenceState(source));
+  return { tables, sequences };
 };
 
 /**
@@ -339,6 +365,57 @@ const applyIdentityField = (identity: Identity, field: IdentityFieldChange): Ide
   }
 };
 
+/**
+ * Drops every live sequence the engine's ownership cascade would drop with the removed owner:
+ * `predicate` selects the live owners a removed table or column covered.
+ */
+const cascadeOwnedSequences = (
+  state: SimulatedState,
+  predicate: (ownedBy: SequenceOwner) => boolean,
+): void => {
+  for (const [key, sequence] of state.sequences) {
+    if (sequence.ownedBy !== undefined && predicate(sequence.ownedBy)) state.sequences.delete(key);
+  }
+};
+
+/**
+ * Applies one emitted `ownedBy` field change to `sequence`: a detach (no `after`) requires the
+ * live owner to deep-equal the step's `before`; an attach or re-own requires the live owner to
+ * be absent or deep-equal `before`, and its target table and column to be live.
+ */
+const applySequenceOwner = (
+  state: SimulatedState,
+  sequence: Mutable<Sequence>,
+  field: { readonly before?: SequenceOwner; readonly after?: SequenceOwner },
+  key: string,
+): void => {
+  if (field.after === undefined) {
+    assert.deepStrictEqual(
+      sequence.ownedBy,
+      field.before,
+      `alter-sequence on ${key} must detach its live owner`,
+    );
+    delete sequence.ownedBy;
+    return;
+  }
+  if (sequence.ownedBy !== undefined) {
+    assert.deepStrictEqual(
+      sequence.ownedBy,
+      field.before,
+      `alter-sequence on ${key} must start from its live owner`,
+    );
+  }
+  const ownerTable = state.tables.get(keyOf(field.after.table));
+  assert.ok(
+    ownerTable !== undefined && ownerTable.columns.has(field.after.column),
+    `alter-sequence on ${key} must own live column ${field.after.column}`,
+  );
+  sequence.ownedBy = {
+    table: { schema: field.after.table.schema, name: field.after.table.name },
+    column: field.after.column,
+  };
+};
+
 /** Applies one step to `state`, failing the test when the step is illegal there. */
 const applyStep = (state: SimulatedState, step: Step): void => {
   switch (step.kind) {
@@ -369,6 +446,7 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         }
       }
       state.tables.delete(key);
+      cascadeOwnedSequences(state, (ownedBy) => sameIdentity(ownedBy.table, step.table));
       return;
     }
     case 'drop-foreign-key': {
@@ -431,6 +509,10 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         }
       }
       table.columns.delete(step.column.name);
+      cascadeOwnedSequences(
+        state,
+        (ownedBy) => sameIdentity(ownedBy.table, step.table) && ownedBy.column === step.column.name,
+      );
       return;
     }
     case 'add-column': {
@@ -625,18 +707,76 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       table.indexes.splice(found, 1);
       return;
     }
-    case 'create-sequence':
-    case 'drop-sequence':
-    case 'alter-sequence':
-      // The simulator's state is table-scoped; sequence steps have no effect on it.
+    case 'create-sequence': {
+      const key = keyOf(step.sequence);
+      assert.equal(state.sequences.has(key), false, `create-sequence of live ${key}`);
+      assert.equal(
+        step.sequence.ownedBy,
+        undefined,
+        `create-sequence ${key} must carry an ownerless payload`,
+      );
+      state.sequences.set(key, copySequenceState(step.sequence));
       return;
+    }
+    case 'drop-sequence': {
+      const key = keyOf(step.sequence);
+      assert.ok(state.sequences.has(key), `drop-sequence of missing ${key}`);
+      state.sequences.delete(key);
+      return;
+    }
+    case 'alter-sequence': {
+      const key = keyOf(step.sequence);
+      const altered = state.sequences.get(key);
+      assert.ok(altered !== undefined, `alter-sequence on missing ${key}`);
+      for (const field of step.fields) {
+        switch (field.field) {
+          case 'ownedBy':
+            applySequenceOwner(state, altered, field, key);
+            break;
+          case 'dataType': {
+            // The engine's `AS` change rewrites a bound equal to the old type's bound to the
+            // new type's before the step's explicit option clauses land, so a plan may omit a
+            // bound the conversion moves.
+            const converted = sequenceTypeChange(
+              altered.dataType,
+              altered.minValue,
+              altered.maxValue,
+              field.after,
+            );
+            altered.dataType = field.after;
+            if (converted.resetMin) altered.minValue = converted.minValue;
+            if (converted.resetMax) altered.maxValue = converted.maxValue;
+            break;
+          }
+          case 'increment':
+            altered.increment = field.after;
+            break;
+          case 'minValue':
+            altered.minValue = field.after;
+            break;
+          case 'maxValue':
+            altered.maxValue = field.after;
+            break;
+          case 'start':
+            altered.start = field.after;
+            break;
+          case 'cache':
+            altered.cache = field.after;
+            break;
+          case 'cycle':
+            altered.cycle = field.after;
+            break;
+        }
+      }
+      return;
+    }
     default:
       // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
       assertNever(step);
   }
 };
 
-/** Asserts the simulated state and the target model hold the same tables and constraints. */
+/** Asserts the simulated state and the target model hold the same tables, members, and sequences. */
 const assertSameState = (state: SimulatedState, target: Model): void => {
   assert.deepStrictEqual(
     [...state.tables.keys()].sort(),
@@ -681,6 +821,18 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       `indexes of ${key}`,
     );
   }
+  assert.deepStrictEqual(
+    [...state.sequences.keys()].sort(),
+    target.sequences.map(keyOf).sort(),
+    'the plan must leave exactly the target sequences',
+  );
+  for (const expected of target.sequences) {
+    assert.deepStrictEqual(
+      state.sequences.get(keyOf(expected)),
+      expected,
+      `sequence ${keyOf(expected)}`,
+    );
+  }
 };
 
 /** Plans `baseline` to `target` and runs the whole plan through the simulator. */
@@ -689,8 +841,20 @@ const simulate = (baseline: Model, target: Model): void => {
   const state = stateOf(baseline);
   const baselineKeys = new Set(baseline.tables.map(keyOf));
   const targetKeys = new Set(target.tables.map(keyOf));
+  const baselineSequenceKeys = new Set(baseline.sequences.map(keyOf));
+  const targetSequenceKeys = new Set(target.sequences.map(keyOf));
+  const targetTables = new Map(target.tables.map((table) => [keyOf(table), table]));
   const dropped = new Map<string, number>();
   const created = new Map<string, number>();
+  const sequenceDrops = new Map<string, number>();
+  const sequenceCreates = new Map<string, number>();
+
+  /** Whether the plan removes `ownedBy`'s table or column: the drop-suppression rule. */
+  const ownerRemoved = (ownedBy: SequenceOwner): boolean => {
+    const targetTable = targetTables.get(keyOf(ownedBy.table));
+    if (targetTable === undefined) return true;
+    return !targetTable.columns.some((column) => column.name === ownedBy.column);
+  };
 
   for (const step of steps) {
     applyStep(state, step);
@@ -701,6 +865,14 @@ const simulate = (baseline: Model, target: Model): void => {
     if (step.kind === 'create-table') {
       const key = keyOf(step.table);
       created.set(key, (created.get(key) ?? 0) + 1);
+    }
+    if (step.kind === 'drop-sequence') {
+      const key = keyOf(step.sequence);
+      sequenceDrops.set(key, (sequenceDrops.get(key) ?? 0) + 1);
+    }
+    if (step.kind === 'create-sequence') {
+      const key = keyOf(step.sequence);
+      sequenceCreates.set(key, (sequenceCreates.get(key) ?? 0) + 1);
     }
   }
 
@@ -715,7 +887,53 @@ const simulate = (baseline: Model, target: Model): void => {
     assert.equal(created.get(key) ?? 0, 1, `added table ${key} must be created exactly once`);
   }
 
+  for (const removed of baseline.sequences) {
+    const key = keyOf(removed);
+    if (targetSequenceKeys.has(key)) continue;
+    // A sequence the plan removes is dropped explicitly unless its owner's removal cascades it.
+    if (removed.ownedBy !== undefined && ownerRemoved(removed.ownedBy)) continue;
+    assert.equal(
+      sequenceDrops.get(key) ?? 0,
+      1,
+      `removed sequence ${key} must be dropped exactly once`,
+    );
+  }
+  for (const added of target.sequences) {
+    const key = keyOf(added);
+    if (baselineSequenceKeys.has(key)) continue;
+    assert.equal(
+      sequenceCreates.get(key) ?? 0,
+      1,
+      `added sequence ${key} must be created exactly once`,
+    );
+  }
+  for (const key of sequenceDrops.keys()) {
+    assert.ok(
+      baselineSequenceKeys.has(key) && !targetSequenceKeys.has(key),
+      `drop-sequence for neither removed nor kept sequence ${key}`,
+    );
+  }
+  for (const key of sequenceCreates.keys()) {
+    assert.ok(
+      !baselineSequenceKeys.has(key) && targetSequenceKeys.has(key),
+      `create-sequence for neither added nor kept sequence ${key}`,
+    );
+  }
+
   assertSameState(state, target);
+};
+
+/** Whether the plan drops and re-adds one column's identity: the recreation path. */
+const recreatesIdentity = (steps: readonly Step[]): boolean => {
+  const dropped = new Set<string>();
+  for (const step of steps) {
+    if (step.kind === 'drop-identity') {
+      dropped.add(`${keyOf(step.table)}:${step.name}`);
+    } else if (step.kind === 'add-identity' && dropped.has(`${keyOf(step.table)}:${step.name}`)) {
+      return true;
+    }
+  }
+  return false;
 };
 
 /**
@@ -748,6 +966,9 @@ interface GeneratedTable {
   readonly columns: Mutable<Column>[];
   primaryKey: Mutable<PrimaryKey> | undefined;
   readonly foreignKeys: Mutable<ForeignKey>[];
+  readonly uniqueConstraints: Mutable<UniqueConstraint>[];
+  readonly checkConstraints: Mutable<CheckConstraint>[];
+  readonly indexes: Mutable<Index>[];
 }
 
 /** A fresh `prefix`-numbered column name for `table`. */
@@ -755,6 +976,163 @@ const freshColumnName = (table: GeneratedTable, prefix: string): string => {
   let index = 0;
   while (table.columns.some((entry) => entry.name === `${prefix}${index}`)) index += 1;
   return `${prefix}${index}`;
+};
+
+/** Canonical identity option variations; `{}` resolves to the engine-default descriptor. */
+const identityVariations: readonly Partial<IdentityInput>[] = [
+  {},
+  { generated: 'by default' },
+  { increment: '2' },
+  { cache: '10' },
+  { cycle: true },
+];
+
+/** A fresh canonical identity for `tableName`'s `columnName`, sometimes with a stated name. */
+const generateIdentity = (tableName: string, columnName: string, random: Random): Identity =>
+  identityColumn({
+    ...random.pick(identityVariations),
+    ...(random.chance(0.6)
+      ? { sequenceName: { schema: 'public', name: `${tableName}_${columnName}_seq` } }
+      : {}),
+  });
+
+/** 1–2 names picked from `columns` without replacement, in pick order. */
+const pickColumnNames = (columns: readonly Column[], random: Random): string[] => {
+  const pool = columns.map((entry) => entry.name);
+  const count = pool.length > 1 && random.chance(0.35) ? 2 : 1;
+  const picked: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    picked.push(pool.splice(Math.floor(random.next() * pool.length), 1)[0]!);
+  }
+  return picked;
+};
+
+/** One fresh ordered column list for `columns` whose identity is not in `taken`. */
+const freshUniqueColumns = (
+  columns: readonly Column[],
+  taken: ReadonlySet<string>,
+  random: Random,
+): string[] | undefined => {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const picked = pickColumnNames(columns, random);
+    if (!taken.has(JSON.stringify(picked))) return picked;
+  }
+  return undefined;
+};
+
+/** 0–2 unique constraints on live `columns` with distinct ordered-column identities. */
+const generateUniqueConstraints = (
+  tableName: string,
+  columns: readonly Column[],
+  random: Random,
+): Mutable<UniqueConstraint>[] => {
+  const constraints: Mutable<UniqueConstraint>[] = [];
+  const taken = new Set<string>();
+  const count = Math.floor(random.next() * 3);
+  for (let index = 0; index < count; index += 1) {
+    const picked = freshUniqueColumns(columns, taken, random);
+    if (picked === undefined) continue;
+    taken.add(JSON.stringify(picked));
+    constraints.push({
+      columns: picked,
+      ...(random.chance(0.5) ? {} : { name: `${tableName}_uq${index}` }),
+    });
+  }
+  return constraints;
+};
+
+/** Simple opaque check expressions; generation and mutation step through them to stay distinct. */
+const checkExpressions: readonly string[] = ['1 = 1', "'' <> 'x'", '2 > 1', "length('abc') > 0"];
+
+/** 0–2 check constraints with distinct expression identities. */
+const generateCheckConstraints = (
+  tableName: string,
+  random: Random,
+): Mutable<CheckConstraint>[] => {
+  const constraints: Mutable<CheckConstraint>[] = [];
+  const count = Math.floor(random.next() * 3);
+  const offset = Math.floor(random.next() * checkExpressions.length);
+  for (let index = 0; index < count; index += 1) {
+    constraints.push({
+      expression: checkExpressions[(offset + index) % checkExpressions.length]!,
+      ...(random.chance(0.5) ? {} : { name: `${tableName}_ck${index}` }),
+    });
+  }
+  return constraints;
+};
+
+/** 0–2 indexes on live `columns`: named `ix0…`, at most one unnamed, some concurrent. */
+const generateIndexes = (columns: readonly Column[], random: Random): Mutable<Index>[] => {
+  const indexes: Mutable<Index>[] = [];
+  const count = Math.floor(random.next() * 3);
+  let unnamed = false;
+  for (let index = 0; index < count; index += 1) {
+    const name = unnamed || !random.chance(0.6) ? `ix${index}` : undefined;
+    if (name === undefined) unnamed = true;
+    indexes.push({
+      ...(name === undefined ? {} : { name }),
+      unique: random.chance(0.4),
+      columns: pickColumnNames(columns, random),
+      ...(random.chance(0.35) ? { concurrently: true } : {}),
+    });
+  }
+  return indexes;
+};
+
+/** A fresh `ix`-numbered name for `table`'s indexes. */
+const freshIndexName = (table: GeneratedTable): string => {
+  let index = 0;
+  while (table.indexes.some((entry) => entry.name === `ix${index}`)) index += 1;
+  return `ix${index}`;
+};
+
+/**
+ * A changed canonical identity for `identity`: exactly one option flips and a stated sequence
+ * name survives, so the diff reports a field change, never a recreation.
+ */
+const alterIdentity = (identity: Identity, random: Random): Identity => {
+  const flips: readonly Partial<IdentityInput>[] = [
+    { generated: identity.generated === 'always' ? 'by default' : 'always' },
+    { increment: identity.increment === '1' ? '2' : '1' },
+    { cache: identity.cache === '1' ? '10' : '1' },
+    { cycle: !identity.cycle },
+  ];
+  return identityColumn({
+    ...random.pick(flips),
+    ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
+  });
+};
+
+/** A restated identity for the recreation path, or `undefined` when `identity` states no name. */
+const recreateIdentity = (identity: Identity, random: Random): Identity | undefined => {
+  const stated = identity.sequenceName;
+  if (stated === undefined) return undefined;
+  return identityColumn({
+    ...random.pick(identityVariations),
+    sequenceName: { schema: stated.schema, name: `${stated.name}_v2` },
+  });
+};
+
+/**
+ * Drops members that fail `valid` or whose identity key repeats an earlier member's, in place.
+ * The keys mirror the diff's matching identities: unique constraints by ordered columns, check
+ * constraints by expression, indexes by name with absence distinct.
+ */
+const retainDistinct = <T>(
+  members: T[],
+  valid: (member: T) => boolean,
+  identityOf: (member: T) => string,
+): void => {
+  const seen = new Set<string>();
+  const kept = members.filter((member) => {
+    if (!valid(member)) return false;
+    const key = identityOf(member);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  members.length = 0;
+  members.push(...kept);
 };
 
 /**
@@ -777,10 +1155,14 @@ const mutatePrimaryKey = (table: GeneratedTable, random: Random): void => {
 
 /**
  * Mutates one generated target table: drops, renames, or reorders a primary key; drops, adds,
- * or alters a text column; and drops or changes a foreign key. A primary key is only added
- * when the baseline table had none, and a rename or reorder keeps its column set, so every
- * generated target stays well-formed. Foreign-key targets are always a present table's
- * `integer` primary-key columns, so the pair stays well-formed too.
+ * or alters a text column; drops, adds, or changes unique and check constraints and indexes;
+ * drops, adds, alters, or recreates an identity; and drops or changes a foreign key. A primary
+ * key is only added when the baseline table had none, and a rename or reorder keeps its column
+ * set, so every generated target stays well-formed. An added identity only ever lands on an
+ * integer column that never carried one, and an alter or recreation preserves the baseline's
+ * sequence-name shape, so the untouched simulator's full-descriptor comparison holds.
+ * Foreign-key targets are always a present table's `integer` primary-key columns, so the pair
+ * stays well-formed too.
  */
 const mutateTable = (
   table: GeneratedTable,
@@ -788,6 +1170,9 @@ const mutateTable = (
   random: Random,
   textTypes: readonly string[],
 ): void => {
+  const identityBearing = new Set(
+    table.columns.filter((entry) => entry.identity !== undefined).map((entry) => entry.name),
+  );
   if (table.primaryKey !== undefined && random.chance(0.3)) {
     table.primaryKey = undefined;
   } else if (table.primaryKey !== undefined && random.chance(0.35)) {
@@ -812,7 +1197,13 @@ const mutateTable = (
   if (alterable.length > 0 && random.chance(0.4)) {
     const altered = random.pick(alterable);
     altered.notNull = !altered.notNull;
-    if (random.chance(0.5)) altered.type = random.pick(textTypes);
+    if (random.chance(0.5)) {
+      const type = random.pick(textTypes);
+      if (altered.identity !== undefined && canonicalIntType(type) === undefined) {
+        delete altered.identity;
+      }
+      altered.type = type;
+    }
     if (random.chance(0.5)) {
       if (altered.default === undefined) altered.default = "'x'";
       else delete altered.default;
@@ -826,14 +1217,238 @@ const mutateTable = (
     if (random.chance(0.5)) changed.name = `${changed.name ?? 'unnamed'}_changed`;
     else changed.onDelete = changed.onDelete === undefined ? 'CASCADE' : undefined;
   }
+
+  // Identity: drop, alter, or recreate one; add one to an integer column that never had any.
+  const identities = table.columns.filter((entry) => entry.identity !== undefined);
+  if (identities.length > 0 && random.chance(0.55)) {
+    const mutated = random.pick(identities);
+    const action = random.next();
+    if (action < 0.3) {
+      delete mutated.identity;
+    } else if (action < 0.8) {
+      mutated.identity = alterIdentity(mutated.identity!, random);
+    } else {
+      mutated.identity =
+        recreateIdentity(mutated.identity!, random) ?? alterIdentity(mutated.identity!, random);
+    }
+  }
+  const identityless = table.columns.filter(
+    (entry) =>
+      entry.identity === undefined &&
+      !identityBearing.has(entry.name) &&
+      canonicalIntType(entry.type) !== undefined,
+  );
+  if (identityless.length > 0 && random.chance(0.3)) {
+    const added = random.pick(identityless);
+    added.identity = generateIdentity(table.name, added.name, random);
+  }
+
+  // Unique constraints: drop, change columns or name, or add one with a fresh identity.
+  if (table.uniqueConstraints.length > 0 && random.chance(0.35)) {
+    table.uniqueConstraints.splice(Math.floor(random.next() * table.uniqueConstraints.length), 1);
+  }
+  if (table.uniqueConstraints.length > 0 && random.chance(0.3)) {
+    const changed = random.pick(table.uniqueConstraints);
+    if (random.chance(0.5)) {
+      changed.name = `${changed.name ?? 'unnamed'}_changed`;
+    } else {
+      const taken = new Set(table.uniqueConstraints.map((entry) => JSON.stringify(entry.columns)));
+      const picked = freshUniqueColumns(table.columns, taken, random);
+      if (picked !== undefined) changed.columns = picked;
+    }
+  }
+  if (table.uniqueConstraints.length < 2 && random.chance(0.3)) {
+    const taken = new Set(table.uniqueConstraints.map((entry) => JSON.stringify(entry.columns)));
+    const picked = freshUniqueColumns(table.columns, taken, random);
+    if (picked !== undefined) {
+      table.uniqueConstraints.push({
+        columns: picked,
+        ...(random.chance(0.5) ? {} : { name: `${table.name}_uq_new` }),
+      });
+    }
+  }
+
+  // Check constraints: drop, change expression or name, or add one with a fresh expression.
+  if (table.checkConstraints.length > 0 && random.chance(0.35)) {
+    table.checkConstraints.splice(Math.floor(random.next() * table.checkConstraints.length), 1);
+  }
+  if (table.checkConstraints.length > 0 && random.chance(0.3)) {
+    const changed = random.pick(table.checkConstraints);
+    if (random.chance(0.5)) {
+      changed.name = `${changed.name ?? 'unnamed'}_changed`;
+    } else {
+      const taken = new Set(table.checkConstraints.map((entry) => entry.expression));
+      const fresh = checkExpressions.find((expression) => !taken.has(expression));
+      if (fresh !== undefined) changed.expression = fresh;
+    }
+  }
+  if (table.checkConstraints.length < 2 && random.chance(0.3)) {
+    const taken = new Set(table.checkConstraints.map((entry) => entry.expression));
+    const fresh = checkExpressions.find((expression) => !taken.has(expression));
+    if (fresh !== undefined) {
+      table.checkConstraints.push({
+        expression: fresh,
+        ...(random.chance(0.5) ? {} : { name: `${table.name}_ck_new` }),
+      });
+    }
+  }
+
+  // Indexes: drop, change columns or uniqueness (toggling `concurrently` only alongside that
+  // structural change), or add one with a fresh name and some concurrency.
+  if (table.indexes.length > 0 && random.chance(0.35)) {
+    table.indexes.splice(Math.floor(random.next() * table.indexes.length), 1);
+  }
+  if (table.indexes.length > 0 && random.chance(0.35)) {
+    const changed = random.pick(table.indexes);
+    if (random.chance(0.5)) {
+      changed.unique = !changed.unique;
+      if (random.chance(0.4)) {
+        changed.concurrently = changed.concurrently === true ? undefined : true;
+      }
+    } else {
+      const previous = JSON.stringify(changed.columns);
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const picked = pickColumnNames(table.columns, random);
+        if (JSON.stringify(picked) === previous) continue;
+        changed.columns = picked;
+        if (random.chance(0.4)) {
+          changed.concurrently = changed.concurrently === true ? undefined : true;
+        }
+        break;
+      }
+    }
+  }
+  if (table.indexes.length < 2 && random.chance(0.3)) {
+    const hasUnnamed = table.indexes.some((entry) => entry.name === undefined);
+    const name = !hasUnnamed && random.chance(0.3) ? undefined : freshIndexName(table);
+    table.indexes.push({
+      ...(name === undefined ? {} : { name }),
+      unique: random.chance(0.4),
+      columns: pickColumnNames(table.columns, random),
+      ...(random.chance(0.4) ? { concurrently: true } : {}),
+    });
+  }
+};
+
+/** Canonical sequence option variations; every pick resolves through `effectiveSequence`. */
+const sequenceVariations: readonly SequenceOptions[] = [
+  {},
+  { dataType: 'integer' },
+  { dataType: 'smallint' },
+  { increment: '2' },
+  { increment: '-1' },
+  { cache: '10' },
+  { cycle: true },
+  { start: '5' },
+  { dataType: 'integer', increment: '2' },
+  { dataType: 'smallint', increment: '-1' },
+  { dataType: 'integer', maxValue: '1000' },
+  { minValue: '2', start: '5' },
+];
+
+/** A canonical `public` sequence named `name`, with a random option variation and owner. */
+const generateSequence = (
+  name: string,
+  ownedBy: SequenceOwner | undefined,
+  random: Random,
+): Mutable<Sequence> =>
+  effectiveSequence({
+    schema: 'public',
+    name,
+    ...random.pick(sequenceVariations),
+    ...(ownedBy === undefined ? {} : { ownedBy }),
+  });
+
+/** Every owner a generated table can supply: one per `public` table column. */
+const sequenceOwnerCandidates = (
+  tables: readonly {
+    readonly name: string;
+    readonly columns: readonly { readonly name: string }[];
+  }[],
+): SequenceOwner[] =>
+  tables.flatMap((table) => table.columns.map((column) => owner(table.name, column.name)));
+
+/**
+ * The pair's sequences: a pool of two identities, each independently present on each side with
+ * a canonical option variation and an optional owner. A baseline sequence sometimes owns a
+ * column the target removes, so a kept sequence has to detach and a removed one cascades; a
+ * target owner always names a live target column.
+ */
+const generateSequences = (
+  baselineTables: readonly Table[],
+  target: ReadonlyMap<string, GeneratedTable>,
+  random: Random,
+): { baseline: Mutable<Sequence>[]; target: Mutable<Sequence>[] } => {
+  const baselineOwners = sequenceOwnerCandidates(baselineTables);
+  const targetOwners = sequenceOwnerCandidates([...target.values()]);
+  const removedOwners: SequenceOwner[] = [];
+  for (const source of baselineTables) {
+    const kept = target.get(source.name);
+    if (kept === undefined) {
+      removedOwners.push(...source.columns.map((column) => owner(source.name, column.name)));
+      continue;
+    }
+    const liveColumns = new Set(kept.columns.map((column) => column.name));
+    for (const column of source.columns) {
+      if (!liveColumns.has(column.name)) removedOwners.push(owner(source.name, column.name));
+    }
+  }
+
+  const pickOwner = (
+    candidates: readonly SequenceOwner[],
+    probability: number,
+  ): SequenceOwner | undefined =>
+    candidates.length > 0 && random.chance(probability) ? random.pick(candidates) : undefined;
+
+  const baseline: Mutable<Sequence>[] = [];
+  const targetSequences: Mutable<Sequence>[] = [];
+  for (const name of ['sq0', 'sq1']) {
+    if (random.chance(0.75)) {
+      // A removed owner forces a detach (kept sequence) or a cascade (removed sequence);
+      // otherwise the owner is usually one that survives the pair.
+      const removed = pickOwner(removedOwners, 0.6);
+      baseline.push(generateSequence(name, removed ?? pickOwner(baselineOwners, 0.6), random));
+    }
+    if (random.chance(0.75)) {
+      targetSequences.push(generateSequence(name, pickOwner(targetOwners, 0.6), random));
+    }
+  }
+  return { baseline, target: targetSequences };
 };
 
 /**
- * One well-formed pseudo-random pair: 2–6 baseline tables, every foreign key pointing at a
+ * Re-validates every sequence owner against `tables`: an owner naming a table or column the
+ * side lacks is re-owned on a live column, or dropped when the side has no columns at all.
+ */
+const revalidateSequenceOwners = (
+  sequences: readonly Mutable<Sequence>[],
+  tables: readonly {
+    readonly name: string;
+    readonly columns: readonly { readonly name: string }[];
+  }[],
+  random: Random,
+): void => {
+  const candidates = sequenceOwnerCandidates(tables);
+  for (const sequence of sequences) {
+    const ownedBy = sequence.ownedBy;
+    if (ownedBy === undefined) continue;
+    const ownerTable = tables.find((table) => table.name === ownedBy.table.name);
+    if (ownerTable?.columns.some((column) => column.name === ownedBy.column) === true) continue;
+    const replacement = candidates.length === 0 ? undefined : random.pick(candidates);
+    if (replacement === undefined) delete sequence.ownedBy;
+    else sequence.ownedBy = { table: { ...replacement.table }, column: replacement.column };
+  }
+};
+
+/**
+ * One well-formed pseudo-random pair: 2–6 baseline tables carrying unique and check
+ * constraints, indexes, and occasional identity columns; every foreign key pointing at a
  * present table's `integer` primary-key columns (single-column or composite), a target built
- * from kept, removed, changed, and added tables, and target foreign keys that never reference
- * a removed table or a dropped primary key. Table order is shuffled so the planner sees
- * arbitrary insertion orders.
+ * from kept, removed, changed, and added tables, target foreign keys that never reference
+ * a removed table or a dropped primary key, and 0–2 sequences per side with canonical options
+ * and owners (kept, changed, dropped, added, attached, detached, transferred, and cascaded).
+ * Constraints and indexes on the target reference only live columns. Table order is shuffled
+ * so the planner sees arbitrary insertion orders.
  */
 const generatePair = (random: Random): { baseline: Model; target: Model } => {
   const textTypes = ['text', 'character varying(12)', 'character varying(24)'];
@@ -850,8 +1465,16 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
 
   const baselineTables = names.map((name): Table => {
     const keyColumns = primaryKeyColumns.get(name)!;
-    const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
-    if (keyColumns.length > 1) columns.push(column('k2', { type: 'integer', notNull: true }));
+    const identityColumnName = random.chance(0.4) ? random.pick(keyColumns) : undefined;
+    const columns: Column[] = keyColumns.map((columnName) =>
+      column(columnName, {
+        type: 'integer',
+        notNull: true,
+        ...(columnName === identityColumnName
+          ? { identity: generateIdentity(name, columnName, random) }
+          : {}),
+      }),
+    );
     const extras = Math.floor(random.next() * 3);
     for (let index = 0; index < extras; index += 1) {
       columns.push(
@@ -891,6 +1514,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
         ? { primaryKey: { name: `${name}_pkey`, columns: [...keyColumns] } }
         : {}),
       foreignKeys,
+      uniqueConstraints: generateUniqueConstraints(name, columns, random),
+      checkConstraints: generateCheckConstraints(name, random),
+      indexes: generateIndexes(columns, random),
     });
   });
 
@@ -899,9 +1525,17 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     if (random.chance(0.25)) continue;
     const generated: GeneratedTable = {
       name: source.name,
-      columns: source.columns.map((entry) => ({ ...entry })),
+      columns: source.columns.map((entry) => ({
+        ...entry,
+        ...(entry.identity === undefined
+          ? {}
+          : { identity: copyIdentityDescriptor(entry.identity) }),
+      })),
       primaryKey: source.primaryKey === undefined ? undefined : copyPrimaryKey(source.primaryKey),
       foreignKeys: source.foreignKeys.map(copyForeignKey),
+      uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
+      checkConstraints: source.checkConstraints.map(copyCheckConstraint),
+      indexes: source.indexes.map(copyIndex),
     };
     if (random.chance(0.55))
       mutateTable(generated, hasPrimaryKey.get(source.name) === true, random, textTypes);
@@ -910,7 +1544,13 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
 
   for (let index = 0; index < 2 && random.chance(0.3); index += 1) {
     const name = `u${index}`;
-    const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
+    const columns: Column[] = [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        ...(random.chance(0.4) ? { identity: generateIdentity(name, 'id', random) } : {}),
+      }),
+    ];
     if (random.chance(0.5)) columns.push(column('e0', { type: random.pick(textTypes) }));
     const composite = random.chance(0.3);
     if (composite) columns.push(column('k2', { type: 'integer', notNull: true }));
@@ -919,6 +1559,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       columns,
       primaryKey: { name: `${name}_pkey`, columns: composite ? ['id', 'k2'] : ['id'] },
       foreignKeys: [],
+      uniqueConstraints: generateUniqueConstraints(name, columns, random),
+      checkConstraints: generateCheckConstraints(name, random),
+      indexes: generateIndexes(columns, random),
     });
   }
 
@@ -963,6 +1606,42 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     );
   }
 
+  // Final well-formedness sweep, mirroring the foreign-key filter: constraints and indexes
+  // reference only live columns and keep distinct matching identities (at most one unnamed
+  // index), and identities stay on integer-family columns.
+  for (const generated of target.values()) {
+    const columnNames = new Set(generated.columns.map((entry) => entry.name));
+    retainDistinct(
+      generated.uniqueConstraints,
+      (constraint) => constraint.columns.every((name) => columnNames.has(name)),
+      (constraint) => JSON.stringify(constraint.columns),
+    );
+    retainDistinct(
+      generated.checkConstraints,
+      () => true,
+      (constraint) => JSON.stringify(constraint.expression),
+    );
+    retainDistinct(
+      generated.indexes,
+      (member) => member.columns.every((name) => columnNames.has(name)),
+      (member) => JSON.stringify([member.name]),
+    );
+    for (const entry of generated.columns) {
+      if (entry.identity !== undefined && canonicalIntType(entry.type) === undefined) {
+        delete entry.identity;
+      }
+    }
+  }
+
+  // Sequences: 0–2 canonical sequences per side, with owners re-validated against each side.
+  const { baseline: baselineSequences, target: targetSequences } = generateSequences(
+    baselineTables,
+    target,
+    random,
+  );
+  revalidateSequenceOwners(baselineSequences, baselineTables, random);
+  revalidateSequenceOwners(targetSequences, [...target.values()], random);
+
   const shuffle = <T>(values: readonly T[]): T[] => {
     const copy = [...values];
     for (let index = copy.length - 1; index > 0; index -= 1) {
@@ -979,11 +1658,20 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       columns: generated.columns,
       ...(generated.primaryKey === undefined ? {} : { primaryKey: generated.primaryKey }),
       foreignKeys: generated.foreignKeys,
+      uniqueConstraints: generated.uniqueConstraints,
+      checkConstraints: generated.checkConstraints,
+      indexes: generated.indexes,
     });
 
   return {
-    baseline: model(...shuffle(baselineTables)),
-    target: model(...shuffle([...target.values()].map(toTable))),
+    baseline: {
+      tables: shuffle(baselineTables),
+      sequences: baselineSequences,
+    },
+    target: {
+      tables: shuffle([...target.values()].map(toTable)),
+      sequences: targetSequences,
+    },
   };
 };
 
@@ -3095,6 +3783,21 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
   let cuts = 0;
   let keyChanges = 0;
   let setAsides = 0;
+  let uniqueAdds = 0;
+  let uniqueDrops = 0;
+  let checkAdds = 0;
+  let checkDrops = 0;
+  let indexCreates = 0;
+  let indexDrops = 0;
+  let concurrentIndexCreates = 0;
+  let concurrentIndexDrops = 0;
+  let identityAdds = 0;
+  let identityDrops = 0;
+  let identityAlters = 0;
+  let recreations = 0;
+  let sequenceCreates = 0;
+  let sequenceDrops = 0;
+  let sequenceAlters = 0;
   for (let round = 0; round < 500; round += 1) {
     const { baseline, target } = generatePair(random);
     try {
@@ -3110,9 +3813,41 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
       target.tables.map((table) => [keyOf(table), new Set(table.foreignKeys.map(foreignKeyKey))]),
     );
     const { steps } = plan(baseline, target);
+    for (const step of steps) {
+      if (
+        step.kind === 'create-index' ||
+        step.kind === 'create-index-concurrently' ||
+        step.kind === 'drop-index' ||
+        step.kind === 'drop-index-concurrently'
+      ) {
+        const concurrent =
+          step.kind === 'create-index-concurrently' || step.kind === 'drop-index-concurrently';
+        assert.equal(
+          step.index.concurrently === true,
+          concurrent,
+          `round ${round}: ${step.kind} must ${concurrent ? '' : 'not '}carry the concurrent flag`,
+        );
+      }
+    }
+    if (recreatesIdentity(steps)) recreations += 1;
+    if (steps.some((step) => step.kind === 'create-sequence')) sequenceCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-sequence')) sequenceDrops += 1;
+    if (steps.some((step) => step.kind === 'alter-sequence')) sequenceAlters += 1;
     if (steps.some((step) => step.kind === 'drop-table')) drops += 1;
     if (steps.some((step) => step.kind === 'create-table')) creates += 1;
     if (steps.some((step) => step.kind === 'drop-primary-key')) keyChanges += 1;
+    if (steps.some((step) => step.kind === 'add-unique-constraint')) uniqueAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-unique-constraint')) uniqueDrops += 1;
+    if (steps.some((step) => step.kind === 'add-check-constraint')) checkAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-check-constraint')) checkDrops += 1;
+    if (steps.some((step) => step.kind === 'create-index')) indexCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-index')) indexDrops += 1;
+    if (steps.some((step) => step.kind === 'create-index-concurrently'))
+      concurrentIndexCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-index-concurrently')) concurrentIndexDrops += 1;
+    if (steps.some((step) => step.kind === 'add-identity')) identityAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-identity')) identityDrops += 1;
+    if (steps.some((step) => step.kind === 'alter-identity')) identityAlters += 1;
     if (
       steps.some(
         (step) =>
@@ -3136,6 +3871,24 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
     setAsides > 0,
     'the generated pairs must include primary-key changes with surviving foreign keys',
   );
+  assert.ok(uniqueAdds > 0, 'the generated pairs must include added unique constraints');
+  assert.ok(uniqueDrops > 0, 'the generated pairs must include removed unique constraints');
+  assert.ok(checkAdds > 0, 'the generated pairs must include added check constraints');
+  assert.ok(checkDrops > 0, 'the generated pairs must include removed check constraints');
+  assert.ok(indexCreates > 0, 'the generated pairs must include created indexes');
+  assert.ok(indexDrops > 0, 'the generated pairs must include dropped indexes');
+  assert.ok(
+    concurrentIndexCreates >= 3,
+    'the generated pairs must include concurrent index creates',
+  );
+  assert.ok(concurrentIndexDrops >= 3, 'the generated pairs must include concurrent index drops');
+  assert.ok(identityAdds > 0, 'the generated pairs must include added identities');
+  assert.ok(identityDrops > 0, 'the generated pairs must include dropped identities');
+  assert.ok(identityAlters > 0, 'the generated pairs must include altered identities');
+  assert.ok(recreations > 0, 'the generated pairs must include recreated identities');
+  assert.ok(sequenceCreates > 0, 'the generated pairs must include created sequences');
+  assert.ok(sequenceDrops > 0, 'the generated pairs must include dropped sequences');
+  assert.ok(sequenceAlters > 0, 'the generated pairs must include altered sequences');
 });
 
 test('a new owned sequence is created before its table and attached after it', () => {
