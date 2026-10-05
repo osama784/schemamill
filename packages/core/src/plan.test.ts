@@ -19,7 +19,7 @@ import type {
   UniqueConstraint,
 } from './model.ts';
 import type { Step, TransactionGroup } from './plan.ts';
-import { groupSteps, TRANSACTIONAL } from './plan.ts';
+import { assertNever, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
  * Tests for the migration plan: the eight global phases with the fifteen table phases at their
@@ -625,6 +625,14 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       table.indexes.splice(found, 1);
       return;
     }
+    case 'create-sequence':
+    case 'drop-sequence':
+    case 'alter-sequence':
+      // The simulator's state is table-scoped; sequence steps have no effect on it.
+      return;
+    default:
+      // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
+      assertNever(step);
   }
 };
 
@@ -1096,6 +1104,15 @@ test('every current step kind is classified, and only the concurrent kinds stand
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
     assert.equal(TRANSACTIONAL[kind], !standalone, kind);
   }
+});
+
+test('an unknown step kind is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(model());
+
+  assert.throws(
+    () => applyStep(state, { kind: 'frobnicate' } as unknown as Step),
+    /Unhandled step kind: frobnicate/,
+  );
 });
 
 test('plan partitions a mixed migration into one transactional group', () => {
