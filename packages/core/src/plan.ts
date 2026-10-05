@@ -268,13 +268,15 @@ export type Step =
     };
 
 /**
- * The exhaustiveness guard for `Step['kind']`: every `switch` that must understand each kind
- * ends its `default` clause here, so a kind with no case fails to typecheck. It throws with the
- * offending kind rather than the whole step, when one is present.
+ * The exhaustiveness guard for a union `switch`: every `switch` that must understand each member
+ * ends its `default` clause here, so a member with no case fails to typecheck. It throws with
+ * `context` and the offending `kind` or `field` when one is present, else the whole value.
  */
-export function assertNever(value: never): never {
-  const kind = (value as { kind?: unknown }).kind;
-  throw new Error(`Unhandled step kind: ${typeof kind === 'string' ? kind : String(value)}`);
+export function assertNever(value: never, context: string): never {
+  const { kind, field } = value as { kind?: unknown; field?: unknown };
+  const detail =
+    typeof kind === 'string' ? kind : typeof field === 'string' ? field : String(value);
+  throw new Error(`Unhandled ${context}: ${detail}`);
 }
 
 /**
@@ -498,6 +500,8 @@ export function plan(baseline: Model, target: Model): Plan {
                       });
                     }
                     break;
+                  default:
+                    assertNever(identityChange, 'identity change kind');
                 }
               }
               break;
@@ -631,6 +635,8 @@ export function plan(baseline: Model, target: Model): Plan {
               indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.after));
               break;
             }
+            default:
+              assertNever(tableChange, 'table change kind');
           }
         }
         break;
@@ -678,6 +684,8 @@ export function plan(baseline: Model, target: Model): Plan {
         }
         break;
       }
+      default:
+        assertNever(change, 'change kind');
     }
   }
 
