@@ -268,6 +268,16 @@ export type Step =
     };
 
 /**
+ * The exhaustiveness guard for `Step['kind']`: every `switch` that must understand each kind
+ * ends its `default` clause here, so a kind with no case fails to typecheck. It throws with the
+ * offending kind rather than the whole step, when one is present.
+ */
+export function assertNever(value: never): never {
+  const kind = (value as { kind?: unknown }).kind;
+  throw new Error(`Unhandled step kind: ${typeof kind === 'string' ? kind : String(value)}`);
+}
+
+/**
  * Whether each step kind may run inside a transaction. Every kind but the two concurrent index
  * kinds is transactional; the `Record` is compile-time exhaustive over `Step['kind']`, so a
  * future kind must be classified before the package compiles. A `false` kind makes `groupSteps`
