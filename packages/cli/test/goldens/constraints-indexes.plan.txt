@@ -1,8 +1,9 @@
-13 steps in 4 groups:
-  group 1 of 4 (standalone):
-     1. drop-index-concurrently    public.users: index users_age_idx (age)
-  group 2 of 4:
-     2. drop-index                 public.users: index users_email_idx (email)
+13 steps in 5 groups:
+  group 1 of 5:
+     1. drop-index                 public.users: index (email)
+  group 2 of 5 (standalone):
+     2. drop-index-concurrently    public.users: index (age)
+  group 3 of 5:
      3. drop-check-constraint      public.users: check constraint users_age_check CHECK (age >= 18)
      4. drop-unique-constraint     public.users: unique constraint users_nickname_key (nickname)
      5. drop-table                 public.gone
@@ -11,16 +12,19 @@
      8. add-unique-constraint      public.users: unique constraint users_nickname_key_v2 (nickname)
      9. add-check-constraint       public.added: check constraint added_code_check CHECK (code <> '')
     10. add-check-constraint       public.users: check constraint users_age_check CHECK (age >= 0)
-    11. create-index               public.added: unique index added_code_idx (code)
-  group 3 of 4 (standalone):
+    11. create-index               public.added: unique index (code)
+  group 4 of 5 (standalone):
     12. create-index-concurrently  public.users: index users_age_idx_v2 (age)
-  group 4 of 4:
-    13. create-index               public.users: unique index users_email_idx (email)
+  group 5 of 5:
+    13. create-index               public.users: unique index (email)
+
+BEGIN;
+DROP INDEX public.users_email_idx;
+COMMIT;
 
 DROP INDEX CONCURRENTLY public.users_age_idx;
 
 BEGIN;
-DROP INDEX public.users_email_idx;
 ALTER TABLE public.users DROP CONSTRAINT users_age_check;
 ALTER TABLE public.users DROP CONSTRAINT users_nickname_key;
 DROP TABLE public.gone;
@@ -33,11 +37,11 @@ ALTER TABLE public.added ADD CONSTRAINT added_code_key UNIQUE (code);
 ALTER TABLE public.users ADD CONSTRAINT users_nickname_key_v2 UNIQUE (nickname);
 ALTER TABLE public.added ADD CONSTRAINT added_code_check CHECK (code <> '');
 ALTER TABLE public.users ADD CONSTRAINT users_age_check CHECK (age >= 0);
-CREATE UNIQUE INDEX added_code_idx ON public.added USING btree (code);
+CREATE UNIQUE INDEX ON public.added USING btree (code);
 COMMIT;
 
 CREATE INDEX CONCURRENTLY users_age_idx_v2 ON public.users USING btree (age);
 
 BEGIN;
-CREATE UNIQUE INDEX users_email_idx ON public.users USING btree (email);
+CREATE UNIQUE INDEX ON public.users USING btree (email);
 COMMIT;

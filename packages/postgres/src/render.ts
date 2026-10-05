@@ -18,6 +18,8 @@ import type {
   UniqueConstraint,
 } from '@schemamill/core';
 
+import { synthesizedIndexName } from './names.ts';
+
 /**
  * Migration SQL rendering: a migration plan → the migration SQL that moves one schema toward
  * another.
@@ -429,11 +431,6 @@ function synthesizedCheckConstraintName(
 ): string {
   const column = checkExpressionColumn(checkConstraint.expression);
   return column === undefined ? `${table.name}_check` : `${table.name}_${column}_check`;
-}
-
-/** PostgreSQL's conventional index name for an unnamed index. */
-function synthesizedIndexName(table: TableIdentity, index: Index): string {
-  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
 }
 
 /** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */

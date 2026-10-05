@@ -28,7 +28,12 @@
  *   or `NULLS NOT DISTINCT` — is skipped and named whole; an index is never partially
  *   imported. A constraint-backed index is never a standalone `Index`: inline and
  *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
- *   consumes the index it names.
+ *   consumes the index it names. Once every statement is translated, a standalone index whose
+ *   name equals PostgreSQL's conventional `<table>_<cols>_idx` for its structure is
+ *   canonicalized back to unnamed, so a dump of an index the model declared unnamed
+ *   round-trips; the name is kept when an unnamed index of the same structure already exists,
+ *   so no duplicate unnamed entry is manufactured, and a name outside the formula — truncated
+ *   or collision-suffixed — stays named.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -115,6 +120,7 @@ import type {
   SelectStmt,
 } from 'libpg-query';
 
+import { synthesizedIndexName } from './names.ts';
 import { parseDump, type ParseFailure, type ParsedStatement } from './parse.ts';
 import type { PreprocessDiagnostic } from './preprocess.ts';
 
@@ -2088,7 +2094,39 @@ function getOrCreateTable(
   return draft;
 }
 
+/** The duplicate guard's key: `unique` and the ordered columns, the name excluded. */
+function indexStructureKey(index: Index): string {
+  return JSON.stringify([index.unique, index.columns]);
+}
+
+/**
+ * Canonicalizes server-generated index names back to unnamed: a `CREATE INDEX ON t (c)`
+ * applies unnamed and PostgreSQL names the index `t_c_idx`, so a dump import would otherwise
+ * store the generated name and diff as remove + add against the model's unnamed declaration.
+ * An index whose name equals `synthesizedIndexName` is stripped, unless its structural key is
+ * already covered by an unnamed entry — present in the draft or stripped earlier — in which
+ * case the name is kept; the guard keeps the pass from manufacturing a duplicate unnamed entry
+ * in either statement order. Runs in import order before the canonical sort, and names outside
+ * the formula stay named: truncation and collision suffixes are not predictable offline.
+ */
+function canonicalizeIndexNames(draft: TableDraft): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const seen = new Set<string>();
+  for (const index of draft.indexes) {
+    if (index.name === undefined) seen.add(indexStructureKey(index));
+  }
+  for (const index of draft.indexes) {
+    const name = index.name;
+    if (name === undefined || name !== synthesizedIndexName(identity, index)) continue;
+    const key = indexStructureKey(index);
+    if (seen.has(key)) continue;
+    delete (index as Mutable<Index>).name;
+    seen.add(key);
+  }
+}
+
 function finalizeTable(draft: TableDraft): Table {
+  canonicalizeIndexNames(draft);
   const table: Mutable<Table> = {
     schema: draft.schema,
     name: draft.name,
