@@ -60,6 +60,19 @@ const readText = (relativeUrl: string): string =>
 const fixturePath = (relativeUrl: string): string =>
   fileURLToPath(new URL(relativeUrl, import.meta.url));
 
+/** A golden's `Hazards:` block — the header and its `  step ` lines — or `null` when absent. */
+function hazardsBlock(golden: string): string | null {
+  const lines = golden.split('\n');
+  const start = lines.indexOf('Hazards:');
+  if (start === -1) return null;
+  const block = [lines[start]!];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (!lines[index]!.startsWith('  step ')) break;
+    block.push(lines[index]!);
+  }
+  return `${block.join('\n')}\n`;
+}
+
 for (const scene of SCENES) {
   for (const command of COMMANDS) {
     test(`${command} prints exactly the ${scene} golden`, async () => {
@@ -77,3 +90,20 @@ for (const scene of SCENES) {
     });
   }
 }
+
+test('compare and plan pin the same hazards block for the hazards and identity scenes', () => {
+  for (const scene of ['hazards', 'identity'] as const) {
+    const compareBlock = hazardsBlock(readText(`../test/goldens/${scene}.compare.txt`));
+    const planBlock = hazardsBlock(readText(`../test/goldens/${scene}.plan.txt`));
+
+    assert.ok(
+      compareBlock !== null && compareBlock.includes('\n  step '),
+      `${scene}.compare.txt carries no hazards`,
+    );
+    assert.ok(
+      planBlock !== null && planBlock.includes('\n  step '),
+      `${scene}.plan.txt carries no hazards`,
+    );
+    assert.equal(compareBlock, planBlock, `${scene}: compare and plan hazards blocks differ`);
+  }
+});

@@ -189,7 +189,7 @@ const USAGE = [
   '  -h, --help                             display help for command',
   '',
   'Commands:',
-  '  compare [options] <baseline> <target>  Print the diff between two DDL dumps.',
+  '  compare [options] <baseline> <target>  Print the diff and any hazards between two DDL dumps.',
   '  plan [options] <baseline> <target>     Print the migration plan and its SQL between two DDL dumps.',
   '  help [command]                         display help for command',
   '',
@@ -250,7 +250,7 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-test('compare prints the diff, and only the diff, to stdout', async (t) => {
+test('compare prints the diff, and only the diff, when there are no hazards', async (t) => {
   const dir = await fixtureDir(t);
   const baseline = await writeDump(dir, 'baseline.sql', BASELINE_DUMP);
   const target = await writeDump(dir, 'target.sql', TARGET_DUMP);

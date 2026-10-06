@@ -43,3 +43,6 @@
     cache 1
     cycle false
     owned by public.to_serial.id
+
+Hazards:
+  step 12 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
