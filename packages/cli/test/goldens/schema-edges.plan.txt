@@ -13,12 +13,12 @@ BEGIN;
 DROP TABLE public."Quoted Target";
 CREATE TABLE app.gadgets (
     id integer NOT NULL,
-    CONSTRAINT gadgets_pkey PRIMARY KEY (id)
+    PRIMARY KEY (id)
 );
 CREATE TABLE public."Quoted Added" (
     "Key" integer NOT NULL,
     "Value" text,
-    CONSTRAINT "Quoted Added_pkey" PRIMARY KEY ("Key")
+    PRIMARY KEY ("Key")
 );
 CREATE TABLE public.empty_added ();
 ALTER TABLE public."MixedCase" ADD COLUMN "Extra" text;

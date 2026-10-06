@@ -138,20 +138,18 @@ const EXPECTED_MODEL: Model = {
       ],
       foreignKeys: [
         {
-          name: 'orders_parent_id_fkey',
           columns: ['parent_id'],
           referencedTable: { schema: 'app', name: 'orders' },
           referencedColumns: ['id'],
         },
         {
-          name: 'orders_user_id_fkey',
           columns: ['user_id'],
           referencedTable: { schema: 'public', name: 'users' },
           referencedColumns: ['id'],
           onDelete: 'CASCADE',
         },
       ],
-      primaryKey: { name: 'orders_pkey', columns: ['id'] },
+      primaryKey: { columns: ['id'] },
       uniqueConstraints: [],
       checkConstraints: [],
       indexes: [],
@@ -198,9 +196,9 @@ const EXPECTED_MODEL: Model = {
         },
       ],
       foreignKeys: [],
-      primaryKey: { name: 'users_pkey', columns: ['id'] },
+      primaryKey: { columns: ['id'] },
       uniqueConstraints: [{ columns: ['email'] }],
-      checkConstraints: [{ name: 'users_age_check', expression: '(age >= 0)' }],
+      checkConstraints: [{ expression: '(age >= 0)' }],
       indexes: [{ name: 'idx_users_email', unique: false, columns: ['email'] }],
     },
   ],
@@ -352,7 +350,6 @@ test('records only stated referential actions and flags foreign-key extras', asy
 
   assert.deepEqual(child.foreignKeys, [
     {
-      name: 'child_a_fkey',
       columns: ['a'],
       referencedTable: { schema: 'public', name: 'parent' },
       referencedColumns: ['id'],
@@ -360,13 +357,14 @@ test('records only stated referential actions and flags foreign-key extras', asy
       onDelete: 'SET DEFAULT',
     },
     {
-      name: 'child_b_fkey',
       columns: ['b'],
       referencedTable: { schema: 'public', name: 'parent' },
       referencedColumns: ['id'],
     },
   ]);
 
+  // Diagnostics are emitted during statement translation, before canonicalization, so they
+  // keep the source name even though the modeled constraint comes back unnamed.
   assert.deepEqual(
     diagnostics
       .filter((diagnostic) => diagnostic.kind === 'flag')
@@ -384,7 +382,10 @@ test('canonicalizes column-level and table-level unique and check constraints', 
     `    a integer UNIQUE,`,
     `    b integer CHECK (b > 0),`,
     `    c integer,`,
+    `    d integer,`,
     `    CONSTRAINT t_named UNIQUE (c),`,
+    `    CONSTRAINT t_d_key UNIQUE (d),`,
+    `    CONSTRAINT t_c_check CHECK (c > 0),`,
     `    CHECK (a < c)`,
     `);`,
   ].join('\n');
@@ -394,12 +395,19 @@ test('canonicalizes column-level and table-level unique and check constraints', 
   assert.ok(table, 'the table is imported');
 
   // Column-level and table-level forms canonicalize alike: a unique constraint is its ordered
-  // columns, a check constraint its expression, and both arrays sort deterministically.
+  // columns, a check constraint its expression, and both arrays sort deterministically. A name
+  // that exactly matches PostgreSQL's conventional formula strips (`t_d_key`, `t_c_check`);
+  // `t_named` does not match any formula and stays.
   assert.deepEqual(table.uniqueConstraints, [
     { columns: ['a'] },
     { name: 't_named', columns: ['c'] },
+    { columns: ['d'] },
   ]);
-  assert.deepEqual(table.checkConstraints, [{ expression: 'a < c' }, { expression: 'b > 0' }]);
+  assert.deepEqual(table.checkConstraints, [
+    { expression: 'a < c' },
+    { expression: 'b > 0' },
+    { expression: 'c > 0' },
+  ]);
   // A constraint-backed index is never a standalone Index.
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics, []);
@@ -438,8 +446,12 @@ test('imports ALTER TABLE ADD CONSTRAINT unique and check, flagging dropped attr
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
+  // `t_a_key` matches PostgreSQL's formula for `UNIQUE (a)` and canonicalizes back to unnamed;
+  // the other unique names do not match their formulas and stay. `t_check` names a
+  // single-column expression with the generic shape, not the formula (`t_a_check`), so it
+  // stays named too.
   assert.deepEqual(table.uniqueConstraints, [
-    { name: 't_a_key', columns: ['a'] },
+    { columns: ['a'] },
     { name: 't_nd_key', columns: ['b'] },
     { name: 't_def_key', columns: ['c'] },
   ]);
@@ -543,6 +555,346 @@ test('a conventional name round-trips against an unnamed declaration with an emp
   assert.deepEqual(diff(baseline, target), []);
 });
 
+test('canonicalizes the conventional primary-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_pkey PRIMARY KEY (a));`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_custom_pkey PRIMARY KEY (b));`,
+    `CREATE TABLE public.v (c integer, CONSTRAINT v_pkey1 PRIMARY KEY (c));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const primaryKeyOf = (name: string) =>
+    model.tables.find((table) => table.name === name)?.primaryKey;
+
+  // PostgreSQL names an unnamed primary key `<table>_pkey`; a collision suffix (`v_pkey1`) and
+  // any other name (`u_custom_pkey`) are outside the formula and stay named. There is no twin
+  // guard: PostgreSQL allows one primary key per table.
+  assert.deepEqual(primaryKeyOf('t'), { columns: ['a'] });
+  assert.deepEqual(primaryKeyOf('u'), { name: 'u_custom_pkey', columns: ['b'] });
+  assert.deepEqual(primaryKeyOf('v'), { name: 'v_pkey1', columns: ['c'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional unique-constraint name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key1 UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_key UNIQUE (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_a_key UNIQUE (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_ab_key UNIQUE (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact `<table>_<cols>_key` formula strips, in the constraint's own column order:
+  // `t_b_key` names the wrong column for `(a)`, `t_a_key1` is a collision suffix,
+  // `t_b_a_key` lists the columns in the wrong order, and `t_ab_key` lacks the separator.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['a'] },
+    { name: 't_a_key1', columns: ['a'] },
+    { name: 't_b_key', columns: ['a'] },
+    { columns: ['a', 'b'] },
+    { name: 't_ab_key', columns: ['a', 'b'] },
+    { name: 't_b_a_key', columns: ['a', 'b'] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional foreign-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.parent2 (x integer, y integer, PRIMARY KEY (x, y));`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey1 FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_a_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_ab_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact `<table>_<cols>_fkey` formula strips, in the constraint's own column order:
+  // `t_b_fkey` names the wrong column for `(a)`, `t_a_fkey1` is a collision suffix,
+  // `t_b_a_fkey` lists the columns in the wrong order, and `t_ab_fkey` lacks the separator.
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 't_a_fkey1',
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 't_b_fkey',
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+    {
+      name: 't_ab_fkey',
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+    {
+      name: 't_b_a_fkey',
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional check-constraint name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_check CHECK (a > 0 AND b > 0);`,
+    `CREATE TABLE public.u (c integer);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_c_check CHECK (c IS NOT NULL);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_check CHECK (true);`,
+    `CREATE TABLE public.v (d integer);`,
+    `ALTER TABLE ONLY public.v ADD CONSTRAINT v_check CHECK (d > 0);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const checksOf = (name: string) =>
+    model.tables.find((candidate) => candidate.name === name)?.checkConstraints;
+
+  // A single-column expression strips only as `<table>_<col>_check`: `t_b_check` names the
+  // wrong column for `a > 0`, and a generic `<table>_check` on a single-column expression
+  // (`v_check`) stays, because PostgreSQL would have assigned `v_d_check`. A multi-column
+  // expression (`t_check`) and a zero-column one (`u_check`) are the generic shape and strip.
+  assert.deepEqual(checksOf('t'), [
+    { expression: 'a > 0' },
+    { name: 't_b_check', expression: 'a > 0' },
+    { expression: 'a > 0 AND b > 0' },
+  ]);
+  assert.deepEqual(checksOf('u'), [{ expression: 'c IS NOT NULL' }, { expression: 'true' }]);
+  assert.deepEqual(checksOf('v'), [{ name: 'v_check', expression: 'd > 0' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a conventional unique name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (a);`,
+  ];
+  const expected = [{ columns: ['a'] }, { name: 't_a_key', columns: ['a'] }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer, b integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the conventional entry: exactly one unnamed entry survives
+    // in either order, so no duplicate unnamed entry is manufactured.
+    assert.deepEqual(table.uniqueConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a conventional foreign-key name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a) REFERENCES public.parent(id);`,
+  ];
+  const parent = { schema: 'public', name: 'parent' };
+  const expected = [
+    { columns: ['a'], referencedTable: parent, referencedColumns: ['id'] },
+    { name: 't_a_fkey', columns: ['a'], referencedTable: parent, referencedColumns: ['id'] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [
+      `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+      `CREATE TABLE public.t (a integer);`,
+      ...order,
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    assert.deepEqual(table.foreignKeys, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('strips a conventional foreign-key name beside a twin differing only in an action', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a) REFERENCES public.parent(id) ON DELETE CASCADE;`,
+  ];
+  const parent = { schema: 'public', name: 'parent' };
+  const plain = { columns: ['a'], referencedTable: parent, referencedColumns: ['id'] };
+  const cascading = {
+    columns: ['a'],
+    referencedTable: parent,
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  };
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer);`,
+  ];
+
+  // The twin guard's key is equality-minus-name: the named foreign key differs from the
+  // unnamed twin in `onDelete`, so it is not a twin, stripping manufactures no duplicate, and
+  // the name is stripped. The core diff's narrower `foreignKeyIdentity` (columns and target
+  // only) would have treated them as twins and kept the name, silently losing the action —
+  // equality-minus-name here is deliberate.
+  const { model: first } = await importDump([...dump, ...statements].join('\n'));
+  assert.deepEqual(first.tables.find((candidate) => candidate.name === 't')?.foreignKeys, [
+    plain,
+    cascading,
+  ]);
+  const { model: second } = await importDump([...dump, ...[...statements].reverse()].join('\n'));
+  assert.deepEqual(second.tables.find((candidate) => candidate.name === 't')?.foreignKeys, [
+    cascading,
+    plain,
+  ]);
+});
+
+test('keeps a conventional check name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (a > 0);`,
+  ];
+  const expected = [{ expression: 'a > 0' }, { name: 't_a_check', expression: 'a > 0' }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    assert.deepEqual(table.checkConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('a conventional constraint name round-trips against an unnamed declaration with an empty diff', async () => {
+  const named = [
+    `CREATE TABLE public.parent (x integer, y integer);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.parent(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.parent (x integer, y integer);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a, b) REFERENCES public.parent(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (a > 0);`,
+  ].join('\n');
+
+  const { model: baseline } = await importDump(named);
+  const { model: target } = await importDump(unnamed);
+  assert.deepEqual(diff(baseline, target), []);
+});
+
+test('keeps a check name the best-effort formula does not predict', async () => {
+  const named = [
+    `CREATE TABLE public.t (a timestamp);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (EXTRACT(epoch FROM a) = 0);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.t (a timestamp);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (EXTRACT(epoch FROM a) = 0);`,
+  ].join('\n');
+
+  const { model } = await importDump(named);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The lexical scan counts `epoch` as a column reference — it is not a function name, a type
+  // after `::`, a CAST alias, or a key word — so the helper predicts `t_check`, while
+  // PostgreSQL cooks the expression to one column, `a`, and names the constraint `t_a_check`.
+  // The name therefore stays, and an import compared against an unnamed declaration of the
+  // same check still reads changed: the fail-safe side of the best-effort formula.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_a_check', expression: 'EXTRACT(epoch FROM a) = 0' },
+  ]);
+  const { model: expected } = await importDump(unnamed);
+  assert.deepEqual(diff(model, expected), [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 't' },
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: { name: 't_a_check', expression: 'EXTRACT(epoch FROM a) = 0' },
+          after: { expression: 'EXTRACT(epoch FROM a) = 0' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('an unnamed foreign key without referenced columns still reads changed after a dump', async () => {
+  const declared = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.child (a integer);`,
+    `ALTER TABLE ONLY public.child ADD CONSTRAINT child_a_fkey FOREIGN KEY (a) REFERENCES public.parent;`,
+  ].join('\n');
+  const serverDump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.child (a integer);`,
+    `ALTER TABLE ONLY public.child ADD CONSTRAINT child_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+  ].join('\n');
+
+  const { model: declaredModel } = await importDump(declared);
+  const { model: serverModel } = await importDump(serverDump);
+
+  // Both declarations canonicalize `child_a_fkey` back to unnamed, but a server dump always
+  // carries the concrete referenced-column list, so the residual mismatch is not the name:
+  // the unnamed declaration states none and the import reads changed on `referencedColumns`.
+  assert.deepEqual(diff(declaredModel, serverModel), [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'child' },
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: {
+            columns: ['a'],
+            referencedTable: { schema: 'public', name: 'parent' },
+            referencedColumns: [],
+          },
+          after: {
+            columns: ['a'],
+            referencedTable: { schema: 'public', name: 'parent' },
+            referencedColumns: ['id'],
+          },
+        },
+      ],
+    },
+  ]);
+});
+
 test('skips whole indexes with elements or clauses outside the minimal envelope', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
@@ -611,9 +963,11 @@ test('consumes a plain unique index into a USING INDEX constraint', async () => 
   assert.ok(table, 'the table is imported');
 
   // The constraint absorbs the index, taking the stated name or the index's when unnamed; no
-  // standalone Index survives.
+  // standalone Index survives. A swallowed name that matches the conventional unique formula
+  // (`t_a_key` for `(a)`) canonicalizes back to unnamed; `t_b_idx` is an index name, not the
+  // formula for `(b)`, so it stays named.
   assert.deepEqual(table.uniqueConstraints, [
-    { name: 't_a_key', columns: ['a'] },
+    { columns: ['a'] },
     { name: 't_b_idx', columns: ['b'] },
   ]);
   assert.deepEqual(table.indexes, []);

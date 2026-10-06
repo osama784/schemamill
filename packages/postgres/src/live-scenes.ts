@@ -56,8 +56,9 @@ import type {
  * (`identity-drop`) — and both conversions between an identity and an owned `nextval` default
  * reusing the same sequence name (`identity-to-sequence`, `sequence-to-identity`).
  *
- * The constraint and index scenes cover this slice's shapes: named and unnamed unique and
- * check constraints on a new table (`constraint-create`), a plain and a unique standalone
+ * The constraint and index scenes cover this slice's shapes: named and unnamed primary-key,
+ * unique, foreign-key, and check constraints on a new table (`constraint-create`), a plain and
+ * a unique standalone
  * index beside a partial and an expression index the model cannot declare (`index-create`),
  * a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
  * transactional steps (`index-concurrently`), a target whose unnamed single-column,
@@ -2459,13 +2460,15 @@ const sequenceToIdentityScene = (): LiveScene => {
 };
 
 /**
- * The constraint round trip: a target whose unique and check constraints span named and
- * unnamed declarations, single- and multi-column. The model canonicalizes every declaration to
- * table level — PostgreSQL does not record whether a constraint was declared on a column or on
- * the table — so the scene proves the canonical shape renders, applies under `ON_ERROR_STOP=1`,
- * dumps, and imports back with the constraints intact: `pg_constraint` spot-checks the
- * PostgreSQL-assigned names, and the import check proves the constraint-backed indexes are not
- * modeled as standalone `Index` entries.
+ * The constraint round trip: a target whose primary key, unique, foreign-key, and check
+ * constraints span named and unnamed declarations (the unnamed foreign key states its
+ * referenced column list). The model canonicalizes every declaration to table level —
+ * PostgreSQL does not record whether a constraint was declared on a column or on the table —
+ * so the scene proves the canonical shape renders, applies under `ON_ERROR_STOP=1`, dumps, and
+ * imports back with the constraints intact: `pg_constraint` spot-checks the conventional names
+ * PostgreSQL assigned, and the import check proves those names came back unnamed, the
+ * constraint-backed indexes are not modeled as standalone `Index` entries, and the known miss
+ * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name.
  */
 const constraintCreateScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -2475,8 +2478,11 @@ const constraintCreateScene = (): LiveScene => {
       column('tenant', { notNull: true }),
       column('name', { notNull: true }),
       column('age', { type: 'integer' }),
+      column('manager_id', { type: 'bigint' }),
+      column('created_at', { type: 'timestamp' }),
     ],
-    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+    primaryKey: { columns: ['id'] },
+    foreignKeys: [foreignKey(['manager_id'], identity('accounts'), { referencedColumns: ['id'] })],
     uniqueConstraints: [
       { name: 'accounts_email_key', columns: ['email'] },
       { columns: ['tenant', 'name'] },
@@ -2485,6 +2491,7 @@ const constraintCreateScene = (): LiveScene => {
       { name: 'accounts_age_check', expression: 'age >= 0' },
       { expression: 'age >= 0 AND char_length(name) > 0' },
       { expression: 'char_length(email) > 0' },
+      { expression: 'EXTRACT(epoch FROM created_at) = 0' },
     ],
   });
 
@@ -2500,7 +2507,8 @@ const constraintCreateScene = (): LiveScene => {
           const kinds = steps.map((step) => step.kind).join(',');
           return kinds ===
             'create-table,add-unique-constraint,add-unique-constraint,' +
-              'add-check-constraint,add-check-constraint,add-check-constraint'
+              'add-check-constraint,add-check-constraint,add-check-constraint,' +
+              'add-check-constraint,add-foreign-key'
             ? undefined
             : `unexpected steps: ${kinds}`;
         },
@@ -2508,26 +2516,40 @@ const constraintCreateScene = (): LiveScene => {
     ],
     importChecks: [
       {
-        description: 'the import models every constraint and no constraint-backed index',
+        description:
+          'the import canonicalizes conventional constraint names and keeps the formula miss',
         failure: (imported) => {
           const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
           if (table === undefined) return 'accounts is not imported';
           const indexes = table.indexes.map((index) => index.name ?? '<unnamed>');
           if (indexes.length > 0) return `standalone indexes imported: ${indexes.join(',')}`;
+          if (table.primaryKey === undefined) return 'the primary key is not imported';
+          if (table.primaryKey.name !== undefined) {
+            return `primary key name: ${table.primaryKey.name}`;
+          }
+          const foreign = table.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}->` +
+                constraint.referencedColumns.join(','),
+            )
+            .join(' ');
+          if (foreign !== '<unnamed>:manager_id->id') return `foreign keys: ${foreign}`;
           const unique = table.uniqueConstraints
             .map(
               (constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}`,
             )
             .join(' ');
-          if (unique !== 'accounts_email_key:email accounts_tenant_name_key:tenant,name') {
+          if (unique !== '<unnamed>:email <unnamed>:tenant,name') {
             return `unique constraints: ${unique}`;
           }
           const checks = table.checkConstraints
             .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
             .join(' ');
           const expectedChecks =
-            'accounts_check:((age >= 0) AND(char_length(name) > 0))' +
-            ' accounts_age_check:(age >= 0) accounts_email_check:(char_length(email) > 0)';
+            '<unnamed>:((age >= 0) AND(char_length(name) > 0))' +
+            ' accounts_created_at_check:(EXTRACT(epoch FROM created_at) =(0)::numeric)' +
+            ' <unnamed>:(age >= 0) <unnamed>:(char_length(email) > 0)';
           if (checks !== expectedChecks) return `check constraints: ${checks}`;
           return undefined;
         },
@@ -2536,14 +2558,35 @@ const constraintCreateScene = (): LiveScene => {
     checks: [
       { description: 'tables', sql: TABLES, expected: 'accounts' },
       {
-        description: 'unique constraint names',
+        description: 'the primary-key name, assigned by PostgreSQL',
+        sql: constraintNames('accounts', 'p'),
+        expected: 'accounts_pkey',
+      },
+      {
+        description: 'the foreign-key name, assigned by PostgreSQL',
+        sql: constraintNames('accounts', 'f'),
+        expected: 'accounts_manager_id_fkey',
+      },
+      {
+        description: 'unique constraint names, assigned by PostgreSQL',
         sql: constraintNames('accounts', 'u'),
         expected: 'accounts_email_key,accounts_tenant_name_key',
       },
       {
         description: 'check constraint names, assigned by PostgreSQL',
         sql: constraintNames('accounts', 'c'),
-        expected: 'accounts_age_check,accounts_check,accounts_email_check',
+        expected:
+          'accounts_age_check,accounts_check,accounts_created_at_check,accounts_email_check',
+      },
+      {
+        description: 'the unnamed primary-key definition',
+        sql: constraintDef('accounts_pkey'),
+        expected: 'PRIMARY KEY (id)',
+      },
+      {
+        description: 'the unnamed foreign-key definition',
+        sql: constraintDef('accounts_manager_id_fkey'),
+        expected: 'FOREIGN KEY (manager_id) REFERENCES accounts(id)',
       },
       {
         description: 'the unnamed unique constraint definition',
@@ -2564,6 +2607,11 @@ const constraintCreateScene = (): LiveScene => {
         description: 'the unnamed multi-column check definition',
         sql: constraintDef('accounts_check'),
         expected: 'CHECK (((age >= 0) AND (char_length(name) > 0)))',
+      },
+      {
+        description: 'the check the best-effort formula does not predict',
+        sql: constraintDef('accounts_created_at_check'),
+        expected: 'CHECK ((EXTRACT(epoch FROM created_at) = (0)::numeric))',
       },
       {
         description: 'the unique constraint owns its backing index',
