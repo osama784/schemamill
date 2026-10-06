@@ -1,15 +1,19 @@
-import { diff } from '@schemamill/core';
+import { diff, plan } from '@schemamill/core';
+import { hazardAnalyzer } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
-import { formatChanges } from './format.ts';
+import { formatChanges, formatHazards } from './format.ts';
 import { importPair } from './run.ts';
 
 /**
- * The `compare` command: read two DDL dumps and print the diff from baseline to target.
+ * The `compare` command: read two DDL dumps and print the diff from baseline to target, then
+ * the same `Hazards:` block `plan` prints for the pair.
  *
- * Wiring only — the diff comes from `@schemamill/core`, the diagnostic lines from
- * `diagnostics.ts`, and the human wording from `format.ts`. An `error` diagnostic makes the
- * exit code 1, but the diff is still printed.
+ * Wiring only — the diff and plan come from `@schemamill/core`, the hazards from
+ * `@schemamill/postgres`, and the human wording from `format.ts`. The hazard step numbers are
+ * indices into the migration plan's step order; `compare` prints no step list, so a line's
+ * `step <n>` refers to the step `schemamill plan` would number `<n>`. An `error` diagnostic
+ * makes the exit code 1, but the diff is still printed.
  */
 
 interface CompareOptions {
@@ -20,7 +24,7 @@ interface CompareOptions {
 export function registerCompare(program: Command): void {
   program
     .command('compare')
-    .description('Print the diff between two DDL dumps.')
+    .description('Print the diff and any hazards between two DDL dumps.')
     .argument('<baseline>', 'path to the baseline DDL dump')
     .argument('<target>', 'path to the target DDL dump')
     .option('--verbose', 'list every import diagnostic')
@@ -30,7 +34,12 @@ export function registerCompare(program: Command): void {
         process.exitCode = 1;
         return;
       }
-      process.stdout.write(formatChanges(diff(imported.baseline, imported.target)));
+      const planned = plan(imported.baseline, imported.target);
+      const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+      const hazardsBlock = hazards.length > 0 ? `\n${formatHazards(hazards)}` : '';
+      process.stdout.write(
+        `${formatChanges(diff(imported.baseline, imported.target))}${hazardsBlock}`,
+      );
       process.exitCode = imported.exitCode;
     });
 }
