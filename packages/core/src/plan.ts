@@ -817,21 +817,34 @@ export function applyChange(application: ChangeApplication, change: Change): voi
     }
     case 'sequence-changed': {
       const identity = copySequenceIdentity(change.sequence);
-      const ownership = change.changes.filter((field) => field.field === 'ownedBy');
-      const options = change.changes.filter((field) => field.field !== 'ownedBy');
+      const options: SequenceFieldChange[] = [];
+      for (const field of change.changes) {
+        switch (field.field) {
+          case 'ownedBy':
+            application.ownershipChanges.push({
+              sequence: copySequenceIdentity(identity),
+              ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
+              ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+            });
+            break;
+          case 'dataType':
+          case 'increment':
+          case 'minValue':
+          case 'maxValue':
+          case 'start':
+          case 'cache':
+          case 'cycle':
+            options.push(copyStepPayload(field));
+            break;
+          default:
+            assertNever(field, 'sequence field');
+        }
+      }
       if (options.length > 0) {
         application.optionAlters.push({
           kind: 'alter-sequence',
           sequence: identity,
-          fields: options.map(copySequenceFieldChange),
-        });
-      }
-      for (const field of ownership) {
-        if (field.field !== 'ownedBy') continue;
-        application.ownershipChanges.push({
-          sequence: copySequenceIdentity(identity),
-          ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-          ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+          fields: options,
         });
       }
       break;
@@ -978,14 +991,25 @@ function copyUniqueConstraint(uniqueConstraint: UniqueConstraint): UniqueConstra
   return { ...uniqueConstraint, columns: [...uniqueConstraint.columns] };
 }
 
+/**
+ * A deep copy of a step-embedded payload, independent of the diff's `Change`. `structuredClone`
+ * preserves the payload's shape — undefined-valued keys and key order included — and throws
+ * loudly on a non-cloneable value (payloads are plain data). Every payload that reaches a step
+ * through a whole-object copy goes through here, so a future nested field cannot alias the
+ * diff's change.
+ */
+function copyStepPayload<T>(value: T): T {
+  return structuredClone(value);
+}
+
 /** A copy of `checkConstraint`, independent of the caller's model. */
 function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint {
-  return { ...checkConstraint };
+  return copyStepPayload(checkConstraint);
 }
 
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
-  return { ...index, columns: [...index.columns] };
+  return copyStepPayload(index);
 }
 
 /** The create step for `index`: concurrent exactly when the index states `concurrently`. */
@@ -1008,12 +1032,12 @@ function indexDropStep(table: TableIdentity, index: Index): Step {
 
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of one identity field change, independent of the diff's payload. */
 function copyIdentityFieldChange(field: IdentityFieldChange): IdentityFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of a column's identity descriptor, independent of the caller's model. */
@@ -1028,16 +1052,6 @@ function copyColumnIdentity(identity: Identity): Identity {
             name: identity.sequenceName.name,
           },
         }),
-  };
-}
-
-/** A copy of one sequence field change, independent of the diff's payload. */
-function copySequenceFieldChange(field: SequenceFieldChange): SequenceFieldChange {
-  if (field.field !== 'ownedBy') return { ...field };
-  return {
-    field: 'ownedBy',
-    ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-    ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
   };
 }
 

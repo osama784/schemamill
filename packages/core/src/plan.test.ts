@@ -12,6 +12,7 @@ import {
 import type { Identity, IdentityInput } from './identity.ts';
 import type {
   Change,
+  ColumnFieldChange,
   IdentityChange,
   IdentityFieldChange,
   SequenceFieldChange,
@@ -4678,6 +4679,124 @@ test('applyChange splits a changed sequence into option and ownership buckets', 
   for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
 });
 
+/**
+ * Payload-aliasing guards: a step payload must not share nested objects with the `Change` it
+ * came from, even fields the current payload types do not declare. Each case fabricates a
+ * nested `nested` field on the input, applies the change through the seam, mutates the nested
+ * object through the produced step payload, and asserts the input never moved. These pin the
+ * bare spreads converted to `copyStepPayload` deep copies.
+ */
+
+/** One aliasing case: how to build the change around the fabricated object and where to find it. */
+interface AliasCase {
+  readonly name: string;
+  readonly build: (nested: { deep: string }) => Change;
+  readonly payload: (application: ChangeApplication) => Record<string, unknown>;
+}
+
+/** The embedded payload of the only step in `steps`, cast for the aliasing probe. */
+const onlyPayload = (steps: readonly Step[], key: string): Record<string, unknown> => {
+  assert.equal(steps.length, 1, `expected exactly one step, got ${steps.length}`);
+  return (steps[0] as unknown as Record<string, Record<string, unknown>>)[key]!;
+};
+
+/** The only field change of the only step in `steps`, cast for the aliasing probe. */
+const onlyFieldPayload = (steps: readonly Step[]): Record<string, unknown> => {
+  assert.equal(steps.length, 1, `expected exactly one step, got ${steps.length}`);
+  const fields = (steps[0] as unknown as { fields: readonly Record<string, unknown>[] }).fields;
+  assert.equal(fields.length, 1, `expected exactly one field, got ${fields.length}`);
+  return fields[0]!;
+};
+
+const aliasCases: readonly AliasCase[] = [
+  {
+    name: 'index create',
+    build: (nested) =>
+      tableChanged({
+        kind: 'index-added',
+        index: { ...index(['a']), nested } as unknown as Index,
+      }),
+    payload: (application) => onlyPayload(application.indexCreates, 'index'),
+  },
+  {
+    name: 'index drop',
+    build: (nested) =>
+      tableChanged({
+        kind: 'index-removed',
+        index: { ...index(['a']), nested } as unknown as Index,
+      }),
+    payload: (application) => onlyPayload(application.indexDrops, 'index'),
+  },
+  {
+    name: 'check constraint',
+    build: (nested) =>
+      tableChanged({
+        kind: 'check-constraint-added',
+        checkConstraint: {
+          ...checkConstraint('a > 0'),
+          nested,
+        } as unknown as CheckConstraint,
+      }),
+    payload: (application) => onlyPayload(application.checkConstraintAdds, 'checkConstraint'),
+  },
+  {
+    name: 'column field change',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [
+          { field: 'notNull', before: false, after: true, nested } as unknown as ColumnFieldChange,
+        ],
+      }),
+    payload: (application) => onlyFieldPayload(application.columnAlters),
+  },
+  {
+    name: 'column identity field change',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [],
+        identity: {
+          kind: 'changed',
+          fields: [
+            {
+              field: 'increment',
+              before: '1',
+              after: '2',
+              nested,
+            } as unknown as IdentityFieldChange,
+          ],
+        },
+      }),
+    payload: (application) => onlyFieldPayload(application.identityAlters),
+  },
+  {
+    name: 'sequence option',
+    build: (nested) =>
+      sequenceChanged([
+        { field: 'increment', before: '1', after: '2', nested } as unknown as SequenceFieldChange,
+      ]),
+    payload: (application) => onlyFieldPayload(application.optionAlters),
+  },
+];
+
+for (const { name, build, payload } of aliasCases) {
+  test(`a step payload deep-copies a fabricated nested field: ${name}`, () => {
+    const nested = { deep: 'original' };
+    const application = applyIsolated(build(nested));
+    const produced = payload(application);
+
+    (produced['nested'] as { deep: string }).deep = 'mutated';
+    assert.equal(
+      nested.deep,
+      'original',
+      'mutating the produced step payload must not mutate the input change',
+    );
+  });
+}
+
 // Deletion detectors, not pipeline validation: `diff` never emits an unknown kind, so these
 // pin the guards that make every future union member a compile error, and the seam contract
 // #50 extends with property coverage.
@@ -4708,5 +4827,16 @@ test('a fabricated identity change kind is rejected by the application guard', (
         columnIdentityChanged({ kind: 'frobnicate' } as unknown as IdentityChange),
       ),
     /Unhandled identity change kind: frobnicate/,
+  );
+});
+
+test('a fabricated sequence field is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        sequenceChanged([{ field: 'frobnicate' } as unknown as SequenceFieldChange]),
+      ),
+    /Unhandled sequence field: frobnicate/,
   );
 });
