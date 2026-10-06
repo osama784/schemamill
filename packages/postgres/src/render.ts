@@ -36,7 +36,11 @@ import {
  * the empty string. The plan's groups must partition its steps — non-empty half-open ranges
  * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
  * guarantees this contract, and a malformed partition throws before any SQL is rendered,
- * naming the violated invariant and the offending indices. `renderSql` walks the plan's
+ * naming the violated invariant and the offending indices. A plan that renders two index
+ * statements of one polarity on one table under one name is refused with `RenderRefusalError`
+ * before anything renders: the second create could not claim the name, and the second drop
+ * would already be gone. A drop and a create of one name are different statements —
+ * `index-changed` decomposes that way — and render. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
  * a standalone group renders its statements bare. A plan with more than one group separates
  * them with one blank line; single-group output is unchanged. `create-table` is the one
@@ -207,11 +211,25 @@ export const RESERVED_KEYWORDS: ReadonlySet<string> = new Set([
 const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 
 /**
+ * Thrown by `renderSql` when a plan cannot render soundly: two index statements of one polarity
+ * on one table resolve to the same name. Callers that report the refusal instead of crashing —
+ * the CLI — catch exactly this class.
+ */
+export class RenderRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RenderRefusalError';
+  }
+}
+
+/**
  * The migration SQL for `plan`, deterministic. `plan.groups` must tile `[0, plan.steps.length)`;
- * a malformed partition throws before anything renders.
+ * a malformed partition throws before anything renders, and so does a plan whose index
+ * statements of one table and polarity would share a name.
  */
 export function renderSql(plan: Plan): string {
   assertGroupsTileSteps(plan);
+  assertIndexNamesUnique(plan);
   if (plan.steps.length === 0) return '';
   const groups: string[] = [];
   for (const group of plan.groups) {
@@ -263,6 +281,63 @@ function assertGroupsTileSteps(plan: Plan): void {
   if (expected !== stepCount) {
     throw new Error(`plan.groups must tile [0, ${stepCount}), but the groups end at ${expected}`);
   }
+}
+
+/**
+ * Refuses a plan that renders two index statements of one polarity on one table under one
+ * resolved name — explicit for a named index, PostgreSQL's conventional name for an unnamed
+ * one. Two creates would collide at apply time, and two drops would drop one name twice, so
+ * the SQL cannot satisfy the plan; explicit-vs-explicit duplicates are refused too. A drop and
+ * a create of one name are different statements — `index-changed` decomposes that way — and
+ * render. Only same-table groups are considered: a named index's uniqueness spans its schema,
+ * which the plan does not model.
+ */
+function assertIndexNamesUnique(plan: Plan): void {
+  const claimed = new Map<string, IndexStatement>();
+  for (const step of plan.steps) {
+    const statement = indexStatement(step);
+    if (statement === undefined) continue;
+    const { table, index, polarity } = statement;
+    const name = index.name ?? synthesizedIndexName(table, index);
+    const key = JSON.stringify([table.schema, table.name, polarity, name]);
+    const previous = claimed.get(key);
+    if (previous !== undefined) {
+      throw new RenderRefusalError(
+        `refusing to render: index ${polarity} on ${renderTable(table)} would share the name ` +
+          `${JSON.stringify(name)}: ${describeIndex(previous.index)} and ${describeIndex(index)}`,
+      );
+    }
+    claimed.set(key, statement);
+  }
+}
+
+/** One index statement's table, index, and polarity, for the duplicate-name guard. */
+interface IndexStatement {
+  readonly table: TableIdentity;
+  readonly index: Index;
+  readonly polarity: 'creates' | 'drops';
+}
+
+/** The index payload of an index step, or `undefined` for every other kind. */
+function indexStatement(step: Step): IndexStatement | undefined {
+  switch (step.kind) {
+    case 'create-index':
+    case 'create-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'creates' };
+    case 'drop-index':
+    case 'drop-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'drops' };
+    default:
+      return undefined;
+  }
+}
+
+/** A refusal-message fragment naming one index by its columns and, when stated, its name. */
+function describeIndex(index: Index): string {
+  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
+  return index.name === undefined
+    ? `an unnamed index on (${columns})`
+    : `an index named ${JSON.stringify(index.name)} on (${columns})`;
 }
 
 /** Binds `renderSql` to the `SqlRenderer` seam. */
