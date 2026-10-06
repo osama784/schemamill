@@ -23,15 +23,15 @@ A table's attribute, named as PostgreSQL names it. Tables have columns.
 _Avoid_: field, attribute
 
 **Primary key**:
-A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one.
+A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one. On import, a primary key whose name is exactly PostgreSQL's generated name for it (`<table>_pkey`) is canonicalized back to unnamed, so a dump of a model-declared unnamed primary key round-trips.
 _Avoid_: pk, key
 
 **Unique constraint**:
-A table constraint requiring an ordered list of its columns to be unique together, named in the source or left unnamed. A unique constraint is never modeled as, or accompanied by, an index.
+A table constraint requiring an ordered list of its columns to be unique together, named in the source or left unnamed. A unique constraint is never modeled as, or accompanied by, an index. On import, a unique constraint whose name is exactly PostgreSQL's generated name for it (`<table>_<cols>_key`) is canonicalized back to unnamed, so a dump of a model-declared unnamed unique constraint round-trips.
 _Avoid_: unique index, key
 
 **Check constraint**:
-A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed.
+A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed. On import, a check constraint whose name is exactly PostgreSQL's generated name for it (`<table>_<column>_check`, or `<table>_check` when the expression does not single out one column) is canonicalized back to unnamed, so a dump of a model-declared unnamed check constraint round-trips.
 _Avoid_: validation rule, predicate
 
 **Index**:
@@ -47,7 +47,7 @@ A link between two tables in the model — what the canvas draws and the plan cr
 _Avoid_: connection, edge, link
 
 **Foreign key**:
-The PostgreSQL constraint behind a relationship. The same fact in the database's language.
+The PostgreSQL constraint behind a relationship. The same fact in the database's language. On import, a foreign key whose name is exactly PostgreSQL's generated name for it (`<table>_<cols>_fkey`) is canonicalized back to unnamed, so a dump of a model-declared unnamed foreign key round-trips.
 _Avoid_: connection, reference
 
 **Snapshot**:
