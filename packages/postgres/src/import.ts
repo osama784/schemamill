@@ -29,11 +29,13 @@
  *   imported. A constraint-backed index is never a standalone `Index`: inline and
  *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
  *   consumes the index it names. Once every statement is translated, a standalone index whose
- *   name equals PostgreSQL's conventional `<table>_<cols>_idx` for its structure is
- *   canonicalized back to unnamed, so a dump of an index the model declared unnamed
- *   round-trips; the name is kept when an unnamed index of the same structure already exists,
- *   so no duplicate unnamed entry is manufactured, and a name outside the formula — truncated
- *   or collision-suffixed — stays named.
+ *   name equals PostgreSQL's conventional `<table>_<cols>_idx` for its structure, and a
+ *   primary key, unique constraint, foreign key, or check constraint whose name equals the
+ *   conventional formula for its structure, are canonicalized back to unnamed, so a dump of a
+ *   declaration the model makes unnamed round-trips; a name is kept when an unnamed entry of
+ *   the same structure already exists, so no duplicate unnamed entry is manufactured, and a
+ *   name outside the formula — truncated or collision-suffixed, or an expression the
+ *   best-effort check formula does not predict — stays named.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -120,7 +122,13 @@ import type {
   SelectStmt,
 } from 'libpg-query';
 
-import { synthesizedIndexName } from './names.ts';
+import {
+  synthesizedCheckConstraintName,
+  synthesizedForeignKeyName,
+  synthesizedIndexName,
+  synthesizedPrimaryKeyName,
+  synthesizedUniqueConstraintName,
+} from './names.ts';
 import { parseDump, type ParseFailure, type ParsedStatement } from './parse.ts';
 import type { PreprocessDiagnostic } from './preprocess.ts';
 
@@ -2099,6 +2107,35 @@ function indexStructureKey(index: Index): string {
   return JSON.stringify([index.unique, index.columns]);
 }
 
+/** The duplicate guard's key for a unique constraint: the ordered columns, the name excluded. */
+function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): string {
+  return JSON.stringify([uniqueConstraint.columns]);
+}
+
+/** The duplicate guard's key for a check constraint: the expression, the name excluded. */
+function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
+  return JSON.stringify([checkConstraint.expression]);
+}
+
+/**
+ * The duplicate guard's key for a foreign key: every modeled field but the name — the
+ * referencing columns, the target, the referenced columns, and both actions, with an absent
+ * action distinct from a stated one. The key is equality-minus-name: a name is kept only
+ * beside a twin identical modulo name; a twin differing in referenced columns or actions has
+ * a different key, the guard does not fire, and the name is stripped. The core diff matches
+ * foreign keys more narrowly (`foreignKeyIdentity`: columns and target only).
+ */
+function foreignKeyStructureKey(foreignKey: ForeignKey): string {
+  return JSON.stringify([
+    foreignKey.columns,
+    foreignKey.referencedTable.schema,
+    foreignKey.referencedTable.name,
+    foreignKey.referencedColumns,
+    foreignKey.onUpdate ?? null,
+    foreignKey.onDelete ?? null,
+  ]);
+}
+
 /**
  * Canonicalizes server-generated index names back to unnamed: a `CREATE INDEX ON t (c)`
  * applies unnamed and PostgreSQL names the index `t_c_idx`, so a dump import would otherwise
@@ -2125,7 +2162,78 @@ function canonicalizeIndexNames(draft: TableDraft): void {
   }
 }
 
+/**
+ * Canonicalizes server-generated primary-key, unique, foreign-key, and check-constraint names
+ * back to unnamed, mirroring `canonicalizeIndexNames`: a constraint whose name equals the
+ * prediction for its structure is stripped, unless an unnamed constraint with the same key —
+ * the same columns, expression, or foreign-key target and actions — already exists in the
+ * draft or was stripped earlier, in which case the name is kept, so neither statement order
+ * manufactures a duplicate unnamed entry. The primary key has no twin guard: PostgreSQL allows
+ * one per table. Runs in import order before the canonical sort, and names outside the formula
+ * stay named: truncation and collision suffixes are not predictable offline, and a check
+ * expression the best-effort formula does not predict keeps its server name.
+ */
+function canonicalizeConstraintNames(draft: TableDraft): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const seenUnique = new Set<string>();
+  const seenForeign = new Set<string>();
+  const seenCheck = new Set<string>();
+
+  // Pre-scan the unnamed entries of each kind, then strip in a second, position-independent pass.
+  for (const uniqueConstraint of draft.uniqueConstraints) {
+    if (uniqueConstraint.name === undefined) {
+      seenUnique.add(uniqueConstraintStructureKey(uniqueConstraint));
+    }
+  }
+  for (const foreignKey of draft.foreignKeys) {
+    if (foreignKey.name === undefined) seenForeign.add(foreignKeyStructureKey(foreignKey));
+  }
+  for (const checkConstraint of draft.checkConstraints) {
+    if (checkConstraint.name === undefined) {
+      seenCheck.add(checkConstraintStructureKey(checkConstraint));
+    }
+  }
+
+  const primaryKey = draft.primaryKey;
+  if (primaryKey !== undefined && primaryKey.name === synthesizedPrimaryKeyName(identity)) {
+    delete (primaryKey as Mutable<PrimaryKey>).name;
+  }
+
+  for (const uniqueConstraint of draft.uniqueConstraints) {
+    const name = uniqueConstraint.name;
+    if (
+      name === undefined ||
+      name !== synthesizedUniqueConstraintName(identity, uniqueConstraint)
+    ) {
+      continue;
+    }
+    const key = uniqueConstraintStructureKey(uniqueConstraint);
+    if (seenUnique.has(key)) continue;
+    delete (uniqueConstraint as Mutable<UniqueConstraint>).name;
+    seenUnique.add(key);
+  }
+  for (const foreignKey of draft.foreignKeys) {
+    const name = foreignKey.name;
+    if (name === undefined || name !== synthesizedForeignKeyName(identity, foreignKey)) continue;
+    const key = foreignKeyStructureKey(foreignKey);
+    if (seenForeign.has(key)) continue;
+    delete (foreignKey as Mutable<ForeignKey>).name;
+    seenForeign.add(key);
+  }
+  for (const checkConstraint of draft.checkConstraints) {
+    const name = checkConstraint.name;
+    if (name === undefined || name !== synthesizedCheckConstraintName(identity, checkConstraint)) {
+      continue;
+    }
+    const key = checkConstraintStructureKey(checkConstraint);
+    if (seenCheck.has(key)) continue;
+    delete (checkConstraint as Mutable<CheckConstraint>).name;
+    seenCheck.add(key);
+  }
+}
+
 function finalizeTable(draft: TableDraft): Table {
+  canonicalizeConstraintNames(draft);
   canonicalizeIndexNames(draft);
   const table: Mutable<Table> = {
     schema: draft.schema,
@@ -2217,23 +2325,21 @@ function samePrimaryKey(left: PrimaryKey, right: PrimaryKey): boolean {
 }
 
 function sameForeignKey(left: ForeignKey, right: ForeignKey): boolean {
-  return (
-    left.name === right.name &&
-    sameStringArray(left.columns, right.columns) &&
-    left.referencedTable.schema === right.referencedTable.schema &&
-    left.referencedTable.name === right.referencedTable.name &&
-    sameStringArray(left.referencedColumns, right.referencedColumns) &&
-    left.onUpdate === right.onUpdate &&
-    left.onDelete === right.onDelete
-  );
+  return left.name === right.name && foreignKeyStructureKey(left) === foreignKeyStructureKey(right);
 }
 
 function sameUniqueConstraint(left: UniqueConstraint, right: UniqueConstraint): boolean {
-  return left.name === right.name && sameStringArray(left.columns, right.columns);
+  return (
+    left.name === right.name &&
+    uniqueConstraintStructureKey(left) === uniqueConstraintStructureKey(right)
+  );
 }
 
 function sameCheckConstraint(left: CheckConstraint, right: CheckConstraint): boolean {
-  return left.name === right.name && left.expression === right.expression;
+  return (
+    left.name === right.name &&
+    checkConstraintStructureKey(left) === checkConstraintStructureKey(right)
+  );
 }
 
 /** Whether two indexes are structurally equal; `concurrently` is apply metadata, excluded. */

@@ -21,7 +21,7 @@ import type {
   UniqueConstraint,
 } from '@schemamill/core';
 
-import { renderSql, sqlRenderer } from './index.ts';
+import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
@@ -659,6 +659,164 @@ test('renders concurrent index kinds bare, one standalone group each', () => {
     }),
     'DROP INDEX CONCURRENTLY public.t_old_idx;\n\nCREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
   );
+});
+
+/**
+ * Asserts that `render` throws a `RenderRefusalError` with exactly `message`: `instanceof`
+ * pins the exported class, and the text pins the refusal wording.
+ */
+const assertRefusal = (render: () => unknown, message: string): void => {
+  let caught: unknown;
+  try {
+    render();
+  } catch (error) {
+    caught = error;
+  }
+  if (!(caught instanceof RenderRefusalError)) {
+    assert.fail(`expected a RenderRefusalError, caught ${String(caught)}`);
+  }
+  assert.equal(caught.message, message);
+};
+
+test('refuses two index creates on one table that resolve to one name', () => {
+  // The reproduced shape: an unnamed index (a) beside an explicit t_a_idx on one table.
+  // PostgreSQL would name the first t_a_idx and then reject the second create.
+  const target = model(
+    table('t', {
+      columns: [column('a')],
+      indexes: [tableIndex(['a']), tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assertRefusal(
+    () => renderSql(plan(model(), target)),
+    'refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)',
+  );
+});
+
+test('refuses two index drops on one table that resolve to one name', () => {
+  // The baseline holds the same twin and the target keeps the table without its indexes:
+  // rendering drops t_a_idx twice, and the second DROP INDEX would fail at apply time.
+  const columns = [column('a')];
+  const baseline = model(
+    table('t', {
+      columns,
+      indexes: [tableIndex(['a']), tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assertRefusal(
+    () => renderSql(plan(baseline, model(table('t', { columns })))),
+    'refusing to render: index drops on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)',
+  );
+});
+
+test('refuses two explicit index creates sharing one name', () => {
+  // Hand-built: the planner pairs same-named indexes into `index-changed`, so two explicit
+  // creates never reach `renderSql` through `plan()` — but the public renderer refuses them.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: 't_a_idx' }),
+          },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['b'], { name: 't_a_idx' }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_idx": an index named "t_a_idx" on (a) and an index named "t_a_idx" on (b)',
+  );
+});
+
+test('refuses unnamed indexes whose synthesized names collide within one table', () => {
+  // A single column `a_b` and the pair `(a, b)` both synthesize `t_a_b_idx`; PostgreSQL would
+  // suffix the second name, so the rendered SQL could not round-trip and the plan is refused.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex(['a_b']) },
+          { kind: 'create-index', table: identity('t'), index: tableIndex(['a', 'b']) },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_b_idx": an unnamed index on (a_b) and an unnamed index on (a, b)',
+  );
+});
+
+test('renders an unnamed index beside a differently named explicit one', () => {
+  // The synthesized t_a_idx and the explicit t_b_idx differ, so both creates render.
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [tableIndex(['a']), tableIndex(['b'], { name: 't_b_idx' })],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(model(), target)),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.t (',
+      '    a text,',
+      '    b text',
+      ');',
+      'CREATE INDEX ON public.t USING btree (a);',
+      'CREATE INDEX t_b_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a drop and a create of one name across the polarity', () => {
+  // `index-changed` decomposes into a drop and a create of the same name, which is
+  // legitimate; only same-polarity duplicates are refused.
+  const columns = [column('a'), column('b')];
+  const baseline = model(
+    table('t', { columns, indexes: [tableIndex(['a'], { name: 't_a_idx' })] }),
+  );
+  const target = model(table('t', { columns, indexes: [tableIndex(['b'], { name: 't_a_idx' })] }));
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'DROP INDEX public.t_a_idx;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('partition violations stay plain Error, never RenderRefusalError', () => {
+  // The guard runs after the partition assertion, so a malformed plan reports its tiling
+  // violation even when it also holds colliding index creates.
+  let caught: unknown;
+  try {
+    renderSql({
+      steps: [
+        { kind: 'create-index', table: identity('t'), index: tableIndex(['a']) },
+        {
+          kind: 'create-index',
+          table: identity('t'),
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+      ],
+      groups: [],
+    });
+  } catch (error) {
+    caught = error;
+  }
+  if (!(caught instanceof Error)) assert.fail(`expected an Error, caught ${String(caught)}`);
+  assert.ok(!(caught instanceof RenderRefusalError), 'the partition check throws first');
+  assert.match(caught.message, /plan\.groups must tile \[0, 2\) in order, but found no groups/);
 });
 
 test('binds the SqlRenderer seam', () => {

@@ -1,10 +1,10 @@
 + table public.added
     id integer NOT NULL
     name text NOT NULL
-    primary key added_pkey (id)
+    primary key (id)
 
 ~ table public.fk_added
-    + foreign key fk_added_target_id_fkey (target_id) → public.pk_added (id)
+    + foreign key (target_id) → public.pk_added (id)
 
 ~ table public.fk_changed
     ~ foreign key (target_id) → public.fk_added: on delete CASCADE → RESTRICT
@@ -13,20 +13,20 @@
     ~ foreign key (target_id) → public.fk_columns_target: referenced columns (a) → (b)
 
 ~ table public.fk_columns_target
-    ~ primary key fk_columns_target_pkey (a) → fk_columns_target_pkey (b)
+    ~ primary key (a) → (b)
 
 ~ table public.fk_name_changed
-    ~ foreign key (target_id) → public.fk_added: name fk_name_changed_target_id_fkey → fk_name_changed_target_id_fkey_v2
+    ~ foreign key (target_id) → public.fk_added: name (none) → fk_name_changed_target_id_fkey_v2
 
 ~ table public.fk_on_update_changed
     ~ foreign key (target_id) → public.fk_added: on update CASCADE → RESTRICT
 
 ~ table public.fk_removed
-    - foreign key fk_removed_target_id_fkey (target_id) → public.fk_added (id)
+    - foreign key (target_id) → public.fk_added (id)
 
 - table public.gone
     id integer NOT NULL
-    primary key gone_pkey (id)
+    primary key (id)
 
 ~ table public.kept
     - column removed text
@@ -35,10 +35,10 @@
     ~ column note: default 'old' → (none)
 
 ~ table public.pk_added
-    + primary key pk_added_pkey (id)
+    + primary key (id)
 
 ~ table public.pk_changed
-    ~ primary key pk_changed_pkey (a) → pk_changed_pkey_v2 (b, a)
+    ~ primary key (a) → pk_changed_pkey_v2 (b, a)
 
 ~ table public.pk_removed
-    - primary key pk_removed_pkey (id)
+    - primary key (id)

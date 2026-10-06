@@ -18,7 +18,13 @@ import type {
   UniqueConstraint,
 } from '@schemamill/core';
 
-import { synthesizedIndexName } from './names.ts';
+import {
+  synthesizedCheckConstraintName,
+  synthesizedForeignKeyName,
+  synthesizedIndexName,
+  synthesizedPrimaryKeyName,
+  synthesizedUniqueConstraintName,
+} from './names.ts';
 
 /**
  * Migration SQL rendering: a migration plan → the migration SQL that moves one schema toward
@@ -30,7 +36,11 @@ import { synthesizedIndexName } from './names.ts';
  * the empty string. The plan's groups must partition its steps — non-empty half-open ranges
  * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
  * guarantees this contract, and a malformed partition throws before any SQL is rendered,
- * naming the violated invariant and the offending indices. `renderSql` walks the plan's
+ * naming the violated invariant and the offending indices. A plan that renders two index
+ * statements of one polarity on one table under one name is refused with `RenderRefusalError`
+ * before anything renders: the second create could not claim the name, and the second drop
+ * would already be gone. A drop and a create of one name are different statements —
+ * `index-changed` decomposes that way — and render. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
  * a standalone group renders its statements bare. A plan with more than one group separates
  * them with one blank line; single-group output is unchanged. `create-table` is the one
@@ -201,11 +211,25 @@ export const RESERVED_KEYWORDS: ReadonlySet<string> = new Set([
 const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 
 /**
+ * Thrown by `renderSql` when a plan cannot render soundly: two index statements of one polarity
+ * on one table resolve to the same name. Callers that report the refusal instead of crashing —
+ * the CLI — catch exactly this class.
+ */
+export class RenderRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RenderRefusalError';
+  }
+}
+
+/**
  * The migration SQL for `plan`, deterministic. `plan.groups` must tile `[0, plan.steps.length)`;
- * a malformed partition throws before anything renders.
+ * a malformed partition throws before anything renders, and so does a plan whose index
+ * statements of one table and polarity would share a name.
  */
 export function renderSql(plan: Plan): string {
   assertGroupsTileSteps(plan);
+  assertIndexNamesUnique(plan);
   if (plan.steps.length === 0) return '';
   const groups: string[] = [];
   for (const group of plan.groups) {
@@ -259,6 +283,63 @@ function assertGroupsTileSteps(plan: Plan): void {
   }
 }
 
+/**
+ * Refuses a plan that renders two index statements of one polarity on one table under one
+ * resolved name — explicit for a named index, PostgreSQL's conventional name for an unnamed
+ * one. Two creates would collide at apply time, and two drops would drop one name twice, so
+ * the SQL cannot satisfy the plan; explicit-vs-explicit duplicates are refused too. A drop and
+ * a create of one name are different statements — `index-changed` decomposes that way — and
+ * render. Only same-table groups are considered: a named index's uniqueness spans its schema,
+ * which the plan does not model.
+ */
+function assertIndexNamesUnique(plan: Plan): void {
+  const claimed = new Map<string, IndexStatement>();
+  for (const step of plan.steps) {
+    const statement = indexStatement(step);
+    if (statement === undefined) continue;
+    const { table, index, polarity } = statement;
+    const name = index.name ?? synthesizedIndexName(table, index);
+    const key = JSON.stringify([table.schema, table.name, polarity, name]);
+    const previous = claimed.get(key);
+    if (previous !== undefined) {
+      throw new RenderRefusalError(
+        `refusing to render: index ${polarity} on ${renderTable(table)} would share the name ` +
+          `${JSON.stringify(name)}: ${describeIndex(previous.index)} and ${describeIndex(index)}`,
+      );
+    }
+    claimed.set(key, statement);
+  }
+}
+
+/** One index statement's table, index, and polarity, for the duplicate-name guard. */
+interface IndexStatement {
+  readonly table: TableIdentity;
+  readonly index: Index;
+  readonly polarity: 'creates' | 'drops';
+}
+
+/** The index payload of an index step, or `undefined` for every other kind. */
+function indexStatement(step: Step): IndexStatement | undefined {
+  switch (step.kind) {
+    case 'create-index':
+    case 'create-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'creates' };
+    case 'drop-index':
+    case 'drop-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'drops' };
+    default:
+      return undefined;
+  }
+}
+
+/** A refusal-message fragment naming one index by its columns and, when stated, its name. */
+function describeIndex(index: Index): string {
+  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
+  return index.name === undefined
+    ? `an unnamed index on (${columns})`
+    : `an index named ${JSON.stringify(index.name)} on (${columns})`;
+}
+
 /** Binds `renderSql` to the `SqlRenderer` seam. */
 export const sqlRenderer: SqlRenderer<Plan> = { render: renderSql };
 
@@ -295,7 +376,7 @@ function renderStep(step: Step): string {
       return `ALTER TABLE ${renderTable(step.table)} ADD ${renderPrimaryKey(step.primaryKey)};`;
     case 'drop-primary-key':
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
-        step.primaryKey.name ?? `${step.table.name}_pkey`,
+        step.primaryKey.name ?? synthesizedPrimaryKeyName(step.table),
       )};`;
     case 'add-foreign-key':
       return `ALTER TABLE ${renderTable(step.table)} ADD ${renderForeignKey(step.foreignKey)};`;
@@ -389,11 +470,6 @@ function renderReferentialActions(foreignKey: ForeignKey): string {
   return `${onUpdate}${onDelete}`;
 }
 
-/** PostgreSQL's conventional foreign-key name for an unnamed constraint. */
-function synthesizedForeignKeyName(table: TableIdentity, foreignKey: ForeignKey): string {
-  return `${table.name}${foreignKey.columns.map((column) => `_${column}`).join('')}_fkey`;
-}
-
 /** A unique-constraint clause, with its name when it has one. */
 function renderUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
   const name =
@@ -411,26 +487,6 @@ function renderCheckConstraint(checkConstraint: CheckConstraint): string {
       ? ''
       : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
   return `${name}CHECK (${checkConstraint.expression})`;
-}
-
-/** PostgreSQL's conventional unique-constraint name for an unnamed constraint. */
-function synthesizedUniqueConstraintName(
-  table: TableIdentity,
-  uniqueConstraint: UniqueConstraint,
-): string {
-  return `${table.name}${uniqueConstraint.columns.map((column) => `_${column}`).join('')}_key`;
-}
-
-/**
- * PostgreSQL's conventional check-constraint name for an unnamed constraint: the single
- * column the expression references when it references exactly one, the table alone otherwise.
- */
-function synthesizedCheckConstraintName(
-  table: TableIdentity,
-  checkConstraint: CheckConstraint,
-): string {
-  const column = checkExpressionColumn(checkConstraint.expression);
-  return column === undefined ? `${table.name}_check` : `${table.name}_${column}_check`;
 }
 
 /** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */
@@ -454,174 +510,6 @@ function renderDropIndex(table: TableIdentity, index: Index, concurrently: boole
   const concurrent = concurrently ? 'CONCURRENTLY ' : '';
   const name = index.name ?? synthesizedIndexName(table, index);
   return `DROP INDEX ${concurrent}${quoteIdentifier(table.schema)}.${quoteIdentifier(name)};`;
-}
-
-/**
- * The words a check expression can carry that are never a column reference, for the
- * best-effort conventional-name scan. Function-like words (`COALESCE`, `NULLIF`, …) are
- * already excluded by their call parentheses.
- */
-const CHECK_KEYWORDS: ReadonlySet<string> = new Set([
-  'all',
-  'and',
-  'any',
-  'array',
-  'as',
-  'between',
-  'case',
-  'cast',
-  'collate',
-  'current_catalog',
-  'current_date',
-  'current_role',
-  'current_schema',
-  'current_time',
-  'current_timestamp',
-  'current_user',
-  'default',
-  'distinct',
-  'else',
-  'end',
-  'escape',
-  'exists',
-  'false',
-  'from',
-  'ilike',
-  'in',
-  'interval',
-  'is',
-  'isnull',
-  'like',
-  'localtime',
-  'localtimestamp',
-  'not',
-  'notnull',
-  'null',
-  'or',
-  'overlaps',
-  'row',
-  'session_user',
-  'similar',
-  'some',
-  'then',
-  'to',
-  'true',
-  'unknown',
-  'user',
-  'when',
-]);
-
-/** The shape of an identifier's first character and its continuation. */
-const IDENTIFIER_START = /[A-Za-z_\u0080-\uffff]/;
-const IDENTIFIER_CONTINUATION = /[A-Za-z0-9_$\u0080-\uffff]/;
-
-/** Matches a dollar-quote delimiter, mirroring the importer's scanner. */
-const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
-
-/**
- * The column a check expression references, when it references exactly one, for PostgreSQL's
- * conventional constraint name. The scan is lexical and best-effort: it counts bare and quoted
- * identifiers that are not function names, type names after `::`, `CAST` aliases, or key
- * words. `undefined` when the expression references zero or several columns.
- */
-function checkExpressionColumn(expression: string): string | undefined {
-  const columns = new Set<string>();
-  let index = 0;
-  while (index < expression.length) {
-    const character = expression[index]!;
-
-    if (character === "'") {
-      index = quotedSpanEnd(expression, index);
-      continue;
-    }
-    if (character === '$') {
-      const end = dollarQuotedEnd(expression, index);
-      if (end !== null) {
-        index = end;
-        continue;
-      }
-    }
-    if (character === '"') {
-      const end = quotedSpanEnd(expression, index);
-      if (isColumnReference(expression, index, end)) {
-        columns.add(expression.slice(index + 1, end - 1).replaceAll('""', '"'));
-      }
-      index = end;
-      continue;
-    }
-    if (IDENTIFIER_START.test(character)) {
-      let end = index + 1;
-      while (end < expression.length && IDENTIFIER_CONTINUATION.test(expression[end]!)) end += 1;
-      const word = expression.slice(index, end);
-      if (isColumnReference(expression, index, end) && !CHECK_KEYWORDS.has(word.toLowerCase())) {
-        columns.add(word);
-      }
-      index = end;
-      continue;
-    }
-    index += 1;
-  }
-  return columns.size === 1 ? [...columns][0] : undefined;
-}
-
-/** Whether the identifier spanning `[start, end)` reads as a column reference. */
-function isColumnReference(text: string, start: number, end: number): boolean {
-  return !isFunctionName(text, end) && !isCastType(text, start) && !isCastAlias(text, start);
-}
-
-/** Whether the token ending at `end` is a function name: the next non-space character is `(`. */
-function isFunctionName(text: string, end: number): boolean {
-  let index = end;
-  while (index < text.length && isWhitespace(text[index]!)) index += 1;
-  return text[index] === '(';
-}
-
-/** Whether the token starting at `start` is a type name: it follows `::`. */
-function isCastType(text: string, start: number): boolean {
-  let index = start - 1;
-  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
-  return index >= 1 && text[index] === ':' && text[index - 1] === ':';
-}
-
-/** Whether the token starting at `start` is a `CAST` alias: it follows the word `AS`. */
-function isCastAlias(text: string, start: number): boolean {
-  let index = start - 1;
-  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
-  if (index < 0) return false;
-  const end = index + 1;
-  while (index >= 0 && IDENTIFIER_CONTINUATION.test(text[index]!)) index -= 1;
-  return text.slice(index + 1, end).toLowerCase() === 'as';
-}
-
-/** Index just past the quoted span starting at `index` (a `'` or `"`), or the end of text. */
-function quotedSpanEnd(text: string, index: number): number {
-  const quote = text[index];
-  let cursor = index + 1;
-  while (cursor < text.length) {
-    const character = text[cursor]!;
-    if (character === quote) {
-      if (text[cursor + 1] === quote) {
-        cursor += 2;
-        continue;
-      }
-      return cursor + 1;
-    }
-    cursor += 1;
-  }
-  return text.length;
-}
-
-/** Index just past a dollar-quoted span starting at `index`, or `null` when none starts there. */
-function dollarQuotedEnd(text: string, index: number): number | null {
-  DOLLAR_QUOTE.lastIndex = index;
-  const delimiter = DOLLAR_QUOTE.exec(text)?.[0] ?? null;
-  if (delimiter === null) return null;
-  const close = text.indexOf(delimiter, index + delimiter.length);
-  return close === -1 ? text.length : close + delimiter.length;
-}
-
-function isWhitespace(character: string): boolean {
-  return /\s/.test(character);
 }
 
 /** One `ALTER COLUMN` statement for one differing field. */

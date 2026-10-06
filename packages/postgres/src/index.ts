@@ -11,4 +11,4 @@ export const coreVersionUsed = coreVersion;
 
 export { analyzeHazards, hazardAnalyzer } from './hazards.ts';
 export { ddlImporter, importDump } from './import.ts';
-export { renderSql, sqlRenderer } from './render.ts';
+export { RenderRefusalError, renderSql, sqlRenderer } from './render.ts';
