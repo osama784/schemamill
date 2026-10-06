@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   canonicalIntType,
+  diff,
   effectiveIdentity,
   effectiveSequence,
   plan,
@@ -4839,4 +4840,559 @@ test('a fabricated sequence field is rejected by the application guard', () => {
       ),
     /Unhandled sequence field: frobnicate/,
   );
+});
+
+// Property coverage for the diff→plan change application (#50). Four seeded properties pin the
+// invariants over generated input: P1 order-independence and determinism, P2 diff-closed write
+// accounting, P3 transaction-group invariants, and P4 unnamed-index twins. Columns are
+// positional, so no permutation touches them. Each property draws from its own seed constant
+// and prints the round and its input on failure; rounds are bounded so the suite stays fast.
+
+/** P1's seed: the golden-ratio constant. */
+const ORDER_SEED = 0x9e3779b9;
+/** P2's seed: the MurmurHash3 finalizer constant. */
+const ACCOUNTING_SEED = 0x85ebca6b;
+/** P3's seed: the MurmurHash3 block constant. */
+const GROUP_SEED = 0xc2b2ae35;
+/** P4's seed: the FNV-1a prime. */
+const TWIN_SEED = 0x27d4eb2f;
+
+/** Rounds for P1–P3; the generated pairs are 2–6 tables and the shapes are small. */
+const PROPERTY_ROUNDS = 250;
+/** Rounds for P4; the twin shapes are hand-built and tiny. */
+const TWIN_ROUNDS = 200;
+/** P1's permutations per pair: K shuffles of the order-independent arrays. */
+const ORDER_PERMUTATIONS = 3;
+/** P4's permutations of the twin-bearing target per round. */
+const TWIN_PERMUTATIONS = 3;
+
+/** A Fisher–Yates shuffle of `values` driven by `random`; the input is untouched. */
+const shuffleWith = <T>(random: Random, values: readonly T[]): T[] => {
+  const copy = [...values];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random.next() * (index + 1));
+    const held = copy[index]!;
+    copy[index] = copy[swap]!;
+    copy[swap] = held;
+  }
+  return copy;
+};
+
+/**
+ * A copy of `source` whose order-independent arrays are shuffled with `random`: the tables, the
+ * sequences, and each table's foreign keys, unique constraints, check constraints, and indexes.
+ * Columns stay in place: they are positional, so permuting them would false-fail.
+ */
+const permutedModel = (source: Model, random: Random): Model => ({
+  tables: shuffleWith(random, source.tables).map((table) => ({
+    ...table,
+    foreignKeys: shuffleWith(random, table.foreignKeys),
+    uniqueConstraints: shuffleWith(random, table.uniqueConstraints),
+    checkConstraints: shuffleWith(random, table.checkConstraints),
+    indexes: shuffleWith(random, table.indexes),
+  })),
+  sequences: shuffleWith(random, source.sequences),
+});
+
+test('seeded pairs keep diff and plan deterministic and order-independent', () => {
+  const random = randomOf(ORDER_SEED);
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const { baseline, target } = generatePair(random);
+    try {
+      const firstDiff = diff(baseline, target);
+      assert.deepStrictEqual(
+        diff(baseline, target),
+        firstDiff,
+        `round ${round}: diff must be deterministic`,
+      );
+      const firstPlan = plan(baseline, target);
+      assert.deepStrictEqual(
+        plan(baseline, target),
+        firstPlan,
+        `round ${round}: plan must be deterministic`,
+      );
+      for (let permutation = 0; permutation < ORDER_PERMUTATIONS; permutation += 1) {
+        const shuffledBaseline = permutedModel(baseline, random);
+        const shuffledTarget = permutedModel(target, random);
+        assert.deepStrictEqual(
+          diff(shuffledBaseline, shuffledTarget),
+          firstDiff,
+          `round ${round} permutation ${permutation}: diff must not depend on array order`,
+        );
+        assert.deepStrictEqual(
+          plan(shuffledBaseline, shuffledTarget),
+          firstPlan,
+          `round ${round} permutation ${permutation}: plan must not depend on array order`,
+        );
+        simulate(shuffledBaseline, shuffledTarget);
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target })}`,
+        { cause: error },
+      );
+    }
+  }
+});
+
+/** The 22 array buckets of a `ChangeApplication`, in interface order. */
+const applicationArrays = [
+  'foreignKeyDrops',
+  'primaryKeyDrops',
+  'columnDrops',
+  'removedTables',
+  'tableCreates',
+  'columnAdds',
+  'columnAlters',
+  'primaryKeyAdds',
+  'foreignKeyAdds',
+  'uniqueConstraintDrops',
+  'uniqueConstraintAdds',
+  'checkConstraintDrops',
+  'checkConstraintAdds',
+  'indexDrops',
+  'indexCreates',
+  'identityDrops',
+  'identityAdds',
+  'identityAlters',
+  'sequenceCreates',
+  'optionAlters',
+  'ownershipChanges',
+  'removedSequences',
+] as const satisfies readonly (keyof ChangeApplication)[];
+
+/** One of the application's array bucket names. */
+type ApplicationArray = (typeof applicationArrays)[number];
+
+/** The writes a `Change[]` must produce: per-bucket counts and the removal-key sets. */
+interface ExpectedWrites {
+  readonly counts: Record<ApplicationArray, number>;
+  readonly removedTableKeys: readonly string[];
+  readonly removedColumnKeys: readonly string[];
+}
+
+/**
+ * The bucket writes `changes` must produce, derived from each change's payload by the documented
+ * accounting rules — not by mirroring `applyChange`. A `column-changed` entry with no scalar
+ * fields writes no `columnAlters` step and a `changed` identity with no differing options writes
+ * no `identityAlters` step: the plan never carries an empty change list.
+ */
+const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
+  const counts: Record<ApplicationArray, number> = {
+    foreignKeyDrops: 0,
+    primaryKeyDrops: 0,
+    columnDrops: 0,
+    removedTables: 0,
+    tableCreates: 0,
+    columnAdds: 0,
+    columnAlters: 0,
+    primaryKeyAdds: 0,
+    foreignKeyAdds: 0,
+    uniqueConstraintDrops: 0,
+    uniqueConstraintAdds: 0,
+    checkConstraintDrops: 0,
+    checkConstraintAdds: 0,
+    indexDrops: 0,
+    indexCreates: 0,
+    identityDrops: 0,
+    identityAdds: 0,
+    identityAlters: 0,
+    sequenceCreates: 0,
+    optionAlters: 0,
+    ownershipChanges: 0,
+    removedSequences: 0,
+  };
+  const removedTableKeys = new Set<string>();
+  const removedColumnKeys = new Set<string>();
+  const count = (bucket: ApplicationArray): void => {
+    counts[bucket] += 1;
+  };
+  for (const change of changes) {
+    switch (change.kind) {
+      case 'table-removed':
+        count('removedTables');
+        removedTableKeys.add(keyOf(change.table));
+        break;
+      case 'table-added':
+        count('tableCreates');
+        counts.foreignKeyAdds += change.table.foreignKeys.length;
+        counts.uniqueConstraintAdds += change.table.uniqueConstraints.length;
+        counts.checkConstraintAdds += change.table.checkConstraints.length;
+        counts.indexCreates += change.table.indexes.length;
+        counts.identityAdds += change.table.columns.filter(
+          (column) => column.identity !== undefined,
+        ).length;
+        break;
+      case 'table-changed':
+        for (const tableChange of change.changes) {
+          switch (tableChange.kind) {
+            case 'column-removed':
+              count('columnDrops');
+              removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
+              break;
+            case 'column-added':
+              count('columnAdds');
+              if (tableChange.column.identity !== undefined) count('identityAdds');
+              break;
+            case 'column-changed':
+              if (tableChange.fields.length > 0) count('columnAlters');
+              if (tableChange.identity !== undefined) {
+                switch (tableChange.identity.kind) {
+                  case 'added':
+                    count('identityAdds');
+                    break;
+                  case 'removed':
+                    count('identityDrops');
+                    break;
+                  case 'recreated':
+                    count('identityDrops');
+                    count('identityAdds');
+                    break;
+                  case 'changed':
+                    if (tableChange.identity.fields.length > 0) count('identityAlters');
+                    break;
+                  default:
+                    assertNever(tableChange.identity, 'identity change kind');
+                }
+              }
+              break;
+            case 'primary-key-added':
+              count('primaryKeyAdds');
+              break;
+            case 'primary-key-removed':
+              count('primaryKeyDrops');
+              break;
+            case 'primary-key-changed':
+              count('primaryKeyDrops');
+              count('primaryKeyAdds');
+              break;
+            case 'foreign-key-added':
+              count('foreignKeyAdds');
+              break;
+            case 'foreign-key-removed':
+              count('foreignKeyDrops');
+              break;
+            case 'foreign-key-changed':
+              count('foreignKeyDrops');
+              count('foreignKeyAdds');
+              break;
+            case 'unique-constraint-added':
+              count('uniqueConstraintAdds');
+              break;
+            case 'unique-constraint-removed':
+              count('uniqueConstraintDrops');
+              break;
+            case 'unique-constraint-changed':
+              count('uniqueConstraintDrops');
+              count('uniqueConstraintAdds');
+              break;
+            case 'check-constraint-added':
+              count('checkConstraintAdds');
+              break;
+            case 'check-constraint-removed':
+              count('checkConstraintDrops');
+              break;
+            case 'check-constraint-changed':
+              count('checkConstraintDrops');
+              count('checkConstraintAdds');
+              break;
+            case 'index-added':
+              count('indexCreates');
+              break;
+            case 'index-removed':
+              count('indexDrops');
+              break;
+            case 'index-changed':
+              count('indexDrops');
+              count('indexCreates');
+              break;
+            default:
+              assertNever(tableChange, 'table change kind');
+          }
+        }
+        break;
+      case 'sequence-added':
+        count('sequenceCreates');
+        if (change.sequence.ownedBy !== undefined) count('ownershipChanges');
+        break;
+      case 'sequence-removed':
+        count('removedSequences');
+        break;
+      case 'sequence-changed':
+        if (change.changes.some((field) => field.field !== 'ownedBy')) count('optionAlters');
+        counts.ownershipChanges += change.changes.filter(
+          (field) => field.field === 'ownedBy',
+        ).length;
+        break;
+      default:
+        assertNever(change, 'change kind');
+    }
+  }
+  return {
+    counts,
+    removedTableKeys: [...removedTableKeys].sort(),
+    removedColumnKeys: [...removedColumnKeys].sort(),
+  };
+};
+
+/** Appends every bucket of `source` onto `target`: the bucket-wise merge of one change's run. */
+const appendApplication = (target: ChangeApplication, source: ChangeApplication): void => {
+  target.foreignKeyDrops.push(...source.foreignKeyDrops);
+  target.primaryKeyDrops.push(...source.primaryKeyDrops);
+  target.columnDrops.push(...source.columnDrops);
+  target.removedTables.push(...source.removedTables);
+  target.tableCreates.push(...source.tableCreates);
+  target.columnAdds.push(...source.columnAdds);
+  target.columnAlters.push(...source.columnAlters);
+  target.primaryKeyAdds.push(...source.primaryKeyAdds);
+  target.foreignKeyAdds.push(...source.foreignKeyAdds);
+  target.uniqueConstraintDrops.push(...source.uniqueConstraintDrops);
+  target.uniqueConstraintAdds.push(...source.uniqueConstraintAdds);
+  target.checkConstraintDrops.push(...source.checkConstraintDrops);
+  target.checkConstraintAdds.push(...source.checkConstraintAdds);
+  target.indexDrops.push(...source.indexDrops);
+  target.indexCreates.push(...source.indexCreates);
+  target.identityDrops.push(...source.identityDrops);
+  target.identityAdds.push(...source.identityAdds);
+  target.identityAlters.push(...source.identityAlters);
+  target.sequenceCreates.push(...source.sequenceCreates);
+  target.optionAlters.push(...source.optionAlters);
+  target.ownershipChanges.push(...source.ownershipChanges);
+  target.removedSequences.push(...source.removedSequences);
+  for (const key of source.removedTableKeys) target.removedTableKeys.add(key);
+  for (const key of source.removedColumnKeys) target.removedColumnKeys.add(key);
+};
+
+test('seeded diffs are consumed exactly once by the change application', () => {
+  const random = randomOf(ACCOUNTING_SEED);
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const { baseline, target } = generatePair(random);
+    try {
+      const changes = diff(baseline, target);
+      const application = emptyChangeApplication();
+      for (const change of changes) applyChange(application, change);
+      const expected = expectedWrites(changes);
+      for (const bucket of applicationArrays) {
+        assert.equal(
+          application[bucket].length,
+          expected.counts[bucket],
+          `round ${round}: ${bucket} count`,
+        );
+      }
+      assert.deepStrictEqual(
+        [...application.removedTableKeys].sort(),
+        expected.removedTableKeys,
+        `round ${round}: removedTableKeys`,
+      );
+      assert.deepStrictEqual(
+        [...application.removedColumnKeys].sort(),
+        expected.removedColumnKeys,
+        `round ${round}: removedColumnKeys`,
+      );
+
+      // Secondary: the whole run must equal the bucket-wise merge of one fresh application per
+      // change, so a wrong payload or a wrong order cannot hide behind matching counts.
+      const merged = emptyChangeApplication();
+      for (const change of changes) {
+        const single = emptyChangeApplication();
+        applyChange(single, change);
+        appendApplication(merged, single);
+      }
+      assert.deepStrictEqual(application, merged, `round ${round}: whole run equals the merge`);
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target })}`,
+        { cause: error },
+      );
+    }
+  }
+});
+
+test('randomized step-kind sequences partition into transaction groups', () => {
+  const random = randomOf(GROUP_SEED);
+  const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
+  assert.equal(kinds.length, 23, 'every step kind must be classified');
+  const seen = new Set<Step['kind']>();
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const length = round === 0 ? 0 : Math.floor(random.next() * 13);
+    const sequence: Step['kind'][] = [];
+    for (let index = 0; index < length; index += 1) sequence.push(random.pick(kinds));
+    for (const kind of sequence) seen.add(kind);
+    const steps = sequence.map((kind) => ({ kind }) as unknown as Step);
+    try {
+      const groups = groupSteps(steps);
+      let cursor = 0;
+      for (const group of groups) {
+        assert.equal(group.start, cursor, 'groups must tile the sequence from 0');
+        assert.ok(group.end > group.start, 'groups must be non-empty');
+        const first = steps[group.start]!;
+        assert.equal(group.transactional, TRANSACTIONAL[first.kind], 'group flag must match');
+        if (group.transactional) {
+          for (let index = group.start; index < group.end; index += 1) {
+            assert.ok(
+              TRANSACTIONAL[steps[index]!.kind],
+              'transactional groups hold only transactional steps',
+            );
+          }
+        } else {
+          assert.equal(group.end - group.start, 1, 'non-transactional steps must stand alone');
+          assert.equal(
+            TRANSACTIONAL[first.kind],
+            false,
+            'a non-transactional group must hold a non-transactional step',
+          );
+        }
+        cursor = group.end;
+      }
+      assert.equal(cursor, steps.length, 'groups must tile the whole sequence');
+      for (let index = 1; index < groups.length; index += 1) {
+        assert.ok(
+          !(groups[index - 1]!.transactional && groups[index]!.transactional),
+          'consecutive transactional groups must coalesce',
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ kinds: sequence })}`,
+        { cause: error },
+      );
+    }
+  }
+  assert.deepStrictEqual(
+    [...seen].sort(),
+    [...kinds].sort(),
+    'the rounds must exercise every step kind',
+  );
+});
+
+/** P4's table columns; the twin shapes index one or two of them. */
+const twinTableColumns: readonly Column[] = [column('a'), column('b'), column('c')];
+
+/** One twin shape: the pair, the explicit twin's payload, and whether σ survives in the target. */
+interface TwinShape {
+  readonly baseline: Model;
+  readonly target: Model;
+  readonly twin: Index;
+  readonly kept: boolean;
+}
+
+/**
+ * One unnamed-index twin shape, built directly (never through `mutateTable`): the baseline keeps
+ * an unnamed index σ; the target either keeps σ beside the explicit twin or replaces σ with it.
+ * The twin is named by the conventional `<table>_<cols>_idx` formula for its own ordered columns,
+ * is the only conventional-named index, and filler indexes (non-conventional names) stay on both
+ * sides. Shapes vary columns, `unique`, `concurrently`, and filler members across rounds.
+ */
+const generateTwinShape = (random: Random): TwinShape => {
+  const pickColumns = (): string[] => {
+    const count = random.chance(0.35) ? 2 : 1;
+    const pool = ['a', 'b', 'c'];
+    const picked: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      picked.push(pool.splice(Math.floor(random.next() * pool.length), 1)[0]!);
+    }
+    return picked;
+  };
+  const conventionalName = (columns: readonly string[]): string => `t_${columns.join('_')}_idx`;
+  const sigma: Mutable<Index> = {
+    unique: random.chance(0.4),
+    columns: pickColumns(),
+    ...(random.chance(0.35) ? { concurrently: true } : {}),
+  };
+  const mode = random.pick(['same', 'different', 'replace'] as const);
+  let twinColumns = pickColumns();
+  if (mode === 'different') {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (JSON.stringify(twinColumns) !== JSON.stringify(sigma.columns)) break;
+      twinColumns = pickColumns();
+    }
+  } else {
+    twinColumns = [...sigma.columns];
+  }
+  const twin: Mutable<Index> = {
+    name: conventionalName(twinColumns),
+    unique: mode === 'different' ? random.chance(0.5) : sigma.unique,
+    columns: twinColumns,
+    ...(random.chance(0.5) ? { concurrently: true } : {}),
+  };
+  const fillers: Mutable<Index>[] = [];
+  const fillerCount = Math.floor(random.next() * 3);
+  for (let index = 0; index < fillerCount; index += 1) {
+    fillers.push({
+      name: `f${index}`,
+      unique: random.chance(0.4),
+      columns: pickColumns(),
+      ...(random.chance(0.35) ? { concurrently: true } : {}),
+    });
+  }
+  const kept = mode !== 'replace';
+  const shape = (indexes: readonly Index[]): Model =>
+    model(table('t', { columns: twinTableColumns, indexes }));
+  return {
+    baseline: shape([sigma, ...fillers]),
+    target: shape(kept ? [sigma, twin, ...fillers] : [twin, ...fillers]),
+    twin,
+    kept,
+  };
+};
+
+/** The index-level changes of a diff, split by kind. */
+const indexChanges = (
+  changes: readonly Change[],
+): { added: Index[]; removed: Index[]; changed: number } => {
+  const added: Index[] = [];
+  const removed: Index[] = [];
+  let changed = 0;
+  for (const change of changes) {
+    if (change.kind !== 'table-changed') continue;
+    for (const tableChange of change.changes) {
+      if (tableChange.kind === 'index-added') added.push(tableChange.index);
+      else if (tableChange.kind === 'index-removed') removed.push(tableChange.index);
+      else if (tableChange.kind === 'index-changed') changed += 1;
+    }
+  }
+  return { added, removed, changed };
+};
+
+test('unnamed-index twins produce a stable, order-independent diff and plan', () => {
+  const random = randomOf(TWIN_SEED);
+  for (let round = 0; round < TWIN_ROUNDS; round += 1) {
+    const { baseline, target, twin, kept } = generateTwinShape(random);
+    try {
+      const forward = indexChanges(diff(baseline, target));
+      assert.equal(forward.added.length, 1, 'the twin must be the only index addition');
+      assert.deepStrictEqual(forward.added[0], twin, 'the addition must carry the twin payload');
+      assert.equal(forward.removed.length, kept ? 0 : 1, 'a replaced σ must be removed');
+      assert.equal(forward.changed, 0, 'an unnamed index and its twin must never pair as changed');
+      const backward = indexChanges(diff(target, baseline));
+      assert.equal(backward.removed.length, 1, 'the reversed diff must remove the twin');
+      assert.deepStrictEqual(backward.removed[0], twin, 'the removal must carry the twin payload');
+      assert.equal(
+        backward.added.length,
+        kept ? 0 : 1,
+        'the reversed diff must restore a replaced σ',
+      );
+      assert.equal(backward.changed, 0, 'an unnamed index and its twin must never pair as changed');
+
+      const forwardPlan = plan(baseline, target);
+      for (let permutation = 0; permutation < TWIN_PERMUTATIONS; permutation += 1) {
+        const shuffledTarget = permutedModel(target, random);
+        assert.deepStrictEqual(
+          diff(baseline, shuffledTarget),
+          diff(baseline, target),
+          `permutation ${permutation}: diff must not depend on index order`,
+        );
+        assert.deepStrictEqual(
+          plan(baseline, shuffledTarget),
+          forwardPlan,
+          `permutation ${permutation}: plan must not depend on index order`,
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target, twin, kept })}`,
+        { cause: error },
+      );
+    }
+  }
 });
