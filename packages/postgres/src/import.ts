@@ -2120,10 +2120,10 @@ function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
 /**
  * The duplicate guard's key for a foreign key: every modeled field but the name — the
  * referencing columns, the target, the referenced columns, and both actions, with an absent
- * action distinct from a stated one. The core diff matches foreign keys more narrowly
- * (`foreignKeyIdentity`: columns and target only), so this deliberately keeps a name beside a
- * twin that differs in referenced columns or actions: stripping there would still lose the
- * action comparison, not manufacture a duplicate.
+ * action distinct from a stated one. The key is equality-minus-name: a name is kept only
+ * beside a twin identical modulo name; a twin differing in referenced columns or actions has
+ * a different key, the guard does not fire, and the name is stripped. The core diff matches
+ * foreign keys more narrowly (`foreignKeyIdentity`: columns and target only).
  */
 function foreignKeyStructureKey(foreignKey: ForeignKey): string {
   return JSON.stringify([
