@@ -10,7 +10,13 @@ import {
   sequenceTypeChange,
 } from './index.ts';
 import type { Identity, IdentityInput } from './identity.ts';
-import type { IdentityFieldChange } from './diff.ts';
+import type {
+  Change,
+  IdentityChange,
+  IdentityFieldChange,
+  SequenceFieldChange,
+  TableChange,
+} from './diff.ts';
 import type { SequenceOptions } from './sequence.ts';
 import type {
   CheckConstraint,
@@ -26,8 +32,14 @@ import type {
   TableIdentity,
   UniqueConstraint,
 } from './model.ts';
-import type { Step, TransactionGroup } from './plan.ts';
-import { assertNever, groupSteps, TRANSACTIONAL } from './plan.ts';
+import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
+import {
+  applyChange,
+  assertNever,
+  emptyChangeApplication,
+  groupSteps,
+  TRANSACTIONAL,
+} from './plan.ts';
 
 /**
  * Tests for the migration plan: the eight global phases with the fifteen table phases at their
@@ -4157,4 +4169,544 @@ test('a deep-frozen model with a changed sequence can be planned without mutatio
       fields: [{ field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'other') }],
     },
   ]);
+});
+
+/**
+ * The `applyChange` seam: the write half of `plan`'s change application, pinned branch by
+ * branch. Every case runs through `applyChange(emptyChangeApplication(), change)` and asserts
+ * exactly which buckets are written and what they carry. This is seam coverage, not pipeline
+ * validation: `diff` never emits a kind outside its unions, so the fabricated-kind tests are
+ * deletion detectors for the exhaustiveness guards, and #50 extends these per-branch
+ * expectations.
+ */
+
+/** Applies one change through the seam and returns the application it wrote. */
+const applyIsolated = (change: Change): ChangeApplication => {
+  const application = emptyChangeApplication();
+  applyChange(application, change);
+  return application;
+};
+
+/**
+ * Asserts that `change` applied to a fresh application writes exactly the buckets named in
+ * `expected`, leaving every other bucket empty. Sets are compared as insertion-ordered arrays.
+ */
+const assertBuckets = (
+  name: string,
+  change: Change,
+  expected: Partial<Record<keyof ChangeApplication, unknown>>,
+): void => {
+  const application = applyIsolated(change);
+  for (const bucket of Object.keys(application) as (keyof ChangeApplication)[]) {
+    const value = application[bucket];
+    const actual = value instanceof Set ? [...value] : value;
+    assert.deepStrictEqual(actual, expected[bucket] ?? [], `${name}: ${String(bucket)}`);
+  }
+};
+
+/** A `table-changed` outer change on table `t` carrying the given sub-change. */
+const tableChanged = (change: TableChange): Change => ({
+  kind: 'table-changed',
+  table: identity('t'),
+  changes: [change],
+});
+
+/** A `column-changed` for column `id` with an empty field list and the given identity change. */
+const columnIdentityChanged = (identity: IdentityChange): Change =>
+  tableChanged({ kind: 'column-changed', name: 'id', fields: [], identity });
+
+/** A `sequence-changed` for sequence `s` carrying the given field changes. */
+const sequenceChanged = (changes: readonly SequenceFieldChange[]): Change => ({
+  kind: 'sequence-changed',
+  sequence: identity('s'),
+  changes,
+});
+
+/** The map key of a table and column pair, mirroring `plan.ts`. */
+const columnKey = (table: TableIdentity, column: string): string =>
+  `${keyOf(table)}\u0000${column}`;
+
+/** A change case for `applyChange` isolation: its exact expected bucket contents. */
+interface BucketCase {
+  readonly name: string;
+  readonly change: Change;
+  readonly buckets: Partial<Record<keyof ChangeApplication, unknown>>;
+}
+
+test('emptyChangeApplication returns fresh independent buckets', () => {
+  const first = emptyChangeApplication();
+  const second = emptyChangeApplication();
+
+  first.foreignKeyDrops.push({ kind: 'drop-table', table: identity('x') });
+  first.removedTableKeys.add(keyOf(identity('x')));
+
+  assert.notEqual(first.foreignKeyDrops, second.foreignKeyDrops);
+  assert.notEqual(first.removedTableKeys, second.removedTableKeys);
+  assert.deepStrictEqual(second.foreignKeyDrops, []);
+  assert.equal(second.removedTableKeys.size, 0);
+});
+
+test('applyChange writes each outer change kind into its buckets', () => {
+  const id = column('id', { type: 'integer', notNull: true });
+  const addedIdentity = column('seq', { type: 'integer', identity: identityColumn() });
+  const addedForeignKey = foreignKey(['id'], identity('other'), { name: 'fresh_id_fkey' });
+  const addedUnique = uniqueConstraint(['id'], { name: 'fresh_id_key' });
+  const addedCheck = checkConstraint('id > 0', { name: 'fresh_id_check' });
+  const addedIndex = index(['id'], { name: 'fresh_ix' });
+  const added = table('fresh', {
+    columns: [id, addedIdentity],
+    primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+    foreignKeys: [addedForeignKey],
+    uniqueConstraints: [addedUnique],
+    checkConstraints: [addedCheck],
+    indexes: [addedIndex],
+  });
+  const removed = table('gone', { columns: [column('id', { type: 'integer', notNull: true })] });
+  const owned = sequence('s', { ownedBy: owner('t', 'id') });
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'table-added',
+      change: { kind: 'table-added', table: added },
+      buckets: {
+        tableCreates: [
+          {
+            kind: 'create-table',
+            table: table('fresh', {
+              columns: [id, addedIdentity],
+              primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+            }),
+          },
+        ],
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: addedForeignKey },
+        ],
+        uniqueConstraintAdds: [
+          {
+            kind: 'add-unique-constraint',
+            table: identity('fresh'),
+            uniqueConstraint: addedUnique,
+          },
+        ],
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: addedCheck },
+        ],
+        indexCreates: [{ kind: 'create-index', table: identity('fresh'), index: addedIndex }],
+        identityAdds: [
+          {
+            kind: 'add-identity',
+            table: identity('fresh'),
+            name: 'seq',
+            identity: identityColumn(),
+          },
+        ],
+      },
+    },
+    {
+      name: 'table-removed',
+      change: { kind: 'table-removed', table: removed },
+      buckets: {
+        removedTables: [{ identity: identity('gone'), table: removed }],
+        removedTableKeys: [keyOf(identity('gone'))],
+      },
+    },
+    {
+      name: 'table-changed',
+      change: tableChanged({ kind: 'column-added', column: column('c', { type: 'integer' }) }),
+      buckets: {
+        columnAdds: [
+          { kind: 'add-column', table: identity('t'), column: column('c', { type: 'integer' }) },
+        ],
+      },
+    },
+    {
+      name: 'sequence-added (owned)',
+      change: { kind: 'sequence-added', sequence: owned },
+      buckets: {
+        sequenceCreates: [{ kind: 'create-sequence', sequence: unowned(owned) }],
+        ownershipChanges: [{ sequence: identity('s'), after: owner('t', 'id') }],
+      },
+    },
+    {
+      name: 'sequence-removed (owned)',
+      change: { kind: 'sequence-removed', sequence: owned },
+      buckets: {
+        removedSequences: [{ identity: identity('s'), ownedBy: owner('t', 'id') }],
+      },
+    },
+    {
+      name: 'sequence-changed (options)',
+      change: sequenceChanged([{ field: 'increment', before: '1', after: '5' }]),
+      buckets: {
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [{ field: 'increment', before: '1', after: '5' }],
+          },
+        ],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange writes each table change kind into its buckets', () => {
+  const beforePrimaryKey: PrimaryKey = { name: 't_pkey', columns: ['id'] };
+  const afterPrimaryKey: PrimaryKey = { name: 't_pkey_2', columns: ['id', 'x'] };
+  const beforeForeignKey = foreignKey(['a'], identity('other'), { name: 't_a_fkey' });
+  const afterForeignKey = foreignKey(['b'], identity('other'), { name: 't_b_fkey' });
+  const beforeUnique = uniqueConstraint(['a'], { name: 't_a_key' });
+  const afterUnique = uniqueConstraint(['b'], { name: 't_b_key' });
+  const beforeCheck = checkConstraint('a > 0', { name: 't_a_check' });
+  const afterCheck = checkConstraint('b > 0', { name: 't_b_check' });
+  const beforeIndex = index(['a'], { name: 't_a_ix' });
+  const afterIndex = index(['b'], { name: 't_b_ix' });
+  const removedColumn = column('gone', { type: 'integer' });
+  const addedColumn = column('fresh', { type: 'integer' });
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'column-added',
+      change: tableChanged({ kind: 'column-added', column: addedColumn }),
+      buckets: {
+        columnAdds: [{ kind: 'add-column', table: identity('t'), column: addedColumn }],
+      },
+    },
+    {
+      name: 'column-removed',
+      change: tableChanged({ kind: 'column-removed', column: removedColumn }),
+      buckets: {
+        columnDrops: [{ kind: 'drop-column', table: identity('t'), column: removedColumn }],
+        removedColumnKeys: [columnKey(identity('t'), 'gone')],
+      },
+    },
+    {
+      name: 'column-changed',
+      change: tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'default', before: '1', after: '2' }],
+      }),
+      buckets: {
+        columnAlters: [
+          {
+            kind: 'alter-column',
+            table: identity('t'),
+            name: 'c',
+            fields: [{ field: 'default', before: '1', after: '2' }],
+          },
+        ],
+      },
+    },
+    {
+      name: 'primary-key-added',
+      change: tableChanged({ kind: 'primary-key-added', primaryKey: afterPrimaryKey }),
+      buckets: {
+        primaryKeyAdds: [
+          { kind: 'add-primary-key', table: identity('t'), primaryKey: afterPrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'primary-key-removed',
+      change: tableChanged({ kind: 'primary-key-removed', primaryKey: beforePrimaryKey }),
+      buckets: {
+        primaryKeyDrops: [
+          { kind: 'drop-primary-key', table: identity('t'), primaryKey: beforePrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'primary-key-changed',
+      change: tableChanged({
+        kind: 'primary-key-changed',
+        before: beforePrimaryKey,
+        after: afterPrimaryKey,
+      }),
+      buckets: {
+        primaryKeyDrops: [
+          { kind: 'drop-primary-key', table: identity('t'), primaryKey: beforePrimaryKey },
+        ],
+        primaryKeyAdds: [
+          { kind: 'add-primary-key', table: identity('t'), primaryKey: afterPrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-added',
+      change: tableChanged({ kind: 'foreign-key-added', foreignKey: afterForeignKey }),
+      buckets: {
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-removed',
+      change: tableChanged({ kind: 'foreign-key-removed', foreignKey: beforeForeignKey }),
+      buckets: {
+        foreignKeyDrops: [
+          { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-changed',
+      change: tableChanged({
+        kind: 'foreign-key-changed',
+        before: beforeForeignKey,
+        after: afterForeignKey,
+      }),
+      buckets: {
+        foreignKeyDrops: [
+          { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeForeignKey },
+        ],
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-added',
+      change: tableChanged({ kind: 'unique-constraint-added', uniqueConstraint: afterUnique }),
+      buckets: {
+        uniqueConstraintAdds: [
+          { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-removed',
+      change: tableChanged({ kind: 'unique-constraint-removed', uniqueConstraint: beforeUnique }),
+      buckets: {
+        uniqueConstraintDrops: [
+          { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-changed',
+      change: tableChanged({
+        kind: 'unique-constraint-changed',
+        before: beforeUnique,
+        after: afterUnique,
+      }),
+      buckets: {
+        uniqueConstraintDrops: [
+          { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+        ],
+        uniqueConstraintAdds: [
+          { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-added',
+      change: tableChanged({ kind: 'check-constraint-added', checkConstraint: afterCheck }),
+      buckets: {
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-removed',
+      change: tableChanged({ kind: 'check-constraint-removed', checkConstraint: beforeCheck }),
+      buckets: {
+        checkConstraintDrops: [
+          { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-changed',
+      change: tableChanged({
+        kind: 'check-constraint-changed',
+        before: beforeCheck,
+        after: afterCheck,
+      }),
+      buckets: {
+        checkConstraintDrops: [
+          { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+        ],
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+        ],
+      },
+    },
+    {
+      name: 'index-added',
+      change: tableChanged({ kind: 'index-added', index: afterIndex }),
+      buckets: {
+        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+      },
+    },
+    {
+      name: 'index-removed',
+      change: tableChanged({ kind: 'index-removed', index: beforeIndex }),
+      buckets: {
+        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
+      },
+    },
+    {
+      name: 'index-changed',
+      change: tableChanged({ kind: 'index-changed', before: beforeIndex, after: afterIndex }),
+      buckets: {
+        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
+        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange writes each identity change kind through column-changed', () => {
+  const descriptor = identityColumn();
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'identity-added',
+      change: columnIdentityChanged({ kind: 'added', identity: descriptor }),
+      buckets: {
+        identityAdds: [
+          { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+        ],
+      },
+    },
+    {
+      name: 'identity-removed',
+      change: columnIdentityChanged({ kind: 'removed', identity: descriptor }),
+      buckets: {
+        identityDrops: [{ kind: 'drop-identity', table: identity('t'), name: 'id' }],
+      },
+    },
+    {
+      name: 'identity-recreated',
+      change: columnIdentityChanged({ kind: 'recreated', identity: descriptor }),
+      buckets: {
+        identityDrops: [{ kind: 'drop-identity', table: identity('t'), name: 'id' }],
+        identityAdds: [
+          { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+        ],
+      },
+    },
+    {
+      name: 'identity-changed',
+      change: columnIdentityChanged({
+        kind: 'changed',
+        fields: [{ field: 'increment', before: '1', after: '2' }],
+      }),
+      buckets: {
+        identityAlters: [
+          {
+            kind: 'alter-identity',
+            table: identity('t'),
+            name: 'id',
+            fields: [{ field: 'increment', before: '1', after: '2' }],
+          },
+        ],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange splits a changed sequence into option and ownership buckets', () => {
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'options only',
+      change: sequenceChanged([
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'increment', before: '1', after: '5' },
+      ]),
+      buckets: {
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [
+              { field: 'dataType', before: 'integer', after: 'bigint' },
+              { field: 'increment', before: '1', after: '5' },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      name: 'ownership only',
+      change: sequenceChanged([
+        { field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'x') },
+      ]),
+      buckets: {
+        ownershipChanges: [
+          { sequence: identity('s'), before: owner('t', 'id'), after: owner('t', 'x') },
+        ],
+      },
+    },
+    {
+      name: 'mixed',
+      change: sequenceChanged([
+        { field: 'ownedBy', before: owner('t', 'id') },
+        { field: 'maxValue', before: '10', after: '20' },
+        { field: 'ownedBy', after: owner('u', 'id') },
+      ]),
+      buckets: {
+        ownershipChanges: [
+          { sequence: identity('s'), before: owner('t', 'id') },
+          { sequence: identity('s'), after: owner('u', 'id') },
+        ],
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [{ field: 'maxValue', before: '10', after: '20' }],
+          },
+        ],
+      },
+    },
+    {
+      name: 'no fields',
+      change: sequenceChanged([]),
+      buckets: {},
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+// Deletion detectors, not pipeline validation: `diff` never emits an unknown kind, so these
+// pin the guards that make every future union member a compile error, and the seam contract
+// #50 extends with property coverage.
+
+test('a fabricated outer change kind is rejected by the application guard', () => {
+  assert.throws(
+    () => applyChange(emptyChangeApplication(), { kind: 'frobnicate' } as unknown as Change),
+    /Unhandled change kind: frobnicate/,
+  );
+});
+
+test('a fabricated table change kind is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        tableChanged({ kind: 'frobnicate' } as unknown as TableChange),
+      ),
+    /Unhandled table change kind: frobnicate/,
+  );
+});
+
+test('a fabricated identity change kind is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        columnIdentityChanged({ kind: 'frobnicate' } as unknown as IdentityChange),
+      ),
+    /Unhandled identity change kind: frobnicate/,
+  );
 });
