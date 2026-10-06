@@ -1,5 +1,10 @@
 import { diff } from './diff.ts';
-import type { ColumnFieldChange, IdentityFieldChange, SequenceFieldChange } from './diff.ts';
+import type {
+  Change,
+  ColumnFieldChange,
+  IdentityFieldChange,
+  SequenceFieldChange,
+} from './diff.ts';
 import type { Identity } from './identity.ts';
 import type {
   CheckConstraint,
@@ -347,363 +352,25 @@ export function groupSteps(
 export function plan(baseline: Model, target: Model): Plan {
   const changes = diff(baseline, target);
 
-  const foreignKeyDrops: Step[] = [];
-  const primaryKeyDrops: Step[] = [];
-  const columnDrops: Step[] = [];
-  const removedTables: RemovedTable[] = [];
-  const tableCreates: Step[] = [];
-  const columnAdds: Step[] = [];
-  const columnAlters: Step[] = [];
-  const primaryKeyAdds: Step[] = [];
-  const foreignKeyAdds: Step[] = [];
-  const uniqueConstraintDrops: Step[] = [];
-  const uniqueConstraintAdds: Step[] = [];
-  const checkConstraintDrops: Step[] = [];
-  const checkConstraintAdds: Step[] = [];
-  const indexDrops: Step[] = [];
-  const indexCreates: Step[] = [];
-  const identityDrops: Step[] = [];
-  const identityAdds: Step[] = [];
-  const identityAlters: Step[] = [];
-  const sequenceCreates: Step[] = [];
-  const optionAlters: Step[] = [];
-  const ownershipChanges: SequenceOwnershipChange[] = [];
-  const removedSequences: RemovedSequence[] = [];
-  const removedTableKeys = new Set<string>();
-  const removedColumnKeys = new Set<string>();
+  const application = emptyChangeApplication();
+  for (const change of changes) applyChange(application, change);
 
-  for (const change of changes) {
-    switch (change.kind) {
-      case 'table-removed': {
-        removedTables.push({
-          identity: copyIdentity(change.table),
-          table: copyTable(change.table),
-        });
-        removedTableKeys.add(keyOf(change.table));
-        break;
-      }
-      case 'table-added': {
-        tableCreates.push({
-          kind: 'create-table',
-          table: copyTableForCreate(change.table),
-        });
-        for (const foreignKey of change.table.foreignKeys) {
-          foreignKeyAdds.push({
-            kind: 'add-foreign-key',
-            table: copyIdentity(change.table),
-            foreignKey: copyForeignKey(foreignKey),
-          });
-        }
-        for (const uniqueConstraint of change.table.uniqueConstraints) {
-          uniqueConstraintAdds.push({
-            kind: 'add-unique-constraint',
-            table: copyIdentity(change.table),
-            uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
-          });
-        }
-        for (const checkConstraint of change.table.checkConstraints) {
-          checkConstraintAdds.push({
-            kind: 'add-check-constraint',
-            table: copyIdentity(change.table),
-            checkConstraint: copyCheckConstraint(checkConstraint),
-          });
-        }
-        for (const index of change.table.indexes) {
-          indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
-        }
-        for (const column of change.table.columns) {
-          if (column.identity === undefined) continue;
-          identityAdds.push({
-            kind: 'add-identity',
-            table: copyIdentity(change.table),
-            name: column.name,
-            identity: copyColumnIdentity(column.identity),
-          });
-        }
-        break;
-      }
-      case 'table-changed': {
-        for (const tableChange of change.changes) {
-          switch (tableChange.kind) {
-            case 'column-removed': {
-              columnDrops.push({
-                kind: 'drop-column',
-                table: copyIdentity(change.table),
-                column: copyColumn(tableChange.column),
-              });
-              removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
-              break;
-            }
-            case 'column-added': {
-              columnAdds.push({
-                kind: 'add-column',
-                table: copyIdentity(change.table),
-                column: copyColumn(tableChange.column),
-              });
-              if (tableChange.column.identity !== undefined) {
-                identityAdds.push({
-                  kind: 'add-identity',
-                  table: copyIdentity(change.table),
-                  name: tableChange.column.name,
-                  identity: copyColumnIdentity(tableChange.column.identity),
-                });
-              }
-              break;
-            }
-            case 'column-changed': {
-              if (tableChange.fields.length > 0) {
-                columnAlters.push({
-                  kind: 'alter-column',
-                  table: copyIdentity(change.table),
-                  name: tableChange.name,
-                  fields: tableChange.fields.map(copyFieldChange),
-                });
-              }
-              const identityChange = tableChange.identity;
-              if (identityChange !== undefined) {
-                switch (identityChange.kind) {
-                  case 'added':
-                    identityAdds.push({
-                      kind: 'add-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                      identity: copyColumnIdentity(identityChange.identity),
-                    });
-                    break;
-                  case 'removed':
-                    identityDrops.push({
-                      kind: 'drop-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                    });
-                    break;
-                  case 'recreated':
-                    identityDrops.push({
-                      kind: 'drop-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                    });
-                    identityAdds.push({
-                      kind: 'add-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                      identity: copyColumnIdentity(identityChange.identity),
-                    });
-                    break;
-                  case 'changed':
-                    if (identityChange.fields.length > 0) {
-                      identityAlters.push({
-                        kind: 'alter-identity',
-                        table: copyIdentity(change.table),
-                        name: tableChange.name,
-                        fields: identityChange.fields.map(copyIdentityFieldChange),
-                      });
-                    }
-                    break;
-                  default:
-                    assertNever(identityChange, 'identity change kind');
-                }
-              }
-              break;
-            }
-            case 'primary-key-removed': {
-              primaryKeyDrops.push({
-                kind: 'drop-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.primaryKey),
-              });
-              break;
-            }
-            case 'primary-key-added': {
-              primaryKeyAdds.push({
-                kind: 'add-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.primaryKey),
-              });
-              break;
-            }
-            case 'primary-key-changed': {
-              primaryKeyDrops.push({
-                kind: 'drop-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.before),
-              });
-              primaryKeyAdds.push({
-                kind: 'add-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.after),
-              });
-              break;
-            }
-            case 'foreign-key-removed': {
-              foreignKeyDrops.push({
-                kind: 'drop-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.foreignKey),
-              });
-              break;
-            }
-            case 'foreign-key-added': {
-              foreignKeyAdds.push({
-                kind: 'add-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.foreignKey),
-              });
-              break;
-            }
-            case 'foreign-key-changed': {
-              foreignKeyDrops.push({
-                kind: 'drop-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.before),
-              });
-              foreignKeyAdds.push({
-                kind: 'add-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.after),
-              });
-              break;
-            }
-            case 'unique-constraint-removed': {
-              uniqueConstraintDrops.push({
-                kind: 'drop-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
-              });
-              break;
-            }
-            case 'unique-constraint-added': {
-              uniqueConstraintAdds.push({
-                kind: 'add-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
-              });
-              break;
-            }
-            case 'unique-constraint-changed': {
-              uniqueConstraintDrops.push({
-                kind: 'drop-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.before),
-              });
-              uniqueConstraintAdds.push({
-                kind: 'add-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.after),
-              });
-              break;
-            }
-            case 'check-constraint-removed': {
-              checkConstraintDrops.push({
-                kind: 'drop-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
-              });
-              break;
-            }
-            case 'check-constraint-added': {
-              checkConstraintAdds.push({
-                kind: 'add-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
-              });
-              break;
-            }
-            case 'check-constraint-changed': {
-              checkConstraintDrops.push({
-                kind: 'drop-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.before),
-              });
-              checkConstraintAdds.push({
-                kind: 'add-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.after),
-              });
-              break;
-            }
-            case 'index-removed': {
-              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.index));
-              break;
-            }
-            case 'index-added': {
-              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.index));
-              break;
-            }
-            case 'index-changed': {
-              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.before));
-              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.after));
-              break;
-            }
-            default:
-              assertNever(tableChange, 'table change kind');
-          }
-        }
-        break;
-      }
-      case 'sequence-added': {
-        sequenceCreates.push({
-          kind: 'create-sequence',
-          sequence: copySequenceWithoutOwner(change.sequence),
-        });
-        if (change.sequence.ownedBy !== undefined) {
-          ownershipChanges.push({
-            sequence: copySequenceIdentity(change.sequence),
-            after: copyOwner(change.sequence.ownedBy),
-          });
-        }
-        break;
-      }
-      case 'sequence-removed': {
-        removedSequences.push({
-          identity: copySequenceIdentity(change.sequence),
-          ...(change.sequence.ownedBy === undefined
-            ? {}
-            : { ownedBy: copyOwner(change.sequence.ownedBy) }),
-        });
-        break;
-      }
-      case 'sequence-changed': {
-        const identity = copySequenceIdentity(change.sequence);
-        const ownership = change.changes.filter((field) => field.field === 'ownedBy');
-        const options = change.changes.filter((field) => field.field !== 'ownedBy');
-        if (options.length > 0) {
-          optionAlters.push({
-            kind: 'alter-sequence',
-            sequence: identity,
-            fields: options.map(copySequenceFieldChange),
-          });
-        }
-        for (const field of ownership) {
-          if (field.field !== 'ownedBy') continue;
-          ownershipChanges.push({
-            sequence: copySequenceIdentity(identity),
-            ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-            ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
-          });
-        }
-        break;
-      }
-      default:
-        assertNever(change, 'change kind');
-    }
-  }
-
-  const { drops: tableDrops, breaks } = orderTableDrops(removedTables);
+  const { drops: tableDrops, breaks } = orderTableDrops(application.removedTables);
   const { drops: dependentKeyDrops, adds: dependentKeyAdds } = dependentForeignKeySteps(
     baseline,
     target,
-    primaryKeyDrops,
+    application.primaryKeyDrops,
   );
 
   const columnRemoved = (table: TableIdentity, column: string): boolean =>
-    removedTableKeys.has(keyOf(table)) || removedColumnKeys.has(columnKey(table, column));
+    application.removedTableKeys.has(keyOf(table)) ||
+    application.removedColumnKeys.has(columnKey(table, column));
 
   const ownerRemoved = (owner: SequenceOwner): boolean => columnRemoved(owner.table, owner.column);
 
   const ownershipDetaches: Step[] = [];
   const ownershipAttaches: Step[] = [];
-  for (const change of ownershipChanges) {
+  for (const change of application.ownershipChanges) {
     if (change.before !== undefined && ownerRemoved(change.before)) {
       ownershipDetaches.push({
         kind: 'alter-sequence',
@@ -733,58 +400,475 @@ export function plan(baseline: Model, target: Model): Plan {
   }
 
   const sequenceDrops: Step[] = [];
-  for (const removed of removedSequences) {
+  for (const removed of application.removedSequences) {
     if (removed.ownedBy !== undefined && ownerRemoved(removed.ownedBy)) continue;
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
   const steps: Step[] = [
-    ...identityDrops,
-    ...sequenceCreates,
+    ...application.identityDrops,
+    ...application.sequenceCreates,
     ...ownershipDetaches,
-    ...foreignKeyDrops,
+    ...application.foreignKeyDrops,
     ...dependentKeyDrops,
     ...breaks,
-    ...indexDrops,
-    ...checkConstraintDrops,
-    ...uniqueConstraintDrops,
+    ...application.indexDrops,
+    ...application.checkConstraintDrops,
+    ...application.uniqueConstraintDrops,
     ...tableDrops,
-    ...primaryKeyDrops,
-    ...columnDrops,
-    ...tableCreates,
-    ...columnAdds,
-    ...columnAlters,
-    ...primaryKeyAdds,
-    ...uniqueConstraintAdds,
-    ...checkConstraintAdds,
-    ...indexCreates,
-    ...foreignKeyAdds,
+    ...application.primaryKeyDrops,
+    ...application.columnDrops,
+    ...application.tableCreates,
+    ...application.columnAdds,
+    ...application.columnAlters,
+    ...application.primaryKeyAdds,
+    ...application.uniqueConstraintAdds,
+    ...application.checkConstraintAdds,
+    ...application.indexCreates,
+    ...application.foreignKeyAdds,
     ...dependentKeyAdds,
     ...ownershipAttaches,
-    ...optionAlters,
+    ...application.optionAlters,
     ...sequenceDrops,
-    ...identityAdds,
-    ...identityAlters,
+    ...application.identityAdds,
+    ...application.identityAlters,
   ];
 
   return { steps, groups: groupSteps(steps) };
 }
 
+/**
+ * The buckets `plan` writes while expanding every `Change` into steps: the write side of the
+ * change application pass, exposed with `emptyChangeApplication` and `applyChange` as an
+ * internal test seam. `plan` builds one application, applies the whole diff through
+ * `applyChange`, then reads the buckets in the post-loop to order, suppress, and phase the
+ * steps. Not package API: the barrel never re-exports the values, and this seam validates
+ * nothing — `diff` never emits a kind or field outside the unions below, so unknown values
+ * here are fabricated detectors, not pipeline input. #50 extends this seam.
+ */
+export interface ChangeApplication {
+  readonly foreignKeyDrops: Step[];
+  readonly primaryKeyDrops: Step[];
+  readonly columnDrops: Step[];
+  /** Removed tables, held with their payload until phase 5 orders the drops. */
+  readonly removedTables: RemovedTable[];
+  readonly tableCreates: Step[];
+  readonly columnAdds: Step[];
+  readonly columnAlters: Step[];
+  readonly primaryKeyAdds: Step[];
+  readonly foreignKeyAdds: Step[];
+  readonly uniqueConstraintDrops: Step[];
+  readonly uniqueConstraintAdds: Step[];
+  readonly checkConstraintDrops: Step[];
+  readonly checkConstraintAdds: Step[];
+  readonly indexDrops: Step[];
+  readonly indexCreates: Step[];
+  readonly identityDrops: Step[];
+  readonly identityAdds: Step[];
+  readonly identityAlters: Step[];
+  readonly sequenceCreates: Step[];
+  readonly optionAlters: Step[];
+  /** A changed sequence's ownership, held until the plan knows which owners it removes. */
+  readonly ownershipChanges: SequenceOwnershipChange[];
+  /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
+  readonly removedSequences: RemovedSequence[];
+  /** The removed tables' keys, for the post-loop owner-removal test. */
+  readonly removedTableKeys: Set<string>;
+  /** The removed columns' keys, for the post-loop owner-removal test. */
+  readonly removedColumnKeys: Set<string>;
+}
+
+/**
+ * A fresh `ChangeApplication` with independent arrays and sets, so separate applications never
+ * share bucket state. Internal test seam, see `ChangeApplication`.
+ */
+export function emptyChangeApplication(): ChangeApplication {
+  return {
+    foreignKeyDrops: [],
+    primaryKeyDrops: [],
+    columnDrops: [],
+    removedTables: [],
+    tableCreates: [],
+    columnAdds: [],
+    columnAlters: [],
+    primaryKeyAdds: [],
+    foreignKeyAdds: [],
+    uniqueConstraintDrops: [],
+    uniqueConstraintAdds: [],
+    checkConstraintDrops: [],
+    checkConstraintAdds: [],
+    indexDrops: [],
+    indexCreates: [],
+    identityDrops: [],
+    identityAdds: [],
+    identityAlters: [],
+    sequenceCreates: [],
+    optionAlters: [],
+    ownershipChanges: [],
+    removedSequences: [],
+    removedTableKeys: new Set<string>(),
+    removedColumnKeys: new Set<string>(),
+  };
+}
+
+/**
+ * Applies one `Change` to `application`: it writes exactly the buckets `plan` reads after the
+ * loop, with the same copies and in the same order. Internal test seam, see
+ * `ChangeApplication`.
+ */
+export function applyChange(application: ChangeApplication, change: Change): void {
+  switch (change.kind) {
+    case 'table-removed': {
+      application.removedTables.push({
+        identity: copyIdentity(change.table),
+        table: copyTable(change.table),
+      });
+      application.removedTableKeys.add(keyOf(change.table));
+      break;
+    }
+    case 'table-added': {
+      application.tableCreates.push({
+        kind: 'create-table',
+        table: copyTableForCreate(change.table),
+      });
+      for (const foreignKey of change.table.foreignKeys) {
+        application.foreignKeyAdds.push({
+          kind: 'add-foreign-key',
+          table: copyIdentity(change.table),
+          foreignKey: copyForeignKey(foreignKey),
+        });
+      }
+      for (const uniqueConstraint of change.table.uniqueConstraints) {
+        application.uniqueConstraintAdds.push({
+          kind: 'add-unique-constraint',
+          table: copyIdentity(change.table),
+          uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
+        });
+      }
+      for (const checkConstraint of change.table.checkConstraints) {
+        application.checkConstraintAdds.push({
+          kind: 'add-check-constraint',
+          table: copyIdentity(change.table),
+          checkConstraint: copyCheckConstraint(checkConstraint),
+        });
+      }
+      for (const index of change.table.indexes) {
+        application.indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
+      }
+      for (const column of change.table.columns) {
+        if (column.identity === undefined) continue;
+        application.identityAdds.push({
+          kind: 'add-identity',
+          table: copyIdentity(change.table),
+          name: column.name,
+          identity: copyColumnIdentity(column.identity),
+        });
+      }
+      break;
+    }
+    case 'table-changed': {
+      for (const tableChange of change.changes) {
+        switch (tableChange.kind) {
+          case 'column-removed': {
+            application.columnDrops.push({
+              kind: 'drop-column',
+              table: copyIdentity(change.table),
+              column: copyColumn(tableChange.column),
+            });
+            application.removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
+            break;
+          }
+          case 'column-added': {
+            application.columnAdds.push({
+              kind: 'add-column',
+              table: copyIdentity(change.table),
+              column: copyColumn(tableChange.column),
+            });
+            if (tableChange.column.identity !== undefined) {
+              application.identityAdds.push({
+                kind: 'add-identity',
+                table: copyIdentity(change.table),
+                name: tableChange.column.name,
+                identity: copyColumnIdentity(tableChange.column.identity),
+              });
+            }
+            break;
+          }
+          case 'column-changed': {
+            if (tableChange.fields.length > 0) {
+              application.columnAlters.push({
+                kind: 'alter-column',
+                table: copyIdentity(change.table),
+                name: tableChange.name,
+                fields: tableChange.fields.map(copyFieldChange),
+              });
+            }
+            const identityChange = tableChange.identity;
+            if (identityChange !== undefined) {
+              switch (identityChange.kind) {
+                case 'added':
+                  application.identityAdds.push({
+                    kind: 'add-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                    identity: copyColumnIdentity(identityChange.identity),
+                  });
+                  break;
+                case 'removed':
+                  application.identityDrops.push({
+                    kind: 'drop-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                  });
+                  break;
+                case 'recreated':
+                  application.identityDrops.push({
+                    kind: 'drop-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                  });
+                  application.identityAdds.push({
+                    kind: 'add-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                    identity: copyColumnIdentity(identityChange.identity),
+                  });
+                  break;
+                case 'changed':
+                  if (identityChange.fields.length > 0) {
+                    application.identityAlters.push({
+                      kind: 'alter-identity',
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                      fields: identityChange.fields.map(copyIdentityFieldChange),
+                    });
+                  }
+                  break;
+                default:
+                  assertNever(identityChange, 'identity change kind');
+              }
+            }
+            break;
+          }
+          case 'primary-key-removed': {
+            application.primaryKeyDrops.push({
+              kind: 'drop-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.primaryKey),
+            });
+            break;
+          }
+          case 'primary-key-added': {
+            application.primaryKeyAdds.push({
+              kind: 'add-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.primaryKey),
+            });
+            break;
+          }
+          case 'primary-key-changed': {
+            application.primaryKeyDrops.push({
+              kind: 'drop-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.before),
+            });
+            application.primaryKeyAdds.push({
+              kind: 'add-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.after),
+            });
+            break;
+          }
+          case 'foreign-key-removed': {
+            application.foreignKeyDrops.push({
+              kind: 'drop-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.foreignKey),
+            });
+            break;
+          }
+          case 'foreign-key-added': {
+            application.foreignKeyAdds.push({
+              kind: 'add-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.foreignKey),
+            });
+            break;
+          }
+          case 'foreign-key-changed': {
+            application.foreignKeyDrops.push({
+              kind: 'drop-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.before),
+            });
+            application.foreignKeyAdds.push({
+              kind: 'add-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.after),
+            });
+            break;
+          }
+          case 'unique-constraint-removed': {
+            application.uniqueConstraintDrops.push({
+              kind: 'drop-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+            });
+            break;
+          }
+          case 'unique-constraint-added': {
+            application.uniqueConstraintAdds.push({
+              kind: 'add-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+            });
+            break;
+          }
+          case 'unique-constraint-changed': {
+            application.uniqueConstraintDrops.push({
+              kind: 'drop-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.before),
+            });
+            application.uniqueConstraintAdds.push({
+              kind: 'add-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.after),
+            });
+            break;
+          }
+          case 'check-constraint-removed': {
+            application.checkConstraintDrops.push({
+              kind: 'drop-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+            });
+            break;
+          }
+          case 'check-constraint-added': {
+            application.checkConstraintAdds.push({
+              kind: 'add-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+            });
+            break;
+          }
+          case 'check-constraint-changed': {
+            application.checkConstraintDrops.push({
+              kind: 'drop-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.before),
+            });
+            application.checkConstraintAdds.push({
+              kind: 'add-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.after),
+            });
+            break;
+          }
+          case 'index-removed': {
+            application.indexDrops.push(
+              indexDropStep(copyIdentity(change.table), tableChange.index),
+            );
+            break;
+          }
+          case 'index-added': {
+            application.indexCreates.push(
+              indexCreateStep(copyIdentity(change.table), tableChange.index),
+            );
+            break;
+          }
+          case 'index-changed': {
+            application.indexDrops.push(
+              indexDropStep(copyIdentity(change.table), tableChange.before),
+            );
+            application.indexCreates.push(
+              indexCreateStep(copyIdentity(change.table), tableChange.after),
+            );
+            break;
+          }
+          default:
+            assertNever(tableChange, 'table change kind');
+        }
+      }
+      break;
+    }
+    case 'sequence-added': {
+      application.sequenceCreates.push({
+        kind: 'create-sequence',
+        sequence: copySequenceWithoutOwner(change.sequence),
+      });
+      if (change.sequence.ownedBy !== undefined) {
+        application.ownershipChanges.push({
+          sequence: copySequenceIdentity(change.sequence),
+          after: copyOwner(change.sequence.ownedBy),
+        });
+      }
+      break;
+    }
+    case 'sequence-removed': {
+      application.removedSequences.push({
+        identity: copySequenceIdentity(change.sequence),
+        ...(change.sequence.ownedBy === undefined
+          ? {}
+          : { ownedBy: copyOwner(change.sequence.ownedBy) }),
+      });
+      break;
+    }
+    case 'sequence-changed': {
+      const identity = copySequenceIdentity(change.sequence);
+      const options: SequenceFieldChange[] = [];
+      for (const field of change.changes) {
+        switch (field.field) {
+          case 'ownedBy':
+            application.ownershipChanges.push({
+              sequence: copySequenceIdentity(identity),
+              ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
+              ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+            });
+            break;
+          case 'dataType':
+          case 'increment':
+          case 'minValue':
+          case 'maxValue':
+          case 'start':
+          case 'cache':
+          case 'cycle':
+            options.push(copyStepPayload(field));
+            break;
+          default:
+            assertNever(field, 'sequence field');
+        }
+      }
+      if (options.length > 0) {
+        application.optionAlters.push({
+          kind: 'alter-sequence',
+          sequence: identity,
+          fields: options,
+        });
+      }
+      break;
+    }
+    default:
+      assertNever(change, 'change kind');
+  }
+}
+
 /** A changed sequence's ownership, held until the plan knows which owners it removes. */
-interface SequenceOwnershipChange {
+export interface SequenceOwnershipChange {
   readonly sequence: SequenceIdentity;
   readonly before?: SequenceOwner;
   readonly after?: SequenceOwner;
 }
 
 /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
-interface RemovedSequence {
+export interface RemovedSequence {
   readonly identity: SequenceIdentity;
   readonly ownedBy?: SequenceOwner;
 }
 
 /** A removed table, held with its canonical payload while table phase 5 orders the drops. */
-interface RemovedTable {
+export interface RemovedTable {
   readonly identity: TableIdentity;
   readonly table: Table;
 }
@@ -907,14 +991,25 @@ function copyUniqueConstraint(uniqueConstraint: UniqueConstraint): UniqueConstra
   return { ...uniqueConstraint, columns: [...uniqueConstraint.columns] };
 }
 
+/**
+ * A deep copy of a step-embedded payload, independent of the diff's `Change`. `structuredClone`
+ * preserves the payload's shape — undefined-valued keys and key order included — and throws
+ * loudly on a non-cloneable value (payloads are plain data). Every payload that reaches a step
+ * through a whole-object copy goes through here, so a future nested field cannot alias the
+ * diff's change.
+ */
+function copyStepPayload<T>(value: T): T {
+  return structuredClone(value);
+}
+
 /** A copy of `checkConstraint`, independent of the caller's model. */
 function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint {
-  return { ...checkConstraint };
+  return copyStepPayload(checkConstraint);
 }
 
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
-  return { ...index, columns: [...index.columns] };
+  return copyStepPayload(index);
 }
 
 /** The create step for `index`: concurrent exactly when the index states `concurrently`. */
@@ -937,12 +1032,12 @@ function indexDropStep(table: TableIdentity, index: Index): Step {
 
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of one identity field change, independent of the diff's payload. */
 function copyIdentityFieldChange(field: IdentityFieldChange): IdentityFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of a column's identity descriptor, independent of the caller's model. */
@@ -957,16 +1052,6 @@ function copyColumnIdentity(identity: Identity): Identity {
             name: identity.sequenceName.name,
           },
         }),
-  };
-}
-
-/** A copy of one sequence field change, independent of the diff's payload. */
-function copySequenceFieldChange(field: SequenceFieldChange): SequenceFieldChange {
-  if (field.field !== 'ownedBy') return { ...field };
-  return {
-    field: 'ownedBy',
-    ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-    ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
   };
 }
 
