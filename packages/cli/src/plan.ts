@@ -1,5 +1,5 @@
 import { plan } from '@schemamill/core';
-import { hazardAnalyzer, renderSql } from '@schemamill/postgres';
+import { hazardAnalyzer, RenderRefusalError, renderSql } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
 import { formatHazards, formatPlan } from './format.ts';
@@ -11,7 +11,9 @@ import { importPair } from './run.ts';
  *
  * Wiring only — the plan comes from `@schemamill/core`, and the hazards and migration SQL from
  * `@schemamill/postgres`, with the human wording from `format.ts`. An `error` diagnostic makes
- * the exit code 1, but the plan is still printed.
+ * the exit code 1, but the plan is still printed. A plan the renderer refuses still prints its
+ * display, then one `schemamill: refusing to render: …` line on stderr and exit code 1; any
+ * other render failure is a bug and crashes.
  */
 
 interface PlanOptions {
@@ -35,11 +37,19 @@ export function registerPlan(program: Command): void {
       const planned = plan(imported.baseline, imported.target);
       const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
       const hazardsBlock = hazards.length > 0 ? `${formatHazards(hazards)}\n` : '';
-      process.stdout.write(
-        planned.steps.length === 0
-          ? formatPlan(planned)
-          : `${formatPlan(planned)}\n${hazardsBlock}${renderSql(planned)}`,
-      );
+      if (planned.steps.length === 0) {
+        process.stdout.write(formatPlan(planned));
+      } else {
+        process.stdout.write(`${formatPlan(planned)}\n${hazardsBlock}`);
+        try {
+          process.stdout.write(renderSql(planned));
+        } catch (error) {
+          if (!(error instanceof RenderRefusalError)) throw error;
+          process.stderr.write(`schemamill: ${error.message}\n`);
+          process.exitCode = 1;
+          return;
+        }
+      }
       process.exitCode = imported.exitCode;
     });
 }

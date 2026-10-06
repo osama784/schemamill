@@ -14,10 +14,11 @@ import { version } from '@schemamill/core';
  * End-to-end tests for the `schemamill` binary.
  *
  * Every test spawns the built CLI in `dist/` (the package's test script builds first): the
- * command scenes pass fixture dumps written into a fresh temp directory, and the usage tests
- * pass their arguments bare. Each asserts the exact stdout, stderr, and exit code: stdout
- * carries only the artifact — or the help and version text — while stderr carries only
- * diagnostics, failures, and usage errors.
+ * command scenes pass fixture dumps written into a fresh temp directory — except the render
+ * refusal, which reads the checked-in pair under `test/fixtures` — and the usage tests pass
+ * their arguments bare. Each asserts the exact stdout, stderr, and exit code: stdout carries
+ * only the artifact — or the help and version text — while stderr carries only diagnostics,
+ * failures, and usage errors.
  */
 
 const execFileAsync = promisify(execFile);
@@ -216,6 +217,11 @@ async function writeDump(dir: string, name: string, contents: string): Promise<s
   return path;
 }
 
+/** A checked-in fixture dump under `test/fixtures`, as a filesystem path. */
+function fixturePath(fileName: string): string {
+  return fileURLToPath(new URL(`../test/fixtures/${fileName}`, import.meta.url));
+}
+
 /** Spawns the built CLI and captures both streams and the exit code, success or failure. */
 async function runCli(...args: readonly string[]): Promise<CliResult> {
   try {
@@ -288,6 +294,33 @@ test('plan on identical dumps says there are no changes', async (t) => {
   assert.equal(result.stdout, 'No changes.\n');
   assert.equal(result.stderr, '');
   assert.equal(result.code, 0);
+});
+
+test('plan prints the display before a render refusal, then one stderr line, exit 1', async () => {
+  // Two creates resolve to `t_a_idx`: the unnamed index imports unnamed and the explicit twin
+  // keeps its name, so `renderSql` refuses. The plan display is already on stdout — the blank
+  // line is the SQL separator with no SQL behind it — and stderr is exactly one line: never a
+  // stack trace.
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('plan', baseline, target);
+
+  assert.equal(
+    result.stdout,
+    [
+      '2 steps in one transaction:',
+      ' 1. create-index  public.t: index (a)',
+      ' 2. create-index  public.t: index t_a_idx (a)',
+      '',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    result.stderr,
+    'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)\n',
+  );
+  assert.equal(result.code, 1);
 });
 
 test('a missing baseline is one stderr line naming the path and reason, exit 1', async (t) => {
