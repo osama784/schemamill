@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Compare prints hazards** — `@schemamill/cli`'s `compare` now plans the pair and prints the same `Hazards:` section `plan` prints, after the diff and separated by one blank line, only when the analysis finds anything, so a clean diff's stdout is unchanged. The hazard step numbers are plan-relative — `compare` prints no step list, so each `step <n>` names the step `schemamill plan` would number `<n>` for the same pair — the help text mentions hazards, and the `hazards` and `identity` compare goldens are re-pinned beside a golden-vs-golden test asserting both commands pin the same block. Exit codes are unchanged ([#51](https://github.com/osama784/schemamill/issues/51)).
+
 ### Changed
 
 - **Index-name canonicalization on import** — `@schemamill/postgres` now canonicalizes a dump's PostgreSQL-generated index name back to unnamed when it is exactly the conventional `<table>_<cols>_idx` for the index's structure, so an index the model declares unnamed (a hand-written `CREATE INDEX ON t (c)`) round-trips through build → dump → import → diff with no spurious drop + add. The pass runs in `finalizeTable` after every statement is translated and before the canonical sort, so the result is independent of statement order, and it keeps the conventional name when an unnamed index of the same structure already exists rather than manufacturing a duplicate unnamed entry. The prediction formula is shared with render's synthesized unnamed drops and moved to `packages/postgres/src/names.ts`. Names outside the formula — truncated at 63 bytes or collision-suffixed (`_idx1`, …) — stay named and still read as remove + add. Compare and plan output now reads unnamed where a dump carried a derivable name, updating the `constraints-indexes` CLI goldens and the live `index-create`/`index-concurrently` import checks, with a new gated `unnamed-index-round-trip` scene pinning the generated catalog names and the unnamed import ([#38](https://github.com/osama784/schemamill/issues/38)).
