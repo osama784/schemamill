@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -14,11 +14,12 @@ import { version } from '@schemamill/core';
  * End-to-end tests for the `schemamill` binary.
  *
  * Every test spawns the built CLI in `dist/` (the package's test script builds first): the
- * command scenes pass fixture dumps written into a fresh temp directory — except the render
- * refusal, which reads the checked-in pair under `test/fixtures` — and the usage tests pass
- * their arguments bare. Each asserts the exact stdout, stderr, and exit code: stdout carries
- * only the artifact — or the help and version text — while stderr carries only diagnostics,
- * failures, and usage errors.
+ * compare and plan scenes pass fixture dumps written into a fresh temp directory — except the
+ * render refusal, which reads the checked-in pair under `test/fixtures` — the init scenes pass
+ * a fresh temp directory as the workspace target, and the usage tests pass their arguments
+ * bare. Each asserts the exact stdout, stderr, and exit code: stdout carries only the artifact
+ * — or the help and version text — while stderr carries only diagnostics, failures, and usage
+ * errors.
  */
 
 const execFileAsync = promisify(execFile);
@@ -190,6 +191,7 @@ const USAGE = [
   '',
   'Commands:',
   '  compare [options] <baseline> <target>  Print the diff and any hazards between two DDL dumps.',
+  '  init [path]                            Create a workspace in a directory.',
   '  plan [options] <baseline> <target>     Print the migration plan and its SQL between two DDL dumps.',
   '  help [command]                         display help for command',
   '',
@@ -463,6 +465,46 @@ test('plan --verbose adds the skip line', async (t) => {
     ].join('\n'),
   );
   assert.equal(result.code, 0);
+});
+
+test('init creates a workspace in a directory, exit 0', async (t) => {
+  const dir = await fixtureDir(t);
+
+  const result = await runCli('init', dir);
+
+  assert.equal(result.stdout, `Initialized workspace at ${dir}\n`);
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  assert.equal(
+    await readFile(join(dir, '.schemamill', 'model.json'), 'utf8'),
+    '{\n  "tables": [],\n  "sequences": []\n}\n',
+  );
+});
+
+test('a second init refuses the existing workspace with the repair hint, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  await runCli('init', dir);
+
+  const result = await runCli('init', dir);
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    `schemamill: workspace already exists at ${dir}: remove ${join(dir, '.schemamill')} to re-create it\n`,
+  );
+  assert.equal(result.code, 1);
+});
+
+test('init refuses a directory inside an existing workspace, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  await runCli('init', dir);
+  const nested = join(dir, 'nested');
+
+  const result = await runCli('init', nested);
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, `schemamill: ${nested} is inside the workspace at ${dir}\n`);
+  assert.equal(result.code, 1);
 });
 
 test('--help prints the usage to stdout, exit 0', async () => {
