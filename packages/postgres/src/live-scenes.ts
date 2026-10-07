@@ -67,6 +67,16 @@ import type {
  * schema qualification is real only because the scene's setup SQL creates the `app` schema
  * (`non-public-index-drop`).
  *
+ * The introspection scenes are the tracer bullet for the `CatalogReader` seam:
+ * `introspection-tracer` builds two raw schemas beside `public` and a model exercising the
+ * covered catalog surface — quoted and mixed-case identifiers, a composite primary key
+ * declared out of name order, an unnamed conventional `<table>_pkey` beside an explicitly
+ * named one, a spread of type spellings, and a column the baseline declares and the target
+ * drops so the migrated database physically holds the `attisdropped` row the read must filter —
+ * and asserts the read matches the applied dump's import; `introspection-flags` pins the exact
+ * deferred-state diagnostics (defaults, generation, identity, partitioning, persistence) the
+ * read reports.
+ *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
  * in place — a model that says otherwise would make the migrated database legitimately differ
@@ -188,6 +198,16 @@ export interface SceneImportCheck {
   ) => string | undefined;
 }
 
+/**
+ * How a scene's live-introspection assertion is checked: `matches-import` requires an empty
+ * diagnostic list, an empty `diff` against the applied dump's import, and a model deep-equal to
+ * that import (order-significant — the real order guard); `flags` pins the diagnostics list
+ * exactly.
+ */
+export type SceneIntrospection =
+  | { readonly assert: 'matches-import' }
+  | { readonly assert: 'flags'; readonly expected: readonly Diagnostic[] };
+
 /** One scene of the live-PostgreSQL harness. */
 export interface LiveScene {
   /** Stable scene name; the harness derives its database names from it. */
@@ -218,6 +238,12 @@ export interface LiveScene {
   readonly checks?: readonly SceneCheck[];
   /** Import facts to assert on both dumps' imports, after the round trip. */
   readonly importChecks?: readonly SceneImportCheck[];
+  /**
+   * Live-introspection facts: when present, the harness reads the migrated database through
+   * `catalogReader` — consumed as `CatalogReader<string, Model, Diagnostic>` — after the
+   * imports and asserts the scene's claim.
+   */
+  readonly introspection?: SceneIntrospection;
 }
 
 /** `public` tables in name order, or the empty string when there are none. */
@@ -3025,6 +3051,182 @@ const nonPublicIndexDropScene = (): LiveScene => {
   };
 };
 
+/**
+ * The live-introspection tracer: a database whose model exercises the covered catalog surface
+ * — two raw schemas beside `public`, quoted and mixed-case identifiers, a composite primary
+ * key declared out of name order, an unnamed conventional `<table>_pkey` that must strip and an
+ * explicitly named primary key that must stay, nullable and `NOT NULL` columns, a spread of
+ * type spellings, and a column the baseline declares and the target drops so the migrated
+ * database physically holds the `attisdropped` row the read must filter. The scene asserts
+ * `matches-import`: no diagnostics, an empty `diff` against the applied dump's import, and a
+ * model deep-equal to that import.
+ */
+const introspectionTracerScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('account_id', { type: 'uuid', notNull: true }),
+      column('tenant'),
+      column('created_at', { type: 'timestamp with time zone', notNull: true }),
+      column('tags', { type: 'integer[]' }),
+      column('score', { type: 'numeric(10,2)' }),
+    ],
+    primaryKey: { columns: ['account_id'] },
+  });
+  const report = table('report', {
+    schema: 'app',
+    columns: [
+      column('id', { type: 'uuid', notNull: true }),
+      column('label', { type: 'character varying(255)', notNull: true }),
+      column('amount', { type: 'numeric(10,2)' }),
+    ],
+    primaryKey: { name: 'report_label_pkey', columns: ['label'] },
+  });
+  const mixed = table('Mixed Table', {
+    columns: [
+      column('Zed', { type: 'integer', notNull: true }),
+      column('alpha', { type: 'integer' }),
+      column('beta', { type: 'integer', notNull: true }),
+      column('note'),
+    ],
+    primaryKey: { columns: ['beta', 'Zed'] },
+  });
+  const composite = table('composite', {
+    columns: [
+      column('a', { type: 'integer', notNull: true }),
+      column('b', { type: 'integer' }),
+      column('c', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { columns: ['c', 'a'] },
+  });
+  const odd = table('Odd Table', {
+    schema: 'Weird Schema',
+    columns: [column('select', { type: 'integer', notNull: true }), column('with "quote')],
+    primaryKey: { columns: ['select'] },
+  });
+  const keep = table('keep', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+
+  return {
+    name: 'introspection-tracer',
+    setupSql: 'CREATE SCHEMA app;\nCREATE SCHEMA "Weird Schema";',
+    baseline: model(
+      accounts,
+      report,
+      mixed,
+      composite,
+      odd,
+      keep,
+      table('lost_cols', {
+        columns: [column('stay', { type: 'integer' }), column('gone')],
+      }),
+    ),
+    target: model(
+      accounts,
+      report,
+      mixed,
+      composite,
+      odd,
+      keep,
+      table('lost_cols', { columns: [column('stay', { type: 'integer' })] }),
+    ),
+    checks: [
+      {
+        description: 'the dropped column physically survives as an attisdropped row',
+        sql:
+          "select attisdropped from pg_attribute where attrelid = 'public.lost_cols'::regclass" +
+          ' and attnum = 2',
+        expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live-introspection flags scene: the deferred catalog states a clean round trip still
+ * meets, each asserted as an exact diagnostic. The model declares a table with a `DEFAULT`
+ * column and a table with an identity column; raw setup SQL adds an unlogged table, a
+ * generated column whose flag must suppress its `atthasdef` default flag, and a partitioned
+ * table with one partition — both partitioned relations skipped and named, the unlogged table
+ * flagged, and neither mapped.
+ */
+const introspectionFlagsScene = (): LiveScene => {
+  const target = model(
+    table('flag_default', {
+      columns: [column('d', { type: 'integer', default: '42' }), column('e')],
+    }),
+    table('flag_identity', {
+      columns: [
+        column('id', { type: 'integer', notNull: true, identity: identityColumn('integer') }),
+        column('name'),
+      ],
+    }),
+  );
+
+  return {
+    name: 'introspection-flags',
+    setupSql: [
+      'CREATE UNLOGGED TABLE public.flag_unlogged (x integer);',
+      'CREATE TABLE public.flag_generated (a integer DEFAULT 1, b integer GENERATED ALWAYS AS (a * 2) STORED);',
+      'CREATE TABLE public.flag_partitioned (k integer, v text) PARTITION BY RANGE (k);',
+      'CREATE TABLE public.flag_partitioned_1 PARTITION OF public.flag_partitioned FOR VALUES FROM (0) TO (10);',
+    ].join('\n'),
+    baseline: model(),
+    target,
+    introspection: {
+      assert: 'flags',
+      expected: [
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_default',
+          message: 'column d has a default; defaults are not read yet',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_generated',
+          message: 'column a has a default; defaults are not read yet',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_generated',
+          message: 'column b is generated; generation is not represented yet',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_identity',
+          message: 'column id is an identity column; identity is not read yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partitioned',
+          message:
+            'table public.flag_partitioned is partitioned; partitioning is not represented yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partitioned_1',
+          message:
+            'table public.flag_partitioned_1 is partitioned; partitioning is not represented yet',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_unlogged',
+          message: 'table public.flag_unlogged is unlogged; persistence is not represented yet',
+        },
+      ],
+    },
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -3056,4 +3258,6 @@ export const scenes: readonly LiveScene[] = [
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
+  introspectionTracerScene(),
+  introspectionFlagsScene(),
 ];
