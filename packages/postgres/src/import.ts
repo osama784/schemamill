@@ -484,6 +484,12 @@ function translateColumn(
       case 'CONSTR_NULL':
       case undefined:
         break;
+      case 'CONSTR_ATTR_DEFERRABLE':
+      case 'CONSTR_ATTR_NOT_DEFERRABLE':
+      case 'CONSTR_ATTR_DEFERRED':
+      case 'CONSTR_ATTR_IMMEDIATE':
+      case 'CONSTR_ATTR_ENFORCED':
+      case 'CONSTR_ATTR_NOT_ENFORCED':
       default:
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
@@ -549,6 +555,19 @@ function translateTableConstraint(
       if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
       return;
     }
+    case undefined:
+    case 'CONSTR_NULL':
+    case 'CONSTR_NOTNULL':
+    case 'CONSTR_DEFAULT':
+    case 'CONSTR_IDENTITY':
+    case 'CONSTR_GENERATED':
+    case 'CONSTR_EXCLUSION':
+    case 'CONSTR_ATTR_DEFERRABLE':
+    case 'CONSTR_ATTR_NOT_DEFERRABLE':
+    case 'CONSTR_ATTR_DEFERRED':
+    case 'CONSTR_ATTR_IMMEDIATE':
+    case 'CONSTR_ATTR_ENFORCED':
+    case 'CONSTR_ATTR_NOT_ENFORCED':
     default:
       diagnostics.push(flagAttribute(statement, identity, `${constraintLabel(constraint)}`));
   }
@@ -1908,6 +1927,7 @@ function referentialAction(code: string | undefined): ReferentialAction | undefi
       return 'SET NULL';
     case 'd':
       return 'SET DEFAULT';
+    case undefined:
     default:
       return undefined;
   }

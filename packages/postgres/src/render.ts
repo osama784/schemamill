@@ -327,6 +327,25 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'drop-index':
     case 'drop-index-concurrently':
       return { table: step.table, index: step.index, polarity: 'drops' };
+    case 'create-table':
+    case 'drop-table':
+    case 'add-column':
+    case 'drop-column':
+    case 'alter-column':
+    case 'add-identity':
+    case 'drop-identity':
+    case 'alter-identity':
+    case 'add-primary-key':
+    case 'drop-primary-key':
+    case 'add-foreign-key':
+    case 'drop-foreign-key':
+    case 'add-unique-constraint':
+    case 'drop-unique-constraint':
+    case 'add-check-constraint':
+    case 'drop-check-constraint':
+    case 'create-sequence':
+    case 'drop-sequence':
+    case 'alter-sequence':
     default:
       return undefined;
   }
