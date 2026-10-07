@@ -337,6 +337,26 @@ function findIdentityStep(
           sameIdentity(candidate.table, entry.table) &&
           candidate.name === entry.name
         );
+      case 'create-table':
+      case 'drop-table':
+      case 'add-column':
+      case 'drop-column':
+      case 'drop-identity':
+      case 'add-primary-key':
+      case 'drop-primary-key':
+      case 'add-foreign-key':
+      case 'drop-foreign-key':
+      case 'add-unique-constraint':
+      case 'drop-unique-constraint':
+      case 'add-check-constraint':
+      case 'drop-check-constraint':
+      case 'create-index':
+      case 'drop-index':
+      case 'create-index-concurrently':
+      case 'drop-index-concurrently':
+      case 'create-sequence':
+      case 'drop-sequence':
+      case 'alter-sequence':
       default:
         return false;
     }
