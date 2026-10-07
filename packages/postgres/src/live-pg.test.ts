@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 
 import { diff, effectiveSequence, plan } from '@schemamill/core';
 import type {
+  CatalogReader,
   Diagnostic,
   Identity,
   Model,
@@ -18,9 +19,9 @@ import type {
   SequenceOwner,
 } from '@schemamill/core';
 
-import { importDump, renderSql } from './index.ts';
+import { catalogReader, importDump, renderSql } from './index.ts';
 import { scenes } from './live-scenes.ts';
-import type { LiveScene, SceneCheck } from './live-scenes.ts';
+import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts';
 
 /**
  * The live-PostgreSQL harness: every scene is built, migrated, dumped, imported back, and
@@ -45,8 +46,9 @@ import type { LiveScene, SceneCheck } from './live-scenes.ts';
  * the modeled sequences and identity columns must come back exactly (see
  * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
  * against both imported models (see `assertImportChecks`), and `diff` between the imported
- * models must be exactly empty. Databases are dropped best-effort, so a failed scene still
- * cleans up after itself.
+ * models must be exactly empty. A scene that declares an `introspection` assertion is then read
+ * back through the production `catalogReader` (see `assertIntrospection`). Databases are
+ * dropped best-effort, so a failed scene still cleans up after itself.
  */
 
 const execFileAsync = promisify(execFile);
@@ -252,6 +254,10 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       [],
       `${scene.name}: the migrated database does not match the database built from the target model`,
     );
+
+    if (scene.introspection !== undefined) {
+      await assertIntrospection(appliedUrl, scene.name, applied, scene.introspection);
+    }
   } finally {
     await dropDatabase(baseUrl, appliedDb);
     await dropDatabase(baseUrl, targetDb);
@@ -620,6 +626,45 @@ function assertImportChecks(
       `${scene.name}: ${what}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
     );
   }
+}
+
+/**
+ * The scene's live-introspection assertion, consuming the production `catalogReader` through
+ * the seam type. The read runs against the migrated database; `matches-import` requires no
+ * diagnostics, an empty `diff` against the applied dump's import, and a model deep-equal to
+ * that import — the order-significant guard — while `flags` pins the diagnostics list exactly.
+ */
+async function assertIntrospection(
+  appliedUrl: string,
+  sceneName: string,
+  applied: ReadResult<Model, Diagnostic>,
+  assertion: SceneIntrospection,
+): Promise<void> {
+  const reader: CatalogReader<string, Model, Diagnostic> = catalogReader;
+  const introspected = await reader.introspect(appliedUrl);
+  if (assertion.assert === 'matches-import') {
+    assert.deepEqual(
+      introspected.diagnostics,
+      [],
+      `${sceneName}: introspection reported diagnostics for a scene the import considers clean`,
+    );
+    assert.deepEqual(
+      diff(introspected.model, applied.model),
+      [],
+      `${sceneName}: the introspected model does not match the applied dump's import`,
+    );
+    assert.deepEqual(
+      introspected.model,
+      applied.model,
+      `${sceneName}: the introspected model is not deep-equal to the applied dump's import`,
+    );
+    return;
+  }
+  assert.deepEqual(
+    introspected.diagnostics,
+    assertion.expected,
+    `${sceneName}: introspection diagnostics differ`,
+  );
 }
 
 /** Asserts that neither dump produced a parse error; skips and flags are allowed. */
