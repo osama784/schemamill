@@ -2885,10 +2885,22 @@ test('added constraints order target-only groups ahead of later baseline-group e
       changes: [
         { kind: 'foreign-key-added', foreignKey: foreignKey(['a'], referenced, { name: 'fk_a1' }) },
         { kind: 'foreign-key-added', foreignKey: foreignKey(['z'], referenced, { name: 'fk_z2' }) },
-        { kind: 'unique-constraint-added', uniqueConstraint: uniqueConstraint(['a'], { name: 'u_a1' }) },
-        { kind: 'unique-constraint-added', uniqueConstraint: uniqueConstraint(['z'], { name: 'u_z2' }) },
-        { kind: 'check-constraint-added', checkConstraint: checkConstraint('a > 0', { name: 'c_a1' }) },
-        { kind: 'check-constraint-added', checkConstraint: checkConstraint('z > 0', { name: 'c_z2' }) },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['a'], { name: 'u_a1' }),
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['z'], { name: 'u_z2' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('a > 0', { name: 'c_a1' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('z > 0', { name: 'c_z2' }),
+        },
         { kind: 'index-added', index: index(['a'], { name: 'i_a1' }) },
         { kind: 'index-added', index: index(['z'], { name: 'i_z2' }) },
       ],

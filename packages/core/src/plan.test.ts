@@ -5447,12 +5447,18 @@ test('drop ordering compares schemas, not just table names', () => {
 
 test('a primary-key change sets aside only foreign keys that reference the key columns', () => {
   const baselineParent = table('parent', {
-    columns: [column('id', { type: 'integer', notNull: true }), column('code', { type: 'integer' })],
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { type: 'integer' }),
+    ],
     primaryKey: { name: 'p_pkey', columns: ['id'] },
     uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
   });
   const targetParent = table('parent', {
-    columns: [column('id', { type: 'integer', notNull: true }), column('code', { type: 'integer' })],
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { type: 'integer' }),
+    ],
     primaryKey: { name: 'p_pkey2', columns: ['id'] },
     uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
   });
@@ -5580,7 +5586,10 @@ test('dependent foreign key grouping distinguishes update actions', () => {
     onUpdate: 'CASCADE',
     onDelete: 'CASCADE',
   });
-  const restrict = foreignKey(['pid'], identity('parent'), { name: 'f_restrict', onDelete: 'RESTRICT' });
+  const restrict = foreignKey(['pid'], identity('parent'), {
+    name: 'f_restrict',
+    onDelete: 'RESTRICT',
+  });
   const child = table('child', {
     columns: [column('pid', { type: 'integer' })],
     foreignKeys: [cascade, restrict],
