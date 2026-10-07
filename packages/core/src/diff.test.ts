@@ -2710,3 +2710,208 @@ test('changed sequence owners are independent copies', () => {
     assert.notEqual(field.after?.table, after.table);
   }
 });
+
+test('sequence owners in different schemas are different owners', () => {
+  const before = owner('t', 'id', 'one');
+  const after = owner('t', 'id', 'two');
+
+  assertDiff(
+    sequenceModel([sequence('s', { ownedBy: before })]),
+    sequenceModel([sequence('s', { ownedBy: after })]),
+    [
+      {
+        kind: 'sequence-changed',
+        sequence: identity('s'),
+        changes: [{ field: 'ownedBy', before, after }],
+      },
+    ],
+  );
+});
+
+test('identity sequence names in different schemas recreate the identity', () => {
+  const baseline = columnIdentity({
+    sequenceName: { schema: 'one', name: 't_id_seq' },
+    cache: '2',
+  });
+  const target = columnIdentity({ sequenceName: { schema: 'two', name: 't_id_seq' } });
+
+  assertDiff(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: baseline })],
+      }),
+    ),
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: target })],
+      }),
+    ),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          {
+            kind: 'column-changed',
+            name: 'id',
+            fields: [],
+            identity: { kind: 'recreated', identity: target },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('foreign key removals, additions, and changes order by their canonical keys', () => {
+  const referenced = identity('r');
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('m'), column('r'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'z1' }),
+        foreignKey(['r'], referenced, { name: 'fk_b', referencedColumns: ['x'] }),
+        foreignKey(['r'], referenced, { name: 'fk_a', referencedColumns: ['y'] }),
+        foreignKey(['m'], referenced, { name: 'mb', referencedColumns: ['x'] }),
+        foreignKey(['m'], referenced, { name: 'ma', referencedColumns: ['y'] }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('m'), column('r'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'z1' }),
+        foreignKey(['z'], referenced, { name: 'z2' }),
+        foreignKey(['a'], referenced, { name: 'a1' }),
+        foreignKey(['m'], referenced, { name: 'md', referencedColumns: ['x'] }),
+        foreignKey(['m'], referenced, { name: 'mc', referencedColumns: ['y'] }),
+      ],
+    }),
+  );
+
+  // Removals leave in the full key order (`fk_a` before `fk_b`), additions in columns then
+  // name order (`a1` before `z2`), and changes by their baseline in the same full key order —
+  // each list differs from the pairing order the duplicates are matched in.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-removed',
+          foreignKey: foreignKey(['r'], referenced, { name: 'fk_a', referencedColumns: ['y'] }),
+        },
+        {
+          kind: 'foreign-key-removed',
+          foreignKey: foreignKey(['r'], referenced, { name: 'fk_b', referencedColumns: ['x'] }),
+        },
+        {
+          kind: 'foreign-key-added',
+          foreignKey: foreignKey(['a'], referenced, { name: 'a1' }),
+        },
+        {
+          kind: 'foreign-key-added',
+          foreignKey: foreignKey(['z'], referenced, { name: 'z2' }),
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['m'], referenced, { name: 'ma', referencedColumns: ['y'] }),
+          after: foreignKey(['m'], referenced, { name: 'mc', referencedColumns: ['y'] }),
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['m'], referenced, { name: 'mb', referencedColumns: ['x'] }),
+          after: foreignKey(['m'], referenced, { name: 'md', referencedColumns: ['x'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('added constraints order target-only groups ahead of later baseline-group extras', () => {
+  const referenced = identity('r');
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('z')],
+      foreignKeys: [foreignKey(['z'], referenced, { name: 'fk_z1' })],
+      uniqueConstraints: [uniqueConstraint(['z'], { name: 'u_z1' })],
+      checkConstraints: [checkConstraint('z > 0', { name: 'c_z1' })],
+      indexes: [index(['z'], { name: 'i_z1' })],
+    }),
+    table('u', {
+      columns: [column('a'), column('w'), column('z')],
+      indexes: [index(['z'], { name: 'i_z1' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'fk_z1' }),
+        foreignKey(['z'], referenced, { name: 'fk_z2' }),
+        foreignKey(['a'], referenced, { name: 'fk_a1' }),
+      ],
+      uniqueConstraints: [
+        uniqueConstraint(['z'], { name: 'u_z1' }),
+        uniqueConstraint(['z'], { name: 'u_z2' }),
+        uniqueConstraint(['a'], { name: 'u_a1' }),
+      ],
+      checkConstraints: [
+        checkConstraint('z > 0', { name: 'c_z1' }),
+        checkConstraint('z > 0', { name: 'c_z2' }),
+        checkConstraint('a > 0', { name: 'c_a1' }),
+      ],
+      indexes: [
+        index(['z'], { name: 'i_z1' }),
+        index(['z'], { name: 'i_z2' }),
+        index(['a'], { name: 'i_a1' }),
+      ],
+    }),
+    table('u', {
+      columns: [column('a'), column('w'), column('z')],
+      indexes: [
+        index(['z'], { name: 'i_z1' }),
+        index(['w'], { name: 'i_z1' }),
+        index(['a'], { name: 'i_a1' }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'foreign-key-added', foreignKey: foreignKey(['a'], referenced, { name: 'fk_a1' }) },
+        { kind: 'foreign-key-added', foreignKey: foreignKey(['z'], referenced, { name: 'fk_z2' }) },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['a'], { name: 'u_a1' }),
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['z'], { name: 'u_z2' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('a > 0', { name: 'c_a1' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('z > 0', { name: 'c_z2' }),
+        },
+        { kind: 'index-added', index: index(['a'], { name: 'i_a1' }) },
+        { kind: 'index-added', index: index(['z'], { name: 'i_z2' }) },
+      ],
+    },
+    {
+      kind: 'table-changed',
+      table: identity('u'),
+      changes: [
+        { kind: 'index-added', index: index(['a'], { name: 'i_a1' }) },
+        { kind: 'index-added', index: index(['w'], { name: 'i_z1' }) },
+      ],
+    },
+  ]);
+});

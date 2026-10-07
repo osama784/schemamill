@@ -4,7 +4,13 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['**/dist/**', '**/coverage/**', '**/node_modules/**'],
+    ignores: [
+      '**/dist/**',
+      '**/coverage/**',
+      '**/node_modules/**',
+      '**/reports/**',
+      '**/.stryker-tmp/**',
+    ],
   },
   eslint.configs.recommended,
   tseslint.configs.recommendedTypeChecked,
@@ -22,6 +28,13 @@ export default tseslint.config(
   {
     files: ['**/*.js', '**/*.mjs', '**/*.cjs'],
     extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      // Node globals for plain scripts; the type-checked configs do not provide them.
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
   },
   {
     // node:test returns a promise that the test runner owns, not the test file.
