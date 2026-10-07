@@ -10,6 +10,7 @@ export default tseslint.config(
       '**/node_modules/**',
       '**/reports/**',
       '**/.stryker-tmp/**',
+      '**/.factory/**',
     ],
   },
   eslint.configs.recommended,
@@ -58,7 +59,29 @@ export default tseslint.config(
               group: ['@schemamill/*'],
               message: '@schemamill/core must not import other schemamill packages.',
             },
+            {
+              group: ['@nestjs/*', 'reflect-metadata'],
+              message:
+                '@schemamill/core must stay framework-free (ADR 0005): no @nestjs/* or reflect-metadata imports',
+            },
           ],
+        },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'Decorator',
+          message: 'framework-free packages must not use decorators (ADR 0005)',
+        },
+        {
+          selector: 'ImportExpression',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
+        },
+        {
+          selector: 'TSImportType',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
         },
       ],
     },
@@ -75,7 +98,29 @@ export default tseslint.config(
               group: ['@schemamill/cli', '@schemamill/server'],
               message: '@schemamill/postgres may import only @schemamill/core.',
             },
+            {
+              group: ['@nestjs/*', 'reflect-metadata'],
+              message:
+                '@schemamill/postgres must stay framework-free (ADR 0005): no @nestjs/* or reflect-metadata imports',
+            },
           ],
+        },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'Decorator',
+          message: 'framework-free packages must not use decorators (ADR 0005)',
+        },
+        {
+          selector: 'ImportExpression',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
+        },
+        {
+          selector: 'TSImportType',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
         },
       ],
     },
@@ -92,7 +137,29 @@ export default tseslint.config(
               group: ['@schemamill/server'],
               message: '@schemamill/cli must not import @schemamill/server.',
             },
+            {
+              group: ['@nestjs/*', 'reflect-metadata'],
+              message:
+                '@schemamill/cli must stay framework-free (ADR 0005): no @nestjs/* or reflect-metadata imports',
+            },
           ],
+        },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'Decorator',
+          message: 'framework-free packages must not use decorators (ADR 0005)',
+        },
+        {
+          selector: 'ImportExpression',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
+        },
+        {
+          selector: 'TSImportType',
+          message:
+            'dynamic imports and import-types bypass the static boundary bans; not allowed below the server (ADR 0005)',
         },
       ],
     },
