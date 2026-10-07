@@ -12,6 +12,12 @@ export {
   sequenceTypeBounds,
   sequenceTypeChange,
 } from './sequence.ts';
+export {
+  initWorkspace,
+  resolveWorkspace,
+  WORKSPACE_DIR_NAME,
+  WORKSPACE_MODEL_FILE_NAME,
+} from './workspace.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';
 export type * from './hazard.ts';
@@ -20,3 +26,4 @@ export type * from './model.ts';
 export type * from './plan.ts';
 export type * from './seam.ts';
 export type * from './sequence.ts';
+export type * from './workspace.ts';
