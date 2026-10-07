@@ -249,6 +249,11 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     'invalid model: unknown field version',
   ],
   [
+    'a model whose tables field is not an array',
+    { tables: {}, sequences: [] },
+    'invalid model: tables is not an array',
+  ],
+  [
     'an unknown table key',
     { tables: [tablePayload({ bogus: true })], sequences: [] },
     'invalid model: unknown field tables[0].bogus',
@@ -265,6 +270,11 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     'a table that is not an object',
     { tables: [1], sequences: [] },
     'invalid model: tables[0] is not an object',
+  ],
+  [
+    'a table whose columns field is not an array',
+    { tables: [tablePayload({ columns: 'x' })], sequences: [] },
+    'invalid model: tables[0].columns is not an array',
   ],
   [
     'a column type that is not a string',
@@ -482,6 +492,17 @@ test('resolveWorkspace resolves the root given explicitly', async (t) => {
   const resolved = await resolveOk(dir);
 
   assert.equal(resolved.root, dir);
+});
+
+test('resolution treats a file component as absent and keeps walking to the workspace root', async (t) => {
+  const dir = await fixtureDir(t);
+  await initOk(dir);
+  await writeFile(join(dir, 'blocker'), 'not a directory', 'utf8');
+
+  const resolved = await resolveOk(join(dir, 'blocker', 'sub'));
+
+  assert.equal(resolved.root, dir);
+  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [] });
 });
 
 test('resolveWorkspace returns the nearest of hand-crafted nested workspaces', async (t) => {
