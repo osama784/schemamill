@@ -25,6 +25,8 @@ Run from the repo root; all five gates must be green before a PR:
 
 Scope a gate to one package with `pnpm --filter @schemamill/<pkg> <script>`.
 
+`pnpm mutation:core` runs the core mutation-testing harness — `pnpm mutation:check` is its scoped sanity check — and is not one of the five gates; see `docs/mutation-testing.md`.
+
 `@schemamill/postgres` carries a live-PostgreSQL harness (`src/live-pg.test.ts`, scenes in `src/live-scenes.ts`) gated on `SCHEMAMILL_TEST_PG_URL`: unset, the live tests skip with a reason; set but unreachable, they fail loudly. A local scratch cluster is available for gated runs — see the latest handoff notes or ask the user for its URL. CI runs Node 24 and 26, plus a `verify-postgres` job on Node 24 against a `postgres:18` service with PostgreSQL 18 client tools.
 
 ## Git rules
