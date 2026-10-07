@@ -22,9 +22,14 @@
     "build": "tsc -b",
     "lint": "eslint .",
     "typecheck": "tsc -b",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test \"src/**/*.test.ts\"",
+    "mutation": "stryker run",
+    "mutation:check": "node scripts/mutation-sanity.mjs"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "10.0.0",
+    "@stryker-mutator/tap-runner": "10.0.0",
+    "@stryker-mutator/typescript-checker": "10.0.0",
     "@types/node": "catalog:",
     "typescript": "catalog:"
   }

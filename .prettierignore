@@ -2,6 +2,8 @@ node_modules/
 dist/
 build/
 coverage/
+reports/
+.stryker-tmp/
 pnpm-lock.yaml
 # The factory workbench: local-only, excluded via .git/info/exclude; never committed.
 .factory/
