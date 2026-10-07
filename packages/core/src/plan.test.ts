@@ -5396,3 +5396,290 @@ test('unnamed-index twins produce a stable, order-independent diff and plan', ()
     }
   }
 });
+
+test("the fallback cut skips the chosen table's own self-reference", () => {
+  const a = table('a', {
+    columns: [column('b_id', { type: 'integer' }), column('parent_id', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['b_id'], identity('b'), { name: 'a_to_b', referencedColumns: ['id'] }),
+      foreignKey(['parent_id'], identity('a'), { name: 'a_self', referencedColumns: ['id'] }),
+    ],
+  });
+  const b = table('b', {
+    columns: [column('a_id', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['a_id'], identity('a'), { name: 'b_to_a', referencedColumns: ['id'] }),
+    ],
+  });
+  const baseline = model(a, b);
+
+  // `a` and `b` reference each other, so the cut falls back to `a`; `a`'s own self-reference
+  // must not become a cut of its own table, while `b`'s reference to `a` still is one.
+  assertPlan(baseline, model(), [
+    { kind: 'drop-foreign-key', table: identity('b'), foreignKey: b.foreignKeys[0]! },
+    { kind: 'drop-table', table: identity('a') },
+    { kind: 'drop-table', table: identity('b') },
+  ]);
+  simulate(baseline, model());
+});
+
+test('drop ordering compares schemas, not just table names', () => {
+  const removed = table('a', { schema: 's1', columns: [column('id')] });
+  const kept = table('a', { schema: 's2', columns: [column('id')] });
+  const dependent = table('b', {
+    schema: 's2',
+    columns: [column('id')],
+    foreignKeys: [
+      foreignKey(['id'], identity('a', 's2'), { name: 'to_s2_a', referencedColumns: ['id'] }),
+    ],
+  });
+  const baseline = model(removed, kept, dependent);
+  const target = model(kept);
+
+  // `b` references `s2.a`, not its same-named `s1.a` sibling, so both removed tables are
+  // ready and `s1.a` still drops first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('a', 's1') },
+    { kind: 'drop-table', table: identity('b', 's2') },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a primary-key change sets aside only foreign keys that reference the key columns', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('code', { type: 'integer' })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+    uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('code', { type: 'integer' })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['pid'], identity('parent'), {
+        name: 'child_code_fk',
+        referencedColumns: ['code'],
+      }),
+    ],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // The child's foreign key names the unique `code` column explicitly, so it does not depend
+  // on the recreated primary key and needs no drop/add pair around it.
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a restored foreign key pairs once per surviving occurrence', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const restored = foreignKey(['pid'], identity('parent'), { name: 'f_dup' });
+  const baseline = model(
+    baselineParent,
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [restored] }),
+  );
+  const target = model(
+    targetParent,
+    table('child', {
+      columns: [column('pid', { type: 'integer' })],
+      foreignKeys: [restored, restored],
+    }),
+  );
+
+  // One baseline occurrence survives on both sides, so exactly one drop/add pair is set
+  // aside; the second target occurrence is the diff's own addition.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: restored },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restored },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restored },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign keys order by columns before names', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const laterColumn = foreignKey(['a', 'z'], identity('parent'), { name: 'aa' });
+  const earlierColumn = foreignKey(['a', 'b'], identity('parent'), { name: 'zz' });
+  const child = table('child', {
+    columns: [column('a'), column('b'), column('z')],
+    foreignKeys: [laterColumn, earlierColumn],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both keys share their first referencing column, so the second column decides — `zz`
+  // (columns a, b) sorts before `aa` (columns a, z) — and the name order must not decide.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: earlierColumn },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: laterColumn },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: earlierColumn },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: laterColumn },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign key grouping distinguishes update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const cascade = foreignKey(['pid'], identity('parent'), {
+    name: 'f_cascade',
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const restrict = foreignKey(['pid'], identity('parent'), { name: 'f_restrict', onDelete: 'RESTRICT' });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [cascade, restrict],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both keys reference the same columns and table, so only their actions distinguish the
+  // occurrence counts: each survives once and gets its own drop/add pair.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: restrict },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restrict },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a sequence detaching from a surviving owner carries only its before side', () => {
+  const kept = table('t', { columns: [column('id', { type: 'bigint' })] });
+  const baseline = sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], kept);
+  const target = sequenceModel([sequence('s')], kept);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-sequence',
+      sequence: identity('s'),
+      fields: [{ field: 'ownedBy', before: owner('t', 'id') }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a duplicated surviving foreign key is set aside once per occurrence', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const wide = foreignKey(['pid', 'x'], identity('parent'), { name: 'wide' });
+  const alternate = foreignKey(['q'], identity('parent'), { name: 'bb' });
+  const unnamed1 = foreignKey(['pid'], identity('parent'));
+  const unnamed2 = foreignKey(['pid'], identity('parent'));
+  const first = foreignKey(['pid'], identity('parent'), { name: 'aa' });
+  const second = foreignKey(['pid'], identity('parent'), { name: 'aa' });
+  const single = foreignKey(['pid'], identity('parent'), { name: 'zz' });
+  const child = table('child', {
+    columns: [
+      column('pid', { type: 'integer' }),
+      column('x', { type: 'integer' }),
+      column('q', { type: 'integer' }),
+    ],
+    foreignKeys: [alternate, wide, single, second, unnamed2, first, unnamed1],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Sorted by referencing columns, then presence before name: the two unnamed keys, the two
+  // `aa` twins, `zz`, then `wide`, then the same-length `bb` on a later column. Each surviving
+  // occurrence gets its own drop/add pair — duplicates yield two pairs, none three — and input
+  // order must not leak.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: single },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: alternate },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: single },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: alternate },
+  ]);
+  simulate(baseline, target);
+});
