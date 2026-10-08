@@ -36,7 +36,7 @@ Load `.agents/skills/branch-pr-flow/SKILL.md` before committing, pushing, openin
 - `main` is release-only. Work lands on `dev` through a feature branch and a PR.
 - Merge commits only. Never amend, rebase, reset, or force-push.
 - Stage explicit paths only. Never `git add -A`.
-- Keep the user's uncommitted files untouched in every session: `skills-lock.json` stays modified and unstaged; the untracked `.agents/skills/{codebase-design,pr}/` directories stay untracked. Never stage, revert, clean, or delete them.
+- Keep the user's uncommitted files untouched in every session. Never stage, revert, clean, or delete them.
 - Use conventional commit messages, one workstream per commit. Write the message to a file and pass `-F` — shell backtick expansion has mangled an inline message before.
 - Add a `CHANGELOG.md` entry under `[Unreleased]` as each user-facing change lands; version cuts follow `.agents/skills/changelog-flow/SKILL.md`.
 
