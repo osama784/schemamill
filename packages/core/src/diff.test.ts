@@ -2028,6 +2028,44 @@ test('duplicate unique constraint identities cancel identical constraints first'
   ]);
 });
 
+test('changed unique constraint pairs with equal baseline names order by their targets', () => {
+  const columns = [column('a')];
+  const duplicate = uniqueConstraint(['a'], { name: 'x' });
+  const baseline = model(
+    table('t', { columns, uniqueConstraints: [duplicate, uniqueConstraint(['a'], { name: 'x' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns,
+      uniqueConstraints: [
+        uniqueConstraint(['a'], { name: 'y' }),
+        uniqueConstraint(['a'], { name: 'z' }),
+      ],
+    }),
+  );
+
+  // The two baseline duplicates both carry the name `x`, so the changed pairs tie on their
+  // baseline member and their target names — `y` then `z` — decide the order.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: duplicate,
+          after: uniqueConstraint(['a'], { name: 'y' }),
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: duplicate,
+          after: uniqueConstraint(['a'], { name: 'z' }),
+        },
+      ],
+    },
+  ]);
+});
+
 test('a check constraint added or removed reports the whole constraint', () => {
   const constraint = checkConstraint('price > 0', { name: 'orders_price_check' });
   const columns = [column('price')];
@@ -2155,6 +2193,44 @@ test('duplicate check constraint identities cancel identical constraints first',
       kind: 'table-changed',
       table: identity('t'),
       changes: [{ kind: 'check-constraint-changed', before: second, after: renamed }],
+    },
+  ]);
+});
+
+test('changed check constraint pairs with equal baseline names order by their targets', () => {
+  const columns = [column('a')];
+  const duplicate = checkConstraint('a > 0', { name: 'x' });
+  const baseline = model(
+    table('t', { columns, checkConstraints: [duplicate, checkConstraint('a > 0', { name: 'x' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns,
+      checkConstraints: [
+        checkConstraint('a > 0', { name: 'y' }),
+        checkConstraint('a > 0', { name: 'z' }),
+      ],
+    }),
+  );
+
+  // The two baseline duplicates both carry the name `x`, so the changed pairs tie on their
+  // baseline member and their target names — `y` then `z` — decide the order.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: duplicate,
+          after: checkConstraint('a > 0', { name: 'y' }),
+        },
+        {
+          kind: 'check-constraint-changed',
+          before: duplicate,
+          after: checkConstraint('a > 0', { name: 'z' }),
+        },
+      ],
     },
   ]);
 });

@@ -5692,3 +5692,174 @@ test('a duplicated surviving foreign key is set aside once per occurrence', () =
   ]);
   simulate(baseline, target);
 });
+
+test('same-name dependent foreign keys distinguish update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const cascade = foreignKey(['pid'], identity('parent'), {
+    name: 'f_dup',
+    onUpdate: 'CASCADE',
+    onDelete: 'RESTRICT',
+  });
+  const setNull = foreignKey(['pid'], identity('parent'), {
+    name: 'f_dup',
+    onUpdate: 'SET NULL',
+    onDelete: 'RESTRICT',
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [setNull, cascade],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Equal names and equal delete actions leave only the update actions to tell the duplicate
+  // keys apart: each survives once and gets its own drop/add pair, `CASCADE` before `SET NULL`.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: setNull },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: setNull },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign keys compare shared columns before lengths', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const wide = foreignKey(['m', 'n'], identity('parent'));
+  const narrow = foreignKey(['z'], identity('parent'));
+  const child = table('child', {
+    columns: [column('m'), column('n'), column('z')],
+    foreignKeys: [narrow, wide],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // `m` sorts before `z`, so the first shared element decides and the wider key is set aside
+  // first, even though the narrower key is shorter and the model lists it first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: narrow },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: narrow },
+  ]);
+  simulate(baseline, target);
+});
+
+test('unnamed dependent foreign keys order by their update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const withoutUpdate = foreignKey(['pid'], identity('parent'));
+  const cascade = foreignKey(['pid'], identity('parent'), { onUpdate: 'CASCADE' });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [withoutUpdate, cascade],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both names are absent, so that comparison ties and the update-action presence decides:
+  // the key without an update action is set aside first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: withoutUpdate },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: withoutUpdate },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+  ]);
+  simulate(baseline, target);
+});
+
+test('named dependent foreign keys are set aside after unnamed ones', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const named = foreignKey(['pid'], identity('parent'), {
+    name: 'f_named',
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const unnamed = foreignKey(['pid'], identity('parent'), {
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [named, unnamed],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // The absent name sorts before the present one, so the unnamed key is set aside first even
+  // though the model lists the named key first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: named },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: named },
+  ]);
+  simulate(baseline, target);
+});
