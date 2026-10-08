@@ -3,6 +3,7 @@ import type {
   Column,
   Hazard,
   HazardAnalyzer,
+  HazardEntity,
   Identity,
   Model,
   Plan,
@@ -20,11 +21,12 @@ import type {
  *
  * `analyzeHazards` reads the baseline and target models together with the plan and reports what
  * PostgreSQL would reject when the plan is applied. It never changes the plan: a hazard is a
- * fact beside it, and every hazard carries the index of the step it belongs to. Entities are
- * sequences — matched by schema and name — and identity columns — matched by table and column
- * name. Each side's options are read as stored, already effective from import. A baseline-only
- * entity is a drop with nothing to apply, and an entity the plan carries no step for reports
- * nothing; the plan is the only source of step indices.
+ * fact beside it, and every hazard carries the index of the step it belongs to and the entity
+ * the step applies to — a sequence identity or an identity column's table and name. Entities
+ * are sequences — matched by schema and name — and identity columns — matched by table and
+ * column name. Each side's options are read as stored, already effective from import. A
+ * baseline-only entity is a drop with nothing to apply, and an entity the plan carries no step
+ * for reports nothing; the plan is the only source of step indices.
  *
  * Definite hazards are self-inconsistent targets, rejected at apply regardless of stored state.
  * Each entity is checked in PostgreSQL's order and every violation is reported: `increment-zero`
@@ -185,9 +187,10 @@ function sequenceHazards(entry: SequenceEntry, steps: readonly Step[]): readonly
         )
       : findSequenceAlterStep(steps, entry.identity);
   if (step === undefined) return [];
-  const definite = definiteHazards(target.dataType, target, step);
+  const entity: HazardEntity = { kind: 'sequence', sequence: entry.identity };
+  const definite = definiteHazards(target.dataType, target, entity, step);
   if (definite.length > 0 || entry.baseline === undefined) return definite;
-  return tightenedHazards(entry.baseline, target, () => step);
+  return tightenedHazards(entry.baseline, target, entity, () => step);
 }
 
 /**
@@ -213,11 +216,12 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   const column = entry.targetColumn;
   if (column === undefined || column.identity === undefined) return [];
   const target = column.identity;
+  const entity: HazardEntity = { kind: 'identity-column', table: entry.table, column: entry.name };
   const dataType = canonicalIntType(column.type);
   if (entry.baseline === undefined) {
     const step = findIdentityStep(steps, entry, 'add-identity');
     if (step === undefined) return [];
-    return definiteHazards(dataType, target, step);
+    return definiteHazards(dataType, target, entity, step);
   }
   const baseline = entry.baseline;
   const alterIdentity = findIdentityStep(steps, entry, 'alter-identity');
@@ -242,11 +246,13 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
       target,
       baseline,
       projection,
+      entity,
       alterIdentity,
       typeStep,
     );
   } else {
-    definite = definiteStep === undefined ? [] : definiteHazards(dataType, target, definiteStep);
+    definite =
+      definiteStep === undefined ? [] : definiteHazards(dataType, target, entity, definiteStep);
   }
   if (definite.length > 0) return definite;
   // A recreation drops the old sequence with its stored value; only a surviving identity's
@@ -269,7 +275,7 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
     (field === 'min'
       ? BigInt(projection.minValue) > BigInt(baseline.minValue)
       : BigInt(projection.maxValue) < BigInt(baseline.maxValue));
-  return tightenedHazards(baseline, target, (field) => {
+  return tightenedHazards(baseline, target, entity, (field) => {
     if (alterIdentity !== undefined && restated(field)) return alterIdentity;
     if (conversionTightens(field) && typeStep !== undefined) return typeStep;
     return conditionalStep;
@@ -288,6 +294,7 @@ function conversionDefiniteHazards(
   target: Options,
   before: Options,
   projection: SequenceTypeChange,
+  entity: HazardEntity,
   alterStep: number,
   typeStep: number,
 ): Hazard[] {
@@ -300,9 +307,10 @@ function conversionDefiniteHazards(
       increment: before.increment,
       cache: before.cache,
     },
+    entity,
     typeStep,
   );
-  return definiteHazards(dataType, target, alterStep).map((hazard) =>
+  return definiteHazards(dataType, target, entity, alterStep).map((hazard) =>
     projected.some((candidate) => sameDefiniteHazard(candidate, hazard))
       ? { ...hazard, step: typeStep }
       : hazard,
@@ -396,11 +404,12 @@ function findStepIndex(
 function definiteHazards(
   dataType: SequenceDataType | undefined,
   options: Options,
+  entity: HazardEntity,
   step: number,
 ): Hazard[] {
   const hazards: Hazard[] = [];
   if (options.increment === '0') {
-    hazards.push({ kind: 'increment-zero', step, increment: options.increment });
+    hazards.push({ kind: 'increment-zero', step, entity, increment: options.increment });
   }
   if (dataType !== undefined) {
     const bounds = sequenceTypeBounds(dataType);
@@ -411,6 +420,7 @@ function definiteHazards(
       hazards.push({
         kind: 'bound-out-of-type-range',
         step,
+        entity,
         dataType,
         field: 'max',
         value: options.maxValue,
@@ -423,6 +433,7 @@ function definiteHazards(
       hazards.push({
         kind: 'bound-out-of-type-range',
         step,
+        entity,
         dataType,
         field: 'min',
         value: options.minValue,
@@ -433,6 +444,7 @@ function definiteHazards(
     hazards.push({
       kind: 'bounds-inverted',
       step,
+      entity,
       minValue: options.minValue,
       maxValue: options.maxValue,
     });
@@ -444,13 +456,14 @@ function definiteHazards(
     hazards.push({
       kind: 'start-out-of-bounds',
       step,
+      entity,
       start: options.start,
       minValue: options.minValue,
       maxValue: options.maxValue,
     });
   }
   if (BigInt(options.cache) <= 0n) {
-    hazards.push({ kind: 'cache-nonpositive', step, cache: options.cache });
+    hazards.push({ kind: 'cache-nonpositive', step, entity, cache: options.cache });
   }
   return hazards;
 }
@@ -462,6 +475,7 @@ function definiteHazards(
 function tightenedHazards(
   before: Options,
   after: Options,
+  entity: HazardEntity,
   stepFor: (field: 'min' | 'max') => number,
 ): Hazard[] {
   const hazards: Hazard[] = [];
@@ -469,6 +483,7 @@ function tightenedHazards(
     hazards.push({
       kind: 'bound-tightened',
       step: stepFor('min'),
+      entity,
       field: 'min',
       before: before.minValue,
       after: after.minValue,
@@ -478,6 +493,7 @@ function tightenedHazards(
     hazards.push({
       kind: 'bound-tightened',
       step: stepFor('max'),
+      entity,
       field: 'max',
       before: before.maxValue,
       after: after.maxValue,

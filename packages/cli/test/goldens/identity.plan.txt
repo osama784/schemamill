@@ -13,7 +13,7 @@
  12. alter-identity   public.tune.id: GENERATED ALWAYS → BY DEFAULT, increment 1 → 2, min value 1 → 0, max value 2147483647 → 99, start 1 → 5, cache 1 → 10, cycle false → true
 
 Hazards:
-  step 12 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
+  step 12 bound-tightened public.tune.id: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
 
 BEGIN;
 ALTER TABLE app.recreate ALTER COLUMN id DROP IDENTITY;

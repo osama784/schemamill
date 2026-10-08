@@ -12,7 +12,8 @@ import { importPair } from './run.ts';
  * Wiring only — the diff and plan come from `@schemamill/core`, the hazards from
  * `@schemamill/postgres`, and the human wording from `format.ts`. The hazard step numbers are
  * indices into the migration plan's step order; `compare` prints no step list, so a line's
- * `step <n>` refers to the step `schemamill plan` would number `<n>`. An `error` diagnostic
+ * `step <n>` refers to the step `schemamill plan` would number `<n>`. Each hazard line also
+ * names the entity it belongs to, so compare lines are self-attributing. An `error` diagnostic
  * makes the exit code 1, but the diff is still printed.
  */
 
