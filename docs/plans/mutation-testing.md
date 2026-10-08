@@ -34,7 +34,7 @@ One documented command mutates `packages/core` against its existing `node:test` 
 
 ## Deferred
 
-Named for the slices that own them, never silent — [`docs/mutation-testing.md` §Deferred](../mutation-testing.md#deferred) is the live list:
+Named for the slices that own them, never silent — the guide's [`§Deferred`](../mutation-testing.md#deferred) is the live list, and these are the slice-owned subset:
 
 - **Repo-wide rollout** — `@schemamill/postgres`, `@schemamill/cli`, and `@schemamill/server` each get their own scoping pass once core's signal and runtime are known.
 - **Per-package gates** — mutation scores as required per-package gates, with thresholds and ratchets, once a baseline is trustworthy.

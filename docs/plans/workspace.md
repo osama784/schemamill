@@ -2,7 +2,7 @@
 
 **Status:** built · **Last updated:** 2026-10-08
 
-The workspace is the container that organizes a user's work on disk — "the unit the studio and the CLI work within" ([CONTEXT.md §Workspace](../../CONTEXT.md)). This slice defined and built the container itself — the workspace directory layout, root resolution, and an `init` that creates one — so the CLI can locate a workspace's canonical model from anywhere below its root, and the later studio can reuse the same layout instead of inventing a second one. It shipped in [#54](https://github.com/osama784/schemamill/issues/54) (PR [#69](https://github.com/osama784/schemamill/pull/69), merge commit `ff13928`); the layout decisions are recorded in [ADR 0010](../adr/0010-workspace-container.md), and the `[Unreleased]` changelog entry carries the shipped behavior.
+The workspace is the container that organizes a user's work on disk — "the unit the studio and the CLI work within" ([CONTEXT.md §Workspace](../../CONTEXT.md)). This slice defined and built the container itself — the workspace directory layout, root resolution, and an `init` that creates one — so the CLI can locate a workspace's canonical model from anywhere below its root, and the later studio can reuse the same layout instead of inventing a second one. It shipped in [#54](https://github.com/osama784/schemamill/issues/54) (PR [#69](https://github.com/osama784/schemamill/pull/69), merge commit `ff13928`); the layout decisions are recorded in [ADR 0010](../adr/0010-workspace-container.md), and the `[Unreleased]` changelog entry carries the shipped behavior. This plan predates the `## Acceptance` convention; its acceptance was captured in [#54](https://github.com/osama784/schemamill/issues/54)'s brief rather than a section here.
 
 ## Goal
 
@@ -44,4 +44,4 @@ Named for the slices that own them, never silent:
 - **Persistence beyond the container** — migration history, apply logs, caches, and lock files; the workspace holds the model, not a product database.
 - **Workspace file-format versioning** — migrating older workspace files forward; addressed when a format actually changes.
 
-The first follow-up — command consumption — is planned in [workspace consumption](./workspace-consumption.md); the rest are tracked as issues filed from the Oct 8 2026 supply pass.
+The first follow-up — command consumption — is planned in [workspace consumption](./workspace-consumption.md); the rest remain deferred in this plan for future supply passes.
