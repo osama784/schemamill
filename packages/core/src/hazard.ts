@@ -1,4 +1,4 @@
-import type { SequenceDataType } from './model.ts';
+import type { SequenceDataType, SequenceIdentity, TableIdentity } from './model.ts';
 
 /**
  * Plan hazards — what could hurt when a migration plan is applied.
@@ -9,17 +9,29 @@ import type { SequenceDataType } from './model.ts';
  * PostgreSQL cross-checks the sequence's stored value against the new bound at apply, that
  * state is not modeled, and the migration may fail.
  *
- * Every hazard carries `step`: the index into `Plan.steps` of the step that carries it.
+ * Every hazard carries `step`: the index into `Plan.steps` of the step that carries it, and
+ * `entity`: the sequence or identity column the hazard belongs to.
  */
 export type Hazard =
   /** The target's `INCREMENT BY 0` — PostgreSQL rejects it at apply (`INCREMENT must not be zero`). */
-  | { readonly kind: 'increment-zero'; readonly step: number; readonly increment: string }
+  | {
+      readonly kind: 'increment-zero';
+      readonly step: number;
+      readonly entity: HazardEntity;
+      readonly increment: string;
+    }
   /** The target's `CACHE` is zero or negative — PostgreSQL rejects it at apply. */
-  | { readonly kind: 'cache-nonpositive'; readonly step: number; readonly cache: string }
+  | {
+      readonly kind: 'cache-nonpositive';
+      readonly step: number;
+      readonly entity: HazardEntity;
+      readonly cache: string;
+    }
   /** The target's `MINVALUE >= MAXVALUE` — PostgreSQL rejects it at apply. */
   | {
       readonly kind: 'bounds-inverted';
       readonly step: number;
+      readonly entity: HazardEntity;
       readonly minValue: string;
       readonly maxValue: string;
     }
@@ -27,6 +39,7 @@ export type Hazard =
   | {
       readonly kind: 'start-out-of-bounds';
       readonly step: number;
+      readonly entity: HazardEntity;
       readonly start: string;
       readonly minValue: string;
       readonly maxValue: string;
@@ -35,6 +48,7 @@ export type Hazard =
   | {
       readonly kind: 'bound-out-of-type-range';
       readonly step: number;
+      readonly entity: HazardEntity;
       readonly dataType: SequenceDataType;
       readonly field: 'min' | 'max';
       readonly value: string;
@@ -46,7 +60,17 @@ export type Hazard =
   | {
       readonly kind: 'bound-tightened';
       readonly step: number;
+      readonly entity: HazardEntity;
       readonly field: 'min' | 'max';
       readonly before: string;
       readonly after: string;
     };
+
+/**
+ * The model entity a hazard belongs to: a sequence, identified by schema and name, or an
+ * identity column, identified by its table and column name. Structured rather than a display
+ * label so identities carrying dots or other punctuation stay unambiguous.
+ */
+export type HazardEntity =
+  | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
+  | { readonly kind: 'identity-column'; readonly table: TableIdentity; readonly column: string };

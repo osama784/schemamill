@@ -110,12 +110,49 @@ test('a target-only sequence reports every definite violation in check order', (
   const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'increment-zero', step, increment: '0' },
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '-50000' },
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'min', value: '-40000' },
-    { kind: 'bounds-inverted', step, minValue: '-40000', maxValue: '-50000' },
-    { kind: 'start-out-of-bounds', step, start: '7', minValue: '-40000', maxValue: '-50000' },
-    { kind: 'cache-nonpositive', step, cache: '0' },
+    {
+      kind: 'increment-zero',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      increment: '0',
+    },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'max',
+      value: '-50000',
+    },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'min',
+      value: '-40000',
+    },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      minValue: '-40000',
+      maxValue: '-50000',
+    },
+    {
+      kind: 'start-out-of-bounds',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      start: '7',
+      minValue: '-40000',
+      maxValue: '-50000',
+    },
+    {
+      kind: 'cache-nonpositive',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      cache: '0',
+    },
   ]);
 });
 
@@ -128,7 +165,14 @@ test('a target-only sequence reports a maximum above its data type', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '40000' },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'max',
+      value: '40000',
+    },
   ]);
 });
 
@@ -144,12 +188,26 @@ test('a target-only sequence reports a minimum above its data type', () => {
     {
       kind: 'bound-out-of-type-range',
       step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
       dataType: 'integer',
       field: 'min',
       value: '4000000000',
     },
-    { kind: 'bounds-inverted', step, minValue: '4000000000', maxValue: '100' },
-    { kind: 'start-out-of-bounds', step, start: '100', minValue: '4000000000', maxValue: '100' },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      minValue: '4000000000',
+      maxValue: '100',
+    },
+    {
+      kind: 'start-out-of-bounds',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      start: '100',
+      minValue: '4000000000',
+      maxValue: '100',
+    },
   ]);
 });
 
@@ -163,12 +221,26 @@ test('a target-only sequence reports a maximum below its data type', () => {
     {
       kind: 'bound-out-of-type-range',
       step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
       dataType: 'integer',
       field: 'max',
       value: '-4000000000',
     },
-    { kind: 'bounds-inverted', step, minValue: '1', maxValue: '-4000000000' },
-    { kind: 'start-out-of-bounds', step, start: '1', minValue: '1', maxValue: '-4000000000' },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      minValue: '1',
+      maxValue: '-4000000000',
+    },
+    {
+      kind: 'start-out-of-bounds',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      start: '1',
+      minValue: '1',
+      maxValue: '-4000000000',
+    },
   ]);
 });
 
@@ -190,12 +262,49 @@ test('a matched sequence reports definite violations on its alter step', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'increment-zero', step, increment: '0' },
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'max', value: '-50000' },
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'min', value: '-40000' },
-    { kind: 'bounds-inverted', step, minValue: '-40000', maxValue: '-50000' },
-    { kind: 'start-out-of-bounds', step, start: '7', minValue: '-40000', maxValue: '-50000' },
-    { kind: 'cache-nonpositive', step, cache: '0' },
+    {
+      kind: 'increment-zero',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      increment: '0',
+    },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'max',
+      value: '-50000',
+    },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'min',
+      value: '-40000',
+    },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      minValue: '-40000',
+      maxValue: '-50000',
+    },
+    {
+      kind: 'start-out-of-bounds',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      start: '7',
+      minValue: '-40000',
+      maxValue: '-50000',
+    },
+    {
+      kind: 'cache-nonpositive',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      cache: '0',
+    },
   ]);
 });
 
@@ -261,6 +370,11 @@ test('an add-identity target reports every definite violation in check order', (
     {
       kind: 'bound-out-of-type-range',
       step: step('min_range'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'min_range',
+      },
       dataType: 'smallint',
       field: 'min',
       value: '-40000',
@@ -268,20 +382,58 @@ test('an add-identity target reports every definite violation in check order', (
     {
       kind: 'bound-out-of-type-range',
       step: step('max_range'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'max_range',
+      },
       dataType: 'integer',
       field: 'max',
       value: '4000000000',
     },
-    { kind: 'bounds-inverted', step: step('inverted'), minValue: '5', maxValue: '5' },
+    {
+      kind: 'bounds-inverted',
+      step: step('inverted'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'inverted',
+      },
+      minValue: '5',
+      maxValue: '5',
+    },
     {
       kind: 'start-out-of-bounds',
       step: step('out_of_bounds'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'out_of_bounds',
+      },
       start: '200',
       minValue: '1',
       maxValue: '100',
     },
-    { kind: 'increment-zero', step: step('bad_increment'), increment: '0' },
-    { kind: 'cache-nonpositive', step: step('bad_cache'), cache: '-1' },
+    {
+      kind: 'increment-zero',
+      step: step('bad_increment'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'bad_increment',
+      },
+      increment: '0',
+    },
+    {
+      kind: 'cache-nonpositive',
+      step: step('bad_cache'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'bad_cache',
+      },
+      cache: '-1',
+    },
   ]);
 });
 
@@ -359,6 +511,11 @@ test('an alter-identity target reports every definite violation in check order',
     {
       kind: 'bound-out-of-type-range',
       step: step('min_range'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'min_range',
+      },
       dataType: 'smallint',
       field: 'min',
       value: '-40000',
@@ -366,20 +523,58 @@ test('an alter-identity target reports every definite violation in check order',
     {
       kind: 'bound-out-of-type-range',
       step: step('max_range'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'max_range',
+      },
       dataType: 'integer',
       field: 'max',
       value: '4000000000',
     },
-    { kind: 'bounds-inverted', step: step('inverted'), minValue: '5', maxValue: '5' },
+    {
+      kind: 'bounds-inverted',
+      step: step('inverted'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'inverted',
+      },
+      minValue: '5',
+      maxValue: '5',
+    },
     {
       kind: 'start-out-of-bounds',
       step: step('out_of_bounds'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'out_of_bounds',
+      },
       start: '200',
       minValue: '1',
       maxValue: '100',
     },
-    { kind: 'increment-zero', step: step('bad_increment'), increment: '0' },
-    { kind: 'cache-nonpositive', step: step('bad_cache'), cache: '-1' },
+    {
+      kind: 'increment-zero',
+      step: step('bad_increment'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'bad_increment',
+      },
+      increment: '0',
+    },
+    {
+      kind: 'cache-nonpositive',
+      step: step('bad_cache'),
+      entity: {
+        kind: 'identity-column',
+        table: { schema: 'public', name: 't' },
+        column: 'bad_cache',
+      },
+      cache: '-1',
+    },
   ]);
 });
 
@@ -390,7 +585,14 @@ test('a matched sequence reports a tightened maximum on its alter step', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bound-tightened', step, field: 'max', before: '100', after: '50' },
+    {
+      kind: 'bound-tightened',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      field: 'max',
+      before: '100',
+      after: '50',
+    },
   ]);
 });
 
@@ -422,7 +624,14 @@ test('a matched sequence attaches the tightening to its option step', () => {
   assert.equal(planned.steps.length, 2);
   assert.equal(step, 1, 'the option alter follows the ownership alter');
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bound-tightened', step, field: 'max', before: '100', after: '50' },
+    {
+      kind: 'bound-tightened',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      field: 'max',
+      before: '100',
+      after: '50',
+    },
   ]);
 });
 
@@ -470,8 +679,22 @@ test('both bounds tightened report the minimum before the maximum', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bound-tightened', step, field: 'min', before: '1', after: '10' },
-    { kind: 'bound-tightened', step, field: 'max', before: '100', after: '50' },
+    {
+      kind: 'bound-tightened',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      field: 'min',
+      before: '1',
+      after: '10',
+    },
+    {
+      kind: 'bound-tightened',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      field: 'max',
+      before: '100',
+      after: '50',
+    },
   ]);
 });
 
@@ -505,6 +728,7 @@ test('an AS conversion that resets a default bound reports the tightening', () =
     {
       kind: 'bound-tightened',
       step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
       field: 'max',
       before: '9223372036854775807',
       after: '2147483647',
@@ -534,6 +758,7 @@ test('an identity narrowed bigint to integer attaches the tightening to alter-co
     {
       kind: 'bound-tightened',
       step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       field: 'max',
       before: '9223372036854775807',
       after: '2147483647',
@@ -578,6 +803,7 @@ test('a conversion tightening attaches to alter-column beside an option alter', 
     {
       kind: 'bound-tightened',
       step: typeStep,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       field: 'max',
       before: '9223372036854775807',
       after: '2147483647',
@@ -611,6 +837,7 @@ test('an identity restating a converted bound keeps the tightening on alter-iden
     {
       kind: 'bound-tightened',
       step: identityStep,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       field: 'max',
       before: '9223372036854775807',
       after: '1000',
@@ -648,6 +875,7 @@ test('a converted custom bound outside the new type range reports it on alter-co
     {
       kind: 'bound-out-of-type-range',
       step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       dataType: 'integer',
       field: 'min',
       value: '-4000000000',
@@ -700,6 +928,7 @@ test('a converted out-of-range bound attaches to the type step before an option 
     {
       kind: 'bound-out-of-type-range',
       step: typeStep,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       dataType: 'integer',
       field: 'min',
       value: '-4000000000',
@@ -747,6 +976,7 @@ test('a bound the option alter introduces stays on the alter-identity step', () 
     {
       kind: 'bound-out-of-type-range',
       step: identityStep,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       dataType: 'integer',
       field: 'min',
       value: '-4000000000',
@@ -828,7 +1058,12 @@ test('a recreated identity reports a definite hazard on its add step', () => {
     ['drop-identity', 'add-identity'],
   );
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'increment-zero', step, increment: '0' },
+    {
+      kind: 'increment-zero',
+      step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
+      increment: '0',
+    },
   ]);
 });
 
@@ -870,6 +1105,36 @@ test('a recreated identity reports no tightened bound', () => {
   assert.deepEqual(analyzeHazards(baseline, target, planned), []);
 });
 
+test('an identity column reports its table and column, never its sequence name', () => {
+  const baseline = model();
+  const target = model(
+    table('t', [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          sequenceName: identity('t_id_seq'),
+          minValue: '1',
+          maxValue: '100',
+          start: '1',
+          cache: '0',
+        }),
+      }),
+    ]),
+  );
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'add-identity');
+
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'cache-nonpositive',
+      step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
+      cache: '0',
+    },
+  ]);
+});
+
 test('a definite violation suppresses the entity\u2019s tightened bounds', () => {
   const baseline = sequenceModel([sequence('s', { minValue: '1', maxValue: '1000', start: '1' })]);
   const target = sequenceModel([sequence('s', { minValue: '10', maxValue: '5', start: '7' })]);
@@ -877,8 +1142,21 @@ test('a definite violation suppresses the entity\u2019s tightened bounds', () =>
   const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bounds-inverted', step, minValue: '10', maxValue: '5' },
-    { kind: 'start-out-of-bounds', step, start: '7', minValue: '10', maxValue: '5' },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      minValue: '10',
+      maxValue: '5',
+    },
+    {
+      kind: 'start-out-of-bounds',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      start: '7',
+      minValue: '10',
+      maxValue: '5',
+    },
   ]);
 });
 
@@ -921,7 +1199,40 @@ test('a target-only entity reports its definite hazards only', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'create-sequence');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bound-out-of-type-range', step, dataType: 'smallint', field: 'min', value: '-40000' },
+    {
+      kind: 'bound-out-of-type-range',
+      step,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      dataType: 'smallint',
+      field: 'min',
+      value: '-40000',
+    },
+  ]);
+});
+
+test('two target-only sequences with the same kind report their own entities', () => {
+  const baseline = model();
+  const target = sequenceModel([sequence('a', { cache: '0' }), sequence('b', { cache: '0' })]);
+  const planned = plan(baseline, target);
+  const step = (name: string): number =>
+    stepIndex(
+      planned,
+      (candidate) => candidate.kind === 'create-sequence' && candidate.sequence.name === name,
+    );
+
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'cache-nonpositive',
+      step: step('a'),
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'a' } },
+      cache: '0',
+    },
+    {
+      kind: 'cache-nonpositive',
+      step: step('b'),
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'b' } },
+      cache: '0',
+    },
   ]);
 });
 
@@ -964,7 +1275,13 @@ test('a non-integer identity column skips only the type-range check', () => {
   const step = stepIndex(planned, (candidate) => candidate.kind === 'add-identity');
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), [
-    { kind: 'bounds-inverted', step, minValue: '5', maxValue: '5' },
+    {
+      kind: 'bounds-inverted',
+      step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
+      minValue: '5',
+      maxValue: '5',
+    },
   ]);
 });
 
@@ -986,6 +1303,7 @@ test('an identity type-range hazard reports the canonical integer type', () => {
     {
       kind: 'bound-out-of-type-range',
       step,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
       dataType: 'integer',
       field: 'max',
       value: '4000000000',

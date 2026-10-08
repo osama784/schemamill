@@ -481,7 +481,14 @@ test('added and removed tables list their constraints and indexes', () => {
 
 test('an increment-zero hazard states the rejection at apply', () => {
   assert.equal(
-    formatHazards([{ kind: 'increment-zero', step: 0, increment: '0' }]),
+    formatHazards([
+      {
+        kind: 'increment-zero',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        increment: '0',
+      },
+    ]),
     [
       'Hazards:',
       '  step 1 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
@@ -491,7 +498,12 @@ test('an increment-zero hazard states the rejection at apply', () => {
 });
 
 test('a cache-nonpositive hazard states the rejection at apply with the actual cache', () => {
-  const cache = (value: string): Hazard => ({ kind: 'cache-nonpositive', step: 0, cache: value });
+  const cache = (value: string): Hazard => ({
+    kind: 'cache-nonpositive',
+    step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+    cache: value,
+  });
 
   assert.equal(
     formatHazards([cache('0')]),
@@ -513,7 +525,15 @@ test('a cache-nonpositive hazard states the rejection at apply with the actual c
 
 test('a bounds-inverted hazard states the rejection at apply with both bounds', () => {
   assert.equal(
-    formatHazards([{ kind: 'bounds-inverted', step: 0, minValue: '100', maxValue: '100' }]),
+    formatHazards([
+      {
+        kind: 'bounds-inverted',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        minValue: '100',
+        maxValue: '100',
+      },
+    ]),
     [
       'Hazards:',
       '  step 1 bounds-inverted: MINVALUE 100 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
@@ -521,7 +541,15 @@ test('a bounds-inverted hazard states the rejection at apply with both bounds', 
     ].join('\n'),
   );
   assert.equal(
-    formatHazards([{ kind: 'bounds-inverted', step: 0, minValue: '500', maxValue: '100' }]),
+    formatHazards([
+      {
+        kind: 'bounds-inverted',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        minValue: '500',
+        maxValue: '100',
+      },
+    ]),
     [
       'Hazards:',
       '  step 1 bounds-inverted: MINVALUE 500 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
@@ -534,6 +562,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
   const outOfBounds = (start: string, minValue: string, maxValue: string): Hazard => ({
     kind: 'start-out-of-bounds',
     step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
     start,
     minValue,
     maxValue,
@@ -562,7 +591,14 @@ test('a bound-out-of-type-range hazard names the bound, value, and data type', (
     field: 'min' | 'max',
     value: string,
     dataType: 'smallint' | 'integer' | 'bigint',
-  ): Hazard => ({ kind: 'bound-out-of-type-range', step: 0, dataType, field, value });
+  ): Hazard => ({
+    kind: 'bound-out-of-type-range',
+    step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+    dataType,
+    field,
+    value,
+  });
 
   assert.equal(
     formatHazards([outOfRange('max', '9999999999', 'integer')]),
@@ -586,6 +622,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
   const tightened = (field: 'min' | 'max', before: string, after: string): Hazard => ({
     kind: 'bound-tightened',
     step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
     field,
     before,
     after,
@@ -611,9 +648,26 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
 
 test('multiple hazards render in payload order, numbered by their step', () => {
   const hazards: readonly Hazard[] = [
-    { kind: 'cache-nonpositive', step: 4, cache: '0' },
-    { kind: 'increment-zero', step: 0, increment: '0' },
-    { kind: 'bound-tightened', step: 11, field: 'max', before: '2147483647', after: '99' },
+    {
+      kind: 'cache-nonpositive',
+      step: 4,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'a' } },
+      cache: '0',
+    },
+    {
+      kind: 'increment-zero',
+      step: 0,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'b' } },
+      increment: '0',
+    },
+    {
+      kind: 'bound-tightened',
+      step: 11,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
+      field: 'max',
+      before: '2147483647',
+      after: '99',
+    },
   ];
 
   assert.equal(
