@@ -491,7 +491,7 @@ test('an increment-zero hazard states the rejection at apply', () => {
     ]),
     [
       'Hazards:',
-      '  step 1 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
+      '  step 1 increment-zero public.s: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
       '',
     ].join('\n'),
   );
@@ -509,7 +509,7 @@ test('a cache-nonpositive hazard states the rejection at apply with the actual c
     formatHazards([cache('0')]),
     [
       'Hazards:',
-      '  step 1 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      '  step 1 cache-nonpositive public.s: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
       '',
     ].join('\n'),
   );
@@ -517,7 +517,7 @@ test('a cache-nonpositive hazard states the rejection at apply with the actual c
     formatHazards([cache('-5')]),
     [
       'Hazards:',
-      '  step 1 cache-nonpositive: CACHE -5 — PostgreSQL rejects this at apply (CACHE (-5) must be greater than zero).',
+      '  step 1 cache-nonpositive public.s: CACHE -5 — PostgreSQL rejects this at apply (CACHE (-5) must be greater than zero).',
       '',
     ].join('\n'),
   );
@@ -536,7 +536,7 @@ test('a bounds-inverted hazard states the rejection at apply with both bounds', 
     ]),
     [
       'Hazards:',
-      '  step 1 bounds-inverted: MINVALUE 100 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
+      '  step 1 bounds-inverted public.s: MINVALUE 100 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -552,7 +552,7 @@ test('a bounds-inverted hazard states the rejection at apply with both bounds', 
     ]),
     [
       'Hazards:',
-      '  step 1 bounds-inverted: MINVALUE 500 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
+      '  step 1 bounds-inverted public.s: MINVALUE 500 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -572,7 +572,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
     formatHazards([outOfBounds('100', '1', '50')]),
     [
       'Hazards:',
-      '  step 1 start-out-of-bounds: START 100 is greater than MAXVALUE 50 — PostgreSQL rejects this at apply.',
+      '  step 1 start-out-of-bounds public.s: START 100 is greater than MAXVALUE 50 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -580,7 +580,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
     formatHazards([outOfBounds('-100', '0', '100')]),
     [
       'Hazards:',
-      '  step 1 start-out-of-bounds: START -100 is less than MINVALUE 0 — PostgreSQL rejects this at apply.',
+      '  step 1 start-out-of-bounds public.s: START -100 is less than MINVALUE 0 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -604,7 +604,7 @@ test('a bound-out-of-type-range hazard names the bound, value, and data type', (
     formatHazards([outOfRange('max', '9999999999', 'integer')]),
     [
       'Hazards:',
-      '  step 1 bound-out-of-type-range: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.',
+      '  step 1 bound-out-of-type-range public.s: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -612,7 +612,7 @@ test('a bound-out-of-type-range hazard names the bound, value, and data type', (
     formatHazards([outOfRange('min', '-32769', 'smallint')]),
     [
       'Hazards:',
-      '  step 1 bound-out-of-type-range: MINVALUE -32769 is out of range for sequence data type smallint — PostgreSQL rejects this at apply.',
+      '  step 1 bound-out-of-type-range public.s: MINVALUE -32769 is out of range for sequence data type smallint — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -632,7 +632,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
     formatHazards([tightened('max', '2147483647', '99')]),
     [
       'Hazards:',
-      "  step 1 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      "  step 1 bound-tightened public.s: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -640,7 +640,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
     formatHazards([tightened('min', '1', '10')]),
     [
       'Hazards:',
-      "  step 1 bound-tightened: min value 1 → 10 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      "  step 1 bound-tightened public.s: min value 1 → 10 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -674,9 +674,9 @@ test('multiple hazards render in payload order, numbered by their step', () => {
     formatHazards(hazards),
     [
       'Hazards:',
-      '  step 5 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
-      '  step 1 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
-      "  step 12 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      '  step 5 cache-nonpositive public.a: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      '  step 1 increment-zero public.b: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
+      "  step 12 bound-tightened public.t.id: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -684,4 +684,33 @@ test('multiple hazards render in payload order, numbered by their step', () => {
 
 test('no hazards render as the header alone', () => {
   assert.equal(formatHazards([]), 'Hazards:\n');
+});
+
+test('mixed sequence and identity column hazards print two- and three-part labels', () => {
+  const hazards: readonly Hazard[] = [
+    {
+      kind: 'cache-nonpositive',
+      step: 0,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      cache: '0',
+    },
+    {
+      kind: 'bound-tightened',
+      step: 3,
+      entity: { kind: 'identity-column', table: { schema: 'app', name: 'users' }, column: 'id' },
+      field: 'max',
+      before: '100',
+      after: '50',
+    },
+  ];
+
+  assert.equal(
+    formatHazards(hazards),
+    [
+      'Hazards:',
+      '  step 1 cache-nonpositive public.s: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      "  step 4 bound-tightened app.users.id: max value 100 → 50 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      '',
+    ].join('\n'),
+  );
 });

@@ -41,10 +41,10 @@
     max value 1000 → 100
 
 Hazards:
-  step 1 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
-  step 2 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).
-  step 3 bound-out-of-type-range: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.
-  step 4 bounds-inverted: MINVALUE 200 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.
-  step 4 start-out-of-bounds: START 200 is greater than MAXVALUE 100 — PostgreSQL rejects this at apply.
-  step 6 bound-tightened: max value 1000 → 100 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
-  step 7 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
+  step 1 cache-nonpositive public.bad_cache: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
+  step 2 increment-zero public.bad_increment: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).
+  step 3 bound-out-of-type-range public.bad_range: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.
+  step 4 bounds-inverted public.bad_two: MINVALUE 200 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.
+  step 4 start-out-of-bounds public.bad_two: START 200 is greater than MAXVALUE 100 — PostgreSQL rejects this at apply.
+  step 6 bound-tightened public.kept_seq: max value 1000 → 100 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.
+  step 7 cache-nonpositive app.bad_identity.id: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).
