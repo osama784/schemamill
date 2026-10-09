@@ -5,22 +5,24 @@
  * `importDump` composes the parse leg (`parseDump`) and translates each statement:
  *
  * - `CREATE TABLE` becomes a `Table`: columns in source order, the primary key (inline,
- *   table-level, or a later `ALTER TABLE`), unique and check constraints, standalone indexes,
- *   and foreign keys. Types and DEFAULT expressions are sliced from the source text — the AST
- *   normalizes types (`int` becomes `int4`), so the model keeps the written spelling,
- *   whitespace-normalized; a check expression is the text between the parentheses after
- *   `CHECK`, normalized the same way. A column declared `GENERATED … AS IDENTITY` becomes the
- *   column's effective identity descriptor (see `identity.ts`): a type PostgreSQL does not
- *   accept for identity columns, and every option the model cannot carry, is flagged by name.
- *   A repeated `CREATE TABLE` for the same schema-qualified identity replaces the table
- *   wholesale, clearing its foreign keys, unique constraints, check constraints, and indexes.
+ *   table-level, or a later `ALTER TABLE`), unique and check constraints, named not-null
+ *   constraints, standalone indexes, and foreign keys. Types and DEFAULT expressions are
+ *   sliced from the source text — the AST normalizes types (`int` becomes `int4`), so the
+ *   model keeps the written spelling, whitespace-normalized; a check expression is the text
+ *   between the parentheses after `CHECK`, normalized the same way. A column declared
+ *   `GENERATED … AS IDENTITY` becomes the column's effective identity descriptor (see
+ *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
+ *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
+ *   schema-qualified identity replaces the table wholesale, clearing its foreign keys, unique
+ *   constraints, check constraints, and indexes.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
  *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key, primary key,
- *   unique constraint, or check constraint to an already imported table. A unique constraint
- *   stated `USING INDEX` consumes the named standalone index when it is a plain column-list
- *   unique index, and the whole constraint is skipped and named otherwise. Any other action
- *   is skipped and named, as is an identity action on a column that is not a modeled identity.
+ *   unique constraint, check constraint, or not-null constraint to an already imported table.
+ *   A unique constraint stated `USING INDEX` consumes the named standalone index when it is a
+ *   plain column-list unique index, and the whole constraint is skipped and named otherwise.
+ *   Any other action is skipped and named, as is an identity action on a column that is not a
+ *   modeled identity.
  * - `CREATE [UNIQUE] INDEX` becomes an `Index` with its name (optional), `unique`, ordered
  *   columns, and `concurrently`. A statement outside the minimal envelope — an expression
  *   element, partial `WHERE`, `INCLUDE (…)`, a non-btree access method, a non-default
@@ -35,7 +37,10 @@
  *   declaration the model makes unnamed round-trips; a name is kept when an unnamed entry of
  *   the same structure already exists, so no duplicate unnamed entry is manufactured, and a
  *   name outside the formula — truncated or collision-suffixed, or an expression the
- *   best-effort check formula does not predict — stays named.
+ *   best-effort check formula does not predict — stays named. A column's not-null name equal
+ *   to the generated `<table>_<column>_not_null` is stripped the same way; no twin guard is
+ *   needed, because one not-null fact per column is the only shape the model carries and the
+ *   duplicate declaration is already collapsed by the merge (see `mergeNotNullDeclaration`).
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -54,11 +59,18 @@
  * behaviour, tablespace, access method, storage parameters, unlogged or temporary
  * persistence, and column-level EXCLUDE, GENERATED, COLLATE, compression, and storage. A
  * unique or check constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
- * `INCLUDE (…)`, `NO INHERIT`, `NOT VALID`, deferrability) is still imported, and each
- * unrepresentable attribute is flagged and dropped, following the foreign-key precedent;
- * `NOT ENFORCED` is flagged under the `NOT VALID` wording, because the parser delivers it
- * through the same `skip_validation` channel — the foreign-key path behaves the same. The one
- * statement-level exception is a partition (`partbound`): a
+ * `INCLUDE (…)`, `NO INHERIT`) is still imported, and each unrepresentable attribute is
+ * flagged and dropped, following the foreign-key precedent; a check constraint's misplaced
+ * deferrability is flagged the same way. Enforcement and deferrability the model carries are
+ * read instead: on a foreign key or check constraint the parser's one `skip_validation`
+ * channel decodes to `NOT VALID` when `is_enforced` is true beside it and to `NOT ENFORCED`
+ * otherwise, and a deferrable primary key, unique constraint, or foreign key keeps
+ * `DEFERRABLE`/`INITIALLY DEFERRED`. A not-null constraint in any shape — inline, table-level,
+ * or `ALTER TABLE … ADD`, named or unnamed — sets the column's `notNull`, with a stated name
+ * on `notNullName`; the duplicate-declaration merge and the generated-name strip below keep
+ * the model's one-fact-per-column shape. A not-null `NOT VALID` keeps its enforced not-null
+ * fact and flags the validation state the model cannot carry. The
+ * one statement-level exception is a partition (`partbound`): a
  * plain-table representation would be a different object, so the whole statement is skipped
  * and named. `ALTER TABLE` on anything but a plain table is skipped the same way.
  *
@@ -75,6 +87,7 @@
 import type {
   CheckConstraint,
   Column,
+  ConstraintEnforcement,
   DdlImporter,
   Diagnostic,
   ForeignKey,
@@ -126,6 +139,7 @@ import {
   synthesizedCheckConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
+  synthesizedNotNullName,
   synthesizedPrimaryKeyName,
   synthesizedUniqueConstraintName,
 } from './names.ts';
@@ -139,7 +153,7 @@ type Mutable<Payload> = { -readonly [Key in keyof Payload]: Payload[Key] };
 interface TableDraft {
   readonly schema: string;
   readonly name: string;
-  columns: readonly Column[];
+  columns: Column[];
   primaryKey?: PrimaryKey;
   readonly foreignKeys: ForeignKey[];
   readonly uniqueConstraints: UniqueConstraint[];
@@ -315,6 +329,9 @@ function translateCreateTable(
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
   draft.indexes.length = 0;
+  // The draft sees the columns as they are collected, so a table-level not-null constraint —
+  // which always follows the column definitions — can attach to its column.
+  draft.columns = columns;
 
   for (const element of elements) {
     const boundaries = clauseBoundaries(element);
@@ -323,8 +340,7 @@ function translateCreateTable(
         statement,
         element.ColumnDef,
         boundaries,
-        schema,
-        identity,
+        { schema, name },
         diagnostics,
       );
       columns.push(translated.column);
@@ -355,24 +371,34 @@ function translateCreateTable(
     );
   }
 
-  draft.columns = columns;
   translateCreateTableExtras(statement, create, identity, diagnostics);
 }
+
+/** A column and its constraints while `translateColumn` assembles them. */
+interface TranslatedColumn {
+  column: Column;
+  primaryKey?: PrimaryKey;
+  foreignKeys: ForeignKey[];
+  uniqueConstraints: UniqueConstraint[];
+  checkConstraints: CheckConstraint[];
+}
+
+/** The constraint an inline `CONSTR_ATTR_*` sibling can fold into. */
+type InlineAttributeTarget =
+  | { readonly kind: 'primary'; readonly value: Mutable<PrimaryKey> }
+  | { readonly kind: 'unique'; readonly value: Mutable<UniqueConstraint> }
+  | { readonly kind: 'foreign'; readonly value: Mutable<ForeignKey> }
+  | { readonly kind: 'check'; readonly value: Mutable<CheckConstraint> };
 
 function translateColumn(
   statement: ParsedStatement,
   column: ColumnDef,
   boundaries: readonly number[],
-  schema: string,
-  identity: string,
+  table: TableIdentity,
   diagnostics: PositionedDiagnostic[],
-): {
-  column: Column;
-  primaryKey?: PrimaryKey;
-  foreignKeys: readonly ForeignKey[];
-  uniqueConstraints: readonly UniqueConstraint[];
-  checkConstraints: readonly CheckConstraint[];
-} {
+): TranslatedColumn {
+  const schema = table.schema;
+  const identity = tableIdentityName(table);
   const name = column.colname ?? '';
   const place = `${identity}.${name}`;
   const constraints = (column.constraints ?? [])
@@ -408,13 +434,7 @@ function translateColumn(
         constraint.contype === 'CONSTR_NOTNULL' || constraint.contype === 'CONSTR_IDENTITY',
     );
 
-  const translated: {
-    column: Column;
-    primaryKey?: PrimaryKey;
-    foreignKeys: ForeignKey[];
-    uniqueConstraints: UniqueConstraint[];
-    checkConstraints: CheckConstraint[];
-  } = {
+  const translated: TranslatedColumn = {
     column: { name, type, notNull },
     foreignKeys: [],
     uniqueConstraints: [],
@@ -433,21 +453,42 @@ function translateColumn(
     }
   }
 
+  // The last non-attribute constraint of the list: consecutive `CONSTR_ATTR_*` siblings fold
+  // into it, in source order.
+  let fold: InlineAttributeTarget | undefined;
+
   for (const constraint of constraints) {
     switch (constraint.contype) {
-      case 'CONSTR_PRIMARY':
-        translated.primaryKey = primaryKeyFromConstraint(constraint, [name]);
+      case 'CONSTR_PRIMARY': {
+        const primaryKey = primaryKeyFromConstraint(constraint, [name]) as Mutable<PrimaryKey>;
+        translated.primaryKey = primaryKey;
+        fold = { kind: 'primary', value: primaryKey };
         break;
-      case 'CONSTR_FOREIGN':
-        translated.foreignKeys.push(
-          foreignKeyFromConstraint(statement, constraint, [name], identity, diagnostics),
-        );
+      }
+      case 'CONSTR_FOREIGN': {
+        const foreignKey = foreignKeyFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<ForeignKey>;
+        translated.foreignKeys.push(foreignKey);
+        fold = { kind: 'foreign', value: foreignKey };
         break;
-      case 'CONSTR_UNIQUE':
-        translated.uniqueConstraints.push(
-          uniqueConstraintFromConstraint(statement, constraint, [name], identity, diagnostics),
-        );
+      }
+      case 'CONSTR_UNIQUE': {
+        const uniqueConstraint = uniqueConstraintFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<UniqueConstraint>;
+        translated.uniqueConstraints.push(uniqueConstraint);
+        fold = { kind: 'unique', value: uniqueConstraint };
         break;
+      }
       case 'CONSTR_CHECK': {
         const checkConstraint = checkConstraintFromConstraint(
           statement,
@@ -455,15 +496,34 @@ function translateColumn(
           identity,
           diagnostics,
         );
-        if (checkConstraint !== undefined) translated.checkConstraints.push(checkConstraint);
+        if (checkConstraint === undefined) {
+          fold = undefined;
+        } else {
+          translated.checkConstraints.push(checkConstraint);
+          fold = { kind: 'check', value: checkConstraint };
+        }
+        break;
+      }
+      case 'CONSTR_NOTNULL': {
+        fold = undefined;
+        const merged = mergeNotNullDeclaration(translated.column, table.name, constraint.conname);
+        if (merged.conflict) {
+          diagnostics.push(
+            flagAttribute(statement, identity, `additional not-null constraint on ${place}`),
+          );
+        } else {
+          translated.column = merged.column;
+        }
         break;
       }
       case 'CONSTR_EXCLUSION':
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
         break;
       case 'CONSTR_IDENTITY':
+        fold = undefined;
         translated.column = columnWithIdentity(
           statement,
           constraint,
@@ -475,14 +535,15 @@ function translateColumn(
         );
         break;
       case 'CONSTR_GENERATED':
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
         break;
-      case 'CONSTR_NOTNULL':
       case 'CONSTR_DEFAULT':
       case 'CONSTR_NULL':
       case undefined:
+        fold = undefined;
         break;
       case 'CONSTR_ATTR_DEFERRABLE':
       case 'CONSTR_ATTR_NOT_DEFERRABLE':
@@ -490,7 +551,10 @@ function translateColumn(
       case 'CONSTR_ATTR_IMMEDIATE':
       case 'CONSTR_ATTR_ENFORCED':
       case 'CONSTR_ATTR_NOT_ENFORCED':
+        applyInlineAttribute(statement, identity, place, fold, constraint, diagnostics);
+        break;
       default:
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
@@ -508,6 +572,128 @@ function translateColumn(
   }
 
   return translated;
+}
+
+/**
+ * Folds an inline constraint attribute into the constraint it follows, or flags it by its raw
+ * parser label when there is no target or the target's kind cannot carry the attribute. The
+ * server rejects those placements — `NOT NULL DEFERRABLE`, `CHECK DEFERRABLE`, `UNIQUE NOT
+ * ENFORCED` — but the raw parser accepts them, so they stay diagnosed rather than silent.
+ */
+function applyInlineAttribute(
+  statement: ParsedStatement,
+  identity: string,
+  place: string,
+  target: InlineAttributeTarget | undefined,
+  attribute: Constraint,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const handled = target !== undefined && applyAttributeToTarget(target, attribute);
+  if (!handled) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${constraintLabel(attribute)} on ${place}`),
+    );
+  }
+}
+
+/** Applies one attribute to one target; `false` when the target's kind cannot carry it. */
+function applyAttributeToTarget(target: InlineAttributeTarget, attribute: Constraint): boolean {
+  switch (target.kind) {
+    case 'primary':
+    case 'unique':
+      return applyDeferrabilityAttribute(target.value, attribute);
+    case 'foreign':
+      return (
+        applyDeferrabilityAttribute(target.value, attribute) ||
+        applyEnforcementAttribute(target.value, attribute)
+      );
+    case 'check':
+      return applyEnforcementAttribute(target.value, attribute);
+  }
+}
+
+/** Applies a deferrability attribute; `false` for any other attribute. */
+function applyDeferrabilityAttribute(
+  target: Mutable<PrimaryKey | UniqueConstraint | ForeignKey>,
+  attribute: Constraint,
+): boolean {
+  const contype = attribute.contype;
+  if (contype === 'CONSTR_ATTR_DEFERRABLE') {
+    target.deferrable = true;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_DEFERRED') {
+    // `INITIALLY DEFERRED` implies `DEFERRABLE`; the model normalizes the pair.
+    target.deferrable = true;
+    target.initiallyDeferred = true;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_NOT_DEFERRABLE') {
+    // An explicit default: consumed, and it resets a preceding `DEFERRABLE`/`INITIALLY
+    // DEFERRED` in source order.
+    delete target.deferrable;
+    delete target.initiallyDeferred;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_IMMEDIATE') {
+    delete target.initiallyDeferred;
+    return true;
+  }
+  return false;
+}
+
+/** Applies an enforcement attribute; `false` for any other attribute. */
+function applyEnforcementAttribute(
+  target: Mutable<ForeignKey | CheckConstraint>,
+  attribute: Constraint,
+): boolean {
+  const contype = attribute.contype;
+  if (contype === 'CONSTR_ATTR_ENFORCED') {
+    delete target.enforcement;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_NOT_ENFORCED') {
+    target.enforcement = 'not-enforced';
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Merges a not-null declaration into a column's not-null fact. PostgreSQL allows one not-null
+ * constraint per column, so declarations for the same column collapse: a name equal to the
+ * generated `<table>_<column>_not_null` formula reads as unnamed for the comparison, identical
+ * facts are ignored, an unnamed and a named declaration become the named one whatever the
+ * order, and two different real names keep the first and report a conflict — legal input the
+ * model collapses by design, never silently.
+ */
+function mergeNotNullDeclaration(
+  column: Column,
+  table: string,
+  incomingName: string | undefined,
+): { readonly column: Column; readonly conflict: boolean } {
+  const incoming = normalizedNotNullName(table, column.name, incomingName);
+  if (!column.notNull) {
+    const copy: Mutable<Column> = { ...column, notNull: true };
+    if (incoming !== undefined) copy.notNullName = incoming;
+    return { column: copy, conflict: false };
+  }
+  const existing = normalizedNotNullName(table, column.name, column.notNullName);
+  if (existing === incoming) return { column, conflict: false };
+  if (existing === undefined)
+    return { column: { ...column, notNullName: incoming }, conflict: false };
+  if (incoming === undefined) return { column, conflict: false };
+  return { column, conflict: true };
+}
+
+/** A not-null name normalized for the one-fact comparison: the generated formula reads unnamed. */
+function normalizedNotNullName(
+  table: string,
+  column: string,
+  name: string | undefined,
+): string | undefined {
+  if (name === undefined) return undefined;
+  return name === synthesizedNotNullName(table, column) ? undefined : name;
 }
 
 function translateTableConstraint(
@@ -555,9 +741,18 @@ function translateTableConstraint(
       if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
       return;
     }
+    case 'CONSTR_NOTNULL':
+      attachNotNullConstraint(
+        statement,
+        constraint,
+        identity,
+        draft.name,
+        draft.columns,
+        diagnostics,
+      );
+      return;
     case undefined:
     case 'CONSTR_NULL':
-    case 'CONSTR_NOTNULL':
     case 'CONSTR_DEFAULT':
     case 'CONSTR_IDENTITY':
     case 'CONSTR_GENERATED':
@@ -570,6 +765,48 @@ function translateTableConstraint(
     case 'CONSTR_ATTR_NOT_ENFORCED':
     default:
       diagnostics.push(flagAttribute(statement, identity, `${constraintLabel(constraint)}`));
+  }
+}
+
+/**
+ * Attaches a table-level or `ALTER TABLE … ADD` not-null declaration to its column: the
+ * column gains `notNull`, and a stated name travels on `notNullName` (merged with any earlier
+ * declaration, see `mergeNotNullDeclaration`). A declaration whose column is not in the draft
+ * is skipped and named; a `NOT VALID` one keeps its enforced not-null fact and flags the
+ * validation state the model cannot carry.
+ */
+function attachNotNullConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  table: string,
+  columns: Column[],
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const key = stringList(constraint.keys)[0];
+  const place = key === undefined ? identity : `${identity}.${key}`;
+  const index = key === undefined ? -1 : columns.findIndex((column) => column.name === key);
+  if (index === -1) {
+    diagnostics.push(
+      skipStatement(statement, `not-null constraint on unknown column ${place}`, place),
+    );
+    return;
+  }
+
+  const column = columns[index]!;
+  const merged = mergeNotNullDeclaration(column, table, constraint.conname);
+  if (merged.conflict) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `additional not-null constraint on ${place}`),
+    );
+  } else {
+    columns[index] = merged.column;
+  }
+
+  if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `NOT VALID on ${constraintLabel(constraint)}`),
+    );
   }
 }
 
@@ -1239,6 +1476,17 @@ function translateAlterTableCommand(
       if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
       return;
     }
+    if (constraint.contype === 'CONSTR_NOTNULL') {
+      attachNotNullConstraint(
+        statement,
+        constraint,
+        identity,
+        draft.name,
+        draft.columns,
+        diagnostics,
+      );
+      return;
+    }
     diagnostics.push(
       skipStatement(
         statement,
@@ -1485,8 +1733,7 @@ function attachColumn(
     statement,
     element.ColumnDef,
     clauseBoundaries(element),
-    draft.schema,
-    identity,
+    { schema: draft.schema, name: draft.name },
     diagnostics,
   );
   draft.columns = [...draft.columns, translated.column];
@@ -1659,6 +1906,7 @@ function findColumnTarget(
 /** A copy of `column` without its identity descriptor. */
 function withoutIdentity(column: Column): Column {
   const copy: Mutable<Column> = { name: column.name, type: column.type, notNull: column.notNull };
+  if (column.notNullName !== undefined) copy.notNullName = column.notNullName;
   if (column.default !== undefined) copy.default = column.default;
   return copy;
 }
@@ -1711,7 +1959,36 @@ function primaryKeyFromConstraint(
   const keys = stringList(constraint.keys);
   const primaryKey: Mutable<PrimaryKey> = { columns: keys.length > 0 ? keys : fallbackColumns };
   if (constraint.conname !== undefined) primaryKey.name = constraint.conname;
+  applyConstraintDeferrability(constraint, primaryKey);
   return primaryKey;
+}
+
+/**
+ * Reads the deferrability a constraint node states: `DEFERRABLE` and `INITIALLY DEFERRED`
+ * arrive as present-true flags, and `INITIALLY DEFERRED` implies `DEFERRABLE` — the model's
+ * normalization. An explicit `NOT DEFERRABLE` is the absent default and never surfaces on the
+ * node, so nothing is written for it.
+ */
+function applyConstraintDeferrability(
+  constraint: Constraint,
+  target: Mutable<PrimaryKey | UniqueConstraint | ForeignKey>,
+): void {
+  if (constraint.deferrable === true || constraint.initdeferred === true) {
+    target.deferrable = true;
+  }
+  if (constraint.initdeferred === true) target.initiallyDeferred = true;
+}
+
+/**
+ * The enforcement a constraint node states, decoded from the parser's single `skip_validation`
+ * channel: `NOT VALID` carries `is_enforced: true` beside it, while `NOT ENFORCED` — and the
+ * combined `NOT VALID NOT ENFORCED`, which collapses to it — omits `is_enforced`; the
+ * serializer never writes a false boolean. Absent when the node states neither.
+ */
+function constraintEnforcement(constraint: Constraint): ConstraintEnforcement | undefined {
+  const flagged = constraint.skip_validation === true || constraint.initially_valid === false;
+  if (!flagged) return undefined;
+  return constraint.is_enforced === true ? 'not-valid' : 'not-enforced';
 }
 
 function foreignKeyFromConstraint(
@@ -1744,11 +2021,11 @@ function foreignKeyFromConstraint(
   if (constraint.fk_matchtype === 'f' || constraint.fk_matchtype === 'p') {
     flag(`MATCH ${constraint.fk_matchtype === 'f' ? 'FULL' : 'PARTIAL'}`);
   }
-  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
-  if (constraint.skip_validation === true || constraint.initially_valid === false)
-    flag('NOT VALID');
   if ((constraint.fk_del_set_cols ?? []).length > 0) flag('column list');
-  if (constraint.is_enforced === false) flag('NOT ENFORCED');
+
+  const enforcement = constraintEnforcement(constraint);
+  if (enforcement !== undefined) foreignKey.enforcement = enforcement;
+  applyConstraintDeferrability(constraint, foreignKey);
 
   return foreignKey;
 }
@@ -1765,7 +2042,8 @@ function uniqueConstraintFromConstraint(
     columns: keys.length > 0 ? keys : fallbackColumns,
   };
   if (constraint.conname !== undefined) uniqueConstraint.name = constraint.conname;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  applyConstraintDeferrability(constraint, uniqueConstraint);
+  flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   return uniqueConstraint;
 }
 
@@ -1790,7 +2068,9 @@ function checkConstraintFromConstraint(
   }
   const checkConstraint: Mutable<CheckConstraint> = { expression };
   if (constraint.conname !== undefined) checkConstraint.name = constraint.conname;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  const enforcement = constraintEnforcement(constraint);
+  if (enforcement !== undefined) checkConstraint.enforcement = enforcement;
+  flagCheckConstraintAttributes(statement, constraint, identity, diagnostics);
   return checkConstraint;
 }
 
@@ -1847,11 +2127,13 @@ function findCheckExpressionStart(sql: string, from: number): number | null {
 }
 
 /**
- * Flags every attribute of a unique or check constraint that the model cannot carry, following
- * the foreign-key precedent: the constraint still imports with its representable identity, and
- * each dropped attribute is named.
+ * Flags every attribute of a unique constraint that the model cannot carry, following the
+ * foreign-key precedent: the constraint still imports with its representable identity, and
+ * each dropped attribute is named. Deferrability is read into the model, so it is absent here;
+ * `NOT VALID`/`NOT ENFORCED` cannot appear on a unique constraint (the server rejects them),
+ * so the enforcement flag is defensive only.
  */
-function flagConstraintAttributes(
+function flagUniqueConstraintAttributes(
   statement: ParsedStatement,
   constraint: Constraint,
   identity: string,
@@ -1865,13 +2147,30 @@ function flagConstraintAttributes(
   if (constraint.nulls_not_distinct === true) flag('NULLS NOT DISTINCT');
   if ((constraint.including ?? []).length > 0) flag('INCLUDE');
   if (constraint.is_no_inherit === true) flag('NO INHERIT');
-  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
-    // `NOT ENFORCED` arrives through the parser's same `skip_validation` channel as
-    // `NOT VALID`, with `is_enforced` omitted rather than false, so it is flagged under the
-    // `NOT VALID` wording — exactly as the pre-existing foreign-key path does.
     flag('NOT VALID');
   }
+}
+
+/**
+ * Flags every attribute of a check constraint that the model cannot carry: `NO INHERIT`, and
+ * deferrability, which the server rejects on a check constraint — only a misplaced inline
+ * attribute node could carry it here, so the flag is defensive. Enforcement is read into the
+ * model and never flagged.
+ */
+function flagCheckConstraintAttributes(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const flag = (description: string): void => {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${description} on ${constraintLabel(constraint)}`),
+    );
+  };
+  if (constraint.is_no_inherit === true) flag('NO INHERIT');
+  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
 }
 
 /**
@@ -1912,7 +2211,8 @@ function attachAlteredUniqueConstraint(
   const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
   const name = constraint.conname ?? index.name;
   if (name !== undefined) uniqueConstraint.name = name;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  applyConstraintDeferrability(constraint, uniqueConstraint);
+  flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   attachUniqueConstraint(draft, uniqueConstraint);
 }
 
@@ -2127,23 +2427,28 @@ function indexStructureKey(index: Index): string {
   return JSON.stringify([index.unique, index.columns]);
 }
 
-/** The duplicate guard's key for a unique constraint: the ordered columns, the name excluded. */
+/** The duplicate guard's key for a unique constraint: the ordered columns and the attributes. */
 function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): string {
-  return JSON.stringify([uniqueConstraint.columns]);
+  return JSON.stringify([
+    uniqueConstraint.columns,
+    uniqueConstraint.deferrable ?? false,
+    uniqueConstraint.initiallyDeferred ?? false,
+  ]);
 }
 
-/** The duplicate guard's key for a check constraint: the expression, the name excluded. */
+/** The duplicate guard's key for a check constraint: the expression and the enforcement. */
 function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
-  return JSON.stringify([checkConstraint.expression]);
+  return JSON.stringify([checkConstraint.expression, checkConstraint.enforcement ?? null]);
 }
 
 /**
  * The duplicate guard's key for a foreign key: every modeled field but the name — the
- * referencing columns, the target, the referenced columns, and both actions, with an absent
- * action distinct from a stated one. The key is equality-minus-name: a name is kept only
- * beside a twin identical modulo name; a twin differing in referenced columns or actions has
- * a different key, the guard does not fire, and the name is stripped. The core diff matches
- * foreign keys more narrowly (`foreignKeyIdentity`: columns and target only).
+ * referencing columns, the target, the referenced columns, both actions, the enforcement, and
+ * the deferrability, with an absent value distinct from a stated one. The key is
+ * equality-minus-name: a name is kept only beside a twin identical modulo name; a twin
+ * differing in referenced columns, actions, or attributes has a different key, the guard does
+ * not fire, and the name is stripped. The core diff matches foreign keys more narrowly
+ * (`foreignKeyIdentity`: columns and target only).
  */
 function foreignKeyStructureKey(foreignKey: ForeignKey): string {
   return JSON.stringify([
@@ -2153,6 +2458,9 @@ function foreignKeyStructureKey(foreignKey: ForeignKey): string {
     foreignKey.referencedColumns,
     foreignKey.onUpdate ?? null,
     foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? false,
+    foreignKey.initiallyDeferred ?? false,
   ]);
 }
 
@@ -2255,6 +2563,7 @@ function canonicalizeConstraintNames(draft: TableDraft): void {
 function finalizeTable(draft: TableDraft): Table {
   canonicalizeConstraintNames(draft);
   canonicalizeIndexNames(draft);
+  canonicalizeNotNullNames(draft);
   const table: Mutable<Table> = {
     schema: draft.schema,
     name: draft.name,
@@ -2266,6 +2575,33 @@ function finalizeTable(draft: TableDraft): Table {
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
   return table;
+}
+
+/**
+ * Canonicalizes PostgreSQL's generated not-null-constraint name back to unnamed: a dump of a
+ * declaration the model makes unnamed carries `<table>_<column>_not_null`, and the model's
+ * unnamed not-null fact must round-trip. The strip is the exact formula and nothing else —
+ * truncation and collision suffixes stay named — and it has no twin guard, because one
+ * not-null fact per column is the only shape the model carries: the duplicate declaration is
+ * already collapsed by `mergeNotNullDeclaration` in either statement order.
+ */
+function canonicalizeNotNullNames(draft: TableDraft): void {
+  draft.columns = draft.columns.map((column) => {
+    if (
+      column.notNullName === undefined ||
+      column.notNullName !== synthesizedNotNullName(draft.name, column.name)
+    ) {
+      return column;
+    }
+    const copy: Mutable<Column> = {
+      name: column.name,
+      type: column.type,
+      notNull: column.notNull,
+    };
+    if (column.default !== undefined) copy.default = column.default;
+    if (column.identity !== undefined) copy.identity = column.identity;
+    return copy;
+  });
 }
 
 /**
@@ -2341,7 +2677,12 @@ function commentObject(node: Node | undefined): string | undefined {
 }
 
 function samePrimaryKey(left: PrimaryKey, right: PrimaryKey): boolean {
-  return left.name === right.name && sameStringArray(left.columns, right.columns);
+  return (
+    left.name === right.name &&
+    sameStringArray(left.columns, right.columns) &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
+  );
 }
 
 function sameForeignKey(left: ForeignKey, right: ForeignKey): boolean {

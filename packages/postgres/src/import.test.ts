@@ -141,6 +141,9 @@ const EXPECTED_MODEL: Model = {
           columns: ['parent_id'],
           referencedTable: { schema: 'app', name: 'orders' },
           referencedColumns: ['id'],
+          deferrable: true,
+          initiallyDeferred: true,
+          enforcement: 'not-valid',
         },
         {
           columns: ['user_id'],
@@ -223,8 +226,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
   { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
@@ -291,11 +292,15 @@ test('imports a pg_dump-shaped dump into the canonical model', async () => {
     ['parent_id', 'user_id'],
   );
 
-  // Actions are stored only when the source states a non-default one.
+  // Actions are stored only when the source states a non-default one; the modeled attributes
+  // (`DEFERRABLE INITIALLY DEFERRED NOT VALID`) are read rather than flagged.
   const [parentForeignKey, userForeignKey] = orders.foreignKeys;
   assert.ok(parentForeignKey && userForeignKey, 'both foreign keys are imported');
   assert.equal('onDelete' in parentForeignKey, false);
   assert.equal('onUpdate' in parentForeignKey, false);
+  assert.equal(parentForeignKey.deferrable, true);
+  assert.equal(parentForeignKey.initiallyDeferred, true);
+  assert.equal(parentForeignKey.enforcement, 'not-valid');
   assert.equal(userForeignKey.onDelete, 'CASCADE');
   assert.equal('onUpdate' in userForeignKey, false);
 });
@@ -355,6 +360,7 @@ test('records only stated referential actions and flags foreign-key extras', asy
       referencedColumns: ['id'],
       onUpdate: 'RESTRICT',
       onDelete: 'SET DEFAULT',
+      deferrable: true,
     },
     {
       columns: ['b'],
@@ -363,16 +369,14 @@ test('records only stated referential actions and flags foreign-key extras', asy
     },
   ]);
 
+  // Deferrability is read into the model now; the attributes outside it stay flagged.
   // Diagnostics are emitted during statement translation, before canonicalization, so they
   // keep the source name even though the modeled constraint comes back unnamed.
   assert.deepEqual(
     diagnostics
       .filter((diagnostic) => diagnostic.kind === 'flag')
       .map((diagnostic) => diagnostic.message),
-    [
-      'dropped MATCH FULL on foreign key child_a_fkey from public.child',
-      'dropped deferrability on foreign key child_a_fkey from public.child',
-    ],
+    ['dropped MATCH FULL on foreign key child_a_fkey from public.child'],
   );
 });
 
@@ -433,7 +437,7 @@ test('normalizes a check expression between its parentheses, comments dropped', 
   assert.deepEqual(diagnostics, []);
 });
 
-test('imports ALTER TABLE ADD CONSTRAINT unique and check, flagging dropped attributes', async () => {
+test('imports ALTER TABLE ADD CONSTRAINT unique and check, reading attributes and flagging the rest', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer, c integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
@@ -453,21 +457,385 @@ test('imports ALTER TABLE ADD CONSTRAINT unique and check, flagging dropped attr
   assert.deepEqual(table.uniqueConstraints, [
     { columns: ['a'] },
     { name: 't_nd_key', columns: ['b'] },
-    { name: 't_def_key', columns: ['c'] },
+    { name: 't_def_key', columns: ['c'], deferrable: true, initiallyDeferred: true },
   ]);
-  assert.deepEqual(table.checkConstraints, [{ name: 't_check', expression: '(a > 0)' }]);
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_check', expression: '(a > 0)', enforcement: 'not-valid' },
+  ]);
 
-  // Every unrepresentable attribute is flagged and dropped; the constraint itself imports.
+  // `NOT VALID` and deferrability are read into the model; the remaining unrepresentable
+  // attributes are flagged and dropped, and the constraint itself imports.
   assert.deepEqual(
     diagnostics.map((diagnostic) => diagnostic.message),
     [
       'dropped NO INHERIT on check constraint t_check from public.t',
-      'dropped NOT VALID on check constraint t_check from public.t',
       'dropped NULLS NOT DISTINCT on unique constraint t_nd_key from public.t',
       'dropped INCLUDE on unique constraint t_nd_key from public.t',
-      'dropped deferrability on unique constraint t_def_key from public.t',
     ],
   );
+});
+
+test('decodes NOT VALID and NOT ENFORCED distinctly on foreign keys and check constraints', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_valid FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_not_valid FOREIGN KEY (a) REFERENCES public.parent(id) NOT VALID;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_not_enforced FOREIGN KEY (a) REFERENCES public.parent(id) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_both FOREIGN KEY (a) REFERENCES public.parent(id) NOT VALID NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_valid CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_not_valid CHECK (a > 0) NOT VALID;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_not_enforced CHECK (a > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_both CHECK (a > 0) NOT VALID NOT ENFORCED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  const foreignKey = (name: string) =>
+    table.foreignKeys.find((candidate) => candidate.name === name);
+  const check = (name: string) =>
+    table.checkConstraints.find((candidate) => candidate.name === name);
+
+  // The normal shape carries no enforcement field at all.
+  assert.equal('enforcement' in (foreignKey('fk_valid') ?? {}), false);
+  assert.equal('enforcement' in (check('ck_valid') ?? {}), false);
+  // `NOT VALID` carries `is_enforced: true` beside `skip_validation`; `NOT ENFORCED` omits it.
+  assert.equal(foreignKey('fk_not_valid')?.enforcement, 'not-valid');
+  assert.equal(foreignKey('fk_not_enforced')?.enforcement, 'not-enforced');
+  assert.equal(check('ck_not_valid')?.enforcement, 'not-valid');
+  assert.equal(check('ck_not_enforced')?.enforcement, 'not-enforced');
+  // The combined wording collapses to the stronger state, never to the `NOT VALID` wording.
+  assert.equal(foreignKey('fk_both')?.enforcement, 'not-enforced');
+  assert.equal(check('ck_both')?.enforcement, 'not-enforced');
+
+  // Every state is read, so nothing is flagged.
+  assert.deepEqual(diagnostics, []);
+});
+
+test('folds inline constraint attributes into the preceding constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT t_a_ck CHECK (a > 0) NOT ENFORCED,`,
+    `    b integer REFERENCES public.parent(id) NOT ENFORCED,`,
+    `    c integer UNIQUE DEFERRABLE INITIALLY DEFERRED,`,
+    `    d integer PRIMARY KEY INITIALLY DEFERRED,`,
+    `    e integer UNIQUE NOT DEFERRABLE,`,
+    `    f integer CONSTRAINT t_f_ck CHECK (f > 0) ENFORCED,`,
+    `    g integer REFERENCES public.parent(id) NOT DEFERRABLE`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // `NOT ENFORCED` folds into an inline CHECK and FK; `INITIALLY DEFERRED` implies deferrable
+  // and the pair applies sequentially to one constraint; `ENFORCED` and `NOT DEFERRABLE` are
+  // the explicit defaults and are consumed without a flag.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_a_ck', expression: 'a > 0', enforcement: 'not-enforced' },
+    { name: 't_f_ck', expression: 'f > 0' },
+  ]);
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      enforcement: 'not-enforced',
+    },
+    {
+      columns: ['g'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['c'], deferrable: true, initiallyDeferred: true },
+    { columns: ['e'] },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['d'], deferrable: true, initiallyDeferred: true });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps flagging inline attributes on incompatible constraints', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT t_a_nn NOT NULL DEFERRABLE,`,
+    `    b integer CONSTRAINT t_b_nn NOT NULL NOT ENFORCED,`,
+    `    c integer CONSTRAINT t_c_ck CHECK (c > 0) DEFERRABLE,`,
+    `    d integer UNIQUE ENFORCED,`,
+    `    e integer UNIQUE NOT ENFORCED,`,
+    `    f integer DEFERRABLE,`,
+    `    g integer NOT ENFORCED`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The server rejects every one of these placements — including a bare attribute with no
+  // preceding constraint; the raw parser accepts them, so the raw enum label is the
+  // diagnostic. Each constraint still imports with its representable facts.
+  assert.equal(table.columns[0]?.notNull, true);
+  assert.equal(table.columns[0]?.notNullName, 't_a_nn');
+  assert.equal(table.columns[1]?.notNull, true);
+  assert.equal(table.columns[1]?.notNullName, 't_b_nn');
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.a from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.b from public.t',
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.c from public.t',
+      'dropped CONSTR_ATTR_ENFORCED on public.t.d from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.e from public.t',
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.f from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.g from public.t',
+    ],
+  );
+});
+
+test('reads table-level deferrability on primary keys, unique constraints, and foreign keys', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY (a) DEFERRABLE;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (b) INITIALLY DEFERRED;`,
+    `CREATE TABLE public.u (c integer, d integer);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_c_fkey FOREIGN KEY (c) REFERENCES public.parent(id) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_d_fkey FOREIGN KEY (d) REFERENCES public.parent(id) DEFERRABLE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // A primary key's deferrability is read now, not silently dropped.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'], deferrable: true });
+  // `INITIALLY DEFERRED` alone implies `DEFERRABLE`, and the generated `t_b_key` still strips.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['b'], deferrable: true, initiallyDeferred: true },
+  ]);
+  // Both foreign keys carry their attributes and canonicalize their generated names.
+  assert.deepEqual(other.foreignKeys, [
+    {
+      columns: ['c'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+    {
+      columns: ['d'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      deferrable: true,
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads not-null constraints in every shape and strips only the generated name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer, c integer, d integer, e integer);`,
+    `ALTER TABLE public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+    `ALTER TABLE public.t ADD CONSTRAINT custom_b_nn NOT NULL b;`,
+    `ALTER TABLE public.t ADD NOT NULL c;`,
+    `CREATE TABLE public.u (f integer CONSTRAINT u_f_not_null NOT NULL, g integer CONSTRAINT custom_g_nn NOT NULL);`,
+    `CREATE TABLE public.v (h integer, CONSTRAINT v_h_not_null NOT NULL h);`,
+    `CREATE TABLE public.w (i integer NOT NULL);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const columnsOf = (name: string) => {
+    const table = model.tables.find((candidate) => candidate.name === name);
+    assert.ok(table, `table ${name} is imported`);
+    return Object.fromEntries(table.columns.map((column) => [column.name, column]));
+  };
+
+  // The generated `<table>_<column>_not_null` strips to unnamed in every shape: `ALTER ADD`
+  // (`t_a_not_null`), an inline name (`u_f_not_null`), and a table-level name
+  // (`v_h_not_null`). The bare `ADD NOT NULL c` and the unnamed inline declaration stay
+  // unnamed.
+  assert.deepEqual(columnsOf('t').a, { name: 'a', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('t').c, { name: 'c', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('u').f, { name: 'f', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('v').h, { name: 'h', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('w').i, { name: 'i', type: 'integer', notNull: true });
+  // A name outside the formula stays named.
+  assert.deepEqual(columnsOf('t').b, {
+    name: 'b',
+    type: 'integer',
+    notNull: true,
+    notNullName: 'custom_b_nn',
+  });
+  assert.deepEqual(columnsOf('u').g, {
+    name: 'g',
+    type: 'integer',
+    notNull: true,
+    notNullName: 'custom_g_nn',
+  });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('merges duplicate not-null declarations in either order, flagging only real conflicts', async () => {
+  // Unnamed ∪ named → named, whatever the order.
+  const unnamedFirst = [
+    `CREATE TABLE public.t (a integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+  ];
+  const namedFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    `ALTER TABLE ONLY public.t ADD NOT NULL a;`,
+  ];
+  for (const statements of [unnamedFirst, namedFirst]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+
+  // A generated-formula name reads as unnamed for the comparison, so the duplicate is
+  // ignored and the strip leaves no name.
+  const formulaDuplicate = await importDump(
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD NOT NULL a;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(formulaDuplicate.model.tables[0]?.columns[0], {
+    name: 'a',
+    type: 'integer',
+    notNull: true,
+  });
+  assert.deepEqual(formulaDuplicate.diagnostics, []);
+
+  // Two different real names keep the first declaration and are flagged, never silent.
+  for (const [names, kept] of [
+    [['first_nn', 'second_nn'], 'first_nn'],
+    [['second_nn', 'first_nn'], 'second_nn'],
+  ] as const) {
+    const dump = [
+      `CREATE TABLE public.t (a integer);`,
+      ...names.map((name) => `ALTER TABLE ONLY public.t ADD CONSTRAINT ${name} NOT NULL a;`),
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: kept,
+    });
+    assert.deepEqual(
+      diagnostics.map((diagnostic) => diagnostic.message),
+      ['dropped additional not-null constraint on public.t.a from public.t'],
+    );
+  }
+});
+
+test('flags not-null declarations whose column is absent', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_missing_not_null NOT NULL missing);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_missing_not_null NOT NULL missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The declaration is skipped, not applied, and the unknown column is named.
+  assert.deepEqual(model.tables.find((table) => table.name === 't')?.columns, [
+    { name: 'a', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(model.tables.find((table) => table.name === 'u')?.columns, [
+    { name: 'b', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.u.missing' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t.missing' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /not-null constraint on unknown column public\.u\.missing/);
+  assert.match(messages, /not-null constraint on unknown column public\.t\.missing/);
+});
+
+test('flags NOT VALID not-null declarations and keeps the enforced fact', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a NOT VALID;`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_b_not_null NOT NULL b NOT VALID);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The model carries the enforced not-null fact; the validation state is the named boundary.
+  assert.deepEqual(model.tables.find((table) => table.name === 't')?.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(model.tables.find((table) => table.name === 'u')?.columns, [
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /dropped NOT VALID on not-null constraint t_a_not_null from public\.t/);
+  assert.match(messages, /dropped NOT VALID on not-null constraint u_b_not_null from public\.u/);
+});
+
+test('keeps a not-null name through DROP IDENTITY', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT custom_nn NOT NULL GENERATED ALWAYS AS IDENTITY);`,
+    `ALTER TABLE public.t ALTER COLUMN a DROP IDENTITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Dropping the identity descriptor is an explicit copy of the column; the not-null fact and
+  // its name survive, only the identity goes.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'custom_nn' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('attribute-carrying declarations round-trip against the unnamed model with an empty diff', async () => {
+  const declared = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer, c integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (b) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.t ADD CHECK (c > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (c) REFERENCES public.parent(id) NOT ENFORCED;`,
+  ].join('\n');
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer, c integer CONSTRAINT t_c_not_null NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (b) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_c_check CHECK (c > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_c_fkey FOREIGN KEY (c) REFERENCES public.parent(id) NOT ENFORCED;`,
+  ].join('\n');
+
+  const { model: declaredModel, diagnostics } = await importDump(declared);
+  const { model: dumpModel } = await importDump(dump);
+
+  // The dump's generated names and attributes read back as the model's unnamed declarations:
+  // enforcement, deferrability, and the named not-null fact all survive the round trip.
+  assert.deepEqual(diff(declaredModel, dumpModel), []);
+  assert.deepEqual(diagnostics, []);
 });
 
 test('imports standalone indexes, unique and concurrent, in name order', async () => {
@@ -969,6 +1337,26 @@ test('consumes a plain unique index into a USING INDEX constraint', async () => 
   assert.deepEqual(table.uniqueConstraints, [
     { columns: ['a'] },
     { name: 't_b_idx', columns: ['b'] },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads deferrability from a USING INDEX unique constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE USING INDEX t_a_idx DEFERRABLE INITIALLY DEFERRED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The consumed index's constraint still reads the attributes the statement states; its name
+  // is the index's (`t_a_idx`), which is not the unique formula for `(a)` and stays.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_idx', columns: ['a'], deferrable: true, initiallyDeferred: true },
   ]);
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics, []);
