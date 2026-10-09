@@ -332,6 +332,8 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'add-column':
     case 'drop-column':
     case 'alter-column':
+    case 'drop-not-null':
+    case 'add-not-null':
     case 'add-identity':
     case 'drop-identity':
     case 'alter-identity':
@@ -385,6 +387,20 @@ function renderStep(step: Step): string {
       return step.fields
         .map((field) => renderColumnAlteration(step.table, step.name, field))
         .join('\n');
+    case 'drop-not-null':
+      return step.name === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
+            step.column,
+          )} DROP NOT NULL;`
+        : `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(step.name)};`;
+    case 'add-not-null':
+      return step.name === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
+            step.column,
+          )} SET NOT NULL;`
+        : `ALTER TABLE ${renderTable(step.table)} ADD CONSTRAINT ${quoteIdentifier(
+            step.name,
+          )} NOT NULL ${quoteIdentifier(step.column)};`;
     case 'add-identity':
       return renderAddIdentity(step.table, step.name, step.identity);
     case 'drop-identity':
@@ -543,6 +559,12 @@ function renderColumnAlteration(
       return `${statement} TYPE ${field.after};`;
     case 'notNull':
       return `${statement} ${field.after ? 'SET' : 'DROP'} NOT NULL;`;
+    case 'notNullName':
+      // The plan consumes a name-involved change into drop-not-null/add-not-null steps, so a
+      // name never reaches an alter-column; reaching here means the plan is malformed.
+      throw new Error(
+        `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a not-null name`,
+      );
     case 'default':
       return field.after === undefined
         ? `${statement} DROP DEFAULT;`

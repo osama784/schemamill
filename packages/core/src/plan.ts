@@ -32,7 +32,7 @@ import type {
  * its steps into transaction groups, telling a renderer what applies as one unit; hazards are a
  * separate analysis.
  *
- * A step is one of twenty-three kinds. A table addition becomes a create-table step carrying
+ * A step is one of twenty-five kinds. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -40,18 +40,22 @@ import type {
  * with its own step and constraints attach only once every referenced table exists. A table
  * removal becomes a drop-table step. A changed table is mapped member by member: a removed
  * column becomes drop-column, an added column add-column, a changed column alter-column
- * carrying only its differing fields in the fixed order `type`, `notNull`, `default`, plus,
- * when the column's identity differs, identity steps — an identity addition becomes an
- * add-identity step carrying the target descriptor, a removal a drop-identity, a change an
- * alter-identity carrying only its differing fields, and a stated sequence-name mismatch a
- * drop-identity and an add-identity (a recreation); a removed, added, or changed primary key
- * becomes a drop-primary-key and/or add-primary-key step; a removed, added, or changed foreign
- * key becomes a drop-foreign-key and/or add-foreign-key step; a removed, added, or changed
- * unique constraint becomes a drop-unique-constraint and/or add-unique-constraint step; a
- * removed, added, or changed check constraint becomes a drop-check-constraint and/or
- * add-check-constraint step; and a removed, added, or changed index becomes a drop-index and/or
- * create-index step. A changed primary key, foreign key, unique constraint, check constraint,
- * or index decomposes into its drop half and its add half.
+ * carrying only its differing fields in the fixed order `type`, `notNull`, `notNullName`,
+ * `default` — except that a `notNullName` difference is name-involved: the plan consumes the
+ * `notNull` and `notNullName` fields into a drop-not-null and/or add-not-null step (a drop
+ * when the baseline column is NOT NULL, an add when the target is) and keeps only the
+ * remaining fields in an alter-column — plus, when the column's identity differs, identity
+ * steps: an identity addition becomes an add-identity step carrying the target descriptor, a
+ * removal a drop-identity, a change an alter-identity carrying only its differing fields, and
+ * a stated sequence-name mismatch a drop-identity and an add-identity (a recreation); a
+ * removed, added, or changed primary key becomes a drop-primary-key and/or add-primary-key
+ * step; a removed, added, or changed foreign key becomes a drop-foreign-key and/or
+ * add-foreign-key step; a removed, added, or changed unique constraint becomes a
+ * drop-unique-constraint and/or add-unique-constraint step; a removed, added, or changed check
+ * constraint becomes a drop-check-constraint and/or add-check-constraint step; and a removed,
+ * added, or changed index becomes a drop-index and/or create-index step. A changed primary key,
+ * foreign key, unique constraint, check constraint, or index decomposes into its drop half and
+ * its add half.
  *
  * The concurrent index kinds are the plan's only non-transactional steps. A create step is
  * `create-index-concurrently` exactly when the target index states `concurrently: true`; a
@@ -84,7 +88,7 @@ import type {
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 4. table operations — the fifteen table phases listed below, in their exact order;
+ * 4. table operations — the seventeen table phases listed below, in their exact order;
  * 5. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
  *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
@@ -126,18 +130,25 @@ import type {
  * 7. drop-column;
  * 8. create-table;
  * 9. add-column;
- * 10. alter-column;
- * 11. add-primary-key — after its columns exist;
- * 12. add-unique-constraint — after its columns exist;
- * 13. add-check-constraint — after its columns exist;
- * 14. create-index — after its columns exist; the concurrent variant stands alone;
- * 15. add-foreign-key — last, once both the table and the referenced table exist, with the
+ * 10. drop-not-null — the name-involved not-null drops, before the column alterations they
+ *     bracket. Each carries the name the baseline column's not-null constraint had, or no
+ *     name when it was unnamed;
+ * 11. alter-column — after the not-null drops and before the not-null adds, so a
+ *     name-involved change never rides an alter-column;
+ * 12. add-not-null — the name-involved not-null adds, after the column alterations. Each
+ *     carries the target constraint's name, or no name when the target's not-null fact is
+ *     unnamed;
+ * 13. add-primary-key — after its columns exist;
+ * 14. add-unique-constraint — after its columns exist;
+ * 15. add-check-constraint — after its columns exist;
+ * 16. create-index — after its columns exist; the concurrent variant stands alone;
+ * 17. add-foreign-key — last, once both the table and the referenced table exist, with the
  *     synthesized primary-key dependents after the diff-derived adds.
  *
  * Within a phase, steps keep the relative order the diff produced: table and sequence changes
  * in identity order, and inside a changed table the diff's documented member order. A table
  * addition contributes its unique-constraint, check-constraint, and index steps to table phases
- * 12–14 and its foreign-key steps to table phase 15, each in the added table's canonical order.
+ * 14–16 and its foreign-key steps to table phase 17, each in the added table's canonical order.
  * The steps synthesized for primary-key changes are ordered as described below, and the
  * cycle-breaking drop-foreign-key steps close table phase 1.
  *
@@ -148,7 +159,7 @@ import type {
  * T's dropped primary-key columns — an empty `referencedColumns` resolves to T's baseline
  * primary key — and whose payload the target still carries unchanged (same owning table, same
  * identity, equal fields) gets a drop-foreign-key step with the baseline payload in table
- * phase 1 and an add-foreign-key step with the target payload in table phase 15. The diff's own
+ * phase 1 and an add-foreign-key step with the target payload in table phase 17. The diff's own
  * drops and adds are never duplicated: only the occurrences the diff's identical-pair
  * cancellation leaves in place are synthesized, so a foreign key the diff removes or replaces
  * needs nothing here, and a removed table's constraints are already gone when table phase 5
@@ -219,13 +230,27 @@ export type Step =
   | { kind: 'add-column'; table: TableIdentity; column: Column }
   /** The baseline has a column the target does not. */
   | { kind: 'drop-column'; table: TableIdentity; column: Column }
-  /** A column both sides have with differing fields, in the fixed order `type`, `notNull`, `default`. */
+  /**
+   * A column both sides have with differing fields, in the fixed order `type`, `notNull`,
+   * `default`. A name-involved change (a differing `notNullName`) consumes both not-null
+   * fields into `drop-not-null`/`add-not-null` steps and leaves only the other fields here.
+   */
   | {
       kind: 'alter-column';
       table: TableIdentity;
       name: string;
       fields: readonly ColumnFieldChange[];
     }
+  /**
+   * The baseline has a not-null fact on a column the target does not keep: a named
+   * `drop-not-null` drops the constraint by name, an unnamed one drops the column's not-null.
+   */
+  | { kind: 'drop-not-null'; table: TableIdentity; column: string; name?: string }
+  /**
+   * The target has a not-null fact on a column the baseline does not: a named `add-not-null`
+   * adds the named constraint, an unnamed one sets the column's not-null.
+   */
+  | { kind: 'add-not-null'; table: TableIdentity; column: string; name?: string }
   /** The target has an identity on a column the baseline does not; the full effective descriptor. */
   | { kind: 'add-identity'; table: TableIdentity; name: string; identity: Identity }
   /** The baseline has an identity on a column the target does not. */
@@ -296,6 +321,8 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'add-column': true,
   'drop-column': true,
   'alter-column': true,
+  'drop-not-null': true,
+  'add-not-null': true,
   'add-identity': true,
   'drop-identity': true,
   'alter-identity': true,
@@ -420,7 +447,9 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.columnDrops,
     ...application.tableCreates,
     ...application.columnAdds,
+    ...application.notNullDrops,
     ...application.columnAlters,
+    ...application.notNullAdds,
     ...application.primaryKeyAdds,
     ...application.uniqueConstraintAdds,
     ...application.checkConstraintAdds,
@@ -454,7 +483,11 @@ export interface ChangeApplication {
   readonly removedTables: RemovedTable[];
   readonly tableCreates: Step[];
   readonly columnAdds: Step[];
+  /** The name-involved not-null drops, bracketing the column alterations. */
+  readonly notNullDrops: Step[];
   readonly columnAlters: Step[];
+  /** The name-involved not-null adds, bracketing the column alterations. */
+  readonly notNullAdds: Step[];
   readonly primaryKeyAdds: Step[];
   readonly foreignKeyAdds: Step[];
   readonly uniqueConstraintDrops: Step[];
@@ -490,7 +523,9 @@ export function emptyChangeApplication(): ChangeApplication {
     removedTables: [],
     tableCreates: [],
     columnAdds: [],
+    notNullDrops: [],
     columnAlters: [],
+    notNullAdds: [],
     primaryKeyAdds: [],
     foreignKeyAdds: [],
     uniqueConstraintDrops: [],
@@ -595,12 +630,52 @@ export function applyChange(application: ChangeApplication, change: Change): voi
             break;
           }
           case 'column-changed': {
-            if (tableChange.fields.length > 0) {
+            const nameInvolved = tableChange.fields.some((field) => field.field === 'notNullName');
+            const remaining: ColumnFieldChange[] = [];
+            if (nameInvolved) {
+              // A name-involved change consumes both not-null fields: the names ride the new
+              // steps, and the not-null facts default to true when the `notNull` field is
+              // absent (a name-only change leaves the column's nullability alone).
+              let beforeNotNull = true;
+              let afterNotNull = true;
+              let beforeName: string | undefined;
+              let afterName: string | undefined;
+              for (const field of tableChange.fields) {
+                if (field.field === 'notNullName') {
+                  beforeName = field.before;
+                  afterName = field.after;
+                } else if (field.field === 'notNull') {
+                  beforeNotNull = field.before;
+                  afterNotNull = field.after;
+                } else {
+                  remaining.push(field);
+                }
+              }
+              if (beforeNotNull) {
+                application.notNullDrops.push({
+                  kind: 'drop-not-null',
+                  table: copyIdentity(change.table),
+                  column: tableChange.name,
+                  ...(beforeName === undefined ? {} : { name: beforeName }),
+                });
+              }
+              if (afterNotNull) {
+                application.notNullAdds.push({
+                  kind: 'add-not-null',
+                  table: copyIdentity(change.table),
+                  column: tableChange.name,
+                  ...(afterName === undefined ? {} : { name: afterName }),
+                });
+              }
+            } else {
+              remaining.push(...tableChange.fields);
+            }
+            if (remaining.length > 0) {
               application.columnAlters.push({
                 kind: 'alter-column',
                 table: copyIdentity(change.table),
                 name: tableChange.name,
-                fields: tableChange.fields.map(copyFieldChange),
+                fields: remaining.map(copyFieldChange),
               });
             }
             const identityChange = tableChange.identity;
@@ -1113,7 +1188,7 @@ function copyTableForCreate(table: Table): Table {
  * The foreign-key steps synthesized for the primary-key drops: for every drop, the baseline
  * foreign keys on surviving tables that resolve to the dropped key's columns and that the
  * target still carries unchanged are set aside with a phase-1 drop and restored with a
- * phase-9 add. Returns the drops and adds in matching discovery order: primary-key drops in
+ * phase-17 add. Returns the drops and adds in matching discovery order: primary-key drops in
  * diff order, dependents per drop in owning-table identity order and canonical foreign-key
  * order.
  */
@@ -1198,6 +1273,9 @@ function foreignKeyKey(foreignKey: ForeignKey): string {
     foreignKey.referencedColumns,
     foreignKey.onUpdate ?? null,
     foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? null,
+    foreignKey.initiallyDeferred ?? null,
   ]);
 }
 

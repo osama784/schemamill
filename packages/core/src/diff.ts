@@ -29,15 +29,16 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * different name.
  *
  * Identity is the model's identity. A table is its schema and name; a column is its name
- * within its table; a table has at most one primary key, compared by its name and its column
- * list; two foreign keys belong together when their referencing columns (order-sensitive) and
- * their referenced table are the same, and any other difference — name, referenced columns,
- * actions — reads as a change to that pair; two unique constraints belong together when their
- * ordered column lists are the same and two check constraints when their expressions are the
- * same, with any other difference — a name, for either — reading as a change to that pair; a
- * named index is identified by its name, so a rename is a removal and an addition, and an
- * unnamed index by its structure — `unique` and ordered columns — with a missing name itself
- * distinct in a diff; a sequence is its schema and name, like a table.
+ * within its table; a table has at most one primary key, compared by its name, its column
+ * list, and its deferrability; two foreign keys belong together when their referencing columns
+ * (order-sensitive) and their referenced table are the same, and any other difference — name,
+ * referenced columns, actions, enforcement, deferrability — reads as a change to that pair;
+ * two unique constraints belong together when their ordered column lists are the same and two
+ * check constraints when their expressions are the same, with any other difference — a name or
+ * an attribute, for either — reading as a change to that pair; a named index is identified by
+ * its name, so a rename is a removal and an addition, and an unnamed index by its structure —
+ * `unique` and ordered columns — with a missing name itself distinct in a diff; a sequence is
+ * its schema and name, like a table.
  *
  * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
  * whose only stated difference is its flag is not a change, and an added or removed index
@@ -55,16 +56,17 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *
  * A column's identity — its `GENERATED … AS IDENTITY` descriptor — is a column property, not
  * a sequence entity, and compares as the `identity` part of the column's change, alongside
- * the scalar fields `type`, `notNull`, and `default`. One identity against a column without
- * one is an addition or a removal carrying that descriptor; two identities compare as a
- * change with only their differing options, in the fixed order `generated`, `increment`,
- * `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is deliberately not an
- * option: it compares only when both sides state one, a stated mismatch is a recreation
- * carrying the target descriptor (the plan drops the baseline identity and adds the target's),
- * and a name absent on either side is a don't-care. When the column's type change crosses
- * canonical integer types (`canonicalIntType`), the identity's `minValue`/`maxValue` compare
- * against the bounds the engine's `AS` conversion would leave, exactly like a sequence's, so
- * the conversion never churns a bound and any bound it would move is restated.
+ * the scalar fields `type`, `notNull`, `notNullName`, and `default`. One identity against a
+ * column without one is an addition or a removal carrying that descriptor; two identities
+ * compare as a change with only their differing options, in the fixed order `generated`,
+ * `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is
+ * deliberately not an option: it compares only when both sides state one, a stated mismatch is
+ * a recreation carrying the target descriptor (the plan drops the baseline identity and adds
+ * the target's), and a name absent on either side is a don't-care. When the column's type
+ * change crosses canonical integer types (`canonicalIntType`), the identity's
+ * `minValue`/`maxValue` compare against the bounds the engine's `AS` conversion would leave,
+ * exactly like a sequence's, so the conversion never churns a bound and any bound it would
+ * move is restated.
  *
  * A column is identified by name alone: the ordinal position of an existing column is not
  * part of the diff. The model stores `columns` in source order for fidelity, and column
@@ -84,17 +86,17 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
  *    order, with only the scalar fields that differ, in the fixed order `type`, `notNull`,
- *    `default`, plus the column's identity change when it has one); then at most one
- *    primary-key addition, removal, or change; then foreign keys removed, added, and changed,
- *    each sorted in the model's foreign-key order (referencing columns element-wise, referenced
- *    table schema then name, then name, absent first — an absent name sorts before any present
- *    one, including the empty string, which remains a distinct, later entry); then unique
- *    constraints removed, added, and changed, each sorted in the model's unique-constraint
- *    order (columns element-wise, then name, absent first the same way); then check constraints
- *    removed, added, and changed, each sorted in the model's check-constraint order
- *    (expression, then name, absent first); then indexes removed, added, and changed, each
- *    sorted by name, absent first. Changed pairs are ordered by their baseline member in that
- *    member's order, then by their target member the same way.
+ *    `notNullName`, `default`, plus the column's identity change when it has one); then at
+ *    most one primary-key addition, removal, or change; then foreign keys removed, added, and
+ *    changed, each sorted in the model's foreign-key order (referencing columns element-wise,
+ *    referenced table schema then name, then name, absent first — an absent name sorts before
+ *    any present one, including the empty string, which remains a distinct, later entry); then
+ *    unique constraints removed, added, and changed, each sorted in the model's
+ *    unique-constraint order (columns element-wise, then name, absent first the same way);
+ *    then check constraints removed, added, and changed, each sorted in the model's
+ *    check-constraint order (expression, then name, absent first); then indexes removed,
+ *    added, and changed, each sorted by name, absent first. Changed pairs are ordered by their
+ *    baseline member in that member's order, then by their target member the same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
  *    come from, as point 2 describes, and no entry states a column's position. A table with no
  *    reported changes is therefore not necessarily structurally identical to its counterpart:
@@ -195,13 +197,14 @@ export type TableChange =
 
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
- * the fixed order `type`, `notNull`, `default`. A `default` change omits the side that has no
- * `DEFAULT`. A column's identity is not a scalar field: it travels as the `identity` part of
- * the `column-changed` entry.
+ * the fixed order `type`, `notNull`, `notNullName`, `default`. A `default` or `notNullName`
+ * change omits the side that states none. A column's identity is not a scalar field: it
+ * travels as the `identity` part of the `column-changed` entry.
  */
 export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
   | { field: 'notNull'; before: boolean; after: boolean }
+  | { field: 'notNullName'; before?: string; after?: string }
   | { field: 'default'; before?: string; after?: string };
 
 /**
@@ -550,6 +553,13 @@ function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[]
   if (baseline.notNull !== target.notNull) {
     fields.push({ field: 'notNull', before: baseline.notNull, after: target.notNull });
   }
+  if (baseline.notNullName !== target.notNullName) {
+    fields.push({
+      field: 'notNullName',
+      ...(baseline.notNullName === undefined ? {} : { before: baseline.notNullName }),
+      ...(target.notNullName === undefined ? {} : { after: target.notNullName }),
+    });
+  }
   if (baseline.default !== target.default) {
     fields.push({
       field: 'default',
@@ -676,7 +686,12 @@ function diffPrimaryKey(
   if (target === undefined) {
     return { kind: 'primary-key-removed', primaryKey: copyPrimaryKey(baseline) };
   }
-  if (baseline.name === target.name && sameStrings(baseline.columns, target.columns)) {
+  if (
+    baseline.name === target.name &&
+    sameStrings(baseline.columns, target.columns) &&
+    baseline.deferrable === target.deferrable &&
+    baseline.initiallyDeferred === target.initiallyDeferred
+  ) {
     return undefined;
   }
   return {
@@ -975,7 +990,10 @@ function foreignKeysEqual(left: ForeignKey, right: ForeignKey): boolean {
     left.referencedTable.name === right.referencedTable.name &&
     sameStrings(left.referencedColumns, right.referencedColumns) &&
     left.onUpdate === right.onUpdate &&
-    left.onDelete === right.onDelete
+    left.onDelete === right.onDelete &&
+    left.enforcement === right.enforcement &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
   );
 }
 
@@ -998,7 +1016,12 @@ function uniqueConstraintIdentity(uniqueConstraint: UniqueConstraint): string {
 }
 
 function uniqueConstraintsEqual(left: UniqueConstraint, right: UniqueConstraint): boolean {
-  return left.name === right.name && sameStrings(left.columns, right.columns);
+  return (
+    left.name === right.name &&
+    sameStrings(left.columns, right.columns) &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
+  );
 }
 
 function groupCheckConstraints(
@@ -1020,7 +1043,11 @@ function checkConstraintIdentity(checkConstraint: CheckConstraint): string {
 }
 
 function checkConstraintsEqual(left: CheckConstraint, right: CheckConstraint): boolean {
-  return left.name === right.name && left.expression === right.expression;
+  return (
+    left.name === right.name &&
+    left.expression === right.expression &&
+    left.enforcement === right.enforcement
+  );
 }
 
 function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {

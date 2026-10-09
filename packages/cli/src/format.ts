@@ -280,6 +280,11 @@ function formatStep(step: Step): string {
       return `${formatIdentity(step.table)}.${formatColumn(step.column)}`;
     case 'alter-column':
       return `${formatIdentity(step.table)}.${step.name}: ${formatColumnFields(step.fields)}`;
+    case 'drop-not-null':
+    case 'add-not-null':
+      return step.name === undefined
+        ? `${formatIdentity(step.table)}.${step.column}`
+        : `${formatIdentity(step.table)}.${step.column} (${step.name})`;
     case 'add-identity':
     case 'drop-identity':
       return `${formatIdentity(step.table)}.${step.name}`;
@@ -442,13 +447,15 @@ function formatColumnFields(fields: readonly ColumnFieldChange[]): string {
   return fields.map(formatColumnField).join(', ');
 }
 
-/** One column field change; `default` names the absent side `(none)`. */
+/** One column field change; `default` and `notNullName` name the absent side `(none)`. */
 function formatColumnField(field: ColumnFieldChange): string {
   switch (field.field) {
     case 'type':
       return `type ${field.before} → ${field.after}`;
     case 'notNull':
       return `not null ${String(field.before)} → ${String(field.after)}`;
+    case 'notNullName':
+      return `not null name ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
     case 'default':
       return `default ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }

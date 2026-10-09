@@ -36,6 +36,13 @@ import type { Identity } from './identity.ts';
  * identity and equality, and only steers how a create or drop is applied — the target index's
  * flag drives a create, the baseline index's flag drives a drop.
  *
+ * Constraint attributes travel with the constraint without being identity: a foreign key or
+ * check constraint carries `enforcement` when the source declares `NOT VALID` or `NOT ENFORCED`
+ * (absent means valid and enforced), a primary key, unique constraint, or foreign key carries
+ * `deferrable`/`initiallyDeferred` when the source declares `DEFERRABLE`/`INITIALLY DEFERRED`
+ * (absent means the immediate default), and a column carries `notNullName` when PostgreSQL 18
+ * names its not-null constraint (only meaningful with `notNull: true`).
+ *
  * `GENERATED … AS IDENTITY` is a column property, not a sequence entity: an identity column
  * carries its effective descriptor on the column (`Column.identity`) and never among
  * `Model.sequences`.
@@ -83,6 +90,12 @@ export interface Column {
   readonly type: string;
   /** Whether the column is declared `NOT NULL`. */
   readonly notNull: boolean;
+  /**
+   * The name of the column's not-null constraint when the source names it (PostgreSQL 18);
+   * meaningful only with `notNull: true`. Absent means the not-null fact is unnamed or the
+   * column is nullable.
+   */
+  readonly notNullName?: string;
   /** The `DEFAULT` expression as written, whitespace-normalized; opaque to the model. */
   readonly default?: string;
   /**
@@ -92,12 +105,27 @@ export interface Column {
   readonly identity?: Identity;
 }
 
+/**
+ * A constraint's enforcement when it is not the default, as PostgreSQL names it: `not-valid`
+ * means declared `NOT VALID` — existing rows are unchecked, new rows are — and `not-enforced`
+ * means declared `NOT ENFORCED`, which PostgreSQL reports as `NOT VALID` too but never
+ * enforces. Absent means the constraint is valid and enforced, the default.
+ */
+export type ConstraintEnforcement = 'not-valid' | 'not-enforced';
+
 /** A table's primary key. */
 export interface PrimaryKey {
   /** Constraint name as written, when the source names it. */
   readonly name?: string;
   /** Key columns, in the constraint's order. */
   readonly columns: readonly string[];
+  /** Whether the constraint is declared `DEFERRABLE`; absent means `NOT DEFERRABLE`. */
+  readonly deferrable?: boolean;
+  /**
+   * Whether the constraint is declared `INITIALLY DEFERRED`; implies `deferrable`, and absent
+   * means `INITIALLY IMMEDIATE`.
+   */
+  readonly initiallyDeferred?: boolean;
 }
 
 /** A unique constraint: the listed columns must be unique together. */
@@ -106,6 +134,13 @@ export interface UniqueConstraint {
   readonly name?: string;
   /** Key columns, in the constraint's order. */
   readonly columns: readonly string[];
+  /** Whether the constraint is declared `DEFERRABLE`; absent means `NOT DEFERRABLE`. */
+  readonly deferrable?: boolean;
+  /**
+   * Whether the constraint is declared `INITIALLY DEFERRED`; implies `deferrable`, and absent
+   * means `INITIALLY IMMEDIATE`.
+   */
+  readonly initiallyDeferred?: boolean;
 }
 
 /** A check constraint: every row must satisfy the expression. */
@@ -114,6 +149,8 @@ export interface CheckConstraint {
   readonly name?: string;
   /** The check expression as written, whitespace-normalized; opaque to the model. */
   readonly expression: string;
+  /** The constraint's enforcement when not the default; absent means valid and enforced. */
+  readonly enforcement?: ConstraintEnforcement;
 }
 
 /** A foreign key constraint: columns on this table pointing at columns of another table. */
@@ -130,6 +167,15 @@ export interface ForeignKey {
   readonly onUpdate?: ReferentialAction;
   /** The `ON DELETE` action when the source states a non-default one. */
   readonly onDelete?: ReferentialAction;
+  /** The constraint's enforcement when not the default; absent means valid and enforced. */
+  readonly enforcement?: ConstraintEnforcement;
+  /** Whether the constraint is declared `DEFERRABLE`; absent means `NOT DEFERRABLE`. */
+  readonly deferrable?: boolean;
+  /**
+   * Whether the constraint is declared `INITIALLY DEFERRED`; implies `deferrable`, and absent
+   * means `INITIALLY IMMEDIATE`.
+   */
+  readonly initiallyDeferred?: boolean;
 }
 
 /**
