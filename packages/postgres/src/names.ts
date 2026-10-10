@@ -10,7 +10,8 @@ import type {
  * PostgreSQL's conventional names, the single prediction source shared by both directions of
  * the round trip: `render.ts` uses the formulas to name an unnamed constraint or index in a
  * drop, and `import.ts` uses them to recognize a server-generated name on a declaration the
- * model made unnamed and canonicalize it back to unnamed.
+ * model made unnamed and canonicalize it back to unnamed. The not-null formula is import-only:
+ * rendering never synthesizes a not-null name, so it serves canonicalization alone.
  *
  * The prediction is deliberately best-effort. PostgreSQL truncates identifiers at 63 bytes and
  * appends collision suffixes (`_idx1`, `_key1`, …) through `makeObjectName`, and neither is
@@ -40,6 +41,16 @@ export function synthesizedUniqueConstraintName(
   uniqueConstraint: UniqueConstraint,
 ): string {
   return `${table.name}${uniqueConstraint.columns.map((column) => `_${column}`).join('')}_key`;
+}
+
+/**
+ * PostgreSQL's conventional not-null-constraint name for an unnamed constraint: the relation
+ * name — never schema-qualified — joined with the column and `_not_null`. Import-only, unlike
+ * the other formulas: rendering never synthesizes a not-null name, because an unnamed
+ * not-null fact renders as plain `NOT NULL`.
+ */
+export function synthesizedNotNullName(table: string, column: string): string {
+  return `${table}_${column}_not_null`;
 }
 
 /**

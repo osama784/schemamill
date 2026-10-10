@@ -33,6 +33,9 @@ import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts
  * reason, so `pnpm test` stays green without PostgreSQL. Set but unreachable, it fails loudly
  * rather than skipping. The harness spawns `psql` and `pg_dump` from `PATH` and adds no client
  * dependency of its own; the server must be PostgreSQL 13 or newer (`DROP DATABASE … FORCE`).
+ * The parent test reads `server_version_num` once before the scene loop, and a scene whose
+ * `minServerMajor` exceeds the server's major is skipped with a named reason, so a scene
+ * carrying PostgreSQL 18 shapes still lets older local servers run the rest of the corpus.
  *
  * Per scene, sequentially: both databases are created fresh and any raw `setupSql` the scene
  * declares is applied to both, for ambient state like a non-public schema; the baseline
@@ -70,13 +73,26 @@ test(
     if (pgUrl === undefined) return; // Unreachable: the test is skipped when the URL is unset.
     const baseUrl = validateBaseUrl(pgUrl);
     await assertReachable(baseUrl);
+    const serverMajor = Math.floor(
+      Number.parseInt(await query(baseUrl, 'show server_version_num'), 10) / 10000,
+    );
 
     const workDir = await mkdtemp(join(tmpdir(), 'schemamill-live-pg-'));
     try {
       for (const scene of scenes) {
-        await t.test(scene.name, async () => {
-          await runScene(baseUrl, workDir, scene);
-        });
+        const minMajor = scene.minServerMajor;
+        await t.test(
+          scene.name,
+          {
+            skip:
+              minMajor !== undefined && minMajor > serverMajor
+                ? `requires PostgreSQL ${minMajor} or newer (server is ${serverMajor})`
+                : false,
+          },
+          async () => {
+            await runScene(baseUrl, workDir, scene);
+          },
+        );
       }
       await t.test(
         'transaction rollback: a failed statement leaves no partial effect',

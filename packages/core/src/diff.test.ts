@@ -370,6 +370,136 @@ test('a column change reports type, notNull, then default', () => {
   ]);
 });
 
+test('a column notNullName rename reports the name field alone', () => {
+  const baseline = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+  const target = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn2' })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNullName', before: 'c_nn', after: 'c_nn2' }],
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNullName', before: 'c_nn2', after: 'c_nn' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a notNullName added or removed reports only the stated side', () => {
+  const unnamed = model(table('t', { columns: [column('c', { notNull: true })] }));
+  const named = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+
+  assertDiff(unnamed, named, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'column-changed', name: 'c', fields: [{ field: 'notNullName', after: 'c_nn' }] },
+      ],
+    },
+  ]);
+  assertDiff(named, unnamed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'column-changed', name: 'c', fields: [{ field: 'notNullName', before: 'c_nn' }] },
+      ],
+    },
+  ]);
+});
+
+test('a column change reports type, notNull, notNullName, then default', () => {
+  const baseline = model(table('t', { columns: [column('c', { type: 'text', default: '0' })] }));
+  const target = model(
+    table('t', {
+      columns: [column('c', { type: 'bigint', notNull: true, notNullName: 'c_nn', default: '1' })],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'bigint' },
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+            { field: 'default', before: '0', after: '1' },
+          ],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a nullable column gaining a named not-null fact reports both fields', () => {
+  const baseline = model(table('t', { columns: [column('c')] }));
+  const target = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+          ],
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'notNull', before: true, after: false },
+            { field: 'notNullName', before: 'c_nn' },
+          ],
+        },
+      ],
+    },
+  ]);
+});
+
 test('type and default text compare exactly as stored', () => {
   const baseline = model(
     table('t', { columns: [column('c', { type: 'numeric(12, 2)', default: 'now()' })] }),
@@ -1104,6 +1234,76 @@ test('a primary key name change is a change', () => {
   ]);
 });
 
+test('a primary key deferrability change is a change', () => {
+  const columns = [column('id', { notNull: true })];
+  const plain = model(table('t', { columns, primaryKey: { name: 't_pkey', columns: ['id'] } }));
+  const deferrable = model(
+    table('t', {
+      columns,
+      primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
+    }),
+  );
+  const deferred = model(
+    table('t', {
+      columns,
+      primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+    }),
+  );
+
+  assertDiff(plain, deferrable, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'] },
+          after: { name: 't_pkey', columns: ['id'], deferrable: true },
+        },
+      ],
+    },
+  ]);
+  assertDiff(deferrable, deferred, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'], deferrable: true },
+          after: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+        },
+      ],
+    },
+  ]);
+  assertDiff(deferred, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+          after: { name: 't_pkey', columns: ['id'] },
+        },
+      ],
+    },
+  ]);
+});
+
+test('equal primary key deferrability produces no change', () => {
+  const columns = [column('id', { notNull: true })];
+  const shape = (): Model =>
+    model(
+      table('t', {
+        columns,
+        primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+      }),
+    );
+
+  assertDiff(shape(), shape(), []);
+});
+
 test('a foreign key added or removed reports the whole constraint', () => {
   const key = foreignKey(['user_id'], identity('users'), {
     name: 't_user_id_fkey',
@@ -1269,6 +1469,104 @@ test('a foreign key name change is a change', () => {
           kind: 'foreign-key-changed',
           before: foreignKey(['a'], parent, { name: 't_a_fkey', referencedColumns: ['id'] }),
           after: foreignKey(['a'], parent, { name: 't_b_fkey', referencedColumns: ['id'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('foreign key enforcement and deferrability changes are changes', () => {
+  const parent = identity('parent');
+  const shape = (rest: Partial<ForeignKey> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        foreignKeys: [
+          foreignKey(['a'], parent, { name: 't_a_fkey', referencedColumns: ['id'], ...rest }),
+        ],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ enforcement: 'not-valid' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ enforcement: 'not-valid' }), shape({ enforcement: 'not-enforced' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-enforced',
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(plain, shape({ deferrable: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ deferrable: true }), shape({ deferrable: true, initiallyDeferred: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
         },
       ],
     },
@@ -1962,6 +2260,48 @@ test("a unique constraint's absent name and empty name are distinct", () => {
   ]);
 });
 
+test('a unique constraint deferrability change is a change', () => {
+  const shape = (rest: Partial<UniqueConstraint> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        uniqueConstraints: [uniqueConstraint(['a'], { name: 't_a_key', ...rest })],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ deferrable: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a'], { name: 't_a_key' }),
+          after: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ deferrable: true }), shape({ deferrable: true, initiallyDeferred: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+          after: uniqueConstraint(['a'], {
+            name: 't_a_key',
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
+        },
+      ],
+    },
+  ]);
+});
+
 test('a unique constraint column list change removes then adds', () => {
   const baseline = model(
     table('t', {
@@ -2146,6 +2486,44 @@ test("a check constraint's absent name and empty name are distinct", () => {
           kind: 'check-constraint-changed',
           before: checkConstraint('price > 0', { name: '' }),
           after: checkConstraint('price > 0'),
+        },
+      ],
+    },
+  ]);
+});
+
+test('a check constraint enforcement change is a change', () => {
+  const shape = (rest: Partial<CheckConstraint> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        checkConstraints: [checkConstraint('a > 0', { name: 't_a_check', ...rest })],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ enforcement: 'not-valid' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('a > 0', { name: 't_a_check' }),
+          after: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ enforcement: 'not-valid' }), shape({ enforcement: 'not-enforced' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' }),
+          after: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-enforced' }),
         },
       ],
     },

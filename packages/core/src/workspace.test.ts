@@ -334,6 +334,111 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     },
     'invalid model: tables[0].columns[0].identity.generated',
   ],
+  [
+    'a foreign key enforcement outside the union',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              enforcement: 'maybe',
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].enforcement',
+  ],
+  [
+    'a check constraint enforcement outside the union',
+    {
+      tables: [
+        tablePayload({ checkConstraints: [{ expression: 'a > 0', enforcement: 'always' }] }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].checkConstraints[0].enforcement',
+  ],
+  [
+    'a not-null name on a nullable column',
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'c', type: 'text', notNull: false, notNullName: 'c_nn' }],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].notNullName',
+  ],
+  [
+    'a not-null name that is not a string',
+    {
+      tables: [
+        tablePayload({ columns: [{ name: 'c', type: 'text', notNull: true, notNullName: 1 }] }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].notNullName',
+  ],
+  [
+    'a deferrability flag that is not a boolean',
+    {
+      tables: [tablePayload({ primaryKey: { columns: ['id'], deferrable: 'yes' } })],
+      sequences: [],
+    },
+    'invalid model: tables[0].primaryKey.deferrable',
+  ],
+  [
+    'an initiallyDeferred flag that is not a boolean',
+    {
+      tables: [tablePayload({ uniqueConstraints: [{ columns: ['a'], initiallyDeferred: 1 }] })],
+      sequences: [],
+    },
+    'invalid model: tables[0].uniqueConstraints[0].initiallyDeferred',
+  ],
+  [
+    'a foreign-key deferrability flag that is not a boolean',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              deferrable: 'yes',
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].deferrable',
+  ],
+  [
+    'a foreign-key initiallyDeferred flag that is not a boolean',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              initiallyDeferred: 1,
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].initiallyDeferred',
+  ],
 ];
 
 for (const [name, payload, prefix] of SHAPE_FAILURES) {
@@ -347,6 +452,29 @@ for (const [name, payload, prefix] of SHAPE_FAILURES) {
     );
   });
 }
+
+test('resolveWorkspace names the constraint enforcement union in the failure', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [
+      tablePayload({
+        foreignKeys: [
+          {
+            columns: ['org_id'],
+            referencedTable: { schema: 'public', name: 'orgs' },
+            referencedColumns: ['id'],
+            enforcement: 'maybe',
+          },
+        ],
+      }),
+    ],
+    sequences: [],
+  });
+
+  assert.equal(
+    diagnostic.message,
+    'invalid model: tables[0].foreignKeys[0].enforcement is not a valid constraint enforcement',
+  );
+});
 
 /** A populated canonical model, as a committed model file would hold it. */
 const POPULATED_MODEL_JSON = `{
@@ -471,6 +599,207 @@ test('resolveWorkspace reads back a populated model written literally', async (t
 
   assert.equal(resolved.root, dir);
   assert.deepStrictEqual(resolved.model, POPULATED_MODEL);
+});
+
+/** A hand-written model carrying every new constraint attribute. */
+const ATTRIBUTE_MODEL_JSON = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "notNull": true,
+          "notNullName": "users_id_not_null",
+          "default": "0"
+        },
+        { "name": "email", "type": "text", "notNull": false }
+      ],
+      "primaryKey": {
+        "name": "users_pkey",
+        "columns": ["id"],
+        "deferrable": true,
+        "initiallyDeferred": true
+      },
+      "foreignKeys": [
+        {
+          "name": "users_org_id_fkey",
+          "columns": ["org_id"],
+          "referencedTable": { "schema": "public", "name": "orgs" },
+          "referencedColumns": ["id"],
+          "onDelete": "CASCADE",
+          "enforcement": "not-enforced",
+          "deferrable": true,
+          "initiallyDeferred": true
+        }
+      ],
+      "uniqueConstraints": [
+        { "columns": ["email"], "deferrable": true, "initiallyDeferred": true }
+      ],
+      "checkConstraints": [
+        { "name": "users_email_check", "expression": "email <> ''", "enforcement": "not-valid" }
+      ],
+      "indexes": []
+    }
+  ],
+  "sequences": []
+}
+`;
+
+/** The model `ATTRIBUTE_MODEL_JSON` must read back as. */
+const ATTRIBUTE_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 'users',
+      columns: [
+        {
+          name: 'id',
+          type: 'bigint',
+          notNull: true,
+          notNullName: 'users_id_not_null',
+          default: '0',
+        },
+        { name: 'email', type: 'text', notNull: false },
+      ],
+      primaryKey: {
+        name: 'users_pkey',
+        columns: ['id'],
+        deferrable: true,
+        initiallyDeferred: true,
+      },
+      foreignKeys: [
+        {
+          name: 'users_org_id_fkey',
+          columns: ['org_id'],
+          referencedTable: { schema: 'public', name: 'orgs' },
+          referencedColumns: ['id'],
+          onDelete: 'CASCADE',
+          enforcement: 'not-enforced',
+          deferrable: true,
+          initiallyDeferred: true,
+        },
+      ],
+      uniqueConstraints: [{ columns: ['email'], deferrable: true, initiallyDeferred: true }],
+      checkConstraints: [
+        { name: 'users_email_check', expression: "email <> ''", enforcement: 'not-valid' },
+      ],
+      indexes: [],
+    },
+  ],
+  sequences: [],
+};
+
+test('resolveWorkspace reads back every constraint attribute written literally', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, ATTRIBUTE_MODEL_JSON);
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, ATTRIBUTE_MODEL);
+});
+
+test('serializeModel emits the new attributes in declaration order', () => {
+  const payload = JSON.parse(serializeModel(ATTRIBUTE_MODEL)) as {
+    tables: Array<{
+      columns: object[];
+      primaryKey: object;
+      foreignKeys: object[];
+      uniqueConstraints: object[];
+      checkConstraints: object[];
+    }>;
+  };
+  const table = payload.tables[0]!;
+
+  assert.deepStrictEqual(Object.keys(table.columns[0]!), [
+    'name',
+    'type',
+    'notNull',
+    'notNullName',
+    'default',
+  ]);
+  assert.deepStrictEqual(Object.keys(table.primaryKey), [
+    'name',
+    'columns',
+    'deferrable',
+    'initiallyDeferred',
+  ]);
+  assert.deepStrictEqual(Object.keys(table.foreignKeys[0]!), [
+    'name',
+    'columns',
+    'referencedTable',
+    'referencedColumns',
+    'onDelete',
+    'enforcement',
+    'deferrable',
+    'initiallyDeferred',
+  ]);
+  assert.deepStrictEqual(Object.keys(table.uniqueConstraints[0]!), [
+    'columns',
+    'deferrable',
+    'initiallyDeferred',
+  ]);
+  assert.deepStrictEqual(Object.keys(table.checkConstraints[0]!), [
+    'name',
+    'expression',
+    'enforcement',
+  ]);
+});
+
+/** A model exercising the optionals the serializers must round-trip, not only emit. */
+const ROUND_TRIP_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 'users',
+      columns: [
+        {
+          name: 'id',
+          type: 'bigint',
+          notNull: true,
+          notNullName: 'users_id_not_null',
+          identity: {
+            generated: 'always',
+            sequenceName: { schema: 'public', name: 'users_id_seq' },
+            increment: '1',
+            minValue: '1',
+            maxValue: '9223372036854775807',
+            start: '1',
+            cache: '1',
+            cycle: false,
+          },
+        },
+      ],
+      primaryKey: { name: 'users_pkey', columns: ['id'], deferrable: true },
+      foreignKeys: [
+        {
+          name: 'users_org_id_fkey',
+          columns: ['org_id'],
+          referencedTable: { schema: 'public', name: 'orgs' },
+          referencedColumns: ['id'],
+          onUpdate: 'CASCADE',
+          enforcement: 'not-enforced',
+          deferrable: true,
+          initiallyDeferred: true,
+        },
+      ],
+      uniqueConstraints: [{ columns: ['email'], deferrable: true, initiallyDeferred: true }],
+      checkConstraints: [{ expression: 'age >= 0', enforcement: 'not-valid' }],
+      indexes: [{ name: 'users_email_idx', unique: true, columns: ['email'], concurrently: true }],
+    },
+  ],
+  sequences: [],
+};
+
+test('serializeModel round-trips a populated model through resolveWorkspace without loss', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(ROUND_TRIP_MODEL));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
 });
 
 test('resolveWorkspace walks up from a nested directory to the nearest root', async (t) => {

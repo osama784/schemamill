@@ -22,7 +22,7 @@ Every plan either renders SQL PostgreSQL accepts or is refused by name before an
 - Refusal surfacing through the hazard channel: today the refusal is stderr + exit 1 in `plan` only; the slice makes it a reported hazard-class fact — `compare` included — with the brief settling the wording and whether the stderr line stays.
 - The check-heuristic fail-safe class: the check-name formula is a lexical best-effort scan, so an expression it misreads keeps its server name; the slice pins the class and decides whether the scan tightens.
 
-**Out, named — never silent:** PostgreSQL 18 named `NOT NULL` constraints, which the [constraint-attributes slice](./constraint-attributes.md) owns; constraint validation against populated tables, which stays data-dependent and named in [hazards](./hazards.md); exclusion constraints; and collision suffixes actually assigned by the server, which need catalog knowledge the guard deliberately lacks.
+**Out, named — never silent:** PostgreSQL 18 named `NOT NULL` constraints, now carried by the [constraint-attributes slice](./constraint-attributes.md) ([#74](https://github.com/osama784/schemamill/issues/74)); constraint validation against populated tables, which stays data-dependent and named in [hazards](./hazards.md); exclusion constraints; and collision suffixes actually assigned by the server, which need catalog knowledge the guard deliberately lacks.
 
 **Deliberately shallow for now:** the guard refuses only what a plan and the baseline it is given can see; a fact that needs the live catalog is named, never guessed.
 

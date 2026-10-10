@@ -6,6 +6,7 @@ import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ConstraintEnforcement,
   ForeignKey,
   Index,
   Model,
@@ -341,6 +342,7 @@ function serializeColumn(column: Column): object {
     name: column.name,
     type: column.type,
     notNull: column.notNull,
+    ...(column.notNullName === undefined ? {} : { notNullName: column.notNullName }),
     ...(column.default === undefined ? {} : { default: column.default }),
     ...(column.identity === undefined ? {} : { identity: serializeIdentity(column.identity) }),
   };
@@ -366,6 +368,8 @@ function serializeKey(key: PrimaryKey | UniqueConstraint): object {
   return {
     ...(key.name === undefined ? {} : { name: key.name }),
     columns: [...key.columns],
+    ...(key.deferrable === undefined ? {} : { deferrable: key.deferrable }),
+    ...(key.initiallyDeferred === undefined ? {} : { initiallyDeferred: key.initiallyDeferred }),
   };
 }
 
@@ -373,6 +377,9 @@ function serializeCheckConstraint(checkConstraint: CheckConstraint): object {
   return {
     ...(checkConstraint.name === undefined ? {} : { name: checkConstraint.name }),
     expression: checkConstraint.expression,
+    ...(checkConstraint.enforcement === undefined
+      ? {}
+      : { enforcement: checkConstraint.enforcement }),
   };
 }
 
@@ -384,6 +391,11 @@ function serializeForeignKey(foreignKey: ForeignKey): object {
     referencedColumns: [...foreignKey.referencedColumns],
     ...(foreignKey.onUpdate === undefined ? {} : { onUpdate: foreignKey.onUpdate }),
     ...(foreignKey.onDelete === undefined ? {} : { onDelete: foreignKey.onDelete }),
+    ...(foreignKey.enforcement === undefined ? {} : { enforcement: foreignKey.enforcement }),
+    ...(foreignKey.deferrable === undefined ? {} : { deferrable: foreignKey.deferrable }),
+    ...(foreignKey.initiallyDeferred === undefined
+      ? {}
+      : { initiallyDeferred: foreignKey.initiallyDeferred }),
   };
 }
 
@@ -445,7 +457,7 @@ const TABLE_KEYS = [
   'checkConstraints',
   'indexes',
 ] as const;
-const COLUMN_KEYS = ['name', 'type', 'notNull', 'default', 'identity'] as const;
+const COLUMN_KEYS = ['name', 'type', 'notNull', 'notNullName', 'default', 'identity'] as const;
 const IDENTITY_KEYS = [
   'generated',
   'sequenceName',
@@ -456,8 +468,8 @@ const IDENTITY_KEYS = [
   'cache',
   'cycle',
 ] as const;
-const KEY_KEYS = ['name', 'columns'] as const;
-const CHECK_CONSTRAINT_KEYS = ['name', 'expression'] as const;
+const KEY_KEYS = ['name', 'columns', 'deferrable', 'initiallyDeferred'] as const;
+const CHECK_CONSTRAINT_KEYS = ['name', 'expression', 'enforcement'] as const;
 const FOREIGN_KEY_KEYS = [
   'name',
   'columns',
@@ -465,6 +477,9 @@ const FOREIGN_KEY_KEYS = [
   'referencedColumns',
   'onUpdate',
   'onDelete',
+  'enforcement',
+  'deferrable',
+  'initiallyDeferred',
 ] as const;
 const INDEX_KEYS = ['name', 'unique', 'columns', 'concurrently'] as const;
 const SEQUENCE_KEYS = [
@@ -488,6 +503,7 @@ const REFERENTIAL_ACTIONS: readonly ReferentialAction[] = [
   'SET NULL',
   'SET DEFAULT',
 ];
+const CONSTRAINT_ENFORCEMENTS: readonly ConstraintEnforcement[] = ['not-valid', 'not-enforced'];
 const SEQUENCE_DATA_TYPES: readonly SequenceDataType[] = ['smallint', 'integer', 'bigint'];
 const IDENTITY_GENERATIONS: readonly IdentityGeneration[] = ['always', 'by default'];
 
@@ -652,6 +668,15 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
     if (!type.ok) return type;
     const notNull = parseBoolean(object.notNull, fieldPath(path, 'notNull'));
     if (!notNull.ok) return notNull;
+    const notNullName = parseOptional(
+      object.notNullName,
+      fieldPath(path, 'notNullName'),
+      parseString,
+    );
+    if (!notNullName.ok) return notNullName;
+    if (notNullName.value !== undefined && notNull.value !== true) {
+      return invalid(`${fieldPath(path, 'notNullName')} is only valid on a NOT NULL column`);
+    }
     const defaultValue = parseOptional(object.default, fieldPath(path, 'default'), parseString);
     if (!defaultValue.ok) return defaultValue;
     const identity = parseOptional(object.identity, fieldPath(path, 'identity'), parseIdentity);
@@ -660,6 +685,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       name: name.value,
       type: type.value,
       notNull: notNull.value,
+      ...(notNullName.value === undefined ? {} : { notNullName: notNullName.value }),
       ...(defaultValue.value === undefined ? {} : { default: defaultValue.value }),
       ...(identity.value === undefined ? {} : { identity: identity.value }),
     });
@@ -713,9 +739,25 @@ function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
     if (!name.ok) return name;
     const columns = parseStringArray(object.columns, fieldPath(path, 'columns'));
     if (!columns.ok) return columns;
+    const deferrable = parseOptional(
+      object.deferrable,
+      fieldPath(path, 'deferrable'),
+      parseBoolean,
+    );
+    if (!deferrable.ok) return deferrable;
+    const initiallyDeferred = parseOptional(
+      object.initiallyDeferred,
+      fieldPath(path, 'initiallyDeferred'),
+      parseBoolean,
+    );
+    if (!initiallyDeferred.ok) return initiallyDeferred;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       columns: columns.value,
+      ...(deferrable.value === undefined ? {} : { deferrable: deferrable.value }),
+      ...(initiallyDeferred.value === undefined
+        ? {}
+        : { initiallyDeferred: initiallyDeferred.value }),
     });
   });
 }
@@ -726,9 +768,16 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
     if (!name.ok) return name;
     const expression = parseString(object.expression, fieldPath(path, 'expression'));
     if (!expression.ok) return expression;
+    const enforcement = parseOptional(
+      object.enforcement,
+      fieldPath(path, 'enforcement'),
+      parseConstraintEnforcement,
+    );
+    if (!enforcement.ok) return enforcement;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       expression: expression.value,
+      ...(enforcement.value === undefined ? {} : { enforcement: enforcement.value }),
     });
   });
 }
@@ -758,6 +807,24 @@ function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
       parseReferentialAction,
     );
     if (!onDelete.ok) return onDelete;
+    const enforcement = parseOptional(
+      object.enforcement,
+      fieldPath(path, 'enforcement'),
+      parseConstraintEnforcement,
+    );
+    if (!enforcement.ok) return enforcement;
+    const deferrable = parseOptional(
+      object.deferrable,
+      fieldPath(path, 'deferrable'),
+      parseBoolean,
+    );
+    if (!deferrable.ok) return deferrable;
+    const initiallyDeferred = parseOptional(
+      object.initiallyDeferred,
+      fieldPath(path, 'initiallyDeferred'),
+      parseBoolean,
+    );
+    if (!initiallyDeferred.ok) return initiallyDeferred;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       columns: columns.value,
@@ -765,12 +832,21 @@ function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
       referencedColumns: referencedColumns.value,
       ...(onUpdate.value === undefined ? {} : { onUpdate: onUpdate.value }),
       ...(onDelete.value === undefined ? {} : { onDelete: onDelete.value }),
+      ...(enforcement.value === undefined ? {} : { enforcement: enforcement.value }),
+      ...(deferrable.value === undefined ? {} : { deferrable: deferrable.value }),
+      ...(initiallyDeferred.value === undefined
+        ? {}
+        : { initiallyDeferred: initiallyDeferred.value }),
     });
   });
 }
 
 function parseReferentialAction(value: unknown, path: string): Parsed<ReferentialAction> {
   return parseEnum(value, path, REFERENTIAL_ACTIONS, 'referential action');
+}
+
+function parseConstraintEnforcement(value: unknown, path: string): Parsed<ConstraintEnforcement> {
+  return parseEnum(value, path, CONSTRAINT_ENFORCEMENTS, 'constraint enforcement');
 }
 
 function parseIndex(value: unknown, path: string): Parsed<Index> {

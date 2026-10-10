@@ -542,6 +542,268 @@ test("unnamed check drops synthesize PostgreSQL's conventional column name", () 
   }
 });
 
+test('renders the four not-null step statements, named or unnamed', () => {
+  // The plan decomposes a name-involved not-null change into its drop and add halves: a named
+  // half states the name in its own statement, an unnamed half keeps the plain `ALTER COLUMN`.
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-not-null', table: identity('t'), column: 'a', name: 't_a_not_null' },
+        { kind: 'drop-not-null', table: identity('t'), column: 'b' },
+        { kind: 'add-not-null', table: identity('t'), column: 'c', name: 't_c_not_null' },
+        { kind: 'add-not-null', table: identity('t'), column: 'd' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP CONSTRAINT t_a_not_null;',
+      'ALTER TABLE public.t ALTER COLUMN b DROP NOT NULL;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_c_not_null NOT NULL c;',
+      'ALTER TABLE public.t ALTER COLUMN d SET NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('quotes the identifiers a not-null step carries', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-not-null',
+          table: identity('Order', 'app'),
+          column: 'Mixed Case',
+          name: 'we"ird',
+        },
+        { kind: 'add-not-null', table: identity('Order', 'app'), column: 'Mixed Case' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE app."Order" DROP CONSTRAINT "we""ird";',
+      'ALTER TABLE app."Order" ALTER COLUMN "Mixed Case" SET NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders add-primary-key deferrability, named or unnamed', () => {
+  // Only a true `deferrable` or `initiallyDeferred` states a word; `false` and absent render
+  // nothing, `NOT DEFERRABLE` being PostgreSQL's default. A stated `initiallyDeferred` implies
+  // deferrable and emits both words.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
+        },
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { columns: ['a', 'b'], initiallyDeferred: true },
+        },
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { name: 't_pkey_immediate', columns: ['id'], deferrable: false },
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE;',
+      'ALTER TABLE public.t ADD PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_pkey_immediate PRIMARY KEY (id);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders create-table primary-key attributes inline', () => {
+  const accounts = table('accounts', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: {
+      name: 'accounts_pkey',
+      columns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(accounts))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.accounts (',
+      '    id bigint NOT NULL,',
+      '    CONSTRAINT accounts_pkey PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders unique-constraint deferrability', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+        },
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a', 'b'], { initiallyDeferred: true }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a) DEFERRABLE;',
+      'ALTER TABLE public.t ADD UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders foreign-key enforcement and deferrability after its actions', () => {
+  // The attribute tail comes last and in PostgreSQL's order: `DEFERRABLE`, `INITIALLY
+  // DEFERRED`, then the enforcement state; nothing is stated for the defaults.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['parent_id'], identity('parent'), {
+            name: 'child_parent_id_fkey',
+            referencedColumns: ['id'],
+            onUpdate: 'CASCADE',
+            onDelete: 'SET NULL',
+            deferrable: true,
+            initiallyDeferred: true,
+            enforcement: 'not-valid',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['tenant_id'], identity('parent'), {
+            name: 'child_tenant_id_fkey',
+            deferrable: true,
+            initiallyDeferred: true,
+            enforcement: 'not-enforced',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['other_id'], identity('parent'), {
+            name: 'child_other_id_fkey',
+            enforcement: 'not-enforced',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['owner_id'], identity('parent'), { deferrable: true }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED NOT VALID;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.parent DEFERRABLE INITIALLY DEFERRED NOT ENFORCED;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_other_id_fkey FOREIGN KEY (other_id) REFERENCES public.parent NOT ENFORCED;',
+      'ALTER TABLE public.child ADD FOREIGN KEY (owner_id) REFERENCES public.parent DEFERRABLE;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders check-constraint enforcement after the expression', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('age >= 0', {
+            name: 't_age_check',
+            enforcement: 'not-valid',
+          }),
+        },
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('age <= 150', { enforcement: 'not-enforced' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_age_check CHECK (age >= 0) NOT VALID;',
+      'ALTER TABLE public.t ADD CHECK (age <= 150) NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a named not-null constraint inline, unnamed unchanged', () => {
+  const users = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true, notNullName: 'users_email_not_null' }),
+      column('nickname'),
+    ],
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(users))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.users (',
+      '    id integer NOT NULL,',
+      '    email text CONSTRAINT users_email_not_null NOT NULL,',
+      '    nickname text',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-column',
+          table: identity('Order', 'app'),
+          column: column('Mixed Case', { notNull: true, notNullName: 'we"ird' }),
+        },
+        { kind: 'add-column', table: identity('t'), column: column('name', { notNull: true }) },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE app."Order" ADD COLUMN "Mixed Case" text CONSTRAINT "we""ird" NOT NULL;',
+      'ALTER TABLE public.t ADD COLUMN name text NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('renders index creates and drops, named or unnamed, unique or not', () => {
   assert.equal(
     renderSql(
@@ -1484,6 +1746,86 @@ test('golden: drops and adds unique and check constraints', () => {
   );
 
   assertGolden('constraints', baseline, target);
+});
+
+test('golden: renders constraint attributes in every position', () => {
+  const events = table('events', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('name')],
+  });
+  const eventsTarget = table('events', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('name')],
+    primaryKey: {
+      name: 'events_pkey',
+      columns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  });
+  const users = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true, notNullName: 'users_email_not_null' }),
+      column('nickname', { notNull: true }),
+      column('handle'),
+    ],
+    uniqueConstraints: [uniqueConstraint(['email'], { name: 'users_email_key' })],
+  });
+  const usersTarget = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true }),
+      column('nickname'),
+      column('handle', { notNull: true, notNullName: 'users_handle_not_null' }),
+    ],
+    uniqueConstraints: [
+      uniqueConstraint(['email'], {
+        name: 'users_email_key',
+        deferrable: true,
+        initiallyDeferred: true,
+      }),
+    ],
+    checkConstraints: [
+      checkConstraint("nickname <> ''", {
+        name: 'users_nickname_check',
+        enforcement: 'not-enforced',
+      }),
+    ],
+  });
+  const orders = table('orders', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('user_id', { type: 'integer', notNull: true }),
+    ],
+    foreignKeys: [
+      foreignKey(['user_id'], identity('users'), {
+        name: 'orders_user_id_fkey',
+        referencedColumns: ['id'],
+        onDelete: 'CASCADE',
+      }),
+    ],
+  });
+  const ordersTarget = table('orders', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('user_id', { type: 'integer', notNull: true }),
+    ],
+    foreignKeys: [
+      foreignKey(['user_id'], identity('users'), {
+        name: 'orders_user_id_fkey',
+        referencedColumns: ['id'],
+        onDelete: 'CASCADE',
+        deferrable: true,
+        initiallyDeferred: true,
+        enforcement: 'not-valid',
+      }),
+    ],
+  });
+
+  assertGolden(
+    'constraint-attributes',
+    model(events, users, orders),
+    model(eventsTarget, usersTarget, ordersTarget),
+  );
 });
 
 test('golden: creates, changes, and drops standalone indexes', () => {

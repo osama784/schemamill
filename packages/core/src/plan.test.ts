@@ -44,7 +44,7 @@ import {
 } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eight global phases with the fifteen table phases at their
+ * Tests for the migration plan: the eight global phases with the seventeen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -315,15 +315,27 @@ const foreignKeyKey = (foreignKey: ForeignKey): string =>
     foreignKey.referencedColumns,
     foreignKey.onUpdate ?? null,
     foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? null,
+    foreignKey.initiallyDeferred ?? null,
   ]);
 
-/** A structural key for a unique constraint, comparing name and columns. */
+/** A structural key for a unique constraint, comparing name, columns, and deferrability. */
 const uniqueConstraintKey = (uniqueConstraint: UniqueConstraint): string =>
-  JSON.stringify([uniqueConstraint.name ?? null, uniqueConstraint.columns]);
+  JSON.stringify([
+    uniqueConstraint.name ?? null,
+    uniqueConstraint.columns,
+    uniqueConstraint.deferrable ?? null,
+    uniqueConstraint.initiallyDeferred ?? null,
+  ]);
 
-/** A structural key for a check constraint, comparing name and expression. */
+/** A structural key for a check constraint, comparing name, expression, and enforcement. */
 const checkConstraintKey = (checkConstraint: CheckConstraint): string =>
-  JSON.stringify([checkConstraint.name ?? null, checkConstraint.expression]);
+  JSON.stringify([
+    checkConstraint.name ?? null,
+    checkConstraint.expression,
+    checkConstraint.enforcement ?? null,
+  ]);
 
 /** A structural key for an index; `concurrently` is apply metadata and excluded. */
 const indexKey = (entry: Index): string =>
@@ -557,6 +569,11 @@ const applyStep = (state: SimulatedState, step: Step): void => {
           case 'notNull':
             altered.notNull = field.after;
             break;
+          case 'notNullName':
+            // The plan consumes a name-involved change into drop-not-null/add-not-null steps,
+            // so an alter-column must never carry one; reaching here is a plan defect.
+            assert.fail(`alter-column on ${step.name} on ${key} must not carry a not-null name`);
+            break;
           case 'default':
             if (field.after === undefined) delete altered.default;
             else altered.default = field.after;
@@ -567,6 +584,38 @@ const applyStep = (state: SimulatedState, step: Step): void => {
             assertNever(field, 'column field');
         }
       }
+      return;
+    }
+    case 'drop-not-null': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-not-null on missing table ${key}`);
+      const altered = table.columns.get(step.column);
+      assert.ok(altered !== undefined, `drop-not-null of missing ${step.column} on ${key}`);
+      assert.equal(altered.notNull, true, `drop-not-null of nullable ${step.column} on ${key}`);
+      assert.equal(
+        altered.notNullName,
+        step.name,
+        `drop-not-null of ${step.column} on ${key} must carry the live name`,
+      );
+      altered.notNull = false;
+      delete altered.notNullName;
+      return;
+    }
+    case 'add-not-null': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-not-null on missing table ${key}`);
+      const altered = table.columns.get(step.column);
+      assert.ok(altered !== undefined, `add-not-null of missing ${step.column} on ${key}`);
+      assert.equal(altered.notNull, false, `add-not-null of NOT NULL ${step.column} on ${key}`);
+      assert.equal(
+        altered.notNullName,
+        undefined,
+        `add-not-null of ${step.column} on ${key} must start unnamed`,
+      );
+      altered.notNull = true;
+      if (step.name !== undefined) altered.notNullName = step.name;
       return;
     }
     case 'add-identity': {
@@ -1788,6 +1837,8 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'add-column',
     'drop-column',
     'alter-column',
+    'drop-not-null',
+    'add-not-null',
     'add-identity',
     'drop-identity',
     'alter-identity',
@@ -1808,7 +1859,7 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'alter-sequence',
   ];
 
-  assert.equal(kinds.length, 23);
+  assert.equal(kinds.length, 25);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -2509,7 +2560,7 @@ test('a primary-key change splits into a drop before column work and an add afte
   ]);
 });
 
-test('a changed foreign key drops in phase 1 and adds in phase 15, around column work', () => {
+test('a changed foreign key drops in phase 1 and adds in phase 17, around column work', () => {
   const parent = identity('parent');
   const before = foreignKey(['parent_id'], parent, {
     name: 't_parent_id_fkey',
@@ -2544,6 +2595,321 @@ test('a changed foreign key drops in phase 1 and adds in phase 15, around column
     { kind: 'add-column', table: identity('t'), column: column('label') },
     { kind: 'add-foreign-key', table: identity('t'), foreignKey: after },
   ]);
+});
+
+test('a named not-null rename decomposes into a drop and an add', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn2' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('attaching and detaching a not-null name brackets the unnamed fact', () => {
+  const unnamed = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+  );
+  const named = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+
+  assertPlan(unnamed, named, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  assertPlan(named, unnamed, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id' },
+  ]);
+  simulate(unnamed, named);
+  simulate(named, unnamed);
+});
+
+test('a named not-null fact added or removed emits one step', () => {
+  const nullable = model(table('t', { columns: [column('id', { type: 'integer' })] }));
+  const named = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+
+  assertPlan(nullable, named, [
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  assertPlan(named, nullable, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  simulate(nullable, named);
+  simulate(named, nullable);
+});
+
+test('a mixed type and not-null-name change keeps the alter-column name-free', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'bigint', notNull: true, notNullName: 't_id_nn2' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('the not-null steps bracket the column alterations in phase order', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' }),
+        column('v'),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', { type: 'bigint', notNull: true, notNullName: 't_id_nn2' }),
+        column('v', { notNull: true }),
+        column('w'),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'add-column', table: identity('t'), column: column('w') },
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+    },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'v',
+      fields: [{ field: 'notNull', before: false, after: true }],
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('no alter-column step ever carries a not-null name', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'integer', notNull: true, notNullName: 't_a_nn' }),
+        column('b', { type: 'integer', notNull: true, notNullName: 't_b_nn' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'bigint', notNull: true, notNullName: 't_a_nn2', default: '0' }),
+        column('b', { type: 'integer' }),
+      ],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'alter-column'),
+    [
+      {
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'a',
+        fields: [
+          { field: 'type', before: 'integer', after: 'bigint' },
+          { field: 'default', after: '0' },
+        ],
+      },
+    ],
+  );
+  for (const step of steps) {
+    if (step.kind !== 'alter-column') continue;
+    for (const field of step.fields) {
+      assert.notEqual(field.field, 'notNullName', 'a name must ride its own step');
+    }
+  }
+  simulate(baseline, target);
+});
+
+test('an attribute-only constraint change decomposes into its drop and add halves', () => {
+  const beforeUnique = uniqueConstraint(['a'], { name: 't_a_key', deferrable: true });
+  const afterUnique = uniqueConstraint(['a'], {
+    name: 't_a_key',
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  const beforeCheck = checkConstraint('a > 0', { name: 't_a_check' });
+  const afterCheck = checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' });
+  const beforeKey = foreignKey(['a'], identity('u'), {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+  });
+  const afterKey = foreignKey(['a'], identity('u'), {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+    enforcement: 'not-enforced',
+  });
+  const parent = table('u', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const baseline = model(
+    parent,
+    table('t', {
+      columns: [column('a')],
+      uniqueConstraints: [beforeUnique],
+      checkConstraints: [beforeCheck],
+      foreignKeys: [beforeKey],
+    }),
+  );
+  const target = model(
+    parent,
+    table('t', {
+      columns: [column('a')],
+      uniqueConstraints: [afterUnique],
+      checkConstraints: [afterCheck],
+      foreignKeys: [afterKey],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeKey },
+    { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+    { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+    { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+    { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+    { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterKey },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an attribute-only foreign-key change coinciding with a primary-key change is set aside once', () => {
+  const before = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['id'],
+  });
+  const after = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['id'],
+    enforcement: 'not-valid',
+  });
+  const baseline = model(
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+  );
+  const target = model(
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+  );
+
+  // The attribute-only foreign-key change is the diff's own drop + add; threading the new
+  // fields through the synthesis key keeps the primary-key change from setting aside a second
+  // pair for the same foreign key.
+  const { steps } = plan(baseline, target);
+  assert.equal(steps.filter((step) => step.kind === 'drop-foreign-key').length, 1);
+  assert.equal(steps.filter((step) => step.kind === 'add-foreign-key').length, 1);
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: after },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an attribute-only foreign-key deferrability change coinciding with a primary-key change is set aside once', () => {
+  // Baseline and target differ only on the field under test, so the diff's drop + add pair is
+  // the only pair: if the synthesis key dropped that field, the dependent-FK synthesis would
+  // fire a second drop + add for the same foreign key.
+  const cases = [
+    { before: { deferrable: true }, after: {} },
+    { before: { deferrable: true, initiallyDeferred: true }, after: { deferrable: true } },
+  ] as const;
+  for (const fields of cases) {
+    const before = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.before,
+    });
+    const after = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.after,
+    });
+    const baseline = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+    );
+    const target = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+    );
+
+    const { steps } = plan(baseline, target);
+    const label = JSON.stringify(fields);
+    assert.equal(
+      steps.filter((step) => step.kind === 'drop-foreign-key').length,
+      1,
+      `one drop-foreign-key for ${label}`,
+    );
+    assert.equal(
+      steps.filter((step) => step.kind === 'add-foreign-key').length,
+      1,
+      `one add-foreign-key for ${label}`,
+    );
+    simulate(baseline, target);
+  }
 });
 
 test('column payloads keep their exact contents', () => {
@@ -2998,7 +3364,7 @@ test('an index flag-only difference produces no plan', () => {
   assertPlan(model(concurrent), model(lazy), []);
 });
 
-test('a mixed migration pins the exact step sequence across all fifteen table phases', () => {
+test('a mixed migration pins the exact step sequence across all seventeen table phases', () => {
   const parent = table('parent', {
     columns: [column('id', { type: 'integer', notNull: true })],
     primaryKey: { name: 'parent_pkey', columns: ['id'] },
@@ -3123,29 +3489,29 @@ test('a mixed migration pins the exact step sequence across all fifteen table ph
     },
     // Phase 9: add-column.
     { kind: 'add-column', table: identity('kept'), column: column('fresh', { type: 'integer' }) },
-    // Phase 10: alter-column.
+    // Phase 11: alter-column.
     {
       kind: 'alter-column',
       table: identity('kept'),
       name: 'note',
       fields: [{ field: 'type', before: 'text', after: 'character varying(12)' }],
     },
-    // Phase 11: add-primary-key.
+    // Phase 13: add-primary-key.
     {
       kind: 'add-primary-key',
       table: identity('kept'),
       primaryKey: { name: 'kept_pkey', columns: ['id', 'fresh'] },
     },
-    // Phase 12: add-unique-constraint, in diff order (fresh before kept).
+    // Phase 14: add-unique-constraint, in diff order (fresh before kept).
     { kind: 'add-unique-constraint', table: identity('fresh'), uniqueConstraint: freshKey },
     { kind: 'add-unique-constraint', table: identity('kept'), uniqueConstraint: liveKey },
-    // Phase 13: add-check-constraint.
+    // Phase 15: add-check-constraint.
     { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: freshCheck },
     { kind: 'add-check-constraint', table: identity('kept'), checkConstraint: liveCheck },
-    // Phase 14: create-index.
+    // Phase 16: create-index.
     { kind: 'create-index', table: identity('fresh'), index: freshIndex },
     { kind: 'create-index', table: identity('kept'), index: liveIndex },
-    // Phase 15: add-foreign-key.
+    // Phase 17: add-foreign-key.
     { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: freshForeignKey },
     { kind: 'add-foreign-key', table: identity('kept'), foreignKey: liveForeignKey },
   ]);
@@ -5211,7 +5577,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 23, 'every step kind must be classified');
+  assert.equal(kinds.length, 25, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);

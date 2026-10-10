@@ -1,0 +1,6 @@
+~ table public.users
+    ~ column email: not null name users_email_nn → users_email_nn_v2
+    ~ primary key (id) → (id)
+    ~ foreign key (team_id) → public.teams: 
+    ~ unique constraint (email): name (none) → (none)
+    + check constraint users_email_check_v2 CHECK (email <> '')

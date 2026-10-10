@@ -67,6 +67,13 @@ import type {
  * schema qualification is real only because the scene's setup SQL creates the `app` schema
  * (`non-public-index-drop`).
  *
+ * The constraint-attribute scenes cover the PostgreSQL 18 shapes: enforcement and deferrability
+ * on every constraint kind that carries them, pinned against the catalog's
+ * `pg_get_constraintdef` (`constraint-attributes`), and the generated not-null-constraint name,
+ * canonicalized back to unnamed on import while a comment keeps the name in the target dump
+ * (`not-null-constraint-names`). Both declare `minServerMajor: 18` and skip with a named reason
+ * on older servers.
+ *
  * The introspection scenes are the tracer bullet for the `CatalogReader` seam:
  * `introspection-tracer` builds two raw schemas beside `public` and a model exercising the
  * covered catalog surface — quoted and mixed-case identifiers, a composite primary key
@@ -212,6 +219,13 @@ export type SceneIntrospection =
 export interface LiveScene {
   /** Stable scene name; the harness derives its database names from it. */
   readonly name: string;
+  /**
+   * The oldest server major the scene can run against. Absent means the harness's base floor
+   * (PostgreSQL 13); a scene that needs a newer major declares it and is skipped with a named
+   * reason on older servers, so PostgreSQL 18 shapes still run on CI while a local PostgreSQL
+   * 16 run keeps the rest of the corpus green.
+   */
+  readonly minServerMajor?: number;
   /** The model the baseline database is built from. */
   readonly baseline: Model;
   /** The model the target database is built from and the migration aims at. */
@@ -2654,6 +2668,315 @@ const constraintCreateScene = (): LiveScene => {
 };
 
 /**
+ * The constraint-attribute round trip: a target changing the enforcement and deferrability of
+ * constraints of every kind PostgreSQL 18 lets carry them. The primary key gains `DEFERRABLE
+ * INITIALLY DEFERRED`, the unique constraint `DEFERRABLE`, one foreign key `NOT VALID`, the
+ * other `DEFERRABLE INITIALLY DEFERRED NOT ENFORCED`, and a new check constraint `NOT
+ * ENFORCED` — the two enforcement wordings never conflated. The migration drops and re-adds
+ * each changed constraint, the catalog checks pin `pg_get_constraintdef` exactly — the
+ * PostgreSQL 18 suffixes included — and the import checks prove every attribute came back on
+ * the model, so the empty diff is a whole-attribute round trip rather than a collapse.
+ */
+const constraintAttributesScene = (): LiveScene => {
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const baselineUsers = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true }),
+      column('team_id', { type: 'integer' }),
+      column('other_id', { type: 'integer' }),
+      column('age', { type: 'integer' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    uniqueConstraints: [{ columns: ['email'] }],
+    foreignKeys: [
+      foreignKey(['team_id'], identity('teams')),
+      foreignKey(['other_id'], identity('teams')),
+    ],
+  });
+  const targetUsers = table('users', {
+    columns: baselineUsers.columns,
+    primaryKey: { columns: ['id'], deferrable: true, initiallyDeferred: true },
+    uniqueConstraints: [{ columns: ['email'], deferrable: true }],
+    foreignKeys: [
+      foreignKey(['team_id'], identity('teams'), { enforcement: 'not-valid' }),
+      foreignKey(['other_id'], identity('teams'), {
+        enforcement: 'not-enforced',
+        deferrable: true,
+        initiallyDeferred: true,
+      }),
+    ],
+    checkConstraints: [
+      { name: 'users_age_check_v2', expression: 'age >= 0', enforcement: 'not-enforced' },
+    ],
+  });
+
+  return {
+    name: 'constraint-attributes',
+    minServerMajor: 18,
+    baseline: model(teams, baselineUsers),
+    target: model(teams, targetUsers),
+    baselineChecks: [
+      {
+        description: 'the baseline foreign-key names are the conventional ones',
+        sql: constraintNames('users', 'f'),
+        expected: 'users_other_id_fkey,users_team_id_fkey',
+      },
+      {
+        description: 'the baseline primary key is plain',
+        sql: constraintDef('users_pkey'),
+        expected: 'PRIMARY KEY (id)',
+      },
+      {
+        description: 'the baseline foreign keys are plain',
+        sql: constraintDef('users_team_id_fkey'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id)',
+      },
+      {
+        description: 'the baseline has no check constraint',
+        sql: constraintCount('users_age_check_v2', 'c'),
+        expected: '0',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'every changed constraint decomposes into a drop and an add',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds ===
+            'drop-foreign-key,drop-foreign-key,drop-unique-constraint,drop-primary-key,' +
+              'add-primary-key,add-unique-constraint,add-check-constraint,add-foreign-key,' +
+              'add-foreign-key'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the primary key definition, with its deferrability',
+        sql: constraintDef('users_pkey'),
+        expected: 'PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED',
+      },
+      {
+        description: 'the unique constraint definition, with its deferrability',
+        sql: constraintDef('users_email_key'),
+        expected: 'UNIQUE (email) DEFERRABLE',
+      },
+      {
+        description: 'the not-valid foreign-key definition',
+        sql: constraintDef('users_team_id_fkey'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id) NOT VALID',
+      },
+      {
+        description: 'the not-enforced foreign-key definition, with its deferrability',
+        sql: constraintDef('users_other_id_fkey'),
+        expected:
+          'FOREIGN KEY (other_id) REFERENCES teams(id) DEFERRABLE INITIALLY DEFERRED NOT ENFORCED',
+      },
+      {
+        description: 'the not-enforced check definition',
+        sql: constraintDef('users_age_check_v2'),
+        expected: 'CHECK ((age >= 0)) NOT ENFORCED',
+      },
+      {
+        description: 'the conventional names survive the drop and add',
+        sql:
+          "select string_agg(conname, ',' order by conname) from pg_constraint" +
+          " where conrelid = 'public.users'::regclass and contype in ('p', 'u', 'f')",
+        expected: 'users_email_key,users_other_id_fkey,users_pkey,users_team_id_fkey',
+      },
+      {
+        description: 'the enforcement states are distinct in the catalog',
+        sql:
+          "select string_agg(conname || '|' || convalidated || '|' || conenforced," +
+          " ',' order by conname) from pg_constraint" +
+          " where conname in ('users_age_check_v2', 'users_other_id_fkey', 'users_team_id_fkey')",
+        expected:
+          'users_age_check_v2|false|false,users_other_id_fkey|false|false,users_team_id_fkey|false|true',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'every enforcement and deferrability attribute comes back, the two wordings distinct',
+        failure: (imported) => {
+          const users = imported.model.tables.find((candidate) => candidate.name === 'users');
+          if (users === undefined) return 'users is not imported';
+          const primaryKey = users.primaryKey;
+          const unique = users.uniqueConstraints.find(
+            (constraint) => constraint.columns.join(',') === 'email',
+          );
+          const team = users.foreignKeys.find(
+            (constraint) => constraint.columns.join(',') === 'team_id',
+          );
+          const other = users.foreignKeys.find(
+            (constraint) => constraint.columns.join(',') === 'other_id',
+          );
+          const check = users.checkConstraints.find(
+            (constraint) => constraint.name === 'users_age_check_v2',
+          );
+          if (
+            primaryKey === undefined ||
+            unique === undefined ||
+            team === undefined ||
+            other === undefined ||
+            check === undefined
+          ) {
+            return 'a constraint is missing from the import';
+          }
+          const facts =
+            `primary key:${String(primaryKey.deferrable)}:${String(primaryKey.initiallyDeferred)}` +
+            ` unique:${String(unique.deferrable)}:${String(unique.initiallyDeferred)}` +
+            ` team:${String(team.enforcement)}:${String(team.deferrable)}` +
+            `:${String(team.initiallyDeferred)}` +
+            ` other:${String(other.enforcement)}:${String(other.deferrable)}` +
+            `:${String(other.initiallyDeferred)} check:${String(check.enforcement)}`;
+          const expected =
+            'primary key:true:true unique:true:undefined team:not-valid:undefined:undefined' +
+            ' other:not-enforced:true:true check:not-enforced';
+          return facts === expected ? undefined : `imported attributes: ${facts}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The generated-not-null-name round trip: a target adding a not-null fact to a previously
+ * nullable column, so the migration's `SET NOT NULL` gives PostgreSQL 18 the generated name
+ * `t_c_not_null`. Raw target SQL comments that constraint, which keeps the name in the target
+ * dump — pg_dump suppresses a generated name only when the constraint carries no comment —
+ * while the migrated database's dump suppresses it, so the empty diff is load-bearing on the
+ * import's formula strip, which reads the generated name back as unnamed. The probes pin the
+ * catalog behavior of `DROP NOT NULL` and `SET NOT NULL` on the baseline-built not-null fact
+ * of `d`, and the catalog checks pin the generated names and the not-null definition.
+ */
+const notNullConstraintNamesScene = (): LiveScene => {
+  const baseline = table('t', {
+    columns: [column('c'), column('d', { notNull: true })],
+  });
+  const target = table('t', {
+    columns: [column('c', { notNull: true }), column('d', { notNull: true })],
+  });
+  // `DROP NOT NULL` must remove the column's `contype = 'n'` row (PostgreSQL 18 records
+  // not-null constraints in `pg_constraint`); the row is looked up by the column's attnum, so
+  // the assertion does not assume the name under test.
+  const assertNoNotNullRowForD = [
+    'DO $$',
+    'BEGIN',
+    '  IF EXISTS (',
+    '    SELECT 1 FROM pg_constraint',
+    "    WHERE conrelid = 'public.t'::regclass",
+    "      AND contype = 'n'",
+    '      AND conkey = ARRAY[(SELECT attnum FROM pg_attribute',
+    "        WHERE attrelid = 'public.t'::regclass AND attname = 'd')::smallint]",
+    '  ) THEN',
+    "    RAISE EXCEPTION 'DROP NOT NULL left a not-null constraint row for t.d';",
+    '  END IF;',
+    'END',
+    '$$;',
+  ].join('\n');
+  // `SET NOT NULL` regenerates the conventional name through `ChooseConstraintName`.
+  const assertGeneratedNameForD = [
+    'DO $$',
+    'BEGIN',
+    '  IF NOT EXISTS (',
+    '    SELECT 1 FROM pg_constraint',
+    "    WHERE conrelid = 'public.t'::regclass",
+    "      AND contype = 'n'",
+    "      AND conname = 't_d_not_null'",
+    '  ) THEN',
+    "    RAISE EXCEPTION 'SET NOT NULL did not regenerate t_d_not_null';",
+    '  END IF;',
+    'END',
+    '$$;',
+  ].join('\n');
+
+  return {
+    name: 'not-null-constraint-names',
+    minServerMajor: 18,
+    baseline: model(baseline),
+    target: model(target),
+    targetExtraSql:
+      "COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'a comment keeps the generated name in the dump';",
+    planChecks: [
+      {
+        description: 'the added not-null fact is one name-free alter-column step',
+        failure: (steps) => {
+          if (steps.length !== 1) return `steps: ${steps.map((step) => step.kind).join(',')}`;
+          const step = steps[0]!;
+          if (step.kind !== 'alter-column') return `step kind: ${step.kind}`;
+          const fields = step.fields
+            .map((field) => `${field.field}:${String(field.before)}:${String(field.after)}`)
+            .join(',');
+          return fields === 'notNull:false:true' ? undefined : `fields: ${fields}`;
+        },
+      },
+    ],
+    probes: [
+      'ALTER TABLE public.t ALTER COLUMN d DROP NOT NULL;',
+      assertNoNotNullRowForD,
+      'ALTER TABLE public.t ALTER COLUMN d SET NOT NULL;',
+      assertGeneratedNameForD,
+    ],
+    checks: [
+      {
+        description: 'the generated not-null-constraint names',
+        sql: constraintNames('t', 'n'),
+        expected: 't_c_not_null,t_d_not_null',
+      },
+      {
+        description: 'the generated not-null definition',
+        sql: constraintDef('t_c_not_null'),
+        expected: 'NOT NULL c',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'both dumps import the columns as unnamed not-null facts; the target carries the comment skip',
+        failure: (imported, source) => {
+          const t = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (t === undefined) return 't is not imported';
+          const facts = t.columns
+            .map(
+              (column) => `${column.name}:${String(column.notNull)}:${String(column.notNullName)}`,
+            )
+            .join(' ');
+          if (facts !== 'c:true:undefined d:true:undefined') return `columns: ${facts}`;
+          const comments = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind !== 'error' && diagnostic.message.includes('COMMENT ON'),
+          );
+          if (source === 'applied') {
+            return comments.length === 0
+              ? undefined
+              : `the migrated database's dump carries comments: ${comments
+                  .map((diagnostic) => diagnostic.message)
+                  .join('; ')}`;
+          }
+          const shape = comments
+            .map((diagnostic) =>
+              diagnostic.kind === 'error'
+                ? `error:${diagnostic.code}:${diagnostic.message}`
+                : `${diagnostic.kind}:${diagnostic.code}:${diagnostic.object}:${diagnostic.message}`,
+            )
+            .join('; ');
+          const expected =
+            'skip:unsupported-statement:public.t.t_c_not_null:' +
+            'skipped COMMENT ON TABCONSTRAINT public.t.t_c_not_null';
+          return shape === expected ? undefined : `comment diagnostics: ${shape}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
  * The standalone-index round trip: a target adding a plain and a unique index, plus raw target
  * SQL declaring a partial and an expression index the model cannot represent. The plan renders
  * only the two modeled indexes; the target dump carries all four, and the import skips the two
@@ -3254,6 +3577,8 @@ export const scenes: readonly LiveScene[] = [
   identityToSequenceScene(),
   sequenceToIdentityScene(),
   constraintCreateScene(),
+  constraintAttributesScene(),
+  notNullConstraintNamesScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),

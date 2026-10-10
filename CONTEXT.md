@@ -50,6 +50,18 @@ _Avoid_: connection, edge, link
 The PostgreSQL constraint behind a relationship. The same fact in the database's language. On import, a foreign key whose name is exactly PostgreSQL's generated name for it (`<table>_<cols>_fkey`) is canonicalized back to unnamed, so a dump of a model-declared unnamed foreign key round-trips.
 _Avoid_: connection, reference
 
+**Constraint enforcement**:
+How a check constraint or foreign key is enforced: absent means valid and enforced, `not-valid` means declared `NOT VALID` — existing rows unchecked, new rows checked — and `not-enforced` means declared `NOT ENFORCED`, which implies not-valid and is never checked. A combined `NOT VALID NOT ENFORCED` declaration collapses to `not-enforced`; the two wordings are never conflated on import.
+_Avoid_: enabled/disabled constraint, enforcement state
+
+**Constraint deferrability**:
+Whether a primary key, unique constraint, or foreign key is checked immediately or at transaction commit, declared `DEFERRABLE` and optionally `INITIALLY DEFERRED`; immediate is the default, and `INITIALLY DEFERRED` implies deferrable. Check constraints reject deferrability at parse time.
+_Avoid_: deferred constraint, deferment
+
+**Not-null constraint name**:
+A not-null constraint's name when PostgreSQL 18 names it, carried beside the column's not-null fact — the model has no separate not-null constraint object. On import, a name exactly matching PostgreSQL's generated `<table>_<column>_not_null` is canonicalized back to unnamed, so a dump of a model-declared named not-null constraint round-trips; a name outside the formula stays named.
+_Avoid_: column constraint name, NN name
+
 **Snapshot**:
 A frozen copy of the model at a point in time. Capture it, name it, list it, compare it.
 _Avoid_: version, state, revision
