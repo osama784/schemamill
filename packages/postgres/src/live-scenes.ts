@@ -2795,7 +2795,8 @@ const constraintAttributesScene = (): LiveScene => {
           "select string_agg(conname || '|' || convalidated || '|' || conenforced," +
           " ',' order by conname) from pg_constraint" +
           " where conname in ('users_age_check_v2', 'users_other_id_fkey', 'users_team_id_fkey')",
-        expected: 'users_age_check_v2|f|f,users_other_id_fkey|f|f,users_team_id_fkey|f|t',
+        expected:
+          'users_age_check_v2|false|false,users_other_id_fkey|false|false,users_team_id_fkey|false|true',
       },
     ],
     importChecks: [
