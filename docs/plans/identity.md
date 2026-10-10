@@ -66,7 +66,7 @@ Three levels pin the slice:
   - Each scene also checks that the identity columns come back column by column: the harness's retention guard matches every target identity against the re-imported model by `schema.table.column`, rejects an invented or moved identity, and fails the scene on any import diagnostic that names identity.
 - **Dogfood** — the sequences slice's 24-table corpus across `public`, `app`, and `"Sales"` (bigserial primary keys, a standalone `public.invoice_seq START WITH 1000`), plus a target that converts `public.audit_log.id` from `bigserial` to `GENERATED ALWAYS AS IDENTITY` reusing `public.audit_log_id_seq` and adds `public.identity_events` with a nameless identity: plan → apply the plan SQL verbatim → re-dump → import → `No changes.`, with no `audit_log_id_seq1` collision, the engine-chosen `public.identity_events_id_seq` for the nameless identity, and `attidentity` `a`/`d` after the migration. Commands and output on [#20](https://github.com/osama784/schemamill/issues/20#issuecomment-5913091302).
 
-On PostgreSQL 16.15 the live suite is 198 tests across 32 scenes, 0 skipped; the `verify-postgres` CI job runs the same harness against PostgreSQL 18.
+On PostgreSQL 16.15 the live suite is 232 tests across 36 scenes, 2 skipped — the two PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 36 run.
 
 ## Done means
 
