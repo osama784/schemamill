@@ -401,6 +401,44 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     },
     'invalid model: tables[0].uniqueConstraints[0].initiallyDeferred',
   ],
+  [
+    'a foreign-key deferrability flag that is not a boolean',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              deferrable: 'yes',
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].deferrable',
+  ],
+  [
+    'a foreign-key initiallyDeferred flag that is not a boolean',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              initiallyDeferred: 1,
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].initiallyDeferred',
+  ],
 ];
 
 for (const [name, payload, prefix] of SHAPE_FAILURES) {
@@ -414,6 +452,29 @@ for (const [name, payload, prefix] of SHAPE_FAILURES) {
     );
   });
 }
+
+test('resolveWorkspace names the constraint enforcement union in the failure', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [
+      tablePayload({
+        foreignKeys: [
+          {
+            columns: ['org_id'],
+            referencedTable: { schema: 'public', name: 'orgs' },
+            referencedColumns: ['id'],
+            enforcement: 'maybe',
+          },
+        ],
+      }),
+    ],
+    sequences: [],
+  });
+
+  assert.equal(
+    diagnostic.message,
+    'invalid model: tables[0].foreignKeys[0].enforcement is not a valid constraint enforcement',
+  );
+});
 
 /** A populated canonical model, as a committed model file would hold it. */
 const POPULATED_MODEL_JSON = `{
@@ -685,6 +746,60 @@ test('serializeModel emits the new attributes in declaration order', () => {
     'expression',
     'enforcement',
   ]);
+});
+
+/** A model exercising the optionals the serializers must round-trip, not only emit. */
+const ROUND_TRIP_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 'users',
+      columns: [
+        {
+          name: 'id',
+          type: 'bigint',
+          notNull: true,
+          notNullName: 'users_id_not_null',
+          identity: {
+            generated: 'always',
+            sequenceName: { schema: 'public', name: 'users_id_seq' },
+            increment: '1',
+            minValue: '1',
+            maxValue: '9223372036854775807',
+            start: '1',
+            cache: '1',
+            cycle: false,
+          },
+        },
+      ],
+      primaryKey: { name: 'users_pkey', columns: ['id'], deferrable: true },
+      foreignKeys: [
+        {
+          name: 'users_org_id_fkey',
+          columns: ['org_id'],
+          referencedTable: { schema: 'public', name: 'orgs' },
+          referencedColumns: ['id'],
+          onUpdate: 'CASCADE',
+          enforcement: 'not-enforced',
+          deferrable: true,
+          initiallyDeferred: true,
+        },
+      ],
+      uniqueConstraints: [{ columns: ['email'], deferrable: true, initiallyDeferred: true }],
+      checkConstraints: [{ expression: 'age >= 0', enforcement: 'not-valid' }],
+      indexes: [{ name: 'users_email_idx', unique: true, columns: ['email'], concurrently: true }],
+    },
+  ],
+  sequences: [],
+};
+
+test('serializeModel round-trips a populated model through resolveWorkspace without loss', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(ROUND_TRIP_MODEL));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
 });
 
 test('resolveWorkspace walks up from a nested directory to the nearest root', async (t) => {

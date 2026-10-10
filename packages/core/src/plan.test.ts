@@ -2862,6 +2862,56 @@ test('an attribute-only foreign-key change coinciding with a primary-key change 
   simulate(baseline, target);
 });
 
+test('an attribute-only foreign-key deferrability change coinciding with a primary-key change is set aside once', () => {
+  // Baseline and target differ only on the field under test, so the diff's drop + add pair is
+  // the only pair: if the synthesis key dropped that field, the dependent-FK synthesis would
+  // fire a second drop + add for the same foreign key.
+  const cases = [
+    { before: { deferrable: true }, after: {} },
+    { before: { deferrable: true, initiallyDeferred: true }, after: { deferrable: true } },
+  ] as const;
+  for (const fields of cases) {
+    const before = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.before,
+    });
+    const after = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.after,
+    });
+    const baseline = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+    );
+    const target = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+    );
+
+    const { steps } = plan(baseline, target);
+    const label = JSON.stringify(fields);
+    assert.equal(
+      steps.filter((step) => step.kind === 'drop-foreign-key').length,
+      1,
+      `one drop-foreign-key for ${label}`,
+    );
+    assert.equal(
+      steps.filter((step) => step.kind === 'add-foreign-key').length,
+      1,
+      `one add-foreign-key for ${label}`,
+    );
+    simulate(baseline, target);
+  }
+});
+
 test('column payloads keep their exact contents', () => {
   const baseline = model(table('t', { columns: [column('a')] }));
   const target = model(
