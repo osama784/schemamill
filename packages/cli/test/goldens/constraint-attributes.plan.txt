@@ -1,0 +1,22 @@
+9 steps in one transaction:
+ 1. drop-foreign-key        public.users: foreign key users_team_fkey (team_id) → public.teams (id)
+ 2. drop-unique-constraint  public.users: unique constraint (email)
+ 3. drop-primary-key        public.users: primary key (id)
+ 4. drop-not-null           public.users.email (users_email_nn)
+ 5. add-not-null            public.users.email (users_email_nn_v2)
+ 6. add-primary-key         public.users: primary key (id)
+ 7. add-unique-constraint   public.users: unique constraint (email)
+ 8. add-check-constraint    public.users: check constraint users_email_check_v2 CHECK (email <> '')
+ 9. add-foreign-key         public.users: foreign key users_team_fkey (team_id) → public.teams (id)
+
+BEGIN;
+ALTER TABLE public.users DROP CONSTRAINT users_team_fkey;
+ALTER TABLE public.users DROP CONSTRAINT users_email_key;
+ALTER TABLE public.users DROP CONSTRAINT users_pkey;
+ALTER TABLE public.users DROP CONSTRAINT users_email_nn;
+ALTER TABLE public.users ADD CONSTRAINT users_email_nn_v2 NOT NULL email;
+ALTER TABLE public.users ADD PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE public.users ADD UNIQUE (email) DEFERRABLE;
+ALTER TABLE public.users ADD CONSTRAINT users_email_check_v2 CHECK (email <> '') NOT ENFORCED;
+ALTER TABLE public.users ADD CONSTRAINT users_team_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) NOT ENFORCED;
+COMMIT;

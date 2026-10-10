@@ -23,6 +23,7 @@ const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 /** Every golden scene, by fixture base name. */
 const SCENES = [
   'all-changes',
+  'constraint-attributes',
   'constraints-indexes',
   'hazards',
   'identity',
