@@ -2,6 +2,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnFieldChange,
+  ConstraintEnforcement,
   ForeignKey,
   Identity,
   IdentityFieldChange,
@@ -71,6 +72,15 @@ import {
  * the model has none, mirroring primary-key and foreign-key rendering. The concurrent index
  * kinds render the same statements with `CONCURRENTLY`; the plan stands them in standalone
  * groups, so they render bare.
+ *
+ * Constraint attributes render after every other clause of their constraint, in PostgreSQL's
+ * order: `DEFERRABLE`, `INITIALLY DEFERRED`, then the enforcement state — `NOT VALID` for
+ * `not-valid`, `NOT ENFORCED` for `not-enforced`. `INITIALLY DEFERRED` implies deferrable, so a
+ * stated `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT
+ * DEFERRABLE` and valid-and-enforced being the defaults. A not-null fact with a name renders
+ * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
+ * `CREATE TABLE` and `ADD COLUMN`; nothing negotiates the server version — the renderer states
+ * the attributes the model carries.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -467,24 +477,31 @@ function renderCreateTable(table: Table): string {
 }
 
 /**
- * One column definition: name, type, and the `NOT NULL` / `DEFAULT` clauses it carries. An
- * identity descriptor renders nothing here: the plan adds it with its own step.
+ * One column definition: name, type, and the `NOT NULL` / `DEFAULT` clauses it carries. A
+ * not-null fact the model names renders PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL`;
+ * without a name it stays the plain `NOT NULL`. An identity descriptor renders nothing here:
+ * the plan adds it with its own step.
  */
 function renderColumn(column: Column): string {
-  const notNull = column.notNull ? ' NOT NULL' : '';
+  const notNull =
+    column.notNull && column.notNullName !== undefined
+      ? ` CONSTRAINT ${quoteIdentifier(column.notNullName)} NOT NULL`
+      : column.notNull
+        ? ' NOT NULL'
+        : '';
   const fallback = column.default === undefined ? '' : ` DEFAULT ${column.default}`;
   return `${quoteIdentifier(column.name)} ${column.type}${notNull}${fallback}`;
 }
 
-/** A primary-key constraint clause, with its name when it has one. */
+/** A primary-key constraint clause, with its name and attributes when it has them. */
 function renderPrimaryKey(primaryKey: PrimaryKey): string {
   const name =
     primaryKey.name === undefined ? '' : `CONSTRAINT ${quoteIdentifier(primaryKey.name)} `;
   const columns = primaryKey.columns.map((column) => quoteIdentifier(column)).join(', ');
-  return `${name}PRIMARY KEY (${columns})`;
+  return `${name}PRIMARY KEY (${columns})${renderDeferrability(primaryKey)}`;
 }
 
-/** A foreign-key constraint clause, with its name, referenced columns, and actions. */
+/** A foreign-key constraint clause, with its name, referenced columns, actions, and attributes. */
 function renderForeignKey(foreignKey: ForeignKey): string {
   const name =
     foreignKey.name === undefined ? '' : `CONSTRAINT ${quoteIdentifier(foreignKey.name)} `;
@@ -495,7 +512,40 @@ function renderForeignKey(foreignKey: ForeignKey): string {
       : `(${foreignKey.referencedColumns.map((column) => quoteIdentifier(column)).join(', ')})`;
   return `${name}FOREIGN KEY (${columns}) REFERENCES ${renderTable(
     foreignKey.referencedTable,
-  )}${referenced}${renderReferentialActions(foreignKey)}`;
+  )}${referenced}${renderReferentialActions(foreignKey)}${renderDeferrability(
+    foreignKey,
+  )}${renderEnforcement(foreignKey.enforcement)}`;
+}
+
+/**
+ * The deferrability clause of a constraint: `DEFERRABLE` and `INITIALLY DEFERRED`, in that
+ * order and after every other clause. `INITIALLY DEFERRED` implies `DEFERRABLE`, so a stated
+ * `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT DEFERRABLE`
+ * being PostgreSQL's default. Shared by the primary-key, unique, and foreign-key clauses.
+ */
+function renderDeferrability(constraint: {
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}): string {
+  const deferrable = constraint.deferrable === true || constraint.initiallyDeferred === true;
+  const initiallyDeferred = constraint.initiallyDeferred === true;
+  return `${deferrable ? ' DEFERRABLE' : ''}${initiallyDeferred ? ' INITIALLY DEFERRED' : ''}`;
+}
+
+/**
+ * The `NOT VALID` / `NOT ENFORCED` tail of a constraint; absent means valid and enforced, the
+ * default. PostgreSQL reports a `NOT ENFORCED` constraint as `NOT VALID` too, but the model
+ * keeps the two states apart, and the renderer states the declaration the model carries.
+ */
+function renderEnforcement(enforcement: ConstraintEnforcement | undefined): string {
+  switch (enforcement) {
+    case undefined:
+      return '';
+    case 'not-valid':
+      return ' NOT VALID';
+    case 'not-enforced':
+      return ' NOT ENFORCED';
+  }
 }
 
 /** The stated `ON UPDATE` / `ON DELETE` actions, in that order; each is optional. */
@@ -505,23 +555,28 @@ function renderReferentialActions(foreignKey: ForeignKey): string {
   return `${onUpdate}${onDelete}`;
 }
 
-/** A unique-constraint clause, with its name when it has one. */
+/** A unique-constraint clause, with its name and attributes when it has them. */
 function renderUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
   const name =
     uniqueConstraint.name === undefined
       ? ''
       : `CONSTRAINT ${quoteIdentifier(uniqueConstraint.name)} `;
   const columns = uniqueConstraint.columns.map((column) => quoteIdentifier(column)).join(', ');
-  return `${name}UNIQUE (${columns})`;
+  return `${name}UNIQUE (${columns})${renderDeferrability(uniqueConstraint)}`;
 }
 
-/** A check-constraint clause, with its name when it has one; the expression is opaque text. */
+/**
+ * A check-constraint clause, with its name when it has one and its enforcement tail; the
+ * expression is opaque text.
+ */
 function renderCheckConstraint(checkConstraint: CheckConstraint): string {
   const name =
     checkConstraint.name === undefined
       ? ''
       : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
-  return `${name}CHECK (${checkConstraint.expression})`;
+  return `${name}CHECK (${checkConstraint.expression})${renderEnforcement(
+    checkConstraint.enforcement,
+  )}`;
 }
 
 /** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */
