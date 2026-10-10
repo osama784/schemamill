@@ -893,6 +893,61 @@ test('index drops are schema-qualified, named or synthesized, both kinds', () =>
   );
 });
 
+test('renders long unnamed drops in their server forms, index and constraints', () => {
+  // PostgreSQL stores an identifier of at most 63 bytes: a synthesized name longer than that
+  // is shrunk by `makeObjectName`, and the drop must name the stored form to apply.
+  const long = 't'.repeat(70);
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-index', table: identity(long), index: tableIndex(['a']) },
+        { kind: 'drop-primary-key', table: identity(long), primaryKey: { columns: ['id'] } },
+        {
+          kind: 'drop-unique-constraint',
+          table: identity(long),
+          uniqueConstraint: uniqueConstraint(['a']),
+        },
+        {
+          kind: 'drop-check-constraint',
+          table: identity(long),
+          checkConstraint: checkConstraint('a > 0'),
+        },
+        {
+          kind: 'drop-foreign-key',
+          table: identity(long),
+          foreignKey: foreignKey(['a'], identity('u')),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      `DROP INDEX public.${'t'.repeat(57)}_a_idx;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(58)}_pkey;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(57)}_a_key;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(55)}_a_check;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(56)}_a_fkey;`,
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders an explicit index drop name exactly as written, even over 63 bytes', () => {
+  // PostgreSQL clips an explicit identifier at parse time; the residual is documented, not
+  // fixed, so the renderer keeps the model's spelling.
+  const explicit = `${'t'.repeat(57)}_a_idx${'y'.repeat(10)}`;
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'drop-index',
+        table: identity('t'),
+        index: tableIndex(['a'], { name: explicit }),
+      }),
+    ),
+    `BEGIN;\nDROP INDEX public.${explicit};\nCOMMIT;\n`,
+  );
+});
+
 test('renders concurrent index kinds bare, one standalone group each', () => {
   const concurrentDrop: Step = {
     kind: 'drop-index-concurrently',
@@ -1051,6 +1106,99 @@ test('renders a drop and a create of one name across the polarity', () => {
       'BEGIN;',
       'DROP INDEX public.t_a_idx;',
       'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('refuses unnamed index predictions that collapse under truncation', () => {
+  // Both predictions exceed 63 bytes and collapse onto one server form; without the guard the
+  // second create would fail at apply time, or the second drop would be a no-op.
+  const hundred = 'x'.repeat(100);
+  const hundredOne = 'x'.repeat(101);
+  const server = `t_${'x'.repeat(57)}_idx`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundredOne]) },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an unnamed index on (${hundredOne}) (predicting "t_${hundredOne}_idx")`,
+  );
+});
+
+test('refuses an unnamed prediction against an explicit name equal to its server form', () => {
+  // The explicit name is exactly the server form the unnamed index predicts, so PostgreSQL
+  // would name the first index and then reject the second create.
+  const hundred = 'x'.repeat(100);
+  const server = `t_${'x'.repeat(57)}_idx`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: server }),
+          },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an index named "${server}" on (a)`,
+  );
+});
+
+test('refuses an explicit name longer than 63 bytes that clips onto a prediction', () => {
+  // The guard compares the explicit name in its server form — its first 63 bytes — so the
+  // over-long name collides with the unnamed index's truncated prediction. The stated name is
+  // already shown in full, so no prediction is repeated for it.
+  const hundred = 'x'.repeat(100);
+  const server = `t_${'x'.repeat(57)}_idx`;
+  const explicit = `${server}${'y'.repeat(10)}`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: explicit }),
+          },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an index named "${explicit}" on (a)`,
+  );
+});
+
+test('renders long unnamed names that do not collapse', () => {
+  // Different server forms: the guard must not refuse long names merely for being long.
+  const x = 'x'.repeat(100);
+  const y = 'y'.repeat(100);
+
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-index', table: identity('t'), index: tableIndex([x]) },
+        { kind: 'drop-index', table: identity('t'), index: tableIndex([y]) },
+      ),
+    ),
+    [
+      'BEGIN;',
+      `DROP INDEX public.t_${'x'.repeat(57)}_idx;`,
+      `DROP INDEX public.t_${'y'.repeat(57)}_idx;`,
       'COMMIT;',
       '',
     ].join('\n'),

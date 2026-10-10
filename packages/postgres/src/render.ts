@@ -25,6 +25,7 @@ import {
   synthesizedIndexName,
   synthesizedPrimaryKeyName,
   synthesizedUniqueConstraintName,
+  truncateIdentifier,
 } from './names.ts';
 
 /**
@@ -38,10 +39,10 @@ import {
  * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
  * guarantees this contract, and a malformed partition throws before any SQL is rendered,
  * naming the violated invariant and the offending indices. A plan that renders two index
- * statements of one polarity on one table under one name is refused with `RenderRefusalError`
- * before anything renders: the second create could not claim the name, and the second drop
- * would already be gone. A drop and a create of one name are different statements —
- * `index-changed` decomposes that way — and render. `renderSql` walks the plan's
+ * statements of one polarity on one table under one server-form name is refused with
+ * `RenderRefusalError` before anything renders: the second create could not claim the name,
+ * and the second drop would already be gone. A drop and a create of one name are different
+ * statements — `index-changed` decomposes that way — and render. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
  * a standalone group renders its statements bare. A plan with more than one group separates
  * them with one blank line; single-group output is unchanged. `create-table` is the one
@@ -96,7 +97,12 @@ import {
  * key, `<table>_<column>_…_fkey` for a foreign key, `<table>_<column>_…_key` for a unique
  * constraint, and `<table>_<column>_check` for a check constraint whose expression references
  * one column (`<table>_check` otherwise) — and `<table>_<column>_…_idx` for an unnamed index
- * drop. Index drops are schema-qualified (`DROP INDEX <schema>.<name>`): a bare index name
+ * drop. The synthesis mirrors the server's own naming, `makeObjectName` and the column
+ * addition loop, including the 63-byte identifier limit: a name longer than 63 bytes renders
+ * in the form PostgreSQL would have stored (see `names.ts`). An explicit name renders exactly
+ * as the model stores it, even longer than 63 bytes; PostgreSQL clips such a name at parse
+ * time, so the statement still resolves the stored name — a documented residual, not a fix.
+ * Index drops are schema-qualified (`DROP INDEX <schema>.<name>`): a bare index name
  * resolves through `search_path`, while `CREATE INDEX` places the index in its table's schema.
  * This is best-effort: PostgreSQL appends numbered suffixes on name collisions, which
  * cannot be known offline, and pg_dump output always carries real constraint names, so
@@ -295,12 +301,14 @@ function assertGroupsTileSteps(plan: Plan): void {
 
 /**
  * Refuses a plan that renders two index statements of one polarity on one table under one
- * resolved name — explicit for a named index, PostgreSQL's conventional name for an unnamed
- * one. Two creates would collide at apply time, and two drops would drop one name twice, so
- * the SQL cannot satisfy the plan; explicit-vs-explicit duplicates are refused too. A drop and
- * a create of one name are different statements — `index-changed` decomposes that way — and
- * render. Only same-table groups are considered: a named index's uniqueness spans its schema,
- * which the plan does not model.
+ * server-form name — an explicit name clipped by PostgreSQL's 63-byte identifier limit, the
+ * conventional prediction for an unnamed one. Two creates would collide at apply time, and
+ * two drops would drop one name twice, so the SQL cannot satisfy the plan;
+ * explicit-vs-explicit duplicates are refused too. A drop and a create of one name are
+ * different statements — `index-changed` decomposes that way — and render. Only same-table
+ * groups are considered: a named index's uniqueness spans its schema, which the plan does not
+ * model. A refusal whose unnamed claimant predicted a longer, untruncated name shows that
+ * prediction beside the claimant, so a truncation collapse is visible.
  */
 function assertIndexNamesUnique(plan: Plan): void {
   const claimed = new Map<string, IndexStatement>();
@@ -308,17 +316,28 @@ function assertIndexNamesUnique(plan: Plan): void {
     const statement = indexStatement(step);
     if (statement === undefined) continue;
     const { table, index, polarity } = statement;
-    const name = index.name ?? synthesizedIndexName(table, index);
+    const name = serverIndexName(table, index);
     const key = JSON.stringify([table.schema, table.name, polarity, name]);
     const previous = claimed.get(key);
     if (previous !== undefined) {
       throw new RenderRefusalError(
         `refusing to render: index ${polarity} on ${renderTable(table)} would share the name ` +
-          `${JSON.stringify(name)}: ${describeIndex(previous.index)} and ${describeIndex(index)}`,
+          `${JSON.stringify(name)}: ${describeIndex(previous.table, previous.index, name)} and ` +
+          `${describeIndex(table, index, name)}`,
       );
     }
     claimed.set(key, statement);
   }
+}
+
+/**
+ * The server form of an index statement's name: an explicit name clipped by PostgreSQL's
+ * 63-byte identifier limit, an unnamed one predicted by the conventional-name mirror.
+ */
+function serverIndexName(table: TableIdentity, index: Index): string {
+  return index.name === undefined
+    ? synthesizedIndexName(table, index)
+    : truncateIdentifier(index.name);
 }
 
 /** One index statement's table, index, and polarity, for the duplicate-name guard. */
@@ -363,12 +382,33 @@ function indexStatement(step: Step): IndexStatement | undefined {
   }
 }
 
-/** A refusal-message fragment naming one index by its columns and, when stated, its name. */
-function describeIndex(index: Index): string {
+/**
+ * A refusal-message fragment naming one index by its columns and, when stated, its name. When
+ * an unnamed index's conventional prediction was truncated to the shared server-form name,
+ * the fragment also shows the untruncated prediction, so the reader can see why two
+ * structurally different indexes collapsed onto one name; a stated name is already displayed,
+ * so it needs no repetition.
+ */
+function describeIndex(table: TableIdentity, index: Index, serverName: string): string {
   const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
-  return index.name === undefined
-    ? `an unnamed index on (${columns})`
-    : `an index named ${JSON.stringify(index.name)} on (${columns})`;
+  if (index.name !== undefined) {
+    return `an index named ${JSON.stringify(index.name)} on (${columns})`;
+  }
+  const description = `an unnamed index on (${columns})`;
+  const prediction = untruncatedIndexName(table, index);
+  return prediction === serverName
+    ? description
+    : `${description} (predicting ${JSON.stringify(prediction)})`;
+}
+
+/**
+ * The name an unnamed index's conventional formula assembles before PostgreSQL's 63-byte
+ * truncation — what the refusal message shows when the server form hides the prediction. It
+ * is the raw table name, each raw column, and the `idx` label joined by underscores, with no
+ * clipping at all.
+ */
+function untruncatedIndexName(table: TableIdentity, index: Index): string {
+  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
 }
 
 /** Binds `renderSql` to the `SqlRenderer` seam. */
