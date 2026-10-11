@@ -9,30 +9,132 @@ import type {
 /**
  * PostgreSQL's conventional names, the single prediction source shared by both directions of
  * the round trip: `render.ts` uses the formulas to name an unnamed constraint or index in a
- * drop, and `import.ts` uses them to recognize a server-generated name on a declaration the
- * model made unnamed and canonicalize it back to unnamed. The not-null formula is import-only:
- * rendering never synthesizes a not-null name, so it serves canonicalization alone.
+ * drop and to see name collapses in its guard, and `import.ts` uses them to recognize a
+ * server-generated name on a declaration the model made unnamed and canonicalize it back to
+ * unnamed. The not-null formula is import-only: rendering never synthesizes a not-null name,
+ * so it serves canonicalization alone.
  *
- * The prediction is deliberately best-effort. PostgreSQL truncates identifiers at 63 bytes and
- * appends collision suffixes (`_idx1`, `_key1`, …) through `makeObjectName`, and neither is
- * predictable offline, so such names stay named and still read as remove + add. The check
- * formula is lexical rather than parse-based, so an expression it misreads keeps its server
- * name — the fail-safe direction.
+ * The prediction mirrors the server's own naming — `makeObjectName` and the column addition
+ * loop — faithfully, including PostgreSQL's 63-byte identifier limit: an explicit identifier
+ * is clipped to its server form by `truncateIdentifier`, and a generated name is assembled
+ * exactly as `makeObjectName` assembles it, so a name longer than 63 bytes predicts the name
+ * PostgreSQL would store rather than an over-long one. The mirror assumes a UTF-8 database:
+ * `pg_mbcliplen` clips at character boundaries of the database encoding, and this module
+ * clips at UTF-8 boundaries; any other encoding is a named residual.
+ *
+ * Collision suffixes (`_idx1`, `_key1`, …) stay unpredictable offline: `ChooseRelationName`
+ * and `ChooseConstraintName` re-run the formula with a numbered label until the name is free
+ * in the catalog, which is not knowable from the model. Such names stay named and still read
+ * as remove + add. The check formula is lexical rather than parse-based, so an expression it
+ * misreads keeps its server name — the fail-safe direction.
  */
+
+/** PostgreSQL's `NAMEDATALEN`: a stored identifier holds at most 63 bytes plus the NUL. */
+const NAMEDATALEN = 64;
+
+/** PostgreSQL's identifier byte limit: `NAMEDATALEN - 1`. */
+const IDENTIFIER_BYTE_LIMIT = NAMEDATALEN - 1;
+
+/** The UTF-8 byte length of one Unicode code point. */
+function utf8ByteLength(character: string): number {
+  const codePoint = character.codePointAt(0)!;
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
+}
+
+/** `text`'s length in UTF-8 bytes. */
+function utf8Length(text: string): number {
+  let bytes = 0;
+  for (const character of text) bytes += utf8ByteLength(character);
+  return bytes;
+}
+
+/**
+ * The longest prefix of `text` that is at most `limit` UTF-8 bytes long, never splitting a
+ * character — the mirror of `pg_mbcliplen` under a UTF-8 database.
+ */
+function clipToBytes(text: string, limit: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const character of text) {
+    const width = utf8ByteLength(character);
+    if (bytes + width > limit) break;
+    bytes += width;
+    end += character.length;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * The server form of an explicit identifier: unchanged at 63 bytes or fewer, otherwise the
+ * longest prefix of at most 63 UTF-8 bytes that never splits a character — the mirror of
+ * `truncate_identifier` and `pg_mbcliplen` under a UTF-8 database, and idempotent. PostgreSQL
+ * clips an explicit identifier when it parses the statement, so a longer name would be stored
+ * as a different name than the statement reads; callers that must reason about the stored name
+ * — the render guard — compare through this form.
+ */
+export function truncateIdentifier(name: string): string {
+  return clipToBytes(name, IDENTIFIER_BYTE_LIMIT);
+}
+
+/**
+ * PostgreSQL's `makeObjectName`: `name1`, then `name2` when given, then `label`, the parts
+ * separated by underscores, truncated so the whole fits PostgreSQL's 63-byte identifier
+ * limit. The longer of the two name parts shrinks byte by byte until both fit (a tie shrinks
+ * `name2`), then each part is clipped at a character boundary; the label is never truncated.
+ * Both inputs are first clipped by `truncateIdentifier`, because PostgreSQL passes stored
+ * names — already at most 63 bytes — into the function.
+ */
+export function makeObjectName(name1: string, name2: string | null, label: string): string {
+  const first = truncateIdentifier(name1);
+  const second = name2 === null ? null : truncateIdentifier(name2);
+  const overhead = (second === null ? 0 : 1) + utf8Length(label) + 1;
+  const available = IDENTIFIER_BYTE_LIMIT - overhead;
+
+  let firstBytes = utf8Length(first);
+  let secondBytes = second === null ? 0 : utf8Length(second);
+  while (firstBytes + secondBytes > available) {
+    if (firstBytes > secondBytes) firstBytes -= 1;
+    else secondBytes -= 1;
+  }
+
+  const clippedFirst = clipToBytes(first, firstBytes);
+  const clippedSecond = second === null ? null : clipToBytes(second, secondBytes);
+  return `${clippedFirst}${clippedSecond === null ? '' : `_${clippedSecond}`}_${label}`;
+}
+
+/**
+ * The column-name part of a generated name, mirroring `ChooseIndexNameAddition` and
+ * `ChooseForeignKeyConstraintNameAddition`: each name appended after an underscore separator,
+ * each name pre-clipped to 63 bytes, stopping after the part that brings the running byte
+ * length to 64 or more. The result may exceed 63 bytes; `makeObjectName` shrinks it into the
+ * final name.
+ */
+export function chooseNameAddition(names: readonly string[]): string {
+  let addition = '';
+  for (const name of names) {
+    if (utf8Length(addition) > 0) addition += '_';
+    addition += truncateIdentifier(name);
+    if (utf8Length(addition) >= NAMEDATALEN) break;
+  }
+  return addition;
+}
 
 /** PostgreSQL's conventional index name for an unnamed index. */
 export function synthesizedIndexName(table: TableIdentity, index: Index): string {
-  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+  return makeObjectName(table.name, chooseNameAddition(index.columns), 'idx');
 }
 
 /** PostgreSQL's conventional primary-key name for an unnamed primary key. */
 export function synthesizedPrimaryKeyName(table: TableIdentity): string {
-  return `${table.name}_pkey`;
+  return makeObjectName(table.name, null, 'pkey');
 }
 
 /** PostgreSQL's conventional foreign-key name for an unnamed constraint. */
 export function synthesizedForeignKeyName(table: TableIdentity, foreignKey: ForeignKey): string {
-  return `${table.name}${foreignKey.columns.map((column) => `_${column}`).join('')}_fkey`;
+  return makeObjectName(table.name, chooseNameAddition(foreignKey.columns), 'fkey');
 }
 
 /** PostgreSQL's conventional unique-constraint name for an unnamed constraint. */
@@ -40,7 +142,7 @@ export function synthesizedUniqueConstraintName(
   table: TableIdentity,
   uniqueConstraint: UniqueConstraint,
 ): string {
-  return `${table.name}${uniqueConstraint.columns.map((column) => `_${column}`).join('')}_key`;
+  return makeObjectName(table.name, chooseNameAddition(uniqueConstraint.columns), 'key');
 }
 
 /**
@@ -50,7 +152,7 @@ export function synthesizedUniqueConstraintName(
  * not-null fact renders as plain `NOT NULL`.
  */
 export function synthesizedNotNullName(table: string, column: string): string {
-  return `${table}_${column}_not_null`;
+  return makeObjectName(table, column, 'not_null');
 }
 
 /**
@@ -62,7 +164,7 @@ export function synthesizedCheckConstraintName(
   checkConstraint: CheckConstraint,
 ): string {
   const column = checkExpressionColumn(checkConstraint.expression);
-  return column === undefined ? `${table.name}_check` : `${table.name}_${column}_check`;
+  return makeObjectName(table.name, column ?? null, 'check');
 }
 
 /**

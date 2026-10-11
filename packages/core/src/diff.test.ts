@@ -1388,27 +1388,248 @@ test('a foreign key onDelete change reports before and after', () => {
   ]);
 });
 
-test('referenced columns empty and present differ', () => {
-  const parent = identity('parent');
-  const baseline = model(
-    table('t', { columns: [column('a')], foreignKeys: [foreignKey(['a'], parent)] }),
-  );
-  const target = model(
+test('both sides omitting referenced columns compare equal through a primary-key change', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (): Table =>
     table('t', {
       columns: [column('a')],
-      foreignKeys: [foreignKey(['a'], parent, { referencedColumns: ['id'] })],
-    }),
-  );
+      foreignKeys: [foreignKey(['a'], identity('parent'))],
+    });
 
+  // Both declarations omit the list, so the pair stays equal and out of the diff even though the
+  // referenced key moved: the dependent-foreign-key synthesis re-points it on the new key.
+  assertDiff(
+    model(parent({ name: 'parent_pkey', columns: ['id'] }), child()),
+    model(parent({ name: 'parent_pkey2', columns: ['legacy_id'] }), child()),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('parent'),
+        changes: [
+          {
+            kind: 'primary-key-changed',
+            before: { name: 'parent_pkey', columns: ['id'] },
+            after: { name: 'parent_pkey2', columns: ['legacy_id'] },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('an empty referenced-column list equals an explicit list of its own model primary key', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The declaration omits the list and a dump states the referenced table's primary key; the
+  // equivalence holds in either direction.
+  assertDiff(model(parent(), child([])), model(parent(), child(['id'])), []);
+  assertDiff(model(parent(), child(['id'])), model(parent(), child([])), []);
+});
+
+test('the omitting side resolves against its own model primary key', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The target omits the list and its own model's key is `id`, so the baseline's explicit `id`
+  // list is equivalent; the baseline's `legacy_id` key must not decide the comparison.
+  assertDiff(
+    model(parent({ name: 'parent_pkey', columns: ['legacy_id'] }), child(['id'])),
+    model(parent({ name: 'parent_pkey', columns: ['id'] }), child([])),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('parent'),
+        changes: [
+          {
+            kind: 'primary-key-changed',
+            before: { name: 'parent_pkey', columns: ['legacy_id'] },
+            after: { name: 'parent_pkey', columns: ['id'] },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('an explicit list matching only the other side primary key stays a change', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+  const baseline = model(parent({ name: 'parent_pkey', columns: ['id'] }), child([]));
+  const target = model(parent({ name: 'parent_pkey2', columns: ['new_id'] }), child(['new_id']));
+
+  // The omission means the baseline key `id`; the explicit `new_id` list is the target's own key,
+  // so the pair reads changed and the plan replaces it instead of setting it aside.
   assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('parent'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 'parent_pkey', columns: ['id'] },
+          after: { name: 'parent_pkey2', columns: ['new_id'] },
+        },
+      ],
+    },
     {
       kind: 'table-changed',
       table: identity('t'),
       changes: [
         {
           kind: 'foreign-key-changed',
-          before: foreignKey(['a'], parent),
-          after: foreignKey(['a'], parent, { referencedColumns: ['id'] }),
+          before: foreignKey(['a'], identity('parent')),
+          after: foreignKey(['a'], identity('parent'), { referencedColumns: ['new_id'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('the equivalence compares the primary key column order', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [
+        column('a', { type: 'integer', notNull: true }),
+        column('b', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['a', 'b'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('x')],
+      foreignKeys: [foreignKey(['x'], identity('parent'), { referencedColumns })],
+    });
+
+  assertDiff(model(parent(), child([])), model(parent(), child(['a', 'b'])), []);
+  assertDiff(model(parent(), child([])), model(parent(), child(['b', 'a'])), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['x'], identity('parent')),
+          after: foreignKey(['x'], identity('parent'), { referencedColumns: ['b', 'a'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('an unresolved referenced-table primary key keeps an omission and a list unequal', () => {
+  const shape = (parent: Table | undefined, referencedColumns: readonly string[]): Model =>
+    model(
+      ...(parent === undefined ? [] : [parent]),
+      table('t', {
+        columns: [column('a')],
+        foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+      }),
+    );
+  const change: Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], identity('parent')),
+          after: foreignKey(['a'], identity('parent'), { referencedColumns: ['id'] }),
+        },
+      ],
+    },
+  ];
+
+  // The referenced table is absent: the omitted list has nothing to resolve to.
+  assertDiff(shape(undefined, []), shape(undefined, ['id']), change);
+  // The table exists but states no primary key: the omission is still unresolved.
+  const keyless = table('parent', { columns: [column('id', { type: 'integer' })] });
+  assertDiff(shape(keyless, []), shape(keyless, ['id']), change);
+});
+
+test('an omission resolves against its own referenced table, not another primary key', () => {
+  const parent = (name: string, keyColumn: string): Table =>
+    table(name, {
+      columns: [column(keyColumn, { type: 'integer', notNull: true })],
+      primaryKey: { name: `${name}_pkey`, columns: [keyColumn] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent_a'), { referencedColumns })],
+    });
+
+  // `other` is indexed after `parent_a`, so a key that ignored the table identity would resolve
+  // the omission to `other`'s primary key and read the explicit `a_id` list as a change.
+  const baseline = model(parent('parent_a', 'a_id'), child([]), parent('other', 'o_id'));
+  const target = model(parent('parent_a', 'a_id'), child(['a_id']), parent('other', 'o_id'));
+
+  assertDiff(baseline, target, []);
+});
+
+test('an explicit list the omitting side does not resolve to stays a change', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The target omits the list and its own key is `id`; the baseline's explicit `legacy_id`
+  // does not match, so the pair reads changed instead of collapsing into the omission.
+  assertDiff(model(parent(), child(['legacy_id'])), model(parent(), child([])), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], identity('parent'), { referencedColumns: ['legacy_id'] }),
+          after: foreignKey(['a'], identity('parent')),
         },
       ],
     },

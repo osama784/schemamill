@@ -2363,6 +2363,54 @@ test('a renamed primary key sets aside a foreign key that omits its referenced c
   simulate(baseline, target);
 });
 
+test('a foreign key whose referenced columns change across a primary-key change is set aside once', () => {
+  const before = foreignKey(['pid'], identity('parent'), { name: 'child_pid_fkey' });
+  const after = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['new_id'],
+  });
+  const baseline = model(
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+  );
+  const target = model(
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey2', columns: ['new_id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+  );
+
+  // The baseline omission resolves to `id` while the target states `new_id`, so the pair is the
+  // diff's own replacement; the structural key differs, so the primary-key change's dependent
+  // synthesis does not set aside a second pair.
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey2', columns: ['new_id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: after },
+  ]);
+  simulate(baseline, target);
+});
+
 test('primary-key dependents are set aside in identity order, including a self-reference', () => {
   const aBKey = foreignKey(['b_id'], identity('c'), {
     name: 'a_b_id_fkey',
