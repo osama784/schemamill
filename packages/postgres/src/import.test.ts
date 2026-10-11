@@ -682,6 +682,30 @@ test('reads not-null constraints in every shape and strips only the generated na
   assert.deepEqual(diagnostics, []);
 });
 
+test('canonicalizes a truncated generated not-null name and keeps a collision-suffixed one', async () => {
+  // The `_not_null` label leaves a 53-byte budget beside the 1-byte table, so the 60-byte
+  // column gives up 8 bytes; the collision suffix gives up 9 instead. PG 18's live name is the
+  // same formula, and the strip is unit-only here.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(52)}_not_null`;
+  const suffixed = `t_${'w'.repeat(51)}_not_null1`;
+  const cases = [
+    [generated, { name: longColumn, type: 'integer', notNull: true }],
+    [suffixed, { name: longColumn, type: 'integer', notNull: true, notNullName: suffixed }],
+  ] as const;
+
+  for (const [name, expected] of cases) {
+    const dump = [
+      `CREATE TABLE public.t (${longColumn} integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT ${name} NOT NULL ${longColumn};`,
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    // Only the exact server form strips; the collision-suffixed name stays named.
+    assert.deepEqual(model.tables[0]?.columns, [expected]);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
 test('merges duplicate not-null declarations in either order, flagging only real conflicts', async () => {
   // Unnamed ∪ named → named, whatever the order.
   const unnamedFirst = [
@@ -740,6 +764,27 @@ test('merges duplicate not-null declarations in either order, flagging only real
       diagnostics.map((diagnostic) => diagnostic.message),
       ['dropped additional not-null constraint on public.t.a from public.t'],
     );
+  }
+});
+
+test('merges a truncated generated not-null declaration with an unnamed one, whatever the order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(52)}_not_null`;
+  const declarations = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} NOT NULL ${longColumn};`,
+    `ALTER TABLE ONLY public.t ADD NOT NULL ${longColumn};`,
+  ];
+
+  for (const order of [declarations, [...declarations].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+
+    // The truncated generated name reads as unnamed for the one-fact comparison, so the
+    // duplicate collapses and the strip leaves no name in either order.
+    assert.deepEqual(model.tables[0]?.columns, [
+      { name: longColumn, type: 'integer', notNull: true },
+    ]);
+    assert.deepEqual(diagnostics, []);
   }
 });
 
@@ -885,6 +930,32 @@ test('canonicalizes only the exact conventional index name', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('canonicalizes a truncated generated index name and keeps a collision-suffixed one', async () => {
+  // `makeObjectName` spends 4 bytes on `_idx` and its separator, so the 60-byte column gives
+  // up 3 bytes to fit 63: the server form is `t_` plus 57 bytes plus `_idx`. A collision suffix
+  // grows the label and the column part gives up 4 bytes instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_idx`;
+  const suffixed = `t_${'w'.repeat(56)}_idx1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `CREATE INDEX ${generated} ON public.t USING btree (${longColumn});`,
+    `CREATE INDEX ${suffixed} ON public.t USING btree (${longColumn});`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name is beyond the offline
+  // prediction and stays named (no unnamed entry shares its structure, so no guard fires).
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: [longColumn] },
+    { name: suffixed, unique: false, columns: [longColumn] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
 test('keeps a conventional name when an unnamed twin exists, whatever the statement order', async () => {
   const statements = [
     `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
@@ -903,6 +974,31 @@ test('keeps a conventional name when an unnamed twin exists, whatever the statem
 
     // The guard keeps the name on the conventional entry: exactly one unnamed structural
     // entry survives in either order, and the result array is identical.
+    assert.deepEqual(table.indexes, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a truncated conventional index name when an unnamed twin exists, whatever the statement order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_idx`;
+  const statements = [
+    `CREATE INDEX ${generated} ON public.t USING btree (${longColumn});`,
+    `CREATE INDEX ON public.t USING btree (${longColumn});`,
+  ];
+  const expected = [
+    { unique: false, columns: [longColumn] },
+    { name: generated, unique: false, columns: [longColumn] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the truncated conventional entry: exactly one unnamed
+    // structural entry survives in either order, as for the short-name form.
     assert.deepEqual(table.indexes, expected);
     assert.deepEqual(diagnostics, []);
   }
@@ -943,6 +1039,28 @@ test('canonicalizes the conventional primary-key name', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('canonicalizes a truncated generated primary-key name', async () => {
+  // A 63-byte table name leaves `_pkey` its 5 bytes only after the table part gives up 5 bytes,
+  // so the server names the primary key with a 58-byte table part. A name one byte short of the
+  // server form is outside the formula and stays named.
+  const longTable = 't'.repeat(63);
+  const generated = `${'t'.repeat(58)}_pkey`;
+  const nearMissTable = 'u'.repeat(63);
+  const nearMiss = `${'u'.repeat(57)}_pkey`;
+  const dump = [
+    `CREATE TABLE public.${longTable} (c integer, CONSTRAINT ${generated} PRIMARY KEY (c));`,
+    `CREATE TABLE public.${nearMissTable} (c integer, CONSTRAINT ${nearMiss} PRIMARY KEY (c));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const primaryKeyOf = (name: string) =>
+    model.tables.find((candidate) => candidate.name === name)?.primaryKey;
+
+  assert.deepEqual(primaryKeyOf(longTable), { columns: ['c'] });
+  assert.deepEqual(primaryKeyOf(nearMissTable), { name: nearMiss, columns: ['c'] });
+  assert.deepEqual(diagnostics, []);
+});
+
 test('canonicalizes only the exact conventional unique-constraint name', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
@@ -968,6 +1086,30 @@ test('canonicalizes only the exact conventional unique-constraint name', async (
     { columns: ['a', 'b'] },
     { name: 't_ab_key', columns: ['a', 'b'] },
     { name: 't_b_a_key', columns: ['a', 'b'] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated unique-constraint name and keeps a collision-suffixed one', async () => {
+  // The `_key` label leaves a 58-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 3 bytes; the collision suffix gives up 4 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_key`;
+  const suffixed = `t_${'w'.repeat(56)}_key1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} UNIQUE (${longColumn});`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} UNIQUE (${longColumn});`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: [longColumn] },
+    { name: suffixed, columns: [longColumn] },
   ]);
   assert.deepEqual(diagnostics, []);
 });
@@ -1031,6 +1173,37 @@ test('canonicalizes only the exact conventional foreign-key name', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('canonicalizes a truncated generated foreign-key name and keeps a collision-suffixed one', async () => {
+  // The `_fkey` label leaves a 57-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 4 bytes; the collision suffix gives up 5 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(56)}_fkey`;
+  const suffixed = `t_${'w'.repeat(55)}_fkey1`;
+  const parent = { schema: 'public', name: 'parent' };
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} FOREIGN KEY (${longColumn}) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} FOREIGN KEY (${longColumn}) REFERENCES public.parent(id);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.foreignKeys, [
+    { columns: [longColumn], referencedTable: parent, referencedColumns: ['id'] },
+    {
+      name: suffixed,
+      columns: [longColumn],
+      referencedTable: parent,
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
 test('canonicalizes only the exact conventional check-constraint name', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
@@ -1062,6 +1235,30 @@ test('canonicalizes only the exact conventional check-constraint name', async ()
   assert.deepEqual(diagnostics, []);
 });
 
+test('canonicalizes a truncated generated check-constraint name and keeps a collision-suffixed one', async () => {
+  // The `_check` label leaves a 56-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 5 bytes; the collision suffix gives up 6 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(55)}_check`;
+  const suffixed = `t_${'w'.repeat(54)}_check1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} CHECK (${longColumn} > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} CHECK (${longColumn} > 0);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.checkConstraints, [
+    { expression: `${longColumn} > 0` },
+    { name: suffixed, expression: `${longColumn} > 0` },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
 test('keeps a conventional unique name when an unnamed twin exists, whatever the statement order', async () => {
   const statements = [
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
@@ -1077,6 +1274,28 @@ test('keeps a conventional unique name when an unnamed twin exists, whatever the
 
     // The guard keeps the name on the conventional entry: exactly one unnamed entry survives
     // in either order, so no duplicate unnamed entry is manufactured.
+    assert.deepEqual(table.uniqueConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a truncated conventional unique name when an unnamed twin exists, whatever the statement order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_key`;
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} UNIQUE (${longColumn});`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (${longColumn});`,
+  ];
+  const expected = [{ columns: [longColumn] }, { name: generated, columns: [longColumn] }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the truncated conventional entry: exactly one unnamed
+    // structural entry survives in either order.
     assert.deepEqual(table.uniqueConstraints, expected);
     assert.deepEqual(diagnostics, []);
   }
