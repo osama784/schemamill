@@ -1539,11 +1539,8 @@ function translateAlterTableCommand(
 
 /**
  * Imports a standalone `CREATE [UNIQUE] INDEX` onto an already imported table, or skips and
- * names the whole statement when any part of it falls outside the minimal envelope. The
- * envelope is a plain btree column list: no expression element, partial `WHERE`, `INCLUDE`,
- * tablespace, storage parameters, `NULLS NOT DISTINCT`, non-btree access method, or
- * non-default ordering, operator class, collation, or NULLS ordering. An index is never
- * partially imported.
+ * names the whole statement when any part of it falls outside the minimal envelope. An index
+ * is never partially imported.
  */
 function translateCreateIndex(
   statement: ParsedStatement,
@@ -1564,61 +1561,78 @@ function translateCreateIndex(
     return;
   }
 
-  const skip = (description: string): void => {
-    diagnostics.push(skipStatement(statement, `CREATE INDEX ${object} (${description})`, object));
-  };
-
-  if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
-    skip(`access method ${create.accessMethod}`);
+  const envelope = classifyIndexEnvelope(create);
+  if (envelope.kind === 'skip') {
+    diagnostics.push(
+      skipStatement(statement, `CREATE INDEX ${object} (${envelope.reason})`, object),
+    );
     return;
+  }
+
+  const index: Mutable<Index> = { unique: envelope.unique, columns: envelope.columns };
+  if (create.idxname !== undefined) index.name = create.idxname;
+  if (create.concurrent === true) index.concurrently = true;
+  attachIndex(draft, index);
+}
+
+/**
+ * The envelope classification of a parsed `CREATE [UNIQUE] INDEX`: the model index's
+ * structure — `unique` and the ordered columns, never the name or `concurrently`, which the
+ * callers own — or the reason the statement falls outside the minimal envelope.
+ */
+export type IndexEnvelope =
+  | { readonly kind: 'index'; readonly unique: boolean; readonly columns: string[] }
+  | { readonly kind: 'skip'; readonly reason: string };
+
+/**
+ * Classifies a parsed `CREATE [UNIQUE] INDEX` against the minimal envelope: a plain btree
+ * column list, with no expression element, partial `WHERE`, `INCLUDE`, tablespace, storage
+ * parameters, `NULLS NOT DISTINCT`, exclusion operators, non-btree access method, or
+ * non-default ordering, operator class, collation, or NULLS ordering. The single
+ * acceptance-rule source for both inbound paths: the dump importer's `translateCreateIndex`
+ * and the live-catalog mapper classify through this function, so a definition the importer
+ * rejects is never modeled from a catalog. Exported for `catalog.ts`; deliberately not
+ * re-exported from `index.ts`.
+ */
+export function classifyIndexEnvelope(create: IndexStmt): IndexEnvelope {
+  if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
+    return { kind: 'skip', reason: `access method ${create.accessMethod}` };
   }
   if ((create.indexIncludingParams ?? []).length > 0) {
-    skip('INCLUDE');
-    return;
+    return { kind: 'skip', reason: 'INCLUDE' };
   }
   if (create.whereClause !== undefined) {
-    skip('partial WHERE');
-    return;
+    return { kind: 'skip', reason: 'partial WHERE' };
   }
   if ((create.options ?? []).length > 0) {
-    skip('storage parameters');
-    return;
+    return { kind: 'skip', reason: 'storage parameters' };
   }
   if (create.tableSpace !== undefined) {
-    skip('tablespace');
-    return;
+    return { kind: 'skip', reason: 'tablespace' };
   }
   if (create.nulls_not_distinct === true) {
-    skip('NULLS NOT DISTINCT');
-    return;
+    return { kind: 'skip', reason: 'NULLS NOT DISTINCT' };
   }
   if ((create.excludeOpNames ?? []).length > 0) {
-    skip('exclusion operators');
-    return;
+    return { kind: 'skip', reason: 'exclusion operators' };
   }
 
   const columns: string[] = [];
   for (const element of create.indexParams ?? []) {
     if (!('IndexElem' in element)) {
-      skip('unrecognized index element');
-      return;
+      return { kind: 'skip', reason: 'unrecognized index element' };
     }
     const column = indexColumn(element.IndexElem);
     if (column === undefined) {
-      skip(indexElementDescription(element.IndexElem));
-      return;
+      return { kind: 'skip', reason: indexElementDescription(element.IndexElem) };
     }
     columns.push(column);
   }
   if (columns.length === 0) {
-    skip('no index columns');
-    return;
+    return { kind: 'skip', reason: 'no index columns' };
   }
 
-  const index: Mutable<Index> = { unique: create.unique === true, columns };
-  if (create.idxname !== undefined) index.name = create.idxname;
-  if (create.concurrent === true) index.concurrently = true;
-  attachIndex(draft, index);
+  return { kind: 'index', unique: create.unique === true, columns };
 }
 
 /**
@@ -2424,8 +2438,12 @@ function getOrCreateTable(
   return draft;
 }
 
-/** The duplicate guard's key: `unique` and the ordered columns, the name excluded. */
-function indexStructureKey(index: Index): string {
+/**
+ * The duplicate guard's key: `unique` and the ordered columns, the name excluded. Shared with
+ * the live-catalog mapper's name canonicalization, so both inbound paths guard on the same
+ * structure; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
+ */
+export function indexStructureKey(index: Index): string {
   return JSON.stringify([index.unique, index.columns]);
 }
 

@@ -34,14 +34,17 @@ import type {
   CatalogReader,
   Column,
   Diagnostic,
+  Index,
   Model,
   PrimaryKey,
   ReadResult,
   Table,
   TableIdentity,
 } from '@schemamill/core';
+import { parse, type IndexStmt } from 'libpg-query';
 
-import { synthesizedPrimaryKeyName } from './names.ts';
+import { classifyIndexEnvelope, indexStructureKey } from './import.ts';
+import { synthesizedIndexName, synthesizedPrimaryKeyName } from './names.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -52,11 +55,20 @@ const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
 
 /**
- * The one read: a single `json` document with the tables, columns, and primary keys of every
- * user schema, system schemas excluded. Tables carry what the deferred-states pass needs
- * (`relkind`, `relispartition`, `relpersistence`); columns are read for ordinary tables only,
- * in attribute order, with the type spelling `format_type` gives; primary-key rows carry the
- * constraint name, the key position, and the column name.
+ * The one read: a single `json` document with the tables, columns, primary keys, and indexes
+ * of every user schema, system schemas excluded. Tables carry what the deferred-states pass
+ * needs (`relkind`, `relispartition`, `relpersistence`); columns are read for ordinary tables
+ * only, in attribute order, with the type spelling `format_type` gives; primary-key rows carry
+ * the constraint name, the key position, and the column name; index rows are read for ordinary
+ * tables only, one row per index, carrying the table identification, the stored name, the
+ * `pg_get_indexdef` definition, the valid and ready flags, and the tablespace name (null for
+ * the default). Constraint-backed indexes are excluded in SQL: a primary-key, unique, or
+ * exclusion constraint consumes the index its `conindid` names, mirroring the dump importer's
+ * `USING INDEX` rule, and the `conrelid` guard keeps a foreign key's `conindid` — the
+ * referenced table's index — from matching. The `indexes` predicate matches the columns'
+ * (`relkind = 'r' AND NOT relispartition`), so no index row can orphan against the mapped
+ * tables. Every section orders deterministically for the payload, but the mapper does not
+ * depend on row order.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -133,6 +145,36 @@ SELECT json_build_object(
         AND namespace.nspname NOT LIKE 'pg\\_%'
       ORDER BY namespace.nspname, relation.relname, key_column.ordinality
     ) AS key_row
+  ), '[]'::json),
+  'indexes', COALESCE((
+    SELECT json_agg(row_to_json(index_row))
+    FROM (
+      SELECT
+        namespace.nspname AS schema,
+        relation.relname AS "tableName",
+        index_relation.relname AS "indexName",
+        pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+        index.indisvalid AS valid,
+        index.indisready AS ready,
+        tablespace.spcname AS tablespace
+      FROM pg_catalog.pg_index AS index
+      JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index.indexrelid
+      JOIN pg_catalog.pg_class AS relation ON relation.oid = index.indrelid
+      JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      LEFT JOIN pg_catalog.pg_constraint AS c ON (
+        index.indrelid = c.conrelid
+        AND index.indexrelid = c.conindid
+        AND c.contype IN ('p', 'u', 'x')
+      )
+      LEFT JOIN pg_catalog.pg_tablespace AS tablespace
+        ON tablespace.oid = index_relation.reltablespace
+      WHERE relation.relkind = 'r'
+        AND NOT relation.relispartition
+        AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND namespace.nspname NOT LIKE 'pg\\_%'
+        AND c.oid IS NULL
+      ORDER BY namespace.nspname, relation.relname, index_relation.relname
+    ) AS index_row
   ), '[]'::json)
 ) AS document
 `.trim();
@@ -224,16 +266,36 @@ interface PrimaryKeyRow {
 }
 
 /**
+ * One `indexes` row of the payload after validation: the table identification, the stored
+ * index name, the state the mapper filters on, and the parsed definition the envelope
+ * classification runs on. The definition parses during row validation, before any grouping, so
+ * an unparseable one is a contract throw carrying the row's payload path.
+ */
+interface IndexRow {
+  readonly schema: string;
+  readonly tableName: string;
+  readonly indexName: string;
+  readonly valid: boolean;
+  readonly ready: boolean;
+  readonly tablespace: string | null;
+  readonly create: IndexStmt;
+}
+
+/**
  * The pure mapper: a validated payload — the `SELECT`'s parsed `json` document — to the
  * canonical model and its diagnostics. Tables come back in canonical order (schema, then name,
  * plain string comparison) and columns in attribute order regardless of payload order, since
  * the model's ordering contract is the mapper's, not SQL's collation's. Contract violations
  * throw; only the deferred catalog states become diagnostics, in canonical table order with
- * table-level flags before a table's column flags and columns in attribute order.
+ * table-level flags before a table's column flags, columns in attribute order, and index
+ * findings after them in stored-name order. Index definitions parse through libpg-query, so the
+ * mapper is async; its output does not depend on payload row order: index rows sort by stored
+ * name before the conventional-name strip, and the entries stable-sort by `name ?? ''` exactly
+ * as `finalizeTable` sorts the importer's.
  */
-export function mapCatalog(payload: unknown): ReadResult<Model, Diagnostic> {
+export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Diagnostic>> {
   const document = expectObject(payload, 'catalog payload');
-  expectFields(document, 'catalog payload', ['tables', 'columns', 'primaryKeys']);
+  expectFields(document, 'catalog payload', ['tables', 'columns', 'primaryKeys', 'indexes']);
   const tables = expectArray(document, 'tables', 'catalog payload').map((row, index) =>
     parseTableRow(row, `catalog payload.tables[${index}]`),
   );
@@ -243,6 +305,10 @@ export function mapCatalog(payload: unknown): ReadResult<Model, Diagnostic> {
   const keyRows = expectArray(document, 'primaryKeys', 'catalog payload').map((row, index) =>
     parsePrimaryKeyRow(row, `catalog payload.primaryKeys[${index}]`),
   );
+  const indexRows: IndexRow[] = [];
+  for (const [index, row] of expectArray(document, 'indexes', 'catalog payload').entries()) {
+    indexRows.push(await parseIndexRow(row, `catalog payload.indexes[${index}]`));
+  }
 
   const tablesByKey = new Map<string, TableRow>();
   for (const table of tables) {
@@ -318,6 +384,24 @@ export function mapCatalog(payload: unknown): ReadResult<Model, Diagnostic> {
     tableKeys.push(keyRow);
   }
 
+  const indexesByTable = new Map<string, IndexRow[]>();
+  const indexIdentities = new Set<string>();
+  for (const row of indexRows) {
+    const key = tableKey(row.schema, row.tableName);
+    requireOrdinaryTable(tablesByKey, key, row.schema, row.tableName, 'index row');
+    const identityKey = tableKey(row.schema, row.indexName);
+    if (indexIdentities.has(identityKey)) {
+      throw new Error(`catalog payload: duplicate index "${row.schema}.${row.indexName}"`);
+    }
+    indexIdentities.add(identityKey);
+    const tableIndexes = indexesByTable.get(key);
+    if (tableIndexes === undefined) {
+      indexesByTable.set(key, [row]);
+      continue;
+    }
+    tableIndexes.push(row);
+  }
+
   const diagnostics: Diagnostic[] = [];
   const modelTables: Table[] = [];
   for (const row of [...tablesByKey.values()].sort(compareTableRows)) {
@@ -350,6 +434,46 @@ export function mapCatalog(payload: unknown): ReadResult<Model, Diagnostic> {
     }
 
     const primaryKey = primaryKeyFor(identity, keysByTable.get(tableKey(row.schema, row.name)));
+
+    const tableIndexRows = [...(indexesByTable.get(tableKey(row.schema, row.name)) ?? [])].sort(
+      compareIndexRowNames,
+    );
+    const namedIndexes: NamedIndex[] = [];
+    for (const indexRow of tableIndexRows) {
+      const indexObject = `${indexRow.schema}.${indexRow.indexName}`;
+      if (!indexRow.valid || !indexRow.ready) {
+        diagnostics.push({
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: indexObject,
+          message: `index ${indexObject} is not valid and ready; invalid indexes are not represented yet`,
+        });
+        continue;
+      }
+      const envelope = classifyIndexEnvelope(indexRow.create);
+      if (envelope.kind === 'skip') {
+        diagnostics.push({
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: indexObject,
+          message: `skipped CREATE INDEX ${indexObject} (${envelope.reason})`,
+        });
+        continue;
+      }
+      if (indexRow.tablespace !== null) {
+        diagnostics.push({
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: indexObject,
+          message: `index ${indexObject} is on tablespace ${indexRow.tablespace}; tablespaces are not represented yet`,
+        });
+      }
+      namedIndexes.push({
+        indexName: indexRow.indexName,
+        index: { unique: envelope.unique, columns: envelope.columns },
+      });
+    }
+
     modelTables.push({
       schema: row.schema,
       name: row.name,
@@ -362,7 +486,7 @@ export function mapCatalog(payload: unknown): ReadResult<Model, Diagnostic> {
       foreignKeys: [],
       uniqueConstraints: [],
       checkConstraints: [],
-      indexes: [],
+      indexes: canonicalizeIndexNames(identity, namedIndexes).sort(compareIndexes),
     });
   }
 
@@ -444,10 +568,64 @@ function tableKey(schema: string, name: string): string {
   return `${schema}\u0000${name}`;
 }
 
+/** One classified catalog index: the stored index name beside the model index's structure. */
+export interface NamedIndex {
+  readonly indexName: string;
+  readonly index: Index;
+}
+
+/**
+ * Canonicalizes server-generated index names back to unnamed, mirroring the dump importer's
+ * `canonicalizeIndexNames`: a stored name equal to `synthesizedIndexName` — the server form,
+ * PostgreSQL's 63-byte truncation included — is stripped, unless an unnamed entry with the
+ * same structure key already exists, in which case the name is kept. Rows must arrive in
+ * stored-name order; stripped entries keep that order among themselves, and the caller
+ * stable-sorts by `name ?? ''` exactly as `finalizeTable` does. In a live catalog every row
+ * arrives named and same-schema index names are unique, so two strippable names cannot
+ * collide: the guard is unreachable there, kept for parity with the importer and pinned by
+ * the unit suite. Exported for the unit suite alongside `mapCatalog`; deliberately not
+ * re-exported from `index.ts`.
+ */
+export function canonicalizeIndexNames(
+  identity: TableIdentity,
+  rows: readonly NamedIndex[],
+): Index[] {
+  const seen = new Set<string>();
+  const indexes: Index[] = [];
+  for (const row of rows) {
+    const structure: { name?: string; unique: boolean; columns: string[] } = {
+      unique: row.index.unique,
+      columns: [...row.index.columns],
+    };
+    const key = indexStructureKey(structure);
+    if (row.indexName === synthesizedIndexName(identity, structure) && !seen.has(key)) {
+      seen.add(key);
+    } else {
+      structure.name = row.indexName;
+    }
+    indexes.push(structure);
+  }
+  return indexes;
+}
+
 /** Canonical table order: schema, then name, plain string comparison. */
 function compareTableRows(left: TableRow, right: TableRow): number {
   if (left.schema !== right.schema) return left.schema < right.schema ? -1 : 1;
   if (left.name !== right.name) return left.name < right.name ? -1 : 1;
+  return 0;
+}
+
+/** Stored index-name order, the order the strip pass walks; plain string comparison. */
+function compareIndexRowNames(left: IndexRow, right: IndexRow): number {
+  if (left.indexName !== right.indexName) return left.indexName < right.indexName ? -1 : 1;
+  return 0;
+}
+
+/** Canonical index order: `name ?? ''`, plain string comparison, as `finalizeTable` sorts. */
+function compareIndexes(left: Index, right: Index): number {
+  const leftName = left.name ?? '';
+  const rightName = right.name ?? '';
+  if (leftName !== rightName) return leftName < rightName ? -1 : 1;
   return 0;
 }
 
@@ -501,6 +679,17 @@ function expectBoolean(row: Record<string, unknown>, path: string, field: string
     throw new Error(`${path}.${field} must be a boolean`);
   }
   return value;
+}
+
+/** The field as a string or null, or a contract throw. */
+function expectNullableString(
+  row: Record<string, unknown>,
+  path: string,
+  field: string,
+): string | null {
+  const value = row[field];
+  if (value === null || typeof value === 'string') return value;
+  throw new Error(`${path}.${field} must be a string or null`);
 }
 
 /** The field as an integer of at least `minimum`, or a contract throw. */
@@ -586,4 +775,43 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     ordinal: expectInteger(row, path, 'ordinal', 1),
     attname: expectString(row, path, 'attname'),
   };
+}
+
+/** An `indexes` row, validated field by field, with its definition parsed. */
+async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
+  const row = expectObject(value, path);
+  expectFields(row, path, [
+    'schema',
+    'tableName',
+    'indexName',
+    'definition',
+    'valid',
+    'ready',
+    'tablespace',
+  ]);
+  const definition = expectString(row, path, 'definition');
+  return {
+    schema: expectString(row, path, 'schema'),
+    tableName: expectString(row, path, 'tableName'),
+    indexName: expectString(row, path, 'indexName'),
+    valid: expectBoolean(row, path, 'valid'),
+    ready: expectBoolean(row, path, 'ready'),
+    tablespace: expectNullableString(row, path, 'tablespace'),
+    create: await parseIndexDefinition(definition, path),
+  };
+}
+
+/** The `IndexStmt` one definition parses to, or a contract throw. */
+async function parseIndexDefinition(definition: string, path: string): Promise<IndexStmt> {
+  let result;
+  try {
+    result = await parse(definition);
+  } catch (error) {
+    throw new Error(`${path}.definition is not parseable: ${reason(error)}`, { cause: error });
+  }
+  const statement = result.stmts?.[0]?.stmt;
+  if (result.stmts?.length !== 1 || statement === undefined || !('IndexStmt' in statement)) {
+    throw new Error(`${path}.definition is not a CREATE INDEX statement`);
+  }
+  return statement.IndexStmt;
 }
