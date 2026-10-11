@@ -3,24 +3,29 @@
  *
  * The transport is the `psql` binary — the live harness's choice, so no client-library
  * dependency is added. One `-c` batch carries one `SELECT` returning one `json` document with
- * the `tables`, `columns`, and `primaryKeys` sections; `psql` runs a single `-c` batch as one
- * implicit transaction, so the three sections share one snapshot. The child environment's
- * `PGOPTIONS` sets `search_path=''` — the congruence with `pg_dump`, which reads the catalog
- * under the same empty path, so `format_type`'s spelling matches the dumped DDL — and
- * `default_transaction_read_only=on` as read-only posture. The read itself is the single
- * `SELECT`, so nothing about it writes; PostgreSQL 13 or newer is assumed (the harness's own
- * floor). `attcompression` exists only from PostgreSQL 14, so it is read through the row's
- * `jsonb` form: on 13 the key is absent and the column reports no explicit compression.
+ * the `tables`, `columns`, `primaryKeys`, and `indexes` sections; `psql` runs a single `-c`
+ * batch as one implicit transaction, so the four sections share one snapshot. The child
+ * environment's `PGOPTIONS` sets `search_path=''` — the congruence with `pg_dump`, which
+ * reads the catalog under the same empty path, so `format_type`'s spelling matches the dumped
+ * DDL — and `default_transaction_read_only=on` as read-only posture. The read itself is the
+ * single `SELECT`, so nothing about it writes; PostgreSQL 13 or newer is assumed (the
+ * harness's own floor). `attcompression` exists only from PostgreSQL 14, so it is read through
+ * the row's `jsonb` form: on 13 the key is absent and the column reports no explicit
+ * compression.
  *
  * Failure handling is a split. Transport failures (spawn error, non-zero exit, unparseable
  * JSON output) and any violation of the `SELECT`'s own payload contract — a missing or
- * wrong-typed field, an unknown or duplicate relation, orphan column or primary-key rows —
- * throw an `Error` carrying the reason. Diagnostics are only for sane-but-deferred catalog
- * state: a partitioned relation is skipped and named, unlogged or temporary persistence is
- * flagged on an imported table, and the column features the model does not carry — defaults,
- * generation, identity, explicit collation, storage, and compression — are each flagged and
- * named. Every diagnostic keeps the import module's grammar: `object` is `<schema>.<table>`
- * and the column, when relevant, is named in `message`; `position` is never set.
+ * wrong-typed field, an unknown or duplicate relation, orphan column, primary-key, or index
+ * rows, a duplicate `(schema, indexName)` index row, or an index definition that does not
+ * parse to one `CREATE INDEX` — throw an `Error` carrying the reason. Diagnostics are only
+ * for sane-but-deferred catalog state: a partitioned relation is skipped and named, unlogged
+ * or temporary persistence is flagged on an imported table, the column features the model
+ * does not carry — defaults, generation, identity, explicit collation, storage, and
+ * compression — are each flagged and named, and an index outside the importer's envelope or
+ * not valid and ready is skipped and named while one on a non-default tablespace is kept and
+ * flagged. Every diagnostic keeps the import module's grammar: `object` is `<schema>.<table>`
+ * — for an index finding, `<schema>.<indexName>` — and the column or index, when relevant, is
+ * named in `message`; `position` is never set.
  *
  * The pure half, `mapCatalog`, takes the parsed payload to the model and diagnostics; it is
  * exported for the unit suite but deliberately not re-exported from `index.ts`, which carries
@@ -181,7 +186,7 @@ SELECT json_build_object(
 
 /**
  * Reads `connection` — a libpq connection URI — into the canonical model, with diagnostics for
- * the catalog state the tracer does not represent. Throws on transport failure, unparseable
+ * the catalog state the model does not represent. Throws on transport failure, unparseable
  * output, or a payload-contract violation.
  */
 export async function introspect(connection: string): Promise<ReadResult<Model, Diagnostic>> {
@@ -493,7 +498,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   return { model: { tables: modelTables, sequences: [] }, diagnostics };
 }
 
-/** The ordinary table a column or primary-key row must reference, or a contract throw. */
+/** The ordinary table a column, primary-key, or index row must reference, or a contract throw. */
 function requireOrdinaryTable(
   tablesByKey: ReadonlyMap<string, TableRow>,
   key: string,
