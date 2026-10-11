@@ -40,7 +40,7 @@ Named for the slices that own them, never silent:
 
 - **Not-null `NOT VALID`** — the validation state of a not-null constraint is flagged and dropped while the enforced not-null fact stays; modeling the state itself waits for a consumer.
 - **Multiple named not-null constraints per column** — the model carries one not-null fact per column, so a source stating several named ones collapses to the first with a named flag; a fuller representation belongs with introspection parity.
-- **Truncation and collision-suffix boundaries** — a generated name truncated at 63 bytes or collision-suffixed (`_key1`, …) stays named; shared with the [render-refusal slice](./render-refusal.md).
+- **Collision-suffix boundaries** — a generated name collision-suffixed (`_key1`, …) stays named; suffixes come from catalog state and are not knowable offline. The truncation half closed in slice A of the [render-refusal slice](./render-refusal.md) ([#75](https://github.com/osama784/schemamill/issues/75), [ADR 0013](../adr/0013-generated-names-and-omitted-declarations-round-trip.md)): a generated name truncated at 63 bytes canonicalizes back to unnamed by its server form.
 - **Introspection parity** — reading these attributes from a live catalog belongs to the [introspection follow-ups](./introspection-attributes.md) ([#60](https://github.com/osama784/schemamill/issues/60), [#77](https://github.com/osama784/schemamill/issues/77)).
 - **`NO INHERIT` not-null constraints** — need inheritance modeling, which stays out.
 - **`ALTER CONSTRAINT … ENFORCED`** — the in-place enforcement flip PostgreSQL 18 offers for foreign keys is not rendered; an enforcement change decomposes to a drop and an add.

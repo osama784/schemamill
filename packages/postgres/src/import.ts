@@ -31,16 +31,18 @@
  *   imported. A constraint-backed index is never a standalone `Index`: inline and
  *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
  *   consumes the index it names. Once every statement is translated, a standalone index whose
- *   name equals PostgreSQL's conventional `<table>_<cols>_idx` for its structure, and a
- *   primary key, unique constraint, foreign key, or check constraint whose name equals the
- *   conventional formula for its structure, are canonicalized back to unnamed, so a dump of a
- *   declaration the model makes unnamed round-trips; a name is kept when an unnamed entry of
- *   the same structure already exists, so no duplicate unnamed entry is manufactured, and a
- *   name outside the formula — truncated or collision-suffixed, or an expression the
- *   best-effort check formula does not predict — stays named. A column's not-null name equal
- *   to the generated `<table>_<column>_not_null` is stripped the same way; no twin guard is
- *   needed, because one not-null fact per column is the only shape the model carries and the
- *   duplicate declaration is already collapsed by the merge (see `mergeNotNullDeclaration`).
+ *   name equals the server form of PostgreSQL's conventional `<table>_<cols>_idx` for its
+ *   structure, and a primary key, unique constraint, foreign key, or check constraint whose
+ *   name equals the server form of the conventional formula for its structure, are
+ *   canonicalized back to unnamed, so a dump of a declaration the model makes unnamed
+ *   round-trips — the server form is what PostgreSQL stores, so a generated name truncated at
+ *   63 bytes strips too. A name is kept when an unnamed entry of the same structure already
+ *   exists, so no duplicate unnamed entry is manufactured, and a name outside the server form
+ *   — collision-suffixed, or an expression the best-effort check formula does not predict —
+ *   stays named. A column's not-null name equal to the server form of the generated
+ *   `<table>_<column>_not_null` is stripped the same way; no twin guard is needed, because one
+ *   not-null fact per column is the only shape the model carries and the duplicate declaration
+ *   is already collapsed by the merge (see `mergeNotNullDeclaration`).
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -2468,11 +2470,12 @@ function foreignKeyStructureKey(foreignKey: ForeignKey): string {
  * Canonicalizes server-generated index names back to unnamed: a `CREATE INDEX ON t (c)`
  * applies unnamed and PostgreSQL names the index `t_c_idx`, so a dump import would otherwise
  * store the generated name and diff as remove + add against the model's unnamed declaration.
- * An index whose name equals `synthesizedIndexName` is stripped, unless its structural key is
- * already covered by an unnamed entry — present in the draft or stripped earlier — in which
- * case the name is kept; the guard keeps the pass from manufacturing a duplicate unnamed entry
- * in either statement order. Runs in import order before the canonical sort, and names outside
- * the formula stay named: truncation and collision suffixes are not predictable offline.
+ * An index whose name equals `synthesizedIndexName` — the server form, PostgreSQL's 63-byte
+ * truncation included — is stripped, unless its structural key is already covered by an
+ * unnamed entry — present in the draft or stripped earlier — in which case the name is kept;
+ * the guard keeps the pass from manufacturing a duplicate unnamed entry in either statement
+ * order. Runs in import order before the canonical sort, and names outside the server form
+ * stay named: collision suffixes are not predictable offline.
  */
 function canonicalizeIndexNames(draft: TableDraft): void {
   const identity: TableIdentity = { schema: draft.schema, name: draft.name };
@@ -2493,13 +2496,13 @@ function canonicalizeIndexNames(draft: TableDraft): void {
 /**
  * Canonicalizes server-generated primary-key, unique, foreign-key, and check-constraint names
  * back to unnamed, mirroring `canonicalizeIndexNames`: a constraint whose name equals the
- * prediction for its structure is stripped, unless an unnamed constraint with the same key —
- * the same columns, expression, or foreign-key target and actions — already exists in the
- * draft or was stripped earlier, in which case the name is kept, so neither statement order
- * manufactures a duplicate unnamed entry. The primary key has no twin guard: PostgreSQL allows
- * one per table. Runs in import order before the canonical sort, and names outside the formula
- * stay named: truncation and collision suffixes are not predictable offline, and a check
- * expression the best-effort formula does not predict keeps its server name.
+ * prediction's server form for its structure is stripped, unless an unnamed constraint with
+ * the same key — the same columns, expression, or foreign-key target and actions — already
+ * exists in the draft or was stripped earlier, in which case the name is kept, so neither
+ * statement order manufactures a duplicate unnamed entry. The primary key has no twin guard:
+ * PostgreSQL allows one per table. Runs in import order before the canonical sort, and names
+ * outside the server form stay named: collision suffixes are not predictable offline, and a
+ * check expression the best-effort formula does not predict keeps its server name.
  */
 function canonicalizeConstraintNames(draft: TableDraft): void {
   const identity: TableIdentity = { schema: draft.schema, name: draft.name };
@@ -2580,10 +2583,11 @@ function finalizeTable(draft: TableDraft): Table {
 /**
  * Canonicalizes PostgreSQL's generated not-null-constraint name back to unnamed: a dump of a
  * declaration the model makes unnamed carries `<table>_<column>_not_null`, and the model's
- * unnamed not-null fact must round-trip. The strip is the exact formula and nothing else —
- * truncation and collision suffixes stay named — and it has no twin guard, because one
- * not-null fact per column is the only shape the model carries: the duplicate declaration is
- * already collapsed by `mergeNotNullDeclaration` in either statement order.
+ * unnamed not-null fact must round-trip. The strip is the server form of the formula and
+ * nothing else — a name PostgreSQL truncated at 63 bytes strips, a collision-suffixed name
+ * stays named — and it has no twin guard, because one not-null fact per column is the only
+ * shape the model carries: the duplicate declaration is already collapsed by
+ * `mergeNotNullDeclaration` in either statement order.
  */
 function canonicalizeNotNullNames(draft: TableDraft): void {
   draft.columns = draft.columns.map((column) => {
