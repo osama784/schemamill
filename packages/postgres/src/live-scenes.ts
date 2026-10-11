@@ -1,4 +1,4 @@
-import { effectiveIdentity, effectiveSequence } from '@schemamill/core';
+import { diff, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
@@ -20,6 +20,8 @@ import type {
   TableIdentity,
   UniqueConstraint,
 } from '@schemamill/core';
+
+import { renderSql } from './render.ts';
 
 /**
  * Scenes for the live-PostgreSQL harness (`live-pg.test.ts`).
@@ -83,6 +85,17 @@ import type {
  * and asserts the read matches the applied dump's import; `introspection-flags` pins the exact
  * deferred-state diagnostics (defaults, generation, identity, partitioning, persistence) the
  * read reports.
+ *
+ * The render-refusal scenes cover generated-name truncation and omitted declarations:
+ * `truncated-name-round-trip` builds a table whose unnamed index, unique constraint, check
+ * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
+ * limit, so the catalog pins the balanced server forms (the assembled long form and the server
+ * form differ) and the migration must drop a long-name unnamed index through the dropped
+ * index's server form — the pre-fix renderer named the assembled form, which PostgreSQL clipped
+ * at parse time to a different name and refused to drop — and `unnamed-fk-round-trip` applies a
+ * foreign key that omits its referenced-column list, pins that the catalog resolves it to the
+ * referenced table's primary key, and proves the dump's explicit list still diffs empty against
+ * the omitting model.
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -3550,6 +3563,303 @@ const introspectionFlagsScene = (): LiveScene => {
   };
 };
 
+/**
+ * The truncated-name round trip: a table whose unnamed index, unique constraint, check
+ * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
+ * limit, plus an unnamed baseline index the target drops. The sizes are qualified so the
+ * assembled long form and the balanced server form differ: these names are
+ * `makeObjectName(table, column, label)`, which shrinks the longer of the two parts until the
+ * whole fits, so each stored name keeps the full 25-byte table name and its label while
+ * clipping the 35–40-byte column part — for example the index stores
+ * `settlement_ledger_entries_originator_transaction_reference__idx`, not the parse-time clip
+ * of the assembled `…_reference_number_idx`. The baseline check pins the server form of the
+ * index the migration's synthesized drop must name (the pre-fix renderer named the assembled
+ * form, which PostgreSQL clipped to a different name and refused to drop), the plan check pins
+ * the rendered drop line, the catalog checks pin the four generated names, and the import
+ * checks prove every dumped name canonicalizes back to unnamed.
+ */
+const truncatedNameRoundTripScene = (): LiveScene => {
+  const members = table('clearing_members', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const ledgerColumns = [
+    column('superseded_originator_reference_value'),
+    column('originator_transaction_reference_number'),
+    column('beneficiary_account_iban_copy_identifier'),
+    column('settlement_window_close_timestamp_marker', { type: 'integer' }),
+    column('originating_bank_clearing_member_id', { type: 'bigint' }),
+  ];
+  const baselineLedger = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['superseded_originator_reference_value'] }],
+  });
+  const targetLedger = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['originator_transaction_reference_number'] }],
+    uniqueConstraints: [{ columns: ['beneficiary_account_iban_copy_identifier'] }],
+    checkConstraints: [{ expression: 'settlement_window_close_timestamp_marker > 0' }],
+    foreignKeys: [
+      foreignKey(['originating_bank_clearing_member_id'], identity('clearing_members'), {
+        referencedColumns: ['id'],
+      }),
+    ],
+  });
+
+  return {
+    name: 'truncated-name-round-trip',
+    baseline: model(members, baselineLedger),
+    target: model(members, targetLedger),
+    baselineChecks: [
+      {
+        description:
+          'the unnamed baseline index stores the balanced server name, not the assembled long form',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: 'settlement_ledger_entries_superseded_originator_reference_v_idx',
+      },
+      {
+        description: 'the referenced table carries its conventional primary key',
+        sql: constraintName('clearing_members', 'p'),
+        expected: 'clearing_members_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan drops the unnamed index and rebuilds the target shapes',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (
+            kinds !==
+            'drop-index,add-unique-constraint,add-check-constraint,create-index,add-foreign-key'
+          ) {
+            return `unexpected steps: ${kinds}`;
+          }
+          const drop = steps[0]!;
+          if (drop.kind !== 'drop-index') return `first step: ${drop.kind}`;
+          if (
+            drop.index.name !== undefined ||
+            drop.index.columns.join(',') !== 'superseded_originator_reference_value'
+          ) {
+            return `the drop does not name the unnamed superseded index`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the rendered drop names the index server form, not the assembled long form',
+        failure: (_steps, migration) => {
+          const line =
+            'DROP INDEX public.settlement_ledger_entries_superseded_originator_reference_v_idx;';
+          return renderSql(migration).includes(line)
+            ? undefined
+            : `the rendered migration does not carry ${line}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description:
+          'the drop applied; the target index and unique-constraint index names are the server forms',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected:
+          'settlement_ledger_entries_beneficiary_account_iban_copy_ide_key,' +
+          'settlement_ledger_entries_originator_transaction_reference__idx',
+      },
+      {
+        description: 'the unnamed unique constraint stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'u'),
+        expected: 'settlement_ledger_entries_beneficiary_account_iban_copy_ide_key',
+      },
+      {
+        description: 'the unnamed check constraint stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'c'),
+        expected: 'settlement_ledger_entries_settlement_window_close_timesta_check',
+      },
+      {
+        description: 'the unnamed foreign key stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'f'),
+        expected: 'settlement_ledger_entries_originating_bank_clearing_member_fkey',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps canonicalize every truncated generated name back to unnamed',
+        failure: (imported, source) => {
+          const ledger = imported.model.tables.find(
+            (candidate) => candidate.name === 'settlement_ledger_entries',
+          );
+          if (ledger === undefined) return 'settlement_ledger_entries is not imported';
+          const namedIndexes = ledger.indexes.filter((index) => index.name !== undefined);
+          if (namedIndexes.length > 0) {
+            return `${source}: index names survived: ${namedIndexes
+              .map((index) => index.name)
+              .join(',')}`;
+          }
+          const indexColumns = ledger.indexes.map((index) => index.columns.join(',')).join('; ');
+          if (indexColumns !== 'originator_transaction_reference_number') {
+            return `${source}: indexes: ${indexColumns}`;
+          }
+          const namedUnique = ledger.uniqueConstraints.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedUnique.length > 0) {
+            return `${source}: unique names survived: ${namedUnique
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const uniqueColumns = ledger.uniqueConstraints
+            .map((constraint) => constraint.columns.join(','))
+            .join('; ');
+          if (uniqueColumns !== 'beneficiary_account_iban_copy_identifier') {
+            return `${source}: unique constraints: ${uniqueColumns}`;
+          }
+          const namedChecks = ledger.checkConstraints.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedChecks.length > 0) {
+            return `${source}: check names survived: ${namedChecks
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const checkExpressions = ledger.checkConstraints
+            .map((constraint) => constraint.expression)
+            .join('; ');
+          if (
+            ledger.checkConstraints.length !== 1 ||
+            !checkExpressions.includes('settlement_window_close_timestamp_marker')
+          ) {
+            return `${source}: check constraints: ${checkExpressions}`;
+          }
+          const namedForeign = ledger.foreignKeys.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedForeign.length > 0) {
+            return `${source}: foreign-key names survived: ${namedForeign
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const foreign = ledger.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.columns.join(',')}->${constraint.referencedColumns.join(',')}`,
+            )
+            .join('; ');
+          return foreign === 'originating_bank_clearing_member_id->id'
+            ? undefined
+            : `${source}: foreign keys: ${foreign}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The unnamed-foreign-key round trip: a target adding a foreign key that omits its
+ * `referencedColumns` list, so the migration renders `REFERENCES category` and PostgreSQL
+ * resolves it to the referenced table's primary key. The plan check pins that the step payload
+ * keeps the omission; the catalog checks pin the resolution to the primary key; and the import
+ * check proves the dump's explicit `(id)` list — a dump always states it — diffs empty against
+ * the omitting model, which a deep-equality assertion could not: the imported foreign key
+ * carries the explicit list by construction.
+ */
+const unnamedFkRoundTripScene = (): LiveScene => {
+  const category = table('category', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('name')],
+    primaryKey: { columns: ['id'] },
+  });
+  const productColumns = [
+    column('id', { type: 'bigint', notNull: true }),
+    column('category_id', { type: 'bigint' }),
+  ];
+  const targetModel = model(
+    category,
+    table('product', {
+      columns: productColumns,
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [foreignKey(['category_id'], identity('category'))],
+    }),
+  );
+
+  return {
+    name: 'unnamed-fk-round-trip',
+    baseline: model(
+      category,
+      table('product', { columns: productColumns, primaryKey: { columns: ['id'] } }),
+    ),
+    target: targetModel,
+    baselineChecks: [
+      {
+        description: 'the baseline product carries no foreign key',
+        sql: constraintCount('product_category_id_fkey', 'f'),
+        expected: '0',
+      },
+      {
+        description: 'the primary key the added foreign key resolves to',
+        sql: constraintNames('category', 'p'),
+        expected: 'category_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the added foreign key keeps its omitted referenced columns in the step',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'add-foreign-key') return `unexpected steps: ${kinds}`;
+          const step = steps[0]!;
+          if (step.kind !== 'add-foreign-key') return `step kind: ${step.kind}`;
+          const referenced = step.foreignKey.referencedColumns.join(',');
+          return referenced === ''
+            ? undefined
+            : `the step resolved the referenced columns: ${referenced}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the unnamed foreign key resolves to the category primary key',
+        sql: constraintDef('product_category_id_fkey'),
+        expected: 'FOREIGN KEY (category_id) REFERENCES category(id)',
+      },
+      {
+        description: 'the foreign key references exactly the primary-key columns',
+        sql:
+          'select confkey = (select primary_key.conkey from pg_constraint primary_key' +
+          ' where primary_key.conrelid = foreign_key.confrelid and primary_key.contype = ' +
+          "'p') from pg_constraint foreign_key where foreign_key.conname = " +
+          "'product_category_id_fkey'",
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          "the dump's explicit referenced list equals the omitting model, so the diff is empty",
+        failure: (imported, source) => {
+          const product = imported.model.tables.find((candidate) => candidate.name === 'product');
+          if (product === undefined) return 'product is not imported';
+          if (product.foreignKeys.length !== 1) {
+            return `${source}: foreign keys: ${product.foreignKeys.length}`;
+          }
+          const foreign = product.foreignKeys[0]!;
+          if (foreign.name !== undefined) {
+            return `${source}: the imported foreign key is named ${foreign.name}`;
+          }
+          const referenced = foreign.referencedColumns.join(',');
+          if (referenced !== 'id') {
+            return `${source}: the dump's referenced list is ${JSON.stringify(referenced)}`;
+          }
+          const changes = diff(targetModel, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the imported model diffs as ${changes
+                .map((change) => change.kind)
+                .join(',')}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -3585,4 +3895,6 @@ export const scenes: readonly LiveScene[] = [
   nonPublicIndexDropScene(),
   introspectionTracerScene(),
   introspectionFlagsScene(),
+  truncatedNameRoundTripScene(),
+  unnamedFkRoundTripScene(),
 ];
