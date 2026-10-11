@@ -1584,6 +1584,58 @@ test('an unresolved referenced-table primary key keeps an omission and a list un
   assertDiff(shape(keyless, []), shape(keyless, ['id']), change);
 });
 
+test('an omission resolves against its own referenced table, not another primary key', () => {
+  const parent = (name: string, keyColumn: string): Table =>
+    table(name, {
+      columns: [column(keyColumn, { type: 'integer', notNull: true })],
+      primaryKey: { name: `${name}_pkey`, columns: [keyColumn] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent_a'), { referencedColumns })],
+    });
+
+  // `other` is indexed after `parent_a`, so a key that ignored the table identity would resolve
+  // the omission to `other`'s primary key and read the explicit `a_id` list as a change.
+  const baseline = model(parent('parent_a', 'a_id'), child([]), parent('other', 'o_id'));
+  const target = model(parent('parent_a', 'a_id'), child(['a_id']), parent('other', 'o_id'));
+
+  assertDiff(baseline, target, []);
+});
+
+test('an explicit list the omitting side does not resolve to stays a change', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The target omits the list and its own key is `id`; the baseline's explicit `legacy_id`
+  // does not match, so the pair reads changed instead of collapsing into the omission.
+  assertDiff(model(parent(), child(['legacy_id'])), model(parent(), child([])), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], identity('parent'), { referencedColumns: ['legacy_id'] }),
+          after: foreignKey(['a'], identity('parent')),
+        },
+      ],
+    },
+  ]);
+});
+
 test('referenced column order is part of the change', () => {
   const parent = identity('parent');
   const baseline = model(
