@@ -1441,7 +1441,7 @@ test('keeps a check name the best-effort formula does not predict', async () => 
   ]);
 });
 
-test('an unnamed foreign key without referenced columns still reads changed after a dump', async () => {
+test('an unnamed foreign key without referenced columns round-trips against a dump', async () => {
   const declared = [
     `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
     `CREATE TABLE public.child (a integer);`,
@@ -1456,30 +1456,10 @@ test('an unnamed foreign key without referenced columns still reads changed afte
   const { model: declaredModel } = await importDump(declared);
   const { model: serverModel } = await importDump(serverDump);
 
-  // Both declarations canonicalize `child_a_fkey` back to unnamed, but a server dump always
-  // carries the concrete referenced-column list, so the residual mismatch is not the name:
-  // the unnamed declaration states none and the import reads changed on `referencedColumns`.
-  assert.deepEqual(diff(declaredModel, serverModel), [
-    {
-      kind: 'table-changed',
-      table: { schema: 'public', name: 'child' },
-      changes: [
-        {
-          kind: 'foreign-key-changed',
-          before: {
-            columns: ['a'],
-            referencedTable: { schema: 'public', name: 'parent' },
-            referencedColumns: [],
-          },
-          after: {
-            columns: ['a'],
-            referencedTable: { schema: 'public', name: 'parent' },
-            referencedColumns: ['id'],
-          },
-        },
-      ],
-    },
-  ]);
+  // Both declarations canonicalize `child_a_fkey` back to unnamed; the server dump carries the
+  // concrete referenced-column list, but the declaration's omission resolves against its own
+  // model's referenced-table primary key (`public.parent.id`), so the two compare equal.
+  assert.deepEqual(diff(declaredModel, serverModel), []);
 });
 
 test('skips whole indexes with elements or clauses outside the minimal envelope', async () => {

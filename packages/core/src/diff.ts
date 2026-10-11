@@ -32,7 +32,12 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * within its table; a table has at most one primary key, compared by its name, its column
  * list, and its deferrability; two foreign keys belong together when their referencing columns
  * (order-sensitive) and their referenced table are the same, and any other difference — name,
- * referenced columns, actions, enforcement, deferrability — reads as a change to that pair;
+ * actions, enforcement, deferrability — reads as a change to that pair. Their referenced
+ * columns compare equivalent when both sides omit them, when one side omits them and the other
+ * lists exactly the omitting side's own model's referenced-table primary key in primary-key
+ * order, or element-wise when both state a list; an absent referenced table or primary key
+ * leaves an omission unequal to every explicit list, and a resolved list is comparison-only —
+ * it never enters a payload;
  * two unique constraints belong together when their ordered column lists are the same and two
  * check constraints when their expressions are the same, with any other difference — a name or
  * an attribute, for either — reading as a change to that pair; a named index is identified by
@@ -264,6 +269,8 @@ export type SequenceFieldChange =
 export function diff(baseline: Model, target: Model): readonly Change[] {
   const baselineTables = [...baseline.tables].sort(compareTables);
   const targetTables = [...target.tables].sort(compareTables);
+  const baselinePrimaryKeys = primaryKeyMap(baseline);
+  const targetPrimaryKeys = primaryKeyMap(target);
 
   const changes: Change[] = [];
   let baselineIndex = 0;
@@ -280,7 +287,12 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
       changes.push({ kind: 'table-added', table: copyTable(targetTable) });
       targetIndex += 1;
     } else {
-      const tableChanges = diffTable(baselineTable, targetTable);
+      const tableChanges = diffTable(
+        baselineTable,
+        targetTable,
+        baselinePrimaryKeys,
+        targetPrimaryKeys,
+      );
       if (tableChanges.length > 0) {
         changes.push({
           kind: 'table-changed',
@@ -422,6 +434,29 @@ function sameIdentity(left: TableIdentity, right: TableIdentity): boolean {
   return left.schema === right.schema && left.name === right.name;
 }
 
+/**
+ * The primary-key columns of every table in a model, keyed by table identity. The whole model is
+ * indexed once per `diff`, so a foreign key that omits its referenced columns can be resolved
+ * against its own side's tables.
+ */
+type PrimaryKeyMap = ReadonlyMap<string, readonly string[]>;
+
+function primaryKeyMap(model: Model): PrimaryKeyMap {
+  const primaryKeys = new Map<string, readonly string[]>();
+  for (const table of model.tables) {
+    if (table.primaryKey !== undefined) primaryKeys.set(tableKey(table), table.primaryKey.columns);
+  }
+  return primaryKeys;
+}
+
+/**
+ * The map key of a table identity; JSON keeps names — which may contain any character —
+ * unambiguous.
+ */
+function tableKey(identity: TableIdentity): string {
+  return JSON.stringify([identity.schema, identity.name]);
+}
+
 /** A copy of `column`, independent of the caller's model, nested identity included. */
 function copyColumn(column: Column): Column {
   return {
@@ -501,11 +536,23 @@ interface ForeignKeyPair {
   readonly after: ForeignKey;
 }
 
-function diffTable(baseline: Table, target: Table): TableChange[] {
+function diffTable(
+  baseline: Table,
+  target: Table,
+  baselinePrimaryKeys: PrimaryKeyMap,
+  targetPrimaryKeys: PrimaryKeyMap,
+): TableChange[] {
   const changes = diffColumns(baseline.columns, target.columns);
   const primaryKey = diffPrimaryKey(baseline.primaryKey, target.primaryKey);
   if (primaryKey !== undefined) changes.push(primaryKey);
-  changes.push(...diffForeignKeys(baseline.foreignKeys, target.foreignKeys));
+  changes.push(
+    ...diffForeignKeys(
+      baseline.foreignKeys,
+      target.foreignKeys,
+      baselinePrimaryKeys,
+      targetPrimaryKeys,
+    ),
+  );
   changes.push(...diffUniqueConstraints(baseline.uniqueConstraints, target.uniqueConstraints));
   changes.push(...diffCheckConstraints(baseline.checkConstraints, target.checkConstraints));
   changes.push(...diffIndexes(baseline.indexes, target.indexes));
@@ -704,6 +751,8 @@ function diffPrimaryKey(
 function diffForeignKeys(
   baseline: readonly ForeignKey[],
   target: readonly ForeignKey[],
+  baselinePrimaryKeys: PrimaryKeyMap,
+  targetPrimaryKeys: PrimaryKeyMap,
 ): TableChange[] {
   const baselineGroups = groupForeignKeys(baseline);
   const targetGroups = groupForeignKeys(target);
@@ -719,7 +768,9 @@ function diffForeignKeys(
 
     // Structurally identical foreign keys cancel; only the rest is paired by order.
     for (const after of targetGroups.get(identity) ?? []) {
-      const match = remainingBaseline.findIndex((before) => foreignKeysEqual(before, after));
+      const match = remainingBaseline.findIndex((before) =>
+        foreignKeysEqual(before, after, baselinePrimaryKeys, targetPrimaryKeys),
+      );
       if (match === -1) remainingTarget.push(after);
       else remainingBaseline.splice(match, 1);
     }
@@ -982,19 +1033,55 @@ function foreignKeyIdentity(foreignKey: ForeignKey): string {
   ]);
 }
 
-function foreignKeysEqual(left: ForeignKey, right: ForeignKey): boolean {
+/**
+ * Whether two foreign keys are equivalent. Every field other than `referencedColumns` — name,
+ * referencing columns, referenced table, referential actions, enforcement, deferrability — stays
+ * a conjunct; the referenced columns compare per `sameReferencedColumns`.
+ */
+function foreignKeysEqual(
+  left: ForeignKey,
+  right: ForeignKey,
+  leftPrimaryKeys: PrimaryKeyMap,
+  rightPrimaryKeys: PrimaryKeyMap,
+): boolean {
   return (
     left.name === right.name &&
     sameStrings(left.columns, right.columns) &&
     left.referencedTable.schema === right.referencedTable.schema &&
     left.referencedTable.name === right.referencedTable.name &&
-    sameStrings(left.referencedColumns, right.referencedColumns) &&
+    sameReferencedColumns(left, right, leftPrimaryKeys, rightPrimaryKeys) &&
     left.onUpdate === right.onUpdate &&
     left.onDelete === right.onDelete &&
     left.enforcement === right.enforcement &&
     left.deferrable === right.deferrable &&
     left.initiallyDeferred === right.initiallyDeferred
   );
+}
+
+/**
+ * Whether two foreign keys' referenced columns are equivalent. Both sides empty is equal
+ * regardless of any primary key — the dependent-foreign-key synthesis owns primary-key moves. One
+ * side empty is equal to an explicit list exactly when that list equals the empty side's own
+ * model's referenced-table primary key, in primary-key order; an absent referenced table or a
+ * table without a primary key leaves the two unequal. Two explicit lists compare element-wise.
+ * The resolved columns never enter a payload: the equivalence is comparison-only.
+ */
+function sameReferencedColumns(
+  left: ForeignKey,
+  right: ForeignKey,
+  leftPrimaryKeys: PrimaryKeyMap,
+  rightPrimaryKeys: PrimaryKeyMap,
+): boolean {
+  if (left.referencedColumns.length === 0 && right.referencedColumns.length === 0) return true;
+  if (left.referencedColumns.length === 0) {
+    const resolved = leftPrimaryKeys.get(tableKey(left.referencedTable));
+    return resolved !== undefined && sameStrings(resolved, right.referencedColumns);
+  }
+  if (right.referencedColumns.length === 0) {
+    const resolved = rightPrimaryKeys.get(tableKey(right.referencedTable));
+    return resolved !== undefined && sameStrings(resolved, left.referencedColumns);
+  }
+  return sameStrings(left.referencedColumns, right.referencedColumns);
 }
 
 function groupUniqueConstraints(
