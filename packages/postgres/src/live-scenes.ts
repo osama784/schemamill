@@ -82,9 +82,15 @@ import { renderSql } from './render.ts';
  * declared out of name order, an unnamed conventional `<table>_pkey` beside an explicitly
  * named one, a spread of type spellings, and a column the baseline declares and the target
  * drops so the migrated database physically holds the `attisdropped` row the read must filter —
- * and asserts the read matches the applied dump's import; `introspection-flags` pins the exact
- * deferred-state diagnostics (defaults, generation, identity, partitioning, persistence) the
- * read reports.
+ * and asserts the read matches the applied dump's import; `introspection-indexes` does the
+ * same for the covered index surface — a constraint-backed primary-key index the read must
+ * consume through `conindid`, a named index, two unnamed indexes whose tie order is the
+ * stored-name order, a standalone unique index, and an unnamed index whose generated name
+ * exceeds the 63-byte limit and strips only in its server form; `introspection-flags` pins the
+ * exact deferred-state diagnostics (defaults, generation, identity, partitioning, persistence)
+ * the read reports, the expression, partial, and `INCLUDE` index skips among them, and
+ * `introspection-flags-nulls-not-distinct` pins the `NULLS NOT DISTINCT` skip gated on
+ * PostgreSQL 15 or newer.
  *
  * The render-refusal scenes cover generated-name truncation and omitted declarations:
  * `truncated-name-round-trip` builds a table whose unnamed index, unique constraint, check
@@ -3481,12 +3487,93 @@ const introspectionTracerScene = (): LiveScene => {
 };
 
 /**
+ * The live-introspection index round trip: a model exercising the covered index surface — an
+ * ordinary table with a primary key, so the constraint-backed `accounts_pkey` index must be
+ * consumed through `conindid` rather than modeled as a standalone index; a named plain index;
+ * two unnamed indexes on one table whose tie order is the stored-name order; a standalone
+ * unique index; and an unnamed index whose generated name exceeds PostgreSQL's 63-byte
+ * identifier limit, so it strips only in its server form (the assembled long form is a
+ * different name). The scene asserts `matches-import`: no diagnostics, an empty `diff` against
+ * the applied dump's import, and a model deep-equal to that import — the order-significant
+ * guard over the two unnamed ties.
+ */
+const introspectionIndexesScene = (): LiveScene => {
+  const accountsColumns = [
+    column('id', { type: 'bigint', notNull: true }),
+    column('tenant', { notNull: true }),
+    column('email', { notNull: true }),
+    column('alpha', { type: 'integer' }),
+    column('beta', { type: 'integer' }),
+  ];
+  const accounts = table('accounts', {
+    columns: accountsColumns,
+    primaryKey: { columns: ['id'] },
+  });
+  const accountsTarget = table('accounts', {
+    columns: accountsColumns,
+    primaryKey: { columns: ['id'] },
+    indexes: [
+      { name: 'accounts_tenant_idx', unique: false, columns: ['tenant'] },
+      { unique: false, columns: ['beta'] },
+      { unique: false, columns: ['alpha'] },
+      { name: 'accounts_email_uniq_idx', unique: true, columns: ['email'] },
+    ],
+  });
+  const ledgerColumns = [column('originator_transaction_reference_number')];
+  const ledger = table('settlement_ledger_entries', { columns: ledgerColumns });
+  const ledgerTarget = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['originator_transaction_reference_number'] }],
+  });
+
+  return {
+    name: 'introspection-indexes',
+    baseline: model(accounts, ledger),
+    target: model(accountsTarget, ledgerTarget),
+    baselineChecks: [
+      {
+        description: 'baseline accounts carries only its constraint-backed primary-key index',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_pkey',
+      },
+      {
+        description: 'baseline settlement_ledger_entries carries no index',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: '',
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated accounts carries the named, unnamed, and unique index names',
+        sql: indexesOf('accounts'),
+        expected:
+          'accounts_alpha_idx,accounts_beta_idx,accounts_email_uniq_idx,accounts_pkey,' +
+          'accounts_tenant_idx',
+      },
+      {
+        description: 'the unnamed long-name index stores the balanced server form',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: 'settlement_ledger_entries_originator_transaction_reference__idx',
+      },
+      {
+        description: 'the standalone unique index is unique in the catalog',
+        sql: indexIsUnique('accounts_email_uniq_idx'),
+        expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
  * The live-introspection flags scene: the deferred catalog states a clean round trip still
  * meets, each asserted as an exact diagnostic. The model declares a table with a `DEFAULT`
  * column and a table with an identity column; raw setup SQL adds an unlogged table, a
- * generated column whose flag must suppress its `atthasdef` default flag, and a partitioned
+ * generated column whose flag must suppress its `atthasdef` default flag, a partitioned
  * table with one partition — both partitioned relations skipped and named, the unlogged table
- * flagged, and neither mapped.
+ * flagged, and neither mapped — and a table carrying an expression, a partial, and an
+ * `INCLUDE` index, each outside the importer's envelope and skipped whole with the importer's
+ * reason.
  */
 const introspectionFlagsScene = (): LiveScene => {
   const target = model(
@@ -3506,6 +3593,10 @@ const introspectionFlagsScene = (): LiveScene => {
     setupSql: [
       'CREATE UNLOGGED TABLE public.flag_unlogged (x integer);',
       'CREATE TABLE public.flag_generated (a integer DEFAULT 1, b integer GENERATED ALWAYS AS (a * 2) STORED);',
+      'CREATE TABLE public.flag_indexed (a integer, b integer, c integer);',
+      'CREATE INDEX flag_expr_idx ON public.flag_indexed USING btree ((a + b));',
+      'CREATE INDEX flag_partial_idx ON public.flag_indexed USING btree (a) WHERE (a > 0);',
+      'CREATE INDEX flag_include_idx ON public.flag_indexed USING btree (a) INCLUDE (b);',
       'CREATE TABLE public.flag_partitioned (k integer, v text) PARTITION BY RANGE (k);',
       'CREATE TABLE public.flag_partitioned_1 PARTITION OF public.flag_partitioned FOR VALUES FROM (0) TO (10);',
     ].join('\n'),
@@ -3541,6 +3632,24 @@ const introspectionFlagsScene = (): LiveScene => {
         {
           kind: 'skip',
           code: 'unsupported-statement',
+          object: 'public.flag_expr_idx',
+          message: 'skipped CREATE INDEX public.flag_expr_idx (expression element)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_include_idx',
+          message: 'skipped CREATE INDEX public.flag_include_idx (INCLUDE)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partial_idx',
+          message: 'skipped CREATE INDEX public.flag_partial_idx (partial WHERE)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
           object: 'public.flag_partitioned',
           message:
             'table public.flag_partitioned is partitioned; partitioning is not represented yet',
@@ -3562,6 +3671,34 @@ const introspectionFlagsScene = (): LiveScene => {
     },
   };
 };
+
+/**
+ * The PostgreSQL 15 `NULLS NOT DISTINCT` index skip, gated: the base-floor flags scene cannot
+ * carry the shape, so this scene runs only on PostgreSQL 15 or newer — skipped with a named
+ * reason on older servers — and pins the exact diagnostic the read reports for a unique index
+ * whose definition carries the clause.
+ */
+const introspectionFlagsNullsNotDistinctScene = (): LiveScene => ({
+  name: 'introspection-flags-nulls-not-distinct',
+  minServerMajor: 15,
+  setupSql: [
+    'CREATE TABLE public.flag_nulls (a integer);',
+    'CREATE UNIQUE INDEX flag_nulls_idx ON public.flag_nulls USING btree (a) NULLS NOT DISTINCT;',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.flag_nulls_idx',
+        message: 'skipped CREATE INDEX public.flag_nulls_idx (NULLS NOT DISTINCT)',
+      },
+    ],
+  },
+});
 
 /**
  * The truncated-name round trip: a table whose unnamed index, unique constraint, check
@@ -3894,7 +4031,9 @@ export const scenes: readonly LiveScene[] = [
   unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
   introspectionTracerScene(),
+  introspectionIndexesScene(),
   introspectionFlagsScene(),
+  introspectionFlagsNullsNotDistinctScene(),
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
 ];
