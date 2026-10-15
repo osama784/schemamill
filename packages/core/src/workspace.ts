@@ -6,6 +6,8 @@ import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnCompression,
+  ColumnStorage,
   ConstraintEnforcement,
   ForeignKey,
   Index,
@@ -17,6 +19,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from './model.ts';
 
@@ -334,6 +337,7 @@ function serializeTable(table: Table): object {
     uniqueConstraints: table.uniqueConstraints.map(serializeKey),
     checkConstraints: table.checkConstraints.map(serializeCheckConstraint),
     indexes: table.indexes.map(serializeIndex),
+    ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
   };
 }
 
@@ -345,6 +349,9 @@ function serializeColumn(column: Column): object {
     ...(column.notNullName === undefined ? {} : { notNullName: column.notNullName }),
     ...(column.default === undefined ? {} : { default: column.default }),
     ...(column.identity === undefined ? {} : { identity: serializeIdentity(column.identity) }),
+    ...(column.collation === undefined ? {} : { collation: column.collation }),
+    ...(column.storage === undefined ? {} : { storage: column.storage }),
+    ...(column.compression === undefined ? {} : { compression: column.compression }),
   };
 }
 
@@ -456,8 +463,19 @@ const TABLE_KEYS = [
   'uniqueConstraints',
   'checkConstraints',
   'indexes',
+  'persistence',
 ] as const;
-const COLUMN_KEYS = ['name', 'type', 'notNull', 'notNullName', 'default', 'identity'] as const;
+const COLUMN_KEYS = [
+  'name',
+  'type',
+  'notNull',
+  'notNullName',
+  'default',
+  'identity',
+  'collation',
+  'storage',
+  'compression',
+] as const;
 const IDENTITY_KEYS = [
   'generated',
   'sequenceName',
@@ -506,6 +524,9 @@ const REFERENTIAL_ACTIONS: readonly ReferentialAction[] = [
 const CONSTRAINT_ENFORCEMENTS: readonly ConstraintEnforcement[] = ['not-valid', 'not-enforced'];
 const SEQUENCE_DATA_TYPES: readonly SequenceDataType[] = ['smallint', 'integer', 'bigint'];
 const IDENTITY_GENERATIONS: readonly IdentityGeneration[] = ['always', 'by default'];
+const TABLE_PERSISTENCES: readonly TablePersistence[] = ['unlogged'];
+const COLUMN_STORAGES: readonly ColumnStorage[] = ['plain', 'external', 'extended', 'main'];
+const COLUMN_COMPRESSIONS: readonly ColumnCompression[] = ['pglz', 'lz4'];
 
 /** Canonical integer string form: optional minus, no leading zeros, `-0` excluded. */
 const CANONICAL_INTEGER = /^(0|-?[1-9][0-9]*)$/;
@@ -563,6 +584,14 @@ function parseArrayOf<T>(
 function parseString(value: unknown, path: string): Parsed<string> {
   if (typeof value !== 'string') return invalid(`${path} is not a string`);
   return parsed(value);
+}
+
+/** A non-empty string; an empty collation can never name a collation. */
+function parseNonEmptyString(value: unknown, path: string): Parsed<string> {
+  const string = parseString(value, path);
+  if (!string.ok) return string;
+  if (string.value === '') return invalid(`${path} is not a non-empty string`);
+  return string;
 }
 
 function parseBoolean(value: unknown, path: string): Parsed<boolean> {
@@ -647,6 +676,12 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
     if (!checkConstraints.ok) return checkConstraints;
     const indexes = parseArrayOf(object.indexes, fieldPath(path, 'indexes'), parseIndex);
     if (!indexes.ok) return indexes;
+    const persistence = parseOptional(
+      object.persistence,
+      fieldPath(path, 'persistence'),
+      parseTablePersistence,
+    );
+    if (!persistence.ok) return persistence;
     return parsed({
       schema: schema.value,
       name: name.value,
@@ -656,6 +691,7 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       uniqueConstraints: uniqueConstraints.value,
       checkConstraints: checkConstraints.value,
       indexes: indexes.value,
+      ...(persistence.value === undefined ? {} : { persistence: persistence.value }),
     });
   });
 }
@@ -681,6 +717,20 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
     if (!defaultValue.ok) return defaultValue;
     const identity = parseOptional(object.identity, fieldPath(path, 'identity'), parseIdentity);
     if (!identity.ok) return identity;
+    const collation = parseOptional(
+      object.collation,
+      fieldPath(path, 'collation'),
+      parseNonEmptyString,
+    );
+    if (!collation.ok) return collation;
+    const storage = parseOptional(object.storage, fieldPath(path, 'storage'), parseColumnStorage);
+    if (!storage.ok) return storage;
+    const compression = parseOptional(
+      object.compression,
+      fieldPath(path, 'compression'),
+      parseColumnCompression,
+    );
+    if (!compression.ok) return compression;
     return parsed({
       name: name.value,
       type: type.value,
@@ -688,8 +738,24 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       ...(notNullName.value === undefined ? {} : { notNullName: notNullName.value }),
       ...(defaultValue.value === undefined ? {} : { default: defaultValue.value }),
       ...(identity.value === undefined ? {} : { identity: identity.value }),
+      ...(collation.value === undefined ? {} : { collation: collation.value }),
+      ...(storage.value === undefined ? {} : { storage: storage.value }),
+      ...(compression.value === undefined ? {} : { compression: compression.value }),
     });
   });
+}
+
+/** Fail-closed parsers for the attribute and persistence unions. */
+function parseTablePersistence(value: unknown, path: string): Parsed<TablePersistence> {
+  return parseEnum(value, path, TABLE_PERSISTENCES, 'table persistence');
+}
+
+function parseColumnStorage(value: unknown, path: string): Parsed<ColumnStorage> {
+  return parseEnum(value, path, COLUMN_STORAGES, 'column storage');
+}
+
+function parseColumnCompression(value: unknown, path: string): Parsed<ColumnCompression> {
+  return parseEnum(value, path, COLUMN_COMPRESSIONS, 'column compression');
 }
 
 function parseIdentity(value: unknown, path: string): Parsed<Identity> {

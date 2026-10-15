@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Change, Hazard, Identity, IdentityChange, Plan } from '@schemamill/core';
+import type { Change, Column, Hazard, Identity, IdentityChange, Plan } from '@schemamill/core';
 
 import { formatChanges, formatHazards, formatPlan } from './format.ts';
 
@@ -287,6 +287,132 @@ test('added and removed columns and added tables surface an identity column', ()
       '~ table public.kept',
       '    + column fresh integer NOT NULL identity: GENERATED ALWAYS',
       '    - column gone integer NOT NULL identity: GENERATED ALWAYS',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('column attribute changes print the collation, storage, and compression samples', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'label',
+          fields: [
+            { field: 'collation', after: 'pg_catalog."C"' },
+            { field: 'storage', before: 'extended' },
+            { field: 'compression', after: 'lz4' },
+          ],
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    ~ column label: collation (none) → pg_catalog."C", storage extended → (none), compression (none) → lz4',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a persistence change prints the effective words in both directions', () => {
+  const toUnlogged: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [{ kind: 'persistence-changed', after: 'unlogged' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(toUnlogged),
+    ['~ table public.users', '    persistence logged → unlogged', ''].join('\n'),
+  );
+
+  const toLogged: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [{ kind: 'persistence-changed', before: 'unlogged' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(toLogged),
+    ['~ table public.users', '    persistence unlogged → logged', ''].join('\n'),
+  );
+});
+
+test('an alter-persistence step prints the target persistence, absent reading logged', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'alter-persistence',
+        table: { schema: 'public', name: 'users' },
+        persistence: 'unlogged',
+      },
+      { kind: 'alter-persistence', table: { schema: 'public', name: 'audit' } },
+    ],
+    groups: [{ start: 0, end: 2, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '2 steps in one transaction:',
+      ' 1. alter-persistence  public.users: persistence unlogged',
+      ' 2. alter-persistence  public.audit: persistence logged',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('added and removed columns print their attributes before the constraints', () => {
+  const attributed: Column = {
+    name: 'label',
+    type: 'text',
+    notNull: true,
+    default: "'x'",
+    collation: 'pg_catalog."C"',
+    storage: 'extended',
+    compression: 'lz4',
+  };
+
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-added',
+      table: {
+        schema: 'public',
+        name: 'users',
+        columns: [attributed],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+        persistence: 'unlogged',
+      },
+    },
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'kept' },
+      changes: [{ kind: 'column-added', column: attributed }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '+ table public.users',
+      '    label text collation pg_catalog."C" storage extended compression lz4 NOT NULL DEFAULT \'x\'',
+      '',
+      '~ table public.kept',
+      '    + column label text collation pg_catalog."C" storage extended compression lz4 NOT NULL DEFAULT \'x\'',
       '',
     ].join('\n'),
   );

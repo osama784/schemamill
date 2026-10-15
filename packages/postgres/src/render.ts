@@ -81,7 +81,8 @@ import {
  * DEFERRABLE` and valid-and-enforced being the defaults. A not-null fact with a name renders
  * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
  * `CREATE TABLE` and `ADD COLUMN`; nothing negotiates the server version — the renderer states
- * the attributes the model carries.
+ * the attributes the model carries. An `alter-persistence` step states the target persistence
+ * as `ALTER TABLE <t> SET UNLOGGED;`, and the absent `LOGGED` default as `SET LOGGED;`.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -363,6 +364,7 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'alter-column':
     case 'drop-not-null':
     case 'add-not-null':
+    case 'alter-persistence':
     case 'add-identity':
     case 'drop-identity':
     case 'alter-identity':
@@ -451,6 +453,10 @@ function renderStep(step: Step): string {
         : `ALTER TABLE ${renderTable(step.table)} ADD CONSTRAINT ${quoteIdentifier(
             step.name,
           )} NOT NULL ${quoteIdentifier(step.column)};`;
+    case 'alter-persistence':
+      return step.persistence === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} SET LOGGED;`
+        : `ALTER TABLE ${renderTable(step.table)} SET UNLOGGED;`;
     case 'add-identity':
       return renderAddIdentity(step.table, step.name, step.identity);
     case 'drop-identity':
@@ -659,6 +665,15 @@ function renderColumnAlteration(
       // name never reaches an alter-column; reaching here means the plan is malformed.
       throw new Error(
         `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a not-null name`,
+      );
+    case 'collation':
+    case 'storage':
+    case 'compression':
+      // The merged TYPE builder owns these fields — a TYPE statement restates the target
+      // collation and the SET statements restate storage and compression — so they never
+      // reach the per-field renderer; reaching here means the plan is malformed.
+      throw new Error(
+        `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a ${field.field} change`,
       );
     case 'default':
       return field.after === undefined

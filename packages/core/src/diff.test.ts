@@ -7,6 +7,7 @@ import type { Identity } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
   ForeignKey,
   Index,
   Model,
@@ -16,6 +17,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from './model.ts';
 
@@ -44,6 +46,7 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  persistence?: TablePersistence;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -56,6 +59,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
@@ -292,6 +296,7 @@ test('a column type change reports the type field', () => {
           kind: 'column-changed',
           name: 'c',
           fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -364,6 +369,7 @@ test('a column change reports type, notNull, then default', () => {
             { field: 'notNull', before: false, after: true },
             { field: 'default', before: '0' },
           ],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -454,7 +460,347 @@ test('a column change reports type, notNull, notNullName, then default', () => {
             { field: 'notNullName', after: 'c_nn' },
             { field: 'default', before: '0', after: '1' },
           ],
+          attributes: { type: 'bigint' },
         },
+      ],
+    },
+  ]);
+});
+
+test('a column change reports collation, storage, then compression after default', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          default: '0',
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(12)',
+          notNull: true,
+          notNullName: 'c_nn',
+          default: '1',
+          collation: 'pg_catalog."en_US"',
+          storage: 'main',
+          compression: 'pglz',
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'character varying(12)' },
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+            { field: 'default', before: '0', after: '1' },
+            { field: 'collation', before: 'pg_catalog."C"', after: 'pg_catalog."en_US"' },
+            { field: 'storage', before: 'extended', after: 'main' },
+            { field: 'compression', before: 'lz4', after: 'pglz' },
+          ],
+          attributes: {
+            type: 'character varying(12)',
+            collation: 'pg_catalog."en_US"',
+            storage: 'main',
+            compression: 'pglz',
+          },
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'character varying(12)', after: 'text' },
+            { field: 'notNull', before: true, after: false },
+            { field: 'notNullName', before: 'c_nn' },
+            { field: 'default', before: '1', after: '0' },
+            { field: 'collation', before: 'pg_catalog."en_US"', after: 'pg_catalog."C"' },
+            { field: 'storage', before: 'main', after: 'extended' },
+            { field: 'compression', before: 'pglz', after: 'lz4' },
+          ],
+          attributes: {
+            type: 'text',
+            collation: 'pg_catalog."C"',
+            storage: 'extended',
+            compression: 'lz4',
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a notNull-only or default-only column change carries no attributes', () => {
+  const base = column('c', {
+    collation: 'pg_catalog."C"',
+    storage: 'external',
+    compression: 'lz4',
+  });
+  const baseline = model(table('t', { columns: [base] }));
+
+  const qualified = model(
+    table('t', {
+      columns: [
+        column('c', {
+          notNull: true,
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  assertDiff(baseline, qualified, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNull', before: false, after: true }],
+        },
+      ],
+    },
+  ]);
+
+  const defaulted = model(
+    table('t', {
+      columns: [
+        column('c', {
+          default: 'now()',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  assertDiff(baseline, defaulted, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'default', after: 'now()' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a type change alone carries the unchanged explicit attributes', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'bigint',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: {
+            type: 'bigint',
+            collation: 'pg_catalog."C"',
+            storage: 'external',
+            compression: 'lz4',
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('an attribute-only change reports the field and the target attributes', () => {
+  const plain = model(table('t', { columns: [column('c')] }));
+
+  const stored = model(table('t', { columns: [column('c', { storage: 'extended' })] }));
+  assertDiff(plain, stored, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'storage', after: 'extended' }],
+          attributes: { type: 'text', storage: 'extended' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(stored, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'storage', before: 'extended' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+
+  const compressed = model(table('t', { columns: [column('c', { compression: 'lz4' })] }));
+  assertDiff(plain, compressed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'compression', after: 'lz4' }],
+          attributes: { type: 'text', compression: 'lz4' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(compressed, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'compression', before: 'lz4' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+
+  const collated = model(table('t', { columns: [column('c', { collation: 'pg_catalog."C"' })] }));
+  assertDiff(plain, collated, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'collation', after: 'pg_catalog."C"' }],
+          attributes: { type: 'text', collation: 'pg_catalog."C"' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(collated, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'collation', before: 'pg_catalog."C"' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a persistence flip reports the persistence-changed member', () => {
+  const logged = table('t', { columns: [column('c')] });
+  const unlogged = table('t', { columns: [column('c')], persistence: 'unlogged' });
+
+  assertDiff(model(logged), model(unlogged), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'persistence-changed', after: 'unlogged' }],
+    },
+  ]);
+  assertDiff(model(unlogged), model(logged), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'persistence-changed', before: 'unlogged' }],
+    },
+  ]);
+  assertDiff(model(unlogged), model(unlogged), []);
+});
+
+test('a persistence change follows the column and index members', () => {
+  const before = table('t', {
+    columns: [column('c', { type: 'text' })],
+    indexes: [index(['c'], { name: 't_c_idx' })],
+  });
+  const after = table('t', {
+    columns: [column('c', { type: 'bigint' })],
+    persistence: 'unlogged',
+    indexes: [index(['c'], { name: 't_c_idx2' })],
+  });
+
+  assertDiff(model(before), model(after), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
+        },
+        { kind: 'index-removed', index: index(['c'], { name: 't_c_idx' }) },
+        { kind: 'index-added', index: index(['c'], { name: 't_c_idx2' }) },
+        { kind: 'persistence-changed', after: 'unlogged' },
       ],
     },
   ]);
@@ -520,6 +866,7 @@ test('type and default text compare exactly as stored', () => {
             { field: 'type', before: 'numeric(12, 2)', after: 'numeric(12,2)' },
             { field: 'default', before: 'now()', after: ' now() ' },
           ],
+          attributes: { type: 'numeric(12,2)' },
         },
       ],
     },
@@ -802,6 +1149,7 @@ test('a column type change suppresses an identity bound the AS conversion moves'
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -843,6 +1191,7 @@ test('a column type change restates an identity bound the AS conversion would mo
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
           identity: {
             kind: 'changed',
             fields: [
@@ -893,6 +1242,7 @@ test('a column type change restates an identity minimum the AS conversion would 
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'smallint', after: 'integer' }],
+          attributes: { type: 'integer' },
           identity: {
             kind: 'changed',
             fields: [
@@ -945,6 +1295,7 @@ test('as-written integer aliases do not convert identity bounds', () => {
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'int4', after: 'integer' }],
+          attributes: { type: 'integer' },
         },
       ],
     },
@@ -1074,6 +1425,41 @@ test('payload columns carry their identity as an independent copy', () => {
   }
 });
 
+test('added and removed table payloads carry persistence and the new column fields', () => {
+  const unlogged = table('t', {
+    columns: [
+      column('c', {
+        type: 'bigint',
+        collation: 'pg_catalog."C"',
+        storage: 'main',
+        compression: 'pglz',
+      }),
+    ],
+    persistence: 'unlogged',
+  });
+
+  assertDiff(model(), model(unlogged), [{ kind: 'table-added', table: unlogged }]);
+  assertDiff(model(unlogged), model(), [{ kind: 'table-removed', table: unlogged }]);
+});
+
+test('a changed column carries the attributes as an independent copy', () => {
+  const targetStorage = 'main';
+  const baseline = model(table('t', { columns: [column('c', { storage: 'external' })] }));
+  const target = model(table('t', { columns: [column('c', { storage: targetStorage })] }));
+
+  const changed = diff(baseline, target)[0]!;
+  assert.equal(changed.kind, 'table-changed');
+  if (changed.kind !== 'table-changed') throw new Error('expected a changed table');
+  const columnChange = changed.changes[0];
+  assert.equal(columnChange?.kind, 'column-changed');
+  if (columnChange?.kind !== 'column-changed') throw new Error('expected a column change');
+  const attributes = columnChange.attributes;
+  assert.ok(attributes !== undefined, 'a storage change must carry the target attributes');
+
+  (attributes as Mutable<ColumnAttributes>).storage = 'plain';
+  assert.equal(target.tables[0]!.columns[0]!.storage, targetStorage);
+});
+
 test('a deep-frozen model with identities can be diffed', () => {
   const baseline = deepFreeze(
     model(
@@ -1105,6 +1491,7 @@ test('a deep-frozen model with identities can be diffed', () => {
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -2015,6 +2402,7 @@ test('a table with many changes emits in the documented order', () => {
           kind: 'column-changed',
           name: 'mutate',
           fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
         {
           kind: 'primary-key-changed',

@@ -3,6 +3,9 @@ import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  ColumnCompression,
+  ColumnStorage,
   ForeignKey,
   Index,
   Model,
@@ -13,6 +16,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from './model.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
@@ -61,8 +65,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *
  * A column's identity — its `GENERATED … AS IDENTITY` descriptor — is a column property, not
  * a sequence entity, and compares as the `identity` part of the column's change, alongside
- * the scalar fields `type`, `notNull`, `notNullName`, and `default`. One identity against a
- * column without one is an addition or a removal carrying that descriptor; two identities
+ * the scalar fields `type`, `notNull`, `notNullName`, `default`, `collation`, `storage`,
+ * and `compression`. One identity against a column without one is an addition or a removal
+ * carrying that descriptor; two identities
  * compare as a change with only their differing options, in the fixed order `generated`,
  * `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is
  * deliberately not an option: it compares only when both sides state one, a stated mismatch is
@@ -91,8 +96,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
  *    order, with only the scalar fields that differ, in the fixed order `type`, `notNull`,
- *    `notNullName`, `default`, plus the column's identity change when it has one); then at
- *    most one primary-key addition, removal, or change; then foreign keys removed, added, and
+ *    `notNullName`, `default`, `collation`, `storage`, `compression`, plus the column's
+ *    identity change when it has one); then at most one primary-key addition, removal, or
+ *    change; then foreign keys removed, added, and
  *    changed, each sorted in the model's foreign-key order (referencing columns element-wise,
  *    referenced table schema then name, then name, absent first — an absent name sorts before
  *    any present one, including the empty string, which remains a distinct, later entry); then
@@ -100,8 +106,10 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    unique-constraint order (columns element-wise, then name, absent first the same way);
  *    then check constraints removed, added, and changed, each sorted in the model's
  *    check-constraint order (expression, then name, absent first); then indexes removed,
- *    added, and changed, each sorted by name, absent first. Changed pairs are ordered by their
- *    baseline member in that member's order, then by their target member the same way.
+ *    added, and changed, each sorted by name, absent first; then the table's
+ *    `persistence-changed` entry when the two sides' persistence differs. Changed pairs are
+ *    ordered by their baseline member in that member's order, then by their target member the
+ *    same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
  *    come from, as point 2 describes, and no entry states a column's position. A table with no
  *    reported changes is therefore not necessarily structurally identical to its counterpart:
@@ -157,13 +165,15 @@ export type TableChange =
   | { kind: 'column-removed'; column: Column }
   /**
    * A column both sides have with differing fields: the scalar fields, plus the identity
-   * difference when the column's identity differs.
+   * difference when the column's identity differs, plus the target-side attribute carrier
+   * when any of `type`, `collation`, `storage`, or `compression` differs.
    */
   | {
       kind: 'column-changed';
       name: string;
       fields: readonly ColumnFieldChange[];
       identity?: IdentityChange;
+      attributes?: ColumnAttributes;
     }
   /** The target has a primary key the baseline does not. */
   | { kind: 'primary-key-added'; primaryKey: PrimaryKey }
@@ -198,19 +208,28 @@ export type TableChange =
   /** An index only the baseline has. */
   | { kind: 'index-removed'; index: Index }
   /** A matched index pair with any structural difference. */
-  | { kind: 'index-changed'; before: Index; after: Index };
+  | { kind: 'index-changed'; before: Index; after: Index }
+  /**
+   * A table both sides have whose persistence differs; a side that states none is `LOGGED`,
+   * the default, and is omitted.
+   */
+  | { kind: 'persistence-changed'; before?: TablePersistence; after?: TablePersistence };
 
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
- * the fixed order `type`, `notNull`, `notNullName`, `default`. A `default` or `notNullName`
- * change omits the side that states none. A column's identity is not a scalar field: it
- * travels as the `identity` part of the `column-changed` entry.
+ * the fixed order `type`, `notNull`, `notNullName`, `default`, `collation`, `storage`,
+ * `compression`. A `default`, `notNullName`, `collation`, `storage`, or `compression` change
+ * omits the side that states none. A column's identity is not a scalar field: it travels as
+ * the `identity` part of the `column-changed` entry.
  */
 export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
   | { field: 'notNull'; before: boolean; after: boolean }
   | { field: 'notNullName'; before?: string; after?: string }
-  | { field: 'default'; before?: string; after?: string };
+  | { field: 'default'; before?: string; after?: string }
+  | { field: 'collation'; before?: string; after?: string }
+  | { field: 'storage'; before?: ColumnStorage; after?: ColumnStorage }
+  | { field: 'compression'; before?: ColumnCompression; after?: ColumnCompression };
 
 /**
  * One differing option of a changed identity; only options that differ are reported, in the
@@ -556,6 +575,13 @@ function diffTable(
   changes.push(...diffUniqueConstraints(baseline.uniqueConstraints, target.uniqueConstraints));
   changes.push(...diffCheckConstraints(baseline.checkConstraints, target.checkConstraints));
   changes.push(...diffIndexes(baseline.indexes, target.indexes));
+  if (baseline.persistence !== target.persistence) {
+    changes.push({
+      kind: 'persistence-changed',
+      ...(baseline.persistence === undefined ? {} : { before: baseline.persistence }),
+      ...(target.persistence === undefined ? {} : { after: target.persistence }),
+    });
+  }
   return changes;
 }
 
@@ -580,16 +606,42 @@ function diffColumns(baseline: readonly Column[], target: readonly Column[]): Ta
     const fields = diffColumnFields(before, column);
     const identity = diffIdentity(before, column);
     if (fields.length > 0 || identity !== undefined) {
+      const attributes = columnAttributes(before, column);
       changes.push({
         kind: 'column-changed',
         name: column.name,
         fields,
         ...(identity === undefined ? {} : { identity }),
+        ...(attributes === undefined ? {} : { attributes }),
       });
     }
   }
 
   return changes;
+}
+
+/**
+ * The target-side attribute carrier of a changed column, or `undefined` when the four
+ * render-relevant values compare equal. The carrier restates the target's explicit
+ * attributes even when only the type differed: the renderer merges a type and collation
+ * change into one `TYPE` statement, which resets storage and compression to the type's
+ * defaults.
+ */
+function columnAttributes(baseline: Column, target: Column): ColumnAttributes | undefined {
+  if (
+    baseline.type === target.type &&
+    baseline.collation === target.collation &&
+    baseline.storage === target.storage &&
+    baseline.compression === target.compression
+  ) {
+    return undefined;
+  }
+  return {
+    type: target.type,
+    ...(target.collation === undefined ? {} : { collation: target.collation }),
+    ...(target.storage === undefined ? {} : { storage: target.storage }),
+    ...(target.compression === undefined ? {} : { compression: target.compression }),
+  };
 }
 
 function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[] {
@@ -612,6 +664,27 @@ function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[]
       field: 'default',
       ...(baseline.default === undefined ? {} : { before: baseline.default }),
       ...(target.default === undefined ? {} : { after: target.default }),
+    });
+  }
+  if (baseline.collation !== target.collation) {
+    fields.push({
+      field: 'collation',
+      ...(baseline.collation === undefined ? {} : { before: baseline.collation }),
+      ...(target.collation === undefined ? {} : { after: target.collation }),
+    });
+  }
+  if (baseline.storage !== target.storage) {
+    fields.push({
+      field: 'storage',
+      ...(baseline.storage === undefined ? {} : { before: baseline.storage }),
+      ...(target.storage === undefined ? {} : { after: target.storage }),
+    });
+  }
+  if (baseline.compression !== target.compression) {
+    fields.push({
+      field: 'compression',
+      ...(baseline.compression === undefined ? {} : { before: baseline.compression }),
+      ...(target.compression === undefined ? {} : { after: target.compression }),
     });
   }
   return fields;

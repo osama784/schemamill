@@ -351,6 +351,7 @@ function findIdentityStep(
       case 'drop-column':
       case 'drop-not-null':
       case 'add-not-null':
+      case 'alter-persistence':
       case 'drop-identity':
       case 'add-primary-key':
       case 'drop-primary-key':

@@ -439,6 +439,47 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     },
     'invalid model: tables[0].foreignKeys[0].initiallyDeferred',
   ],
+  [
+    'a column storage method outside the union',
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'c', type: 'text', notNull: false, storage: 'packed' }],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].storage',
+  ],
+  [
+    'a column compression method outside the union',
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'c', type: 'text', notNull: false, compression: 'zstd' }],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].compression',
+  ],
+  [
+    'an empty collation',
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'c', type: 'text', notNull: false, collation: '' }],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].collation',
+  ],
+  [
+    'a table persistence outside the union',
+    { tables: [tablePayload({ persistence: 'temporary' })], sequences: [] },
+    'invalid model: tables[0].persistence',
+  ],
 ];
 
 for (const [name, payload, prefix] of SHAPE_FAILURES) {
@@ -474,6 +515,53 @@ test('resolveWorkspace names the constraint enforcement union in the failure', a
     diagnostic.message,
     'invalid model: tables[0].foreignKeys[0].enforcement is not a valid constraint enforcement',
   );
+});
+
+test('resolveWorkspace names the column attribute and persistence failures in full', async (t) => {
+  const cases: ReadonlyArray<readonly [unknown, string]> = [
+    [
+      {
+        tables: [
+          tablePayload({
+            columns: [{ name: 'c', type: 'text', notNull: false, storage: 'packed' }],
+          }),
+        ],
+        sequences: [],
+      },
+      'invalid model: tables[0].columns[0].storage is not a valid column storage',
+    ],
+    [
+      {
+        tables: [
+          tablePayload({
+            columns: [{ name: 'c', type: 'text', notNull: false, compression: 'zstd' }],
+          }),
+        ],
+        sequences: [],
+      },
+      'invalid model: tables[0].columns[0].compression is not a valid column compression',
+    ],
+    [
+      {
+        tables: [
+          tablePayload({
+            columns: [{ name: 'c', type: 'text', notNull: false, collation: '' }],
+          }),
+        ],
+        sequences: [],
+      },
+      'invalid model: tables[0].columns[0].collation is not a non-empty string',
+    ],
+    [
+      { tables: [tablePayload({ persistence: 'temporary' })], sequences: [] },
+      'invalid model: tables[0].persistence is not a valid table persistence',
+    ],
+  ];
+
+  for (const [payload, message] of cases) {
+    const diagnostic = await resolvePayload(t, payload);
+    assert.equal(diagnostic.message, message);
+  }
 });
 
 /** A populated canonical model, as a committed model file would hold it. */
@@ -607,13 +695,17 @@ const ATTRIBUTE_MODEL_JSON = `{
     {
       "schema": "public",
       "name": "users",
+      "persistence": "unlogged",
       "columns": [
         {
           "name": "id",
           "type": "bigint",
           "notNull": true,
           "notNullName": "users_id_not_null",
-          "default": "0"
+          "default": "0",
+          "collation": "app.ci_collation",
+          "storage": "extended",
+          "compression": "lz4"
         },
         { "name": "email", "type": "text", "notNull": false }
       ],
@@ -654,6 +746,7 @@ const ATTRIBUTE_MODEL: Model = {
     {
       schema: 'public',
       name: 'users',
+      persistence: 'unlogged',
       columns: [
         {
           name: 'id',
@@ -661,6 +754,9 @@ const ATTRIBUTE_MODEL: Model = {
           notNull: true,
           notNullName: 'users_id_not_null',
           default: '0',
+          collation: 'app.ci_collation',
+          storage: 'extended',
+          compression: 'lz4',
         },
         { name: 'email', type: 'text', notNull: false },
       ],
@@ -719,6 +815,20 @@ test('serializeModel emits the new attributes in declaration order', () => {
     'notNull',
     'notNullName',
     'default',
+    'collation',
+    'storage',
+    'compression',
+  ]);
+  assert.deepStrictEqual(Object.keys(table), [
+    'schema',
+    'name',
+    'columns',
+    'primaryKey',
+    'foreignKeys',
+    'uniqueConstraints',
+    'checkConstraints',
+    'indexes',
+    'persistence',
   ]);
   assert.deepStrictEqual(Object.keys(table.primaryKey), [
     'name',
@@ -770,9 +880,13 @@ const ROUND_TRIP_MODEL: Model = {
             cache: '1',
             cycle: false,
           },
+          collation: 'pg_catalog."C"',
+          storage: 'main',
+          compression: 'pglz',
         },
       ],
       primaryKey: { name: 'users_pkey', columns: ['id'], deferrable: true },
+      persistence: 'unlogged',
       foreignKeys: [
         {
           name: 'users_org_id_fkey',
@@ -800,6 +914,24 @@ test('serializeModel round-trips a populated model through resolveWorkspace with
   const resolved = await resolveOk(dir);
 
   assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
+});
+
+test('serializeModel emits a column identity before its attributes, and persistence last', () => {
+  const payload = JSON.parse(serializeModel(ROUND_TRIP_MODEL)) as {
+    tables: Array<{ columns: object[]; persistence?: string }>;
+  };
+
+  assert.deepStrictEqual(Object.keys(payload.tables[0]!.columns[0]!), [
+    'name',
+    'type',
+    'notNull',
+    'notNullName',
+    'identity',
+    'collation',
+    'storage',
+    'compression',
+  ]);
+  assert.equal(payload.tables[0]!.persistence, 'unlogged');
 });
 
 test('resolveWorkspace walks up from a nested directory to the nearest root', async (t) => {
