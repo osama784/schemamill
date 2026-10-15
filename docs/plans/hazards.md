@@ -42,12 +42,13 @@ Sequence and identity state are not modeled: `last_value`, `is_called`, `RESTART
 
 ## Deferred gaps
 
-Two apply-time gaps stay outside the analyzer, named here and deferred:
+The following apply-time gaps stay outside the analyzer, named here and deferred:
 
 - **Constraint validation on populated tables** — adding a unique or check constraint to a table holding rows can fail when an existing row violates it, the same data-dependent property `add-foreign-key` already has today, unflagged. The analyzer reads two models and a plan, never data, so it cannot decide it.
 - **`INVALID` indexes** — a failed `CREATE INDEX CONCURRENTLY` leaves an invalid index behind, an apply-history fact PostgreSQL records in its catalog but the model does not carry; the analyzer cannot see it, and the generated plan cannot repair it.
+- **Persistence rewrites and locks** — `ALTER TABLE … SET LOGGED`/`SET UNLOGGED` rewrites the table under an access-exclusive lock, so a persistence change the plan renders carries a definite lock and rewrite cost. Unlike the type-change rewrite family above, the model carries persistence, so this hazard is model-knowable and belongs to this plan rather than the type-semantics non-goal; arrived with the [column attributes slice](./introspection-attributes.md) ([#77](https://github.com/osama784/schemamill/issues/77)).
 
-Both arrived with the [constraints and indexes slice](./constraints-indexes.md) ([#33](https://github.com/osama784/schemamill/issues/33)).
+The first two arrived with the [constraints and indexes slice](./constraints-indexes.md) ([#33](https://github.com/osama784/schemamill/issues/33)).
 
 ## Output shape
 
@@ -69,4 +70,4 @@ Two levels and the live evidence pin the slice:
 
 ## Non-goals
 
-Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful rewrite analysis needs type semantics the model deliberately lacks. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). SQL comments, sequence-state modeling, and auto-remediation stay out; and the two gaps the constraints and indexes slice surfaced — validation of a unique or check constraint against existing rows, and the `INVALID` index a failed `CONCURRENTLY` build leaves behind — are named under [Deferred gaps](#deferred-gaps). The analyzer never changes a step, emits no new SQL clause, and adds no flag.
+Relation-level hazard families — rewrites, locks, and downtime — are named non-goals for later slices: truthful type-change rewrite analysis needs type semantics the model deliberately lacks, while the persistence rewrite the model can see is named under [Deferred gaps](#deferred-gaps). Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). SQL comments, sequence-state modeling, and auto-remediation stay out; and the two gaps the constraints and indexes slice surfaced — validation of a unique or check constraint against existing rows, and the `INVALID` index a failed `CONCURRENTLY` build leaves behind — are named under [Deferred gaps](#deferred-gaps). The analyzer never changes a step, emits no new SQL clause, and adds no flag.
