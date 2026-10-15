@@ -2999,8 +2999,14 @@ function extractDefaultText(
   return extractSourceText(sql, startIndex, boundaries);
 }
 
-/** Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads `numeric(12,2)`. */
-function normalizeSourceText(text: string): string {
+/**
+ * Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads
+ * `numeric(12,2)`. The default-expression and `COLLATE` readers share it, and the catalog
+ * mapper imports it for the default expressions `pg_get_expr` renders, so both sides of the
+ * dump-import congruence bar normalize identically. Exported for that sharing, deliberately
+ * not re-exported from `index.ts`.
+ */
+export function normalizeSourceText(text: string): string {
   let normalized = '';
   let pendingSpace = false;
   let index = 0;

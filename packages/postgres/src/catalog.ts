@@ -9,21 +9,26 @@
  * reads the catalog under the same empty path, so `format_type`'s spelling matches the dumped
  * DDL — and `default_transaction_read_only=on` as read-only posture. The read itself is the
  * single `SELECT`, so nothing about it writes; PostgreSQL 13 or newer is assumed (the
- * harness's own floor). `attcompression` exists only from PostgreSQL 14, so it is read through
- * the row's `jsonb` form: on 13 the key is absent and the column reports no explicit
- * compression.
+ * harness's own floor: `pg_attrdef`, `pg_collation`, and `format` all exist there).
+ * `attcompression` exists only from PostgreSQL 14, so it is read through the row's `jsonb`
+ * form: on 13 the key is absent and the column reports no explicit compression. A column's
+ * default expression reads through `pg_attrdef` and `pg_get_expr`, and its explicit
+ * collation's qualified name is assembled in SQL from `pg_collation` and the collation's
+ * namespace with `format('%I.%I', …)` — `quote_ident`'s quoting, the spelling `pg_dump`
+ * writes — with NULL standing for the model's absent state in both reads.
  *
  * Failure handling is a split. Transport failures (spawn error, non-zero exit, unparseable
  * JSON output) and any violation of the `SELECT`'s own payload contract — a missing or
  * wrong-typed field, an unknown or duplicate relation, orphan column, primary-key, or index
- * rows, a duplicate `(schema, indexName)` index row, or an index definition that does not
- * parse to one `CREATE INDEX` — throw an `Error` carrying the reason. Diagnostics are only
- * for sane-but-deferred catalog state: a partitioned relation is skipped and named, unlogged
- * or temporary persistence is flagged on an imported table, the column features the model
- * does not carry — defaults, generation, identity, explicit collation, storage, and
- * compression — are each flagged and named, and an index outside the importer's envelope or
- * not valid and ready is skipped and named while one on a non-default tablespace is kept and
- * flagged. Every diagnostic keeps the import module's grammar: `object` is `<schema>.<table>`
+ * rows, a duplicate `(schema, indexName)` index row, an unknown storage or compression letter
+ * behind an explicit setting, or an index definition that does not parse to one
+ * `CREATE INDEX` — throw an `Error` carrying the reason. Diagnostics are only for
+ * sane-but-deferred catalog state: a partitioned relation is skipped and named, temporary
+ * persistence is flagged on an imported table, the column features the model does not carry —
+ * generation and identity — are each flagged and named, and an index outside the importer's
+ * envelope or not valid and ready is skipped and named while one on a non-default tablespace
+ * is kept and flagged. Every diagnostic keeps the import module's grammar: `object` is
+ * `<schema>.<table>`
  * — for an index finding, `<schema>.<indexName>` — and the column or index, when relevant, is
  * named in `message`; `position` is never set.
  *
@@ -38,6 +43,8 @@ import { promisify } from 'node:util';
 import type {
   CatalogReader,
   Column,
+  ColumnCompression,
+  ColumnStorage,
   Diagnostic,
   Index,
   Model,
@@ -45,10 +52,11 @@ import type {
   ReadResult,
   Table,
   TableIdentity,
+  TablePersistence,
 } from '@schemamill/core';
 import { parse, type IndexStmt } from 'libpg-query';
 
-import { classifyIndexEnvelope, indexStructureKey } from './import.ts';
+import { classifyIndexEnvelope, indexStructureKey, normalizeSourceText } from './import.ts';
 import { synthesizedIndexName, synthesizedPrimaryKeyName } from './names.ts';
 
 const execFileAsync = promisify(execFile);
@@ -63,7 +71,11 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * The one read: a single `json` document with the tables, columns, primary keys, and indexes
  * of every user schema, system schemas excluded. Tables carry what the deferred-states pass
  * needs (`relkind`, `relispartition`, `relpersistence`); columns are read for ordinary tables
- * only, in attribute order, with the type spelling `format_type` gives; primary-key rows carry
+ * only, in attribute order, with the type spelling `format_type` gives, the `pg_attrdef`
+ * default expression `pg_get_expr` renders (null when there is none), the explicit
+ * collation's `pg_dump` spelling (`format('%I.%I', …)` over `pg_collation` and its namespace,
+ * null when the collation is the type's), and the `attstorage`/`typstorage`/`attcompression`
+ * letters the explicit-only gates compare; primary-key rows carry
  * the constraint name, the key position, and the column name; index rows are read for ordinary
  * tables only, one row per index, carrying the table identification, the stored name, the
  * `pg_get_indexdef` definition, the valid and ready flags, and the tablespace name (null for
@@ -107,8 +119,14 @@ SELECT json_build_object(
         attribute.attidentity AS attidentity,
         attribute.attgenerated AS attgenerated,
         attribute.atthasdef AS atthasdef,
+        pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid) AS "default",
         attribute.attcollation::bigint AS attcollation,
         attribute_type.typcollation::bigint AS typcollation,
+        CASE
+          WHEN attribute.attcollation <> 0
+            AND attribute.attcollation <> attribute_type.typcollation
+          THEN pg_catalog.format('%I.%I', collation_namespace.nspname, collation_row.collname)
+        END AS collation,
         attribute.attstorage AS attstorage,
         attribute_type.typstorage AS typstorage,
         COALESCE(to_jsonb(attribute) ->> 'attcompression', '') AS attcompression
@@ -116,6 +134,13 @@ SELECT json_build_object(
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
       JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = relation.oid
       LEFT JOIN pg_catalog.pg_type AS attribute_type ON attribute_type.oid = attribute.atttypid
+      LEFT JOIN pg_catalog.pg_attrdef AS attrdef
+        ON attrdef.adrelid = attribute.attrelid
+       AND attrdef.adnum = attribute.attnum
+      LEFT JOIN pg_catalog.pg_collation AS collation_row
+        ON collation_row.oid = attribute.attcollation
+      LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+        ON collation_namespace.oid = collation_row.collnamespace
       WHERE relation.relkind = 'r'
         AND NOT relation.relispartition
         AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -254,8 +279,10 @@ interface ColumnRow {
   readonly attidentity: string;
   readonly attgenerated: string;
   readonly atthasdef: boolean;
+  readonly default: string | null;
   readonly attcollation: number;
   readonly typcollation: number;
+  readonly collation: string | null;
   readonly attstorage: string;
   readonly typstorage: string;
   readonly attcompression: string;
@@ -421,15 +448,16 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       });
       continue;
     }
-    if (row.relpersistence !== 'p') {
-      const persistence = row.relpersistence === 'u' ? 'unlogged' : 'temporary';
+    if (row.relpersistence === 't') {
       diagnostics.push({
         kind: 'flag',
         code: 'unsupported-attribute',
         object,
-        message: `table ${object} is ${persistence}; persistence is not represented yet`,
+        message: `table ${object} is temporary; persistence is not represented yet`,
       });
     }
+    const persistence: TablePersistence | undefined =
+      row.relpersistence === 'u' ? 'unlogged' : undefined;
 
     const tableColumns = (columnsByTable.get(tableKey(row.schema, row.name)) ?? []).sort(
       (left, right) => left.attnum - right.attnum,
@@ -486,12 +514,14 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         name: column.name,
         type: column.type,
         notNull: column.attnotnull,
+        ...columnAttributes(column),
       })),
       ...(primaryKey === undefined ? {} : { primaryKey }),
       foreignKeys: [],
       uniqueConstraints: [],
       checkConstraints: [],
       indexes: canonicalizeIndexNames(identity, namedIndexes).sort(compareIndexes),
+      ...(persistence === undefined ? {} : { persistence }),
     });
   }
 
@@ -520,7 +550,12 @@ function requireOrdinaryTable(
   return row;
 }
 
-/** The deferred-state flags of one ordinary table's column, in the pinned cause order. */
+/**
+ * The deferred-state flags of one ordinary table's column, in the pinned cause order:
+ * generation, then identity. The default expression, the explicit collation, storage, and
+ * compression now travel the model and carry no flag; a generated column keeps its flag and
+ * never reads the generation expression its `atthasdef` marks as a default.
+ */
 function columnDiagnostics(object: string, column: ColumnRow): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
   const flag = (text: string): void => {
@@ -533,22 +568,96 @@ function columnDiagnostics(object: string, column: ColumnRow): Diagnostic[] {
   };
   if (column.attgenerated !== '') {
     flag('is generated; generation is not represented yet');
-  } else if (column.atthasdef) {
-    flag('has a default; defaults are not read yet');
   }
   if (column.attidentity !== '') {
     flag('is an identity column; identity is not read yet');
   }
-  if (column.attcollation !== 0 && column.attcollation !== column.typcollation) {
-    flag('has an explicit collation; collation is not represented yet');
-  }
-  if (column.attstorage !== column.typstorage) {
-    flag('has an explicit storage setting; storage is not represented yet');
-  }
-  if (column.attcompression !== '') {
-    flag('has an explicit compression setting; compression is not represented yet');
-  }
   return diagnostics;
+}
+
+/** PostgreSQL's `attstorage` letters, as the model spells them. */
+const COLUMN_STORAGE_LETTERS: Readonly<Record<string, ColumnStorage>> = {
+  p: 'plain',
+  e: 'external',
+  x: 'extended',
+  m: 'main',
+};
+
+/** PostgreSQL's `attcompression` letters, as the model spells them. */
+const COLUMN_COMPRESSION_LETTERS: Readonly<Record<string, ColumnCompression>> = {
+  p: 'pglz',
+  l: 'lz4',
+};
+
+/**
+ * The canonical column fields the catalog's explicit-only gates carry: the default expression
+ * in the dump importer's normalized form and the explicit collation, storage, and compression,
+ * each present exactly when the catalog states it. Absent keys stay absent — the model's
+ * absent state — so a column the catalog reads clean maps byte-identically to its import.
+ */
+function columnAttributes(
+  row: ColumnRow,
+): Pick<Column, 'default' | 'collation' | 'storage' | 'compression'> {
+  const defaultText = columnDefault(row);
+  const collation = explicitCollation(row);
+  const storage = explicitStorage(row);
+  const compression = explicitCompression(row);
+  return {
+    ...(defaultText === undefined ? {} : { default: defaultText }),
+    ...(collation === undefined ? {} : { collation }),
+    ...(storage === undefined ? {} : { storage }),
+    ...(compression === undefined ? {} : { compression }),
+  };
+}
+
+/**
+ * The default expression the row states, whitespace-normalized with the dump importer's
+ * semantics (`extractDefaultText`'s), or `undefined` when there is none. A generated column
+ * keeps its flag and never reads a default, and `atthasdef` without an attrdef row — a NULL
+ * `pg_get_expr` — reads as no default.
+ */
+function columnDefault(row: ColumnRow): string | undefined {
+  if (row.attgenerated !== '' || !row.atthasdef || row.default === null) return undefined;
+  return normalizeSourceText(row.default);
+}
+
+/**
+ * The explicit collation's `pg_dump` spelling, or `undefined` when the column's collation is
+ * its type's — the catalog's explicit-only marker. The SQL already gates the same way, so the
+ * spelling arrives exactly for the explicit case; the gate is repeated here because the
+ * canonicalization rule is the mapper's.
+ */
+function explicitCollation(row: ColumnRow): string | undefined {
+  if (row.attcollation === 0 || row.attcollation === row.typcollation) return undefined;
+  return row.collation ?? undefined;
+}
+
+/**
+ * The modeled storage method the row states explicitly — the letter mapped to its word — or
+ * `undefined` when the storage is the type's. A letter outside PostgreSQL's set is a payload
+ * contract violation.
+ */
+function explicitStorage(row: ColumnRow): ColumnStorage | undefined {
+  if (row.attstorage === row.typstorage) return undefined;
+  const storage = COLUMN_STORAGE_LETTERS[row.attstorage];
+  if (storage === undefined) {
+    throw new Error(`catalog payload: unknown attstorage letter "${row.attstorage}"`);
+  }
+  return storage;
+}
+
+/**
+ * The modeled compression method the row states explicitly — the letter mapped to its word —
+ * or `undefined` when no method is stated (the empty string on the PostgreSQL 13 floor
+ * included). A letter outside PostgreSQL's set is a payload contract violation.
+ */
+function explicitCompression(row: ColumnRow): ColumnCompression | undefined {
+  if (row.attcompression === '') return undefined;
+  const compression = COLUMN_COMPRESSION_LETTERS[row.attcompression];
+  if (compression === undefined) {
+    throw new Error(`catalog payload: unknown attcompression letter "${row.attcompression}"`);
+  }
+  return compression;
 }
 
 /**
@@ -745,8 +854,10 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     'attidentity',
     'attgenerated',
     'atthasdef',
+    'default',
     'attcollation',
     'typcollation',
+    'collation',
     'attstorage',
     'typstorage',
     'attcompression',
@@ -761,8 +872,10 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     attidentity: expectString(row, path, 'attidentity'),
     attgenerated: expectString(row, path, 'attgenerated'),
     atthasdef: expectBoolean(row, path, 'atthasdef'),
+    default: expectNullableString(row, path, 'default'),
     attcollation: expectInteger(row, path, 'attcollation', 0),
     typcollation: expectInteger(row, path, 'typcollation', 0),
+    collation: expectNullableString(row, path, 'collation'),
     attstorage: expectString(row, path, 'attstorage'),
     typstorage: expectString(row, path, 'typstorage'),
     attcompression: expectString(row, path, 'attcompression'),
