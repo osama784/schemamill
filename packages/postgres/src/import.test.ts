@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { diff } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
+import { extractCollationText } from './import.ts';
 import { ddlImporter, importDump } from './index.ts';
 
 /** Kind, code, and object of a diagnostic, with `object` omitted for errors. */
@@ -168,7 +169,13 @@ const EXPECTED_MODEL: Model = {
           default: "nextval('public.users_id_seq'::regclass)",
         },
         { name: 'email', type: 'character varying(12)', notNull: true },
-        { name: 'display_name', type: 'text', notNull: false, default: "'anon'" },
+        {
+          name: 'display_name',
+          type: 'text',
+          notNull: false,
+          default: "'anon'",
+          collation: '"C"',
+        },
         { name: 'age', type: 'numeric(12,2)', notNull: false },
         { name: 'score', type: 'double precision', notNull: false, default: '0.0' },
         { name: 'active', type: 'boolean', notNull: true, default: 'true' },
@@ -225,7 +232,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'statement_timeout' },
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
@@ -2354,4 +2360,226 @@ test('names a setval call and keeps non-setval or non-literal select generic', a
   const messages = diagnostics.map((diagnostic) => diagnostic.message);
   assert.equal(messages[0], "skipped SELECT setval('public.s', 1, false)");
   assert.deepEqual(messages.slice(1), ['skipped SELECT statement', 'skipped SELECT statement']);
+});
+
+test('reads inline collations as written, whitespace-normalized', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text COLLATE pg_catalog."C",`,
+    `    b text COLLATE probe77."User_C" DEFAULT 'x',`,
+    `    c text DEFAULT 'y'::text COLLATE "C",`,
+    `    d text   COLLATE   pg_catalog."C"   NOT NULL,`,
+    `    e text COLLATE c_lower /* the default */,`,
+    `    f text COLLATE "My Schema"."Coll"`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  // Every spelling reads as written: qualified, quoted, mixed-case, and the dump's
+  // DEFAULT-before-COLLATE order; whitespace runs collapse and comments drop.
+  assert.deepEqual(
+    t.columns.map((column) => column.collation),
+    [
+      'pg_catalog."C"',
+      'probe77."User_C"',
+      '"C"',
+      'pg_catalog."C"',
+      'c_lower',
+      '"My Schema"."Coll"',
+    ],
+  );
+  assert.deepEqual(diagnostics, []);
+  // Boundaries hold in both orders: the DEFAULT and NOT NULL beside a COLLATE survive.
+  assert.equal(t.columns[1]?.default, "'x'");
+  assert.equal(t.columns[3]?.notNull, true);
+});
+
+test('reconstructs a collation from parsed name parts when no location is written', () => {
+  const string = (sval: string) => ({ String: { sval } });
+  assert.equal(
+    extractCollationText('', { collname: [string('pg_catalog'), string('C')], location: -1 }, []),
+    'pg_catalog."C"',
+  );
+  assert.equal(extractCollationText('', { collname: [string('c_lower')] }, []), 'c_lower');
+  assert.equal(extractCollationText('', { collname: [] }, []), undefined);
+});
+
+test('reads inline storage and compression qualifiers as model words', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text STORAGE EXTERNAL COMPRESSION LZ4,`,
+    `    b text STORAGE "plain",`,
+    `    c text COMPRESSION pglz,`,
+    `    d text STORAGE default,`,
+    `    e text STORAGE sideways,`,
+    `    f text COMPRESSION zstd,`,
+    `    g text COMPRESSION default`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  // PostgreSQL matches storage words and compression methods case-insensitively.
+  assert.equal(t.columns[0]?.storage, 'external');
+  assert.equal(t.columns[0]?.compression, 'lz4');
+  assert.equal(t.columns[1]?.storage, 'plain');
+  assert.equal(t.columns[2]?.compression, 'pglz');
+  // An explicit default is the model's absent value, not a flag; an unreadable word drops the
+  // attribute and flags it.
+  assert.equal('storage' in (t.columns[3] ?? {}), false);
+  assert.equal('storage' in (t.columns[4] ?? {}), false);
+  assert.equal('compression' in (t.columns[5] ?? {}), false);
+  assert.equal('compression' in (t.columns[6] ?? {}), false);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped storage on public.t.e from public.t',
+      'dropped compression on public.t.f from public.t',
+    ],
+  );
+});
+
+test('applies post-data SET STORAGE and SET COMPRESSION to the column draft', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a text, b text, c text, d text);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET STORAGE MAIN;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION pglz;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN d SET COMPRESSION lz4;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN d SET COMPRESSION default;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET STORAGE DEFAULT;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN missing SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET COMPRESSION sideways;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  assert.equal(t.columns[0]?.storage, 'external');
+  assert.equal(t.columns[0]?.compression, undefined);
+  assert.equal(t.columns[1]?.storage, undefined);
+  assert.equal(t.columns[2]?.compression, 'pglz');
+  assert.equal(t.columns[3]?.compression, undefined);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'skipped SET STORAGE for unknown column public.t.missing',
+      'dropped compression on public.t.a from public.t',
+    ],
+  );
+});
+
+test('reads table persistence, flips it, and resets it on a repeated CREATE TABLE', async () => {
+  const dump = [
+    `CREATE UNLOGGED TABLE public.u (id integer);`,
+    `CREATE TABLE public.l (id integer);`,
+    `ALTER TABLE public.l SET UNLOGGED;`,
+    `ALTER TABLE public.l SET LOGGED;`,
+    `ALTER TABLE public.u SET LOGGED;`,
+    `CREATE UNLOGGED TABLE public.m (id integer);`,
+    `CREATE TABLE public.m (id integer);`,
+    `CREATE TEMPORARY TABLE public.tmp (id integer);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const byName = new Map(model.tables.map((table) => [table.name, table]));
+  // SET LOGGED clears the persisted fact; a repeated CREATE TABLE replaces the table
+  // wholesale; temporary persists as a flag only (it is not modeled).
+  assert.equal(byName.get('u')?.persistence, undefined);
+  assert.equal(byName.get('l')?.persistence, undefined);
+  assert.equal(byName.get('m')?.persistence, undefined);
+  assert.equal(byName.get('tmp')?.persistence, undefined);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped temporary-table persistence from public.tmp'],
+  );
+});
+
+test('keeps column attributes through the generated not-null-name strip and DROP IDENTITY', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text CONSTRAINT t_a_not_null NOT NULL COLLATE "C",`,
+    `    b bigint GENERATED ALWAYS AS IDENTITY`,
+    `);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET COMPRESSION lz4;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b DROP IDENTITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  const [a, b] = t.columns;
+  assert.ok(a !== undefined && b !== undefined, 'both columns import');
+  // The generated not-null name strips without taking the collation or storage with it.
+  assert.equal('notNullName' in a, false);
+  assert.equal(a.collation, '"C"');
+  assert.equal(a.storage, 'external');
+  // DROP IDENTITY drops the descriptor without taking the compression with it.
+  assert.equal('identity' in b, false);
+  assert.equal(b.notNull, true);
+  assert.equal(b.compression, 'lz4');
+});
+
+test('reads the pg_dump attribute spellings captured live (PostgreSQL 16.15)', async () => {
+  // Byte-for-byte shapes from the probe dump: CREATE UNLOGGED TABLE, a qualified pg_catalog
+  // collation, a quoted user collation, DEFAULT before COLLATE in pg_dump's order, and the
+  // post-data ALTER TABLE ONLY … SET STORAGE / SET COMPRESSION forms.
+  const dump = [
+    `CREATE UNLOGGED TABLE probe77.attrs (`,
+    `    id integer NOT NULL,`,
+    `    c_qualified text DEFAULT 'q'::text COLLATE pg_catalog."C",`,
+    `    c_user text DEFAULT 'u'::text COLLATE probe77."User_C",`,
+    `    s_ext text,`,
+    `    s_main text,`,
+    `    comp_pglz text`,
+    `);`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN s_ext SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN s_main SET STORAGE MAIN;`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN comp_pglz SET COMPRESSION pglz;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'probe77',
+      name: 'attrs',
+      columns: [
+        { name: 'id', type: 'integer', notNull: true },
+        {
+          name: 'c_qualified',
+          type: 'text',
+          notNull: false,
+          default: "'q'::text",
+          collation: 'pg_catalog."C"',
+        },
+        {
+          name: 'c_user',
+          type: 'text',
+          notNull: false,
+          default: "'u'::text",
+          collation: 'probe77."User_C"',
+        },
+        { name: 's_ext', type: 'text', notNull: false, storage: 'external' },
+        { name: 's_main', type: 'text', notNull: false, storage: 'main' },
+        { name: 'comp_pglz', type: 'text', notNull: false, compression: 'pglz' },
+      ],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+      persistence: 'unlogged',
+    },
+  ]);
 });
