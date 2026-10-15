@@ -1,0 +1,34 @@
+14 steps in one transaction:
+  1. add-column         public.attrs.fresh text collation pg_catalog."C" storage extended compression lz4
+  2. alter-column       public.attrs.d_add: default (none) → 1
+  3. alter-column       public.attrs.d_change: default 1 → 2
+  4. alter-column       public.attrs.d_remove: default 7 → (none)
+  5. alter-column       public.attrs.c_add: collation (none) → pg_catalog."C"
+  6. alter-column       public.attrs.c_change: collation pg_catalog."C" → pg_catalog."POSIX"
+  7. alter-column       public.attrs.c_remove: collation pg_catalog."C" → (none)
+  8. alter-column       public.attrs.s_add: storage (none) → external
+  9. alter-column       public.attrs.s_remove: storage main → (none)
+ 10. alter-column       public.attrs.comp_add: compression (none) → pglz
+ 11. alter-column       public.attrs.comp_remove: compression pglz → (none)
+ 12. alter-column       public.attrs.merged: type text → character varying(12), collation pg_catalog."C" → pg_catalog."POSIX"
+ 13. alter-persistence  public.backed: persistence logged
+ 14. alter-persistence  public.flipped: persistence unlogged
+
+BEGIN;
+ALTER TABLE public.attrs ADD COLUMN fresh text COLLATE pg_catalog."C";
+ALTER TABLE ONLY public.attrs ALTER COLUMN fresh SET STORAGE EXTENDED;
+ALTER TABLE ONLY public.attrs ALTER COLUMN fresh SET COMPRESSION lz4;
+ALTER TABLE public.attrs ALTER COLUMN d_add SET DEFAULT 1;
+ALTER TABLE public.attrs ALTER COLUMN d_change SET DEFAULT 2;
+ALTER TABLE public.attrs ALTER COLUMN d_remove DROP DEFAULT;
+ALTER TABLE public.attrs ALTER COLUMN c_add TYPE text COLLATE pg_catalog."C";
+ALTER TABLE public.attrs ALTER COLUMN c_change TYPE text COLLATE pg_catalog."POSIX";
+ALTER TABLE public.attrs ALTER COLUMN c_remove TYPE text;
+ALTER TABLE ONLY public.attrs ALTER COLUMN s_add SET STORAGE EXTERNAL;
+ALTER TABLE ONLY public.attrs ALTER COLUMN s_remove SET STORAGE DEFAULT;
+ALTER TABLE ONLY public.attrs ALTER COLUMN comp_add SET COMPRESSION pglz;
+ALTER TABLE ONLY public.attrs ALTER COLUMN comp_remove SET COMPRESSION default;
+ALTER TABLE public.attrs ALTER COLUMN merged TYPE character varying(12) COLLATE pg_catalog."POSIX";
+ALTER TABLE public.backed SET LOGGED;
+ALTER TABLE public.flipped SET UNLOGGED;
+COMMIT;

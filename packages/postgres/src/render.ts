@@ -1,7 +1,10 @@
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  ColumnCompression,
   ColumnFieldChange,
+  ColumnStorage,
   ConstraintEnforcement,
   ForeignKey,
   Identity,
@@ -82,6 +85,31 @@ import {
  * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
  * `CREATE TABLE` and `ADD COLUMN`; nothing negotiates the server version — the renderer states
  * the attributes the model carries.
+ *
+ * Column attributes render in PostgreSQL's grammar order. `renderColumn` states an explicit
+ * collation inline, after the type and before the constraints: `name type COLLATE <collation>
+ * [NOT NULL] [DEFAULT <x>]`. Inline `STORAGE` and `COMPRESSION` qualifiers are never rendered —
+ * both are recent grammar — so a created or added column's explicit storage and compression
+ * follow its statement as post-data `ALTER TABLE ONLY` statements, storage before compression,
+ * each statement only when the column states it. `CREATE UNLOGGED TABLE` states an `unlogged`
+ * table's persistence, and an `alter-persistence` step states the target persistence as
+ * `ALTER TABLE <t> SET UNLOGGED;` or the absent `LOGGED` default as `SET LOGGED;`.
+ *
+ * An `alter-column` step renders its statements in a fixed order: the merged `TYPE` statement
+ * when the type or the collation differs, the per-field not-null and default statements, then
+ * `SET STORAGE`, then `SET COMPRESSION`. The merged statement is exactly one
+ * `ALTER TABLE <t> ALTER COLUMN <c> TYPE <target.type>[ COLLATE <target.collation>];`, both
+ * halves read from the step's target `attributes` carrier — a type change on a collated column
+ * restates the unchanged collation, and a collation removal renders the bare target type —
+ * because PostgreSQL rejects two `TYPE` clauses for one change. A `TYPE` statement resets the
+ * column's storage and compression to the type's defaults, so the carrier's explicit values
+ * are restated after it; a standalone storage or compression change states its `SET` statement
+ * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. Every
+ * `SET STORAGE`/`SET COMPRESSION` statement — create tail, add tail, post-`TYPE` restatement,
+ * or standalone — carries the dump's post-data `ONLY` form; only the merged `TYPE` statement
+ * stays bare. A plan that reaches the renderer malformed — a `type` or `collation` field whose
+ * step carries no `attributes` carrier, or any attribute field reaching the per-field renderer
+ * — throws rather than render a guess.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -363,6 +391,7 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'alter-column':
     case 'drop-not-null':
     case 'add-not-null':
+    case 'alter-persistence':
     case 'add-identity':
     case 'drop-identity':
     case 'alter-identity':
@@ -428,15 +457,13 @@ function renderStep(step: Step): string {
     case 'drop-table':
       return `DROP TABLE ${renderTable(step.table)};`;
     case 'add-column':
-      return `ALTER TABLE ${renderTable(step.table)} ADD COLUMN ${renderColumn(step.column)};`;
+      return renderAddColumn(step.table, step.column);
     case 'drop-column':
       return `ALTER TABLE ${renderTable(step.table)} DROP COLUMN ${quoteIdentifier(
         step.column.name,
       )};`;
     case 'alter-column':
-      return step.fields
-        .map((field) => renderColumnAlteration(step.table, step.name, field))
-        .join('\n');
+      return renderAlterColumn(step.table, step.name, step.fields, step.attributes);
     case 'drop-not-null':
       return step.name === undefined
         ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
@@ -451,6 +478,10 @@ function renderStep(step: Step): string {
         : `ALTER TABLE ${renderTable(step.table)} ADD CONSTRAINT ${quoteIdentifier(
             step.name,
           )} NOT NULL ${quoteIdentifier(step.column)};`;
+    case 'alter-persistence':
+      return step.persistence === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} SET LOGGED;`
+        : `ALTER TABLE ${renderTable(step.table)} SET UNLOGGED;`;
     case 'add-identity':
       return renderAddIdentity(step.table, step.name, step.identity);
     case 'drop-identity':
@@ -504,25 +535,47 @@ function renderStep(step: Step): string {
   }
 }
 
-/** `CREATE TABLE` for `table`, one column per line and the primary key trailing. */
+/**
+ * `CREATE [UNLOGGED] TABLE` for `table`, one column per line and the primary key trailing.
+ * An explicit storage or compression cannot render inline in the create statement, so each
+ * such column's post-data `ALTER TABLE ONLY` statements follow it, storage before compression,
+ * in column order. An `unlogged` table states `UNLOGGED`.
+ */
 function renderCreateTable(table: Table): string {
+  const persistence = table.persistence === 'unlogged' ? 'UNLOGGED ' : '';
   const lines = table.columns.map((column) => `    ${renderColumn(column)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${renderPrimaryKey(table.primaryKey)}`);
-  if (lines.length === 0) return `CREATE TABLE ${renderTable(table)} ();`;
+  if (lines.length === 0) return `CREATE ${persistence}TABLE ${renderTable(table)} ();`;
 
   const body = lines
     .map((line, index) => (index === lines.length - 1 ? line : `${line},`))
     .join('\n');
-  return `CREATE TABLE ${renderTable(table)} (\n${body}\n);`;
+  const statements = [`CREATE ${persistence}TABLE ${renderTable(table)} (\n${body}\n);`];
+  for (const column of table.columns) {
+    statements.push(...renderColumnAttributeStatements(table, column));
+  }
+  return statements.join('\n');
 }
 
 /**
- * One column definition: name, type, and the `NOT NULL` / `DEFAULT` clauses it carries. A
- * not-null fact the model names renders PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL`;
+ * One added column: the `ADD COLUMN` statement and, for explicit attributes, the post-data
+ * `ALTER TABLE ONLY` statements that state them, storage before compression.
+ */
+function renderAddColumn(table: TableIdentity, column: Column): string {
+  const statements = [`ALTER TABLE ${renderTable(table)} ADD COLUMN ${renderColumn(column)};`];
+  statements.push(...renderColumnAttributeStatements(table, column));
+  return statements.join('\n');
+}
+
+/**
+ * One column definition: name, type, and the `COLLATE` / `NOT NULL` / `DEFAULT` clauses it
+ * carries, in PostgreSQL's grammar order. An explicit collation follows the type; a not-null
+ * fact the model names renders PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL`, and
  * without a name it stays the plain `NOT NULL`. An identity descriptor renders nothing here:
- * the plan adds it with its own step.
+ * the plan adds it with its own step. Storage and compression never render inline.
  */
 function renderColumn(column: Column): string {
+  const collation = column.collation === undefined ? '' : ` COLLATE ${column.collation}`;
   const notNull =
     column.notNull && column.notNullName !== undefined
       ? ` CONSTRAINT ${quoteIdentifier(column.notNullName)} NOT NULL`
@@ -530,7 +583,54 @@ function renderColumn(column: Column): string {
         ? ' NOT NULL'
         : '';
   const fallback = column.default === undefined ? '' : ` DEFAULT ${column.default}`;
-  return `${quoteIdentifier(column.name)} ${column.type}${notNull}${fallback}`;
+  return `${quoteIdentifier(column.name)} ${column.type}${collation}${notNull}${fallback}`;
+}
+
+/**
+ * The post-data statements a created or added column's explicit storage and compression need:
+ * `ALTER TABLE ONLY … ALTER COLUMN … SET STORAGE …` and `… SET COMPRESSION …`, in that order,
+ * each only when the column states it. Inline `STORAGE`/`COMPRESSION` qualifiers are never
+ * rendered; `ONLY` matches the dump's post-data form, and inheritance is out of scope.
+ */
+function renderColumnAttributeStatements(table: TableIdentity, column: Column): string[] {
+  const statements: string[] = [];
+  if (column.storage !== undefined) {
+    statements.push(renderSetStorage(table, column.name, column.storage));
+  }
+  if (column.compression !== undefined) {
+    statements.push(renderSetCompression(table, column.name, column.compression));
+  }
+  return statements;
+}
+
+/**
+ * One `SET STORAGE` statement for a column: the explicit method in PostgreSQL's upper-case
+ * word, or `DEFAULT` when the target states none (the storage removal). Every form — the
+ * `CREATE TABLE`/`ADD COLUMN` tail, the post-`TYPE` restatement, and the standalone change —
+ * carries the dump's post-data `ONLY` form; inheritance is out of scope.
+ */
+function renderSetStorage(
+  table: TableIdentity,
+  name: string,
+  storage: ColumnStorage | undefined,
+): string {
+  const target = storage === undefined ? 'DEFAULT' : storage.toUpperCase();
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET STORAGE ${target};`;
+}
+
+/**
+ * One `SET COMPRESSION` statement for a column: the explicit method, or `default` when the
+ * target states none (the compression removal). Every form — the `CREATE TABLE`/`ADD COLUMN`
+ * tail, the post-`TYPE` restatement, and the standalone change — carries the dump's post-data
+ * `ONLY` form; inheritance is out of scope.
+ */
+function renderSetCompression(
+  table: TableIdentity,
+  name: string,
+  compression: ColumnCompression | undefined,
+): string {
+  const target = compression === undefined ? 'default' : compression;
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
 }
 
 /** A primary-key constraint clause, with its name and attributes when it has them. */
@@ -642,7 +742,81 @@ function renderDropIndex(table: TableIdentity, index: Index, concurrently: boole
   return `DROP INDEX ${concurrent}${quoteIdentifier(table.schema)}.${quoteIdentifier(name)};`;
 }
 
-/** One `ALTER COLUMN` statement for one differing field. */
+/**
+ * One `alter-column` step as its statements, joined `\n`, in the step's fixed order: the
+ * merged `TYPE` statement when the type or the collation differs, the per-field not-null and
+ * default statements, then `SET STORAGE`, then `SET COMPRESSION`. The merged statement reads
+ * both halves from the step's target `attributes` carrier and states the target collation only
+ * when it has one; a `TYPE` statement resets storage and compression to the type's defaults,
+ * so the carrier's explicit values are restated after it. With no type or collation change, a
+ * storage or compression field states its own `SET` statement, the absent target restoring the
+ * default. Every `SET` statement carries the dump's post-data `ONLY` form; only the merged
+ * `TYPE` statement stays bare. A `type` or `collation` field without its carrier is a
+ * malformed plan and throws.
+ */
+function renderAlterColumn(
+  table: TableIdentity,
+  name: string,
+  fields: readonly ColumnFieldChange[],
+  attributes: ColumnAttributes | undefined,
+): string {
+  const statement = `ALTER TABLE ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)}`;
+  const merged = fields.some((field) => field.field === 'type' || field.field === 'collation');
+  const carrier = merged ? requiredAttributes(table, name, attributes) : undefined;
+  const statements: string[] = [];
+  if (carrier !== undefined) {
+    const collation = carrier.collation === undefined ? '' : ` COLLATE ${carrier.collation}`;
+    statements.push(`${statement} TYPE ${carrier.type}${collation};`);
+  }
+  for (const field of fields) {
+    if (field.field === 'notNull' || field.field === 'default') {
+      statements.push(renderColumnAlteration(table, name, field));
+    }
+  }
+  if (carrier !== undefined) {
+    // The TYPE statement's reset matches a target that states no value, so only the explicit
+    // ones restate.
+    if (carrier.storage !== undefined) {
+      statements.push(renderSetStorage(table, name, carrier.storage));
+    }
+    if (carrier.compression !== undefined) {
+      statements.push(renderSetCompression(table, name, carrier.compression));
+    }
+  } else {
+    for (const field of fields) {
+      if (field.field === 'storage') {
+        statements.push(renderSetStorage(table, name, field.after));
+      } else if (field.field === 'compression') {
+        statements.push(renderSetCompression(table, name, field.after));
+      }
+    }
+  }
+  return statements.join('\n');
+}
+
+/**
+ * The step's target `attributes` carrier, or a malformed-plan error: a `type` or `collation`
+ * field drives the merged `TYPE` statement whose type and collation both come from the
+ * carrier, so a step without one cannot render the change it carries.
+ */
+function requiredAttributes(
+  table: TableIdentity,
+  name: string,
+  attributes: ColumnAttributes | undefined,
+): ColumnAttributes {
+  if (attributes === undefined) {
+    throw new Error(
+      `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must carry the target attributes of a type or collation change`,
+    );
+  }
+  return attributes;
+}
+
+/**
+ * One per-field `ALTER COLUMN` statement for a differing not-null or default value; every
+ * other field belongs to the merged `TYPE` builder or the storage/compression statements, so
+ * reaching here means the plan is malformed.
+ */
 function renderColumnAlteration(
   table: TableIdentity,
   name: string,
@@ -650,8 +824,6 @@ function renderColumnAlteration(
 ): string {
   const statement = `ALTER TABLE ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)}`;
   switch (field.field) {
-    case 'type':
-      return `${statement} TYPE ${field.after};`;
     case 'notNull':
       return `${statement} ${field.after ? 'SET' : 'DROP'} NOT NULL;`;
     case 'notNullName':
@@ -659,6 +831,17 @@ function renderColumnAlteration(
       // name never reaches an alter-column; reaching here means the plan is malformed.
       throw new Error(
         `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a not-null name`,
+      );
+    case 'type':
+    case 'collation':
+    case 'storage':
+    case 'compression':
+      // The merged TYPE builder and the storage/compression statements own these fields — a
+      // TYPE statement restates the target collation and the SET statements state storage and
+      // compression — so they never reach the per-field renderer; reaching here means the
+      // plan is malformed.
+      throw new Error(
+        `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a ${field.field} change`,
       );
     case 'default':
       return field.after === undefined

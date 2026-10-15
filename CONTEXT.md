@@ -62,6 +62,22 @@ _Avoid_: deferred constraint, deferment
 A not-null constraint's name when PostgreSQL 18 names it, carried beside the column's not-null fact — the model has no separate not-null constraint object. On import, a name exactly matching PostgreSQL's generated `<table>_<column>_not_null` is canonicalized back to unnamed, so a dump of a model-declared named not-null constraint round-trips; a name outside the formula stays named.
 _Avoid_: column constraint name, NN name
 
+**Column collation**:
+A column's explicit collation, carried as opaque, whitespace-normalized text in the spelling a dump writes — qualified and quoted, e.g. `pg_catalog."C"` — so it is attribute text, never identity. Absent means the type's default collation. Import keeps the source's spelling as written and the catalog reproduces pg_dump's spelling, so a dump's forms round-trip; a hand-authored spelling that differs from them is a named residual.
+_Avoid_: charset, locale, sort order
+
+**Column storage**:
+A column's explicit storage method: `plain`, `external`, `extended`, or `main`. Absent means the type's default. A method equal to the type's default reads back as absent from a live catalog — `attstorage` carries no explicit bit — and a dump cannot carry the distinction either.
+_Avoid_: toast mode, storage class
+
+**Column compression**:
+A column's explicit compression method: `pglz` or `lz4`. Absent means the type's default. `attcompression` exists only from PostgreSQL 14: on the 13 floor the catalog reports no explicit method.
+_Avoid_: codec, encoding
+
+**Table persistence**:
+A table's persistence when it is not PostgreSQL's default: `unlogged`. Absent means `LOGGED`. Temporary persistence is not modeled and stays flagged.
+_Avoid_: logging, durability
+
 **Snapshot**:
 A frozen copy of the model at a point in time. Capture it, name it, list it, compare it.
 _Avoid_: version, state, revision

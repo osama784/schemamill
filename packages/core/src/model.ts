@@ -43,6 +43,14 @@ import type { Identity } from './identity.ts';
  * (absent means the immediate default), and a column carries `notNullName` when PostgreSQL 18
  * names its not-null constraint (only meaningful with `notNull: true`).
  *
+ * Column attributes and table persistence are explicit-only. A column carries `collation`
+ * (opaque, whitespace-normalized text as written — a qualified or quoted name is not a column
+ * name, so it is never identity), `storage`, or `compression` only when the source states the
+ * attribute; absent means the type's default or no explicit method. A table carries
+ * `persistence` only when it is `UNLOGGED`; absent means `LOGGED`, PostgreSQL's default.
+ * `ColumnAttributes` is the target-side carrier a `column-changed` entry and its `alter-column`
+ * step use to restate a column's render-relevant values.
+ *
  * `GENERATED … AS IDENTITY` is a column property, not a sequence entity: an identity column
  * carries its effective descriptor on the column (`Column.identity`) and never among
  * `Model.sequences`.
@@ -80,7 +88,24 @@ export interface Table extends TableIdentity {
   readonly checkConstraints: readonly CheckConstraint[];
   /** Standalone indexes on the table, in the model's deterministic order. */
   readonly indexes: readonly Index[];
+  /**
+   * The table's persistence when it is not `LOGGED`, PostgreSQL's default; absent means
+   * `LOGGED`. Temporary persistence is not modeled and stays flagged by import and introspection.
+   */
+  readonly persistence?: TablePersistence;
 }
+
+/**
+ * A table's persistence when it is not the default: `unlogged` means the source declares
+ * `UNLOGGED`. Absent means `LOGGED`.
+ */
+export type TablePersistence = 'unlogged';
+
+/** A column's explicit storage method, in PostgreSQL's words (`pg_attribute.attstorage`). */
+export type ColumnStorage = 'plain' | 'external' | 'extended' | 'main';
+
+/** A column's explicit compression method, in PostgreSQL's words (`pg_attribute.attcompression`). */
+export type ColumnCompression = 'pglz' | 'lz4';
 
 /** A column of a table. */
 export interface Column {
@@ -103,6 +128,38 @@ export interface Column {
    * effective values (normalization lives in `identity.ts`); absent when it is not.
    */
   readonly identity?: Identity;
+  /**
+   * The `COLLATE` name as written, whitespace-normalized; opaque to the model. Absent means
+   * the type's default collation. A qualified or quoted name is not a column name, so the
+   * collation is attribute text, never identity.
+   */
+  readonly collation?: string;
+  /**
+   * The column's explicit storage method; absent means the type's default. An explicit method
+   * equal to the type's default is stored as stated — the model is explicit-only, not
+   * normalized against the type.
+   */
+  readonly storage?: ColumnStorage;
+  /** The column's explicit compression method; absent means the type's default. */
+  readonly compression?: ColumnCompression;
+}
+
+/**
+ * The target column's render-relevant values, carried by a `column-changed` entry and its
+ * `alter-column` step whenever `type`, `collation`, `storage`, or `compression` differs: a
+ * merged `TYPE` statement must restate an unchanged explicit collation, and it resets storage
+ * and compression to the type's defaults. The type is always stated; the attributes are
+ * present exactly when the target states them.
+ */
+export interface ColumnAttributes {
+  /** The type as written, whitespace-normalized; opaque to the model. */
+  readonly type: string;
+  /** The `COLLATE` name as written; absent means the type's default collation. */
+  readonly collation?: string;
+  /** The explicit storage method; absent means the type's default. */
+  readonly storage?: ColumnStorage;
+  /** The explicit compression method; absent means the type's default. */
+  readonly compression?: ColumnCompression;
 }
 
 /**

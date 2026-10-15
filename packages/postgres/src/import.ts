@@ -17,7 +17,9 @@
  *   constraints, check constraints, and indexes.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
- *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key, primary key,
+ *   order the statement lists them; `ALTER COLUMN … SET STORAGE` and `SET COMPRESSION` apply
+ *   the stated method to the column, `DEFAULT` clearing it, and `SET LOGGED`/`SET UNLOGGED`
+ *   set the table's persistence; `ADD CONSTRAINT` attaches a foreign key, primary key,
  *   unique constraint, check constraint, or not-null constraint to an already imported table.
  *   A unique constraint stated `USING INDEX` consumes the named standalone index when it is a
  *   plain column-list unique index, and the whole constraint is skipped and named otherwise.
@@ -58,9 +60,11 @@
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
- * behaviour, tablespace, access method, storage parameters, unlogged or temporary
- * persistence, and column-level EXCLUDE, GENERATED, COLLATE, compression, and storage. A
- * unique or check constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
+ * behaviour, tablespace, access method, storage parameters, and temporary persistence. What
+ * the model does carry reads instead: a column's `COLLATE` as the written,
+ * whitespace-normalized name, its inline `STORAGE` and `COMPRESSION` qualifiers as the
+ * model's words, and `CREATE UNLOGGED TABLE` as the table's persistence. A unique or check
+ * constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
  * `INCLUDE (…)`, `NO INHERIT`) is still imported, and each unrepresentable attribute is
  * flagged and dropped, following the foreign-key precedent; a check constraint's misplaced
  * deferrability is flagged the same way. Enforcement and deferrability the model carries are
@@ -89,6 +93,8 @@
 import type {
   CheckConstraint,
   Column,
+  ColumnCompression,
+  ColumnStorage,
   ConstraintEnforcement,
   DdlImporter,
   Diagnostic,
@@ -110,6 +116,7 @@ import type {
   SkipDiagnosticCode,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from '@schemamill/core';
 import {
@@ -125,6 +132,7 @@ import type {
   AlterSeqStmt,
   AlterTableCmd,
   AlterTableStmt,
+  CollateClause,
   ColumnDef,
   Constraint,
   CreateSeqStmt,
@@ -161,6 +169,8 @@ interface TableDraft {
   readonly uniqueConstraints: UniqueConstraint[];
   readonly checkConstraints: CheckConstraint[];
   readonly indexes: Index[];
+  /** `unlogged` while the source says so; `undefined` is `LOGGED`, the default. */
+  persistence?: TablePersistence;
 }
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
@@ -325,12 +335,13 @@ function translateCreateTable(
 
   const columns: Column[] = [];
   // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys,
-  // unique constraints, check constraints, and indexes.
+  // unique constraints, check constraints, indexes, and persistence.
   draft.primaryKey = undefined;
   draft.foreignKeys.length = 0;
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
   draft.indexes.length = 0;
+  draft.persistence = undefined;
   // The draft sees the columns as they are collected, so a table-level not-null constraint —
   // which always follows the column definitions — can attach to its column.
   draft.columns = columns;
@@ -373,7 +384,7 @@ function translateCreateTable(
     );
   }
 
-  translateCreateTableExtras(statement, create, identity, diagnostics);
+  translateCreateTableExtras(statement, create, identity, draft, diagnostics);
 }
 
 /** A column and its constraints while `translateColumn` assembles them. */
@@ -564,16 +575,124 @@ function translateColumn(
   }
 
   if (column.collClause !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `COLLATE on ${place}`));
+    const collation = extractCollationText(statement.sql, column.collClause, spanBoundaries);
+    if (collation === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `COLLATE on ${place}`));
+    } else {
+      translated.column = { ...translated.column, collation };
+    }
   }
+
+  if (column.storage_name !== undefined) {
+    const storage = storageWord(column.storage_name);
+    if (storage === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+    } else {
+      translated.column = withColumnStorage(translated.column, storage ?? undefined);
+    }
+  }
+
   if (column.compression !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
-  }
-  if (column.storage !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+    const compression = compressionWord(column.compression);
+    if (compression === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
+    } else {
+      translated.column = withColumnCompression(translated.column, compression ?? undefined);
+    }
   }
 
   return translated;
+}
+
+/** PostgreSQL's storage words, as the model spells them. */
+const COLUMN_STORAGE_WORDS: Readonly<Record<string, ColumnStorage>> = {
+  plain: 'plain',
+  external: 'external',
+  extended: 'extended',
+  main: 'main',
+};
+
+/** PostgreSQL's compression methods, as the model spells them. */
+const COLUMN_COMPRESSION_WORDS: Readonly<Record<string, ColumnCompression>> = {
+  pglz: 'pglz',
+  lz4: 'lz4',
+};
+
+/**
+ * The modeled storage a qualifier names: the word, `null` for `DEFAULT` (the type's default,
+ * the model's absent), or `undefined` when the source states a word the model cannot carry.
+ * PostgreSQL matches the words case-insensitively.
+ */
+function storageWord(value: string | undefined): ColumnStorage | null | undefined {
+  if (value === undefined) return undefined;
+  const word = value.toLowerCase();
+  if (word === 'default') return null;
+  return COLUMN_STORAGE_WORDS[word];
+}
+
+/**
+ * The modeled compression method a qualifier names: the method, `null` for `default` (the
+ * model's absent), or `undefined` when the source states a method the model cannot carry.
+ */
+function compressionWord(value: string | undefined): ColumnCompression | null | undefined {
+  if (value === undefined) return undefined;
+  const word = value.toLowerCase();
+  if (word === 'default') return null;
+  return COLUMN_COMPRESSION_WORDS[word];
+}
+
+/** A copy of `column` with `storage` set, or cleared when the word is absent. */
+function withColumnStorage(column: Column, storage: ColumnStorage | undefined): Column {
+  const copy: Mutable<Column> = { ...column };
+  if (storage === undefined) delete copy.storage;
+  else copy.storage = storage;
+  return copy;
+}
+
+/** A copy of `column` with `compression` set, or cleared when the word is absent. */
+function withColumnCompression(column: Column, compression: ColumnCompression | undefined): Column {
+  const copy: Mutable<Column> = { ...column };
+  if (compression === undefined) delete copy.compression;
+  else copy.compression = compression;
+  return copy;
+}
+
+const COLLATE_KEYWORD = 'COLLATE';
+
+/**
+ * Slices a column's inline `COLLATE` name from the source text — as written,
+ * whitespace-normalized — or, when the parser reports no location, reconstructs it from the
+ * parsed name parts, quoting each part that could not have been written bare. The source-text
+ * pattern is `extractDefaultText`'s; exported for the unit test of the location-less path,
+ * deliberately not re-exported from `index.ts`.
+ */
+export function extractCollationText(
+  sql: string,
+  collClause: CollateClause,
+  boundaries: readonly number[],
+): string | undefined {
+  const location = collClause.location;
+  if (location !== undefined && location >= 0) {
+    const startIndex = skipTrivia(sql, byteOffsetToUtf16(sql, location + COLLATE_KEYWORD.length));
+    const text = extractSourceText(sql, startIndex, boundaries);
+    return text.length > 0 ? text : undefined;
+  }
+  return reconstructCollationName(collClause.collname);
+}
+
+/** Rebuilds a collation's dotted name from string parts, preserving each part's spelling. */
+function reconstructCollationName(parts: readonly Node[] | undefined): string | undefined {
+  const names = stringList(parts);
+  if (names.length === 0) return undefined;
+  return names.map(quoteIdentifierAsWritten).join('.');
+}
+
+/**
+ * A name part as written: bare when it is a lowercase identifier, quoted otherwise — an
+ * uppercase letter or any other character can only come from a quoted spelling.
+ */
+function quoteIdentifierAsWritten(name: string): string {
+  return /^[a-z_][a-z0-9_$]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
 }
 
 /**
@@ -816,6 +935,7 @@ function translateCreateTableExtras(
   statement: ParsedStatement,
   create: CreateStmt,
   identity: string,
+  draft: TableDraft,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const flag = (description: string): void => {
@@ -830,7 +950,7 @@ function translateCreateTableExtras(
   if (create.tablespacename !== undefined) flag('tablespace');
   if (create.accessMethod !== undefined) flag('access method');
   if ((create.options ?? []).length > 0) flag('storage parameters');
-  if (create.relation?.relpersistence === 'u') flag('unlogged-table persistence');
+  if (create.relation?.relpersistence === 'u') draft.persistence = 'unlogged';
   if (create.relation?.relpersistence === 't') flag('temporary-table persistence');
 }
 
@@ -868,8 +988,8 @@ function translateCreateSequence(
   const options = readCreateSequenceOptions(statement, create.options ?? [], identity, diagnostics);
   if (options === undefined) return;
 
-  // Persistence is not modeled; the re-render is a plain sequence, so flag the loss, exactly
-  // as the table path flags unlogged and temporary tables.
+  // Sequence persistence is not modeled; the re-render is a plain sequence, so flag the loss,
+  // exactly as the table path flags temporary tables (unlogged table persistence is read).
   if (create.sequence?.relpersistence === 'u') {
     diagnostics.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
   }
@@ -1528,6 +1648,21 @@ function translateAlterTableCommand(
     return;
   }
 
+  if (command.subtype === 'AT_SetLogged') {
+    draft.persistence = undefined;
+    return;
+  }
+
+  if (command.subtype === 'AT_SetUnLogged') {
+    draft.persistence = 'unlogged';
+    return;
+  }
+
+  if (command.subtype === 'AT_SetStorage' || command.subtype === 'AT_SetCompression') {
+    applyColumnMethod(statement, command, identity, draft, diagnostics);
+    return;
+  }
+
   diagnostics.push(
     skipStatement(
       statement,
@@ -1729,6 +1864,55 @@ function attachColumnDefault(
 }
 
 /**
+ * Applies one post-data `ALTER COLUMN … SET STORAGE`/`SET COMPRESSION` to its column: the
+ * word replaces the column's explicit value, `DEFAULT` clears it (the type's default, the
+ * model's absent), and a column or word the model cannot carry is skipped or flagged — never
+ * silent.
+ */
+function applyColumnMethod(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const isStorage = command.subtype === 'AT_SetStorage';
+  const action = isStorage ? 'SET STORAGE' : 'SET COMPRESSION';
+  const name = command.name;
+  const column =
+    name === undefined ? undefined : draft.columns.find((candidate) => candidate.name === name);
+  if (name === undefined || column === undefined) {
+    const place = name === undefined ? identity : `${identity}.${name}`;
+    diagnostics.push(skipStatement(statement, `${action} for unknown column ${place}`, place));
+    return;
+  }
+  const place = `${identity}.${name}`;
+
+  const value =
+    command.def !== undefined && 'String' in command.def ? command.def.String.sval : undefined;
+  if (isStorage) {
+    const storage = storageWord(value);
+    if (storage === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+      return;
+    }
+    draft.columns = draft.columns.map((candidate) =>
+      candidate === column ? withColumnStorage(candidate, storage ?? undefined) : candidate,
+    );
+    return;
+  }
+
+  const compression = compressionWord(value);
+  if (compression === undefined) {
+    diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
+    return;
+  }
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? withColumnCompression(candidate, compression ?? undefined) : candidate,
+  );
+}
+
+/**
  * Appends an `ALTER TABLE … ADD COLUMN` column to the draft, with inline primary key and
  * foreign keys, exactly as a `CREATE TABLE` column (including inline identity).
  */
@@ -1921,9 +2105,8 @@ function findColumnTarget(
 
 /** A copy of `column` without its identity descriptor. */
 function withoutIdentity(column: Column): Column {
-  const copy: Mutable<Column> = { name: column.name, type: column.type, notNull: column.notNull };
-  if (column.notNullName !== undefined) copy.notNullName = column.notNullName;
-  if (column.default !== undefined) copy.default = column.default;
+  const copy: Mutable<Column> = { ...column };
+  delete copy.identity;
   return copy;
 }
 
@@ -2595,6 +2778,7 @@ function finalizeTable(draft: TableDraft): Table {
     indexes: [...draft.indexes].sort(compareIndexes),
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
+  if (draft.persistence !== undefined) table.persistence = draft.persistence;
   return table;
 }
 
@@ -2615,13 +2799,8 @@ function canonicalizeNotNullNames(draft: TableDraft): void {
     ) {
       return column;
     }
-    const copy: Mutable<Column> = {
-      name: column.name,
-      type: column.type,
-      notNull: column.notNull,
-    };
-    if (column.default !== undefined) copy.default = column.default;
-    if (column.identity !== undefined) copy.identity = column.identity;
+    const copy: Mutable<Column> = { ...column };
+    delete copy.notNullName;
     return copy;
   });
 }
@@ -2820,8 +2999,14 @@ function extractDefaultText(
   return extractSourceText(sql, startIndex, boundaries);
 }
 
-/** Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads `numeric(12,2)`. */
-function normalizeSourceText(text: string): string {
+/**
+ * Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads
+ * `numeric(12,2)`. The default-expression and `COLLATE` readers share it, and the catalog
+ * mapper imports it for the default expressions `pg_get_expr` renders, so both sides of the
+ * dump-import congruence bar normalize identically. Exported for that sharing, deliberately
+ * not re-exported from `index.ts`.
+ */
+export function normalizeSourceText(text: string): string {
   let normalized = '';
   let pendingSpace = false;
   let index = 0;

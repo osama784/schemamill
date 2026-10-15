@@ -18,6 +18,7 @@ import type {
   Step,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from '@schemamill/core';
 
@@ -86,9 +87,13 @@ import { renderSql } from './render.ts';
  * same for the covered index surface — a constraint-backed primary-key index the read must
  * consume through `conindid`, a named index, two unnamed indexes whose tie order is the
  * stored-name order, a standalone unique index, and an unnamed index whose generated name
- * exceeds the 63-byte limit and strips only in its server form; `introspection-flags` pins the
- * exact deferred-state diagnostics (defaults, generation, identity, partitioning, persistence)
- * the read reports, the expression, partial, and `INCLUDE` index skips among them, and
+ * exceeds the 63-byte limit and strips only in its server form; `column-attributes` is the
+ * attribute round trip on PostgreSQL 16 or newer — defaults, a system and a user collation,
+ * storage, compression, and persistence — with the physical catalog state pinned so a
+ * renderer omission cannot hide behind the two dumps agreeing; `introspection-flags` pins the
+ * exact deferred-state diagnostics the read still reports (generation, identity, the
+ * partitioned-table skip, and the invalid, expression, partial, and `INCLUDE` index skips)
+ * while the covered states read back instead of flagging; and
  * `introspection-flags-nulls-not-distinct` pins the `NULLS NOT DISTINCT` skip gated on
  * PostgreSQL 15 or newer.
  *
@@ -123,6 +128,7 @@ const column = (name: string, fields: Partial<Omit<Column, 'name'>> = {}): Colum
 interface TableParts {
   schema?: string;
   columns?: readonly Column[];
+  persistence?: TablePersistence;
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
@@ -135,6 +141,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   schema: parts.schema ?? 'public',
   name,
   columns: parts.columns ?? [],
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
@@ -339,6 +346,72 @@ const indexIsValid = (name: string, schema = 'public'): string =>
 /** A named table is present: `name|0` or `name|1`, pinned as one text fact. */
 const tableExists = (tableName: string): string =>
   `select '${tableName}' || '|' || count(*) from pg_tables where schemaname = 'public' and tablename = '${tableName}'`;
+
+/**
+ * One table's column defaults, in attribute order, each as `name|expression` or `name|<none>`,
+ * joined by spaces: the `pg_attrdef` text `pg_get_expr` renders, the physical read behind the
+ * covered default state.
+ */
+const defaultsOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || coalesce(pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid), '<none>'), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' left join pg_catalog.pg_attrdef AS attrdef' +
+  ' on attrdef.adrelid = attribute.attrelid and attrdef.adnum = attribute.attnum' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's collation states, in attribute order, each as `name|qualified-name`, with
+ * `default` for the type's own collation and `none` for a non-collatable type (oid zero): the
+ * physical read behind the covered explicit-collation state, pinning the oid against the
+ * type's.
+ */
+const collationsOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || case` +
+  " when attribute.attcollation = 0 then 'none'" +
+  " when attribute.attcollation = attribute_type.typcollation then 'default'" +
+  " else pg_catalog.format('%I.%I', collation_namespace.nspname, collation_row.collname) end, ' ' order by attribute.attnum)" +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' join pg_catalog.pg_type AS attribute_type on attribute_type.oid = attribute.atttypid' +
+  ' left join pg_catalog.pg_collation AS collation_row on collation_row.oid = attribute.attcollation' +
+  ' left join pg_catalog.pg_namespace AS collation_namespace' +
+  ' on collation_namespace.oid = collation_row.collnamespace' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/** One table's column types, in attribute order, each as `name|format_type`, joined by spaces. */
+const typesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's storage letters, in attribute order, each as `name|attstorage|typstorage`, joined
+ * by spaces: the physical read behind the covered explicit-storage state, the type's letter
+ * beside it so an explicit state cannot hide behind the type's default.
+ */
+const storageModesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || attribute.attstorage::text || '|' || attribute_type.typstorage::text, ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' join pg_catalog.pg_type AS attribute_type on attribute_type.oid = attribute.atttypid' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's compression letters, in attribute order, each as `name|letter`, the letter read
+ * from the row's `jsonb` form — empty for no explicit method — exactly as the catalog read sees
+ * it: the physical read behind the covered explicit-compression state.
+ */
+const compressionModesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || (to_jsonb(attribute) ->> 'attcompression'), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/** One table's `pg_class.relpersistence` letter: `p`, `u`, or `t`. */
+const relPersistenceOf = (tableName: string, schema = 'public'): string =>
+  `select relpersistence::text from pg_class where oid = '${schema}.${tableName}'::regclass`;
 
 /** `public` sequences in name order, or the empty string when there are none. */
 const SEQUENCES =
@@ -3566,19 +3639,300 @@ const introspectionIndexesScene = (): LiveScene => {
 };
 
 /**
- * The live-introspection flags scene: the deferred catalog states a clean round trip still
- * meets, each asserted as an exact diagnostic. The model declares a table with a `DEFAULT`
- * column and a table with an identity column; raw setup SQL adds an unlogged table, a
- * generated column whose flag must suppress its `atthasdef` default flag, a partitioned
- * table with one partition — both partitioned relations skipped and named, the unlogged table
- * flagged, and neither mapped — and a table carrying an expression, a partial, and an
- * `INCLUDE` index, each outside the importer's envelope and skipped whole with the importer's
- * reason.
+ * The live column-attribute round trip: the covered per-column and per-table states on a
+ * PostgreSQL 16 or newer server (the storage removal renders `SET STORAGE DEFAULT`, 16+;
+ * compression reads need 14; the 13–15 residual is named). The pairs carry defaults added,
+ * changed, removed, and written as an expression and in cast shape (`pg_attrdef`/`pg_get_expr`
+ * behind the read); a collation added, changed from `pg_catalog."C"` to a quoted mixed-case
+ * user collation in a non-public schema, and removed; a storage change and a removal; a
+ * compression add and a removal (`pglz` only, so the scene does not depend on `lz4` being
+ * compiled in); a simultaneous type-and-collation change and a type change with explicit
+ * storage and compression, so the merged `TYPE` statement and the post-`TYPE` restatements are
+ * pinned live; and a persistence flip in both directions. `checks` pin the physical catalog
+ * state — the `pg_attrdef` default text, the `attstorage`/`typstorage` letters, the `jsonb`
+ * compression letter, the collation's qualified name against `typcollation`, and
+ * `pg_class.relpersistence` — so a renderer omission cannot hide behind the two dumps agreeing:
+ * `matches-import` alone is renderer-symmetric.
+ */
+const columnAttributesScene = (): LiveScene => {
+  const defaults = table('defaults', {
+    columns: [
+      column('d_add', { type: 'integer' }),
+      column('d_change', { type: 'integer', default: '1' }),
+      column('d_remove', { type: 'integer', default: '7' }),
+      column('d_expr', { type: 'timestamp with time zone' }),
+      column('d_cast'),
+    ],
+  });
+  const defaultsTarget = table('defaults', {
+    columns: [
+      column('d_add', { type: 'integer', default: '1' }),
+      column('d_change', { type: 'integer', default: '2' }),
+      column('d_remove', { type: 'integer' }),
+      column('d_expr', { type: 'timestamp with time zone', default: 'now()' }),
+      column('d_cast', { default: "'x'::text" }),
+    ],
+  });
+  const colls = table('colls', {
+    columns: [
+      column('c_add'),
+      column('c_change', { collation: 'pg_catalog."C"' }),
+      column('c_remove', { collation: 'app."User_C"' }),
+    ],
+  });
+  const collsTarget = table('colls', {
+    columns: [
+      column('c_add', { collation: 'pg_catalog."C"' }),
+      column('c_change', { collation: 'app."User_C"' }),
+      column('c_remove'),
+    ],
+  });
+  const methods = table('methods', {
+    columns: [
+      column('s_change'),
+      column('s_remove', { storage: 'main' }),
+      column('comp_add'),
+      column('comp_remove', { compression: 'pglz' }),
+    ],
+  });
+  const methodsTarget = table('methods', {
+    columns: [
+      column('s_change', { storage: 'external' }),
+      column('s_remove'),
+      column('comp_add', { compression: 'pglz' }),
+      column('comp_remove'),
+    ],
+  });
+  const merged = table('merged', {
+    columns: [
+      column('m_type_coll', { collation: 'pg_catalog."C"' }),
+      column('m_reset', { storage: 'external', compression: 'pglz' }),
+    ],
+  });
+  const mergedTarget = table('merged', {
+    columns: [
+      column('m_type_coll', { type: 'character varying(12)', collation: 'pg_catalog."POSIX"' }),
+      column('m_reset', {
+        type: 'character varying(12)',
+        storage: 'external',
+        compression: 'pglz',
+      }),
+    ],
+  });
+  const flipUp = table('flip_up', { columns: [column('id', { type: 'integer' })] });
+  const flipUpTarget = table('flip_up', {
+    persistence: 'unlogged',
+    columns: [column('id', { type: 'integer' })],
+  });
+  const flipDown = table('flip_down', {
+    persistence: 'unlogged',
+    columns: [column('id', { type: 'integer' })],
+  });
+  const flipDownTarget = table('flip_down', { columns: [column('id', { type: 'integer' })] });
+
+  const baseline = model(defaults, colls, methods, merged, flipUp, flipDown);
+  const target = model(
+    defaultsTarget,
+    collsTarget,
+    methodsTarget,
+    mergedTarget,
+    flipUpTarget,
+    flipDownTarget,
+  );
+
+  return {
+    name: 'column-attributes',
+    minServerMajor: 16,
+    setupSql: [
+      'CREATE SCHEMA app;',
+      'CREATE COLLATION app."User_C" (provider = libc, locale = \'C\');',
+    ].join('\n'),
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'baseline defaults: only d_change and d_remove state one',
+        sql: defaultsOf('defaults'),
+        expected: 'd_add|<none> d_change|1 d_remove|7 d_expr|<none> d_cast|<none>',
+      },
+      {
+        description: 'baseline collations: the system and the user spelling, c_add bare',
+        sql: collationsOf('colls'),
+        expected: 'c_add|default c_change|pg_catalog."C" c_remove|app."User_C"',
+      },
+      {
+        description: 'baseline storage: s_remove explicit main, the rest the type default',
+        sql: storageModesOf('methods'),
+        expected: 's_change|x|x s_remove|m|x comp_add|x|x comp_remove|x|x',
+      },
+      {
+        description: 'baseline compression: comp_remove explicit pglz',
+        sql: compressionModesOf('methods'),
+        expected: 's_change| s_remove| comp_add| comp_remove|p',
+      },
+      {
+        description: 'baseline merged: m_reset explicit external storage, text being the type',
+        sql: storageModesOf('merged'),
+        expected: 'm_type_coll|x|x m_reset|e|x',
+      },
+      {
+        description: 'baseline merged: m_reset explicit pglz compression',
+        sql: compressionModesOf('merged'),
+        expected: 'm_type_coll| m_reset|p',
+      },
+      {
+        description: 'baseline flip_up is logged',
+        sql: relPersistenceOf('flip_up'),
+        expected: 'p',
+      },
+      {
+        description: 'baseline flip_down is unlogged',
+        sql: relPersistenceOf('flip_down'),
+        expected: 'u',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the type-and-collation change renders one merged TYPE statement',
+        failure: (_steps, migration) => {
+          const lines = renderSql(migration).split('\n');
+          const statements = lines.filter((line) =>
+            line.startsWith('ALTER TABLE public.merged ALTER COLUMN m_type_coll '),
+          );
+          const expected =
+            'ALTER TABLE public.merged ALTER COLUMN m_type_coll TYPE character varying(12)' +
+            ' COLLATE pg_catalog."POSIX";';
+          return statements.length === 1 && statements[0] === expected
+            ? undefined
+            : `statements: ${statements.join(' | ')}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated defaults, the cast-shaped and expression forms exact',
+        sql: defaultsOf('defaults'),
+        expected: "d_add|1 d_change|2 d_remove|<none> d_expr|now() d_cast|'x'::text",
+      },
+      {
+        description:
+          'the migrated collations: the system spelling, the user collation, the removal',
+        sql: collationsOf('colls'),
+        expected: 'c_add|pg_catalog."C" c_change|app."User_C" c_remove|default',
+      },
+      {
+        description: 'the migrated storage letters; the removal resets to the type default',
+        sql: storageModesOf('methods'),
+        expected: 's_change|e|x s_remove|x|x comp_add|x|x comp_remove|x|x',
+      },
+      {
+        description: 'the migrated compression letters; the removal clears the explicit method',
+        sql: compressionModesOf('methods'),
+        expected: 's_change| s_remove| comp_add|p comp_remove|',
+      },
+      {
+        description: 'the merged type change lands on both columns',
+        sql: typesOf('merged'),
+        expected: 'm_type_coll|character varying(12) m_reset|character varying(12)',
+      },
+      {
+        description: 'the post-TYPE restatement restores the explicit storage',
+        sql: storageModesOf('merged'),
+        expected: 'm_type_coll|x|x m_reset|e|x',
+      },
+      {
+        description: 'the post-TYPE restatement restores the explicit compression',
+        sql: compressionModesOf('merged'),
+        expected: 'm_type_coll| m_reset|p',
+      },
+      {
+        description: 'the logged-to-unlogged flip lands',
+        sql: relPersistenceOf('flip_up'),
+        expected: 'u',
+      },
+      {
+        description: 'the unlogged-to-logged flip lands',
+        sql: relPersistenceOf('flip_down'),
+        expected: 'p',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import every attribute state exactly',
+        failure: (imported, source) => {
+          const facts = (name: string): string => {
+            const found = imported.model.tables.find((candidate) => candidate.name === name);
+            if (found === undefined) return 'not imported';
+            return found.columns
+              .map((column) =>
+                [column.name, column.default, column.collation, column.storage, column.compression]
+                  .map((value) => value ?? '-')
+                  .join('|'),
+              )
+              .join(' ');
+          };
+          const expected: readonly (readonly [string, string])[] = [
+            [
+              'defaults',
+              "d_add|1|-|-|- d_change|2|-|-|- d_remove|-|-|-|- d_expr|now()|-|-|- d_cast|'x'::text|-|-|-",
+            ],
+            ['colls', 'c_add|-|pg_catalog."C"|-|- c_change|-|app."User_C"|-|- c_remove|-|-|-|-'],
+            [
+              'methods',
+              's_change|-|-|external|- s_remove|-|-|-|- comp_add|-|-|-|pglz comp_remove|-|-|-|-',
+            ],
+            ['merged', 'm_type_coll|-|pg_catalog."POSIX"|-|- m_reset|-|-|external|pglz'],
+          ];
+          for (const [name, wanted] of expected) {
+            const actual = facts(name);
+            if (actual !== wanted) return `${source}: ${name}: ${actual}`;
+          }
+          const persistence = ['flip_up', 'flip_down']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              return `${name}:${found === undefined ? 'not imported' : (found.persistence ?? '-')}`;
+            })
+            .join(' ');
+          return persistence === 'flip_up:unlogged flip_down:-'
+            ? undefined
+            : `${source}: ${persistence}`;
+        },
+      },
+      {
+        description: 'each dump imports to the authored target model, attributes and all',
+        failure: (imported, source) => {
+          const changes = diff(target, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the import diffs as ${changes.map((change) => change.kind).join(',')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live-introspection flags scene: the covered column and table states now read back
+ * instead of flagging, and the deferred states stay flagged, each asserted as an exact
+ * diagnostic. The model declares `flag_covered` — a default, an explicit collation, storage,
+ * and compression — and `flag_identity`; raw setup SQL adds an unlogged table whose
+ * persistence reads back, a generated column whose flag must suppress its `atthasdef` default
+ * flag, a partitioned table with one partition — both partitioned relations skipped and
+ * named, and neither mapped — and a table carrying expression, partial, and `INCLUDE` indexes
+ * plus an index marked invalid by a catalog write (a model cannot declare an invalid index),
+ * each outside the model's envelope and skipped whole with the read's reason. The covered
+ * states produce no diagnostic, so the exact list is the pin that their flags stayed gone.
  */
 const introspectionFlagsScene = (): LiveScene => {
   const target = model(
-    table('flag_default', {
-      columns: [column('d', { type: 'integer', default: '42' }), column('e')],
+    table('flag_covered', {
+      columns: [
+        column('d', { type: 'integer', default: '42' }),
+        column('c', { collation: 'pg_catalog."C"' }),
+        column('s', { storage: 'main' }),
+        column('m', { compression: 'pglz' }),
+      ],
     }),
     table('flag_identity', {
       columns: [
@@ -3597,6 +3951,8 @@ const introspectionFlagsScene = (): LiveScene => {
       'CREATE INDEX flag_expr_idx ON public.flag_indexed USING btree ((a + b));',
       'CREATE INDEX flag_partial_idx ON public.flag_indexed USING btree (a) WHERE (a > 0);',
       'CREATE INDEX flag_include_idx ON public.flag_indexed USING btree (a) INCLUDE (b);',
+      'CREATE INDEX flag_invalid_idx ON public.flag_indexed USING btree (c);',
+      "UPDATE pg_catalog.pg_index SET indisvalid = false WHERE indexrelid = 'public.flag_invalid_idx'::regclass;",
       'CREATE TABLE public.flag_partitioned (k integer, v text) PARTITION BY RANGE (k);',
       'CREATE TABLE public.flag_partitioned_1 PARTITION OF public.flag_partitioned FOR VALUES FROM (0) TO (10);',
     ].join('\n'),
@@ -3605,18 +3961,6 @@ const introspectionFlagsScene = (): LiveScene => {
     introspection: {
       assert: 'flags',
       expected: [
-        {
-          kind: 'flag',
-          code: 'unsupported-attribute',
-          object: 'public.flag_default',
-          message: 'column d has a default; defaults are not read yet',
-        },
-        {
-          kind: 'flag',
-          code: 'unsupported-attribute',
-          object: 'public.flag_generated',
-          message: 'column a has a default; defaults are not read yet',
-        },
         {
           kind: 'flag',
           code: 'unsupported-attribute',
@@ -3644,6 +3988,13 @@ const introspectionFlagsScene = (): LiveScene => {
         {
           kind: 'skip',
           code: 'unsupported-statement',
+          object: 'public.flag_invalid_idx',
+          message:
+            'index public.flag_invalid_idx is not valid and ready; invalid indexes are not represented yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
           object: 'public.flag_partial_idx',
           message: 'skipped CREATE INDEX public.flag_partial_idx (partial WHERE)',
         },
@@ -3660,12 +4011,6 @@ const introspectionFlagsScene = (): LiveScene => {
           object: 'public.flag_partitioned_1',
           message:
             'table public.flag_partitioned_1 is partitioned; partitioning is not represented yet',
-        },
-        {
-          kind: 'flag',
-          code: 'unsupported-attribute',
-          object: 'public.flag_unlogged',
-          message: 'table public.flag_unlogged is unlogged; persistence is not represented yet',
         },
       ],
     },
@@ -4032,6 +4377,7 @@ export const scenes: readonly LiveScene[] = [
   nonPublicIndexDropScene(),
   introspectionTracerScene(),
   introspectionIndexesScene(),
+  columnAttributesScene(),
   introspectionFlagsScene(),
   introspectionFlagsNullsNotDistinctScene(),
   truncatedNameRoundTripScene(),

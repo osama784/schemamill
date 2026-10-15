@@ -19,6 +19,7 @@ import type {
   Table,
   TableChange,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from '@schemamill/core';
 
@@ -266,6 +267,8 @@ function formatTableChange(change: TableChange): string {
         change.before,
         change.after,
       )}`;
+    case 'persistence-changed':
+      return `persistence ${formatPersistence(change.before)} → ${formatPersistence(change.after)}`;
   }
 }
 
@@ -285,6 +288,8 @@ function formatStep(step: Step): string {
       return step.name === undefined
         ? `${formatIdentity(step.table)}.${step.column}`
         : `${formatIdentity(step.table)}.${step.column} (${step.name})`;
+    case 'alter-persistence':
+      return `${formatIdentity(step.table)}: persistence ${formatPersistence(step.persistence)}`;
     case 'add-identity':
     case 'drop-identity':
       return `${formatIdentity(step.table)}.${step.name}`;
@@ -323,14 +328,18 @@ function formatIdentity(identity: TableIdentity): string {
 }
 
 /**
- * A column as `<name> <type>` plus ` NOT NULL`, ` DEFAULT <default>`, and, when it carries one,
- * a compact `identity: GENERATED …` clause naming the generation mode. The identity descriptor's
- * sequence name and options are not spelled out here; a changed column's identity options get
- * their own `identity:` sub-lines.
+ * A column as `<name> <type>` plus, when present, `collation <c>`, `storage <word>`, and
+ * `compression <word>`, then ` NOT NULL`, ` DEFAULT <default>`, and, when it carries one,
+ * a compact `identity: GENERATED …` clause naming the generation mode. The identity
+ * descriptor's sequence name and options are not spelled out here; a changed column's
+ * identity options get their own `identity:` sub-lines.
  */
 function formatColumn(column: Column): string {
   const nameAndType = [column.name, column.type].filter((part) => part !== '').join(' ');
   const clauses: string[] = [];
+  if (column.collation !== undefined) clauses.push(`collation ${column.collation}`);
+  if (column.storage !== undefined) clauses.push(`storage ${column.storage}`);
+  if (column.compression !== undefined) clauses.push(`compression ${column.compression}`);
   if (column.notNull) clauses.push('NOT NULL');
   if (column.default !== undefined && column.default !== '') {
     clauses.push(`DEFAULT ${column.default}`);
@@ -447,7 +456,10 @@ function formatColumnFields(fields: readonly ColumnFieldChange[]): string {
   return fields.map(formatColumnField).join(', ');
 }
 
-/** One column field change; `default` and `notNullName` name the absent side `(none)`. */
+/**
+ * One column field change; `default`, `notNullName`, `collation`, `storage`, and
+ * `compression` name the absent side `(none)`.
+ */
 function formatColumnField(field: ColumnFieldChange): string {
   switch (field.field) {
     case 'type':
@@ -458,6 +470,12 @@ function formatColumnField(field: ColumnFieldChange): string {
       return `not null name ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
     case 'default':
       return `default ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'collation':
+      return `collation ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'storage':
+      return `storage ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'compression':
+      return `compression ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }
 }
 
@@ -567,6 +585,11 @@ function formatIndexChanges(before: Index, after: Index): string {
     fields.push(`columns (${before.columns.join(', ')}) → (${after.columns.join(', ')})`);
   }
   return fields.join(', ');
+}
+
+/** The effective persistence word: absent means `LOGGED`, PostgreSQL's default. */
+function formatPersistence(persistence: TablePersistence | undefined): string {
+  return persistence ?? 'logged';
 }
 
 /** The value when present, `(none)` when the payload omits it. */

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import type { Diagnostic, Index, Model, TableIdentity } from '@schemamill/core';
 
 import { canonicalizeIndexNames, mapCatalog } from './catalog.ts';
+import { importDump } from './import.ts';
 
 /**
  * Tests for the live-catalog payload mapper: literal payload fixtures in the dump-importer
@@ -11,8 +12,9 @@ import { canonicalizeIndexNames, mapCatalog } from './catalog.ts';
  * Transport behavior (the `psql` spawn, JSON parsing, exit handling) is exercised by the gated
  * live suite; here the payload contract is the subject: canonical order out of shuffled rows,
  * conventional-name stripping for primary keys and indexes, the index envelope's skip grammar,
- * invalid and tablespace index handling, every deferred-state diagnostic, and the throws for
- * malformed, orphan, and duplicate payloads.
+ * invalid and tablespace index handling, every deferred-state diagnostic, the default and
+ * explicit-attribute canonicalization rules, and the throws for malformed, orphan, and
+ * duplicate payloads.
  */
 
 /** A `tables` row: an ordinary permanent table unless overridden. */
@@ -42,8 +44,10 @@ const column = (
   attidentity: '',
   attgenerated: '',
   atthasdef: false,
+  default: null,
   attcollation: 0,
   typcollation: 0,
+  collation: null,
   attstorage: 'x',
   typstorage: 'x',
   attcompression: '',
@@ -246,18 +250,18 @@ test('strips only the conventional primary-key name and keeps every other', asyn
   );
 });
 
-test('flags every deferred column state with the pinned wording and order', async () => {
+test('keeps the deferred column flags byte-stable and never reads a generated default', async () => {
   const read = await mapCatalog(
     payload({
       tables: [table('app', 'flags')],
       columns: [
-        column('app', 'flags', 1, 'gen', { attgenerated: 's', atthasdef: true }),
-        column('app', 'flags', 2, 'def', { atthasdef: true }),
-        column('app', 'flags', 3, 'ident', { attidentity: 'a' }),
-        column('app', 'flags', 4, 'coll', { attcollation: 100, typcollation: 950 }),
-        column('app', 'flags', 5, 'stor', { attstorage: 'e', typstorage: 'x' }),
-        column('app', 'flags', 6, 'comp', { attcompression: 'p' }),
-        column('app', 'flags', 7, 'clean'),
+        column('app', 'flags', 1, 'gen', {
+          attgenerated: 's',
+          atthasdef: true,
+          default: '(2 * 3)',
+        }),
+        column('app', 'flags', 2, 'ident', { attidentity: 'a' }),
+        column('app', 'flags', 3, 'clean'),
       ],
     }),
   );
@@ -273,32 +277,7 @@ test('flags every deferred column state with the pinned wording and order', asyn
       kind: 'flag',
       code: 'unsupported-attribute',
       object: 'app.flags',
-      message: 'column def has a default; defaults are not read yet',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'app.flags',
       message: 'column ident is an identity column; identity is not read yet',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'app.flags',
-      message: 'column coll has an explicit collation; collation is not represented yet',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'app.flags',
-      message: 'column stor has an explicit storage setting; storage is not represented yet',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'app.flags',
-      message:
-        'column comp has an explicit compression setting; compression is not represented yet',
     },
   ];
   assert.deepEqual(read.diagnostics, expected);
@@ -306,15 +285,191 @@ test('flags every deferred column state with the pinned wording and order', asyn
     assert.equal('position' in diagnostic, false, 'introspection diagnostics carry no position');
   }
 
-  // A generated column has `atthasdef` set, but the generated flag suppresses the default one.
+  // A generated column carries `atthasdef` and an attrdef row for its generation expression;
+  // the flag suppresses the default read, and the covered states carry no flag at all.
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    { name: 'gen', type: 'text', notNull: false },
+    { name: 'ident', type: 'text', notNull: false },
+    { name: 'clean', type: 'text', notNull: false },
+  ]);
+});
+
+test('reads defaults whitespace-normalized, only with atthasdef and an attrdef row', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'q', { atthasdef: true, default: "'q'::text" }),
+        column('public', 't', 2, 'arr', { atthasdef: true, default: 'ARRAY[1, 2, 3]' }),
+        column('public', 't', 3, 'now', { atthasdef: true, default: 'CURRENT_TIMESTAMP' }),
+        column('public', 't', 4, 'spaced', { atthasdef: true, default: '(2  +   3)' }),
+        column('public', 't', 5, 'unset', { default: 'ignored' }),
+        column('public', 't', 6, 'no-row', { atthasdef: true }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    { name: 'q', type: 'text', notNull: false, default: "'q'::text" },
+    { name: 'arr', type: 'text', notNull: false, default: 'ARRAY[1,2,3]' },
+    { name: 'now', type: 'text', notNull: false, default: 'CURRENT_TIMESTAMP' },
+    { name: 'spaced', type: 'text', notNull: false, default: '(2 + 3)' },
+    { name: 'unset', type: 'text', notNull: false },
+    { name: 'no-row', type: 'text', notNull: false },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('reads a default byte-identical to the dump import of its own dumped text', async () => {
+  // The pin behind the dump-import congruence bar: the catalog normalizes `pg_get_expr` text
+  // with the importer's own helper, so the dump's `DEFAULT ARRAY[1, 2, 3]` and the catalog's
+  // `ARRAY[1, 2, 3]` map to one model value.
+  const imported = await importDump(
+    "CREATE TABLE public.t (a integer DEFAULT ARRAY[1, 2, 3], b text DEFAULT 'a''b'::text, c timestamptz DEFAULT now());",
+  );
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'a', {
+          type: 'integer',
+          atthasdef: true,
+          default: 'ARRAY[1, 2, 3]',
+        }),
+        column('public', 't', 2, 'b', { atthasdef: true, default: "'a''b'::text" }),
+        column('public', 't', 3, 'c', {
+          type: 'timestamp with time zone',
+          atthasdef: true,
+          default: 'now()',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(imported.diagnostics, []);
+  assert.deepEqual(read.diagnostics, []);
   assert.deepEqual(
-    read.model.tables[0]?.columns.map((column) => column.name),
-    ['gen', 'def', 'ident', 'coll', 'stor', 'comp', 'clean'],
-    'flagged columns still map: only the model surface is narrowed',
+    read.model.tables[0]?.columns.map((column) => column.default),
+    imported.model.tables[0]?.columns.map((column) => column.default),
+    'both sides of the congruence bar normalize to the same default text',
   );
 });
 
-test('flags persistence, skips partitioned relations, and maps neither', async () => {
+test("reads an explicit collation in pg_dump's spelling, only when explicit", async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        // The live-probe spellings: a bare quoted name in `pg_catalog` and a mixed-case user
+        // collation in its own schema, both as `format('%I.%I', …)` assembles them.
+        column('public', 't', 1, 'c_qualified', {
+          attcollation: 950,
+          typcollation: 100,
+          collation: 'pg_catalog."C"',
+        }),
+        column('public', 't', 2, 'c_user', {
+          attcollation: 49153,
+          typcollation: 100,
+          collation: 'probe77."User_C"',
+        }),
+        // The SQL gates the spelling, but the mapper's explicit-only rule is its own gate: a
+        // value equal to the type's collation is dropped even when the payload carries text.
+        column('public', 't', 3, 'c_default', {
+          attcollation: 100,
+          typcollation: 100,
+          collation: 'pg_catalog."default"',
+        }),
+        column('public', 't', 4, 'c_none', { attcollation: 0, typcollation: 0 }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    { name: 'c_qualified', type: 'text', notNull: false, collation: 'pg_catalog."C"' },
+    { name: 'c_user', type: 'text', notNull: false, collation: 'probe77."User_C"' },
+    { name: 'c_default', type: 'text', notNull: false },
+    { name: 'c_none', type: 'text', notNull: false },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps the storage letters, only when explicit', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'plain', { attstorage: 'p', typstorage: 'x' }),
+        column('public', 't', 2, 'external', { attstorage: 'e', typstorage: 'x' }),
+        column('public', 't', 3, 'extended', { attstorage: 'x', typstorage: 'p' }),
+        column('public', 't', 4, 'main', { attstorage: 'm', typstorage: 'x' }),
+        column('public', 't', 5, 'same', { attstorage: 'e', typstorage: 'e' }),
+        column('public', 't', 6, 'same-plain', { attstorage: 'p', typstorage: 'p' }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.tables[0]?.columns.map((column) => column.storage ?? '(absent)'),
+    ['plain', 'external', 'extended', 'main', '(absent)', '(absent)'],
+    "the letter maps to its word only where it differs from the type's storage",
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps the compression letters, only when explicit', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'pglz', { attcompression: 'p' }),
+        column('public', 't', 2, 'lz4', { attcompression: 'l' }),
+        column('public', 't', 3, 'none'),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.tables[0]?.columns.map((column) => column.compression ?? '(absent)'),
+    ['pglz', 'lz4', '(absent)'],
+    'the empty string is the absent state — the PostgreSQL 13 floor reads no letter at all',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps default, collation, storage, and compression together on one column', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'all', {
+          atthasdef: true,
+          default: "'x'::text",
+          attcollation: 950,
+          typcollation: 100,
+          collation: 'pg_catalog."C"',
+          attstorage: 'e',
+          typstorage: 'x',
+          attcompression: 'l',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    {
+      name: 'all',
+      type: 'text',
+      notNull: false,
+      default: "'x'::text",
+      collation: 'pg_catalog."C"',
+      storage: 'external',
+      compression: 'lz4',
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('reads unlogged persistence, keeps temporary flagged, and skips partitioned relations', async () => {
   const read = await mapCatalog(
     payload({
       tables: [
@@ -322,18 +477,25 @@ test('flags persistence, skips partitioned relations, and maps neither', async (
         table('public', 'partitioned', { relkind: 'p' }),
         table('public', 'temp', { relpersistence: 't' }),
         table('public', 'partition_child', { relispartition: true }),
+        table('public', 'logged'),
       ],
       columns: [
         column('public', 'unlogged', 1, 'x', { type: 'integer' }),
         column('public', 'temp', 1, 'y'),
+        column('public', 'logged', 1, 'z'),
       ],
     }),
   );
 
   assert.deepEqual(
     read.model.tables.map((table) => `${table.schema}.${table.name}`),
-    ['public.temp', 'public.unlogged'],
-    'only ordinary, permanent relations are mapped',
+    ['public.logged', 'public.temp', 'public.unlogged'],
+    'ordinary relations are mapped; partitioned ones are skipped',
+  );
+  assert.deepEqual(
+    read.model.tables.map((table) => `${table.name}:${table.persistence ?? '(absent)'}`),
+    ['logged:(absent)', 'temp:(absent)', 'unlogged:unlogged'],
+    'unlogged persistence travels the model; logged is absent and temporary is not modeled',
   );
   assert.deepEqual(read.diagnostics, [
     {
@@ -353,12 +515,6 @@ test('flags persistence, skips partitioned relations, and maps neither', async (
       code: 'unsupported-attribute',
       object: 'public.temp',
       message: 'table public.temp is temporary; persistence is not represented yet',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'public.unlogged',
-      message: 'table public.unlogged is unlogged; persistence is not represented yet',
     },
   ]);
 });
@@ -737,6 +893,46 @@ test('throws on malformed payloads', async () => {
         columns: [column('public', 't', 1, 'x', { attnotnull: 'no' })],
       }),
       /catalog payload\.columns\[0\]\.attnotnull must be a boolean/,
+    ],
+    [
+      'a non-string default',
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'x', { default: 7 })],
+      }),
+      /catalog payload\.columns\[0\]\.default must be a string or null/,
+    ],
+    [
+      'a non-string collation',
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'x', { collation: 7 })],
+      }),
+      /catalog payload\.columns\[0\]\.collation must be a string or null/,
+    ],
+    [
+      'an unknown column row field',
+      payload({
+        tables: [table('public', 't')],
+        columns: [{ ...column('public', 't', 1, 'x'), extra: true }],
+      }),
+      /catalog payload\.columns\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'an unknown storage letter behind an explicit setting',
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'x', { attstorage: 'z', typstorage: 'x' })],
+      }),
+      /catalog payload: unknown attstorage letter "z"/,
+    ],
+    [
+      'an unknown compression letter',
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'x', { attcompression: 'q' })],
+      }),
+      /catalog payload: unknown attcompression letter "q"/,
     ],
     [
       'a non-positive column number',

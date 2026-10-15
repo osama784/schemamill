@@ -23,6 +23,7 @@ import type { SequenceOptions } from './sequence.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
   ForeignKey,
   Index,
   Model,
@@ -32,6 +33,7 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from './model.ts';
 import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
@@ -44,7 +46,7 @@ import {
 } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eight global phases with the seventeen table phases at their
+ * Tests for the migration plan: the eight global phases with the eighteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -72,6 +74,7 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  persistence?: TablePersistence;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -84,6 +87,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
 });
 
 /** A table with an `integer` primary key column `id` and the given extra members. */
@@ -245,6 +249,7 @@ interface SimulatedTable {
   readonly uniqueConstraints: Mutable<UniqueConstraint>[];
   readonly checkConstraints: Mutable<CheckConstraint>[];
   readonly indexes: Mutable<Index>[];
+  persistence: TablePersistence | undefined;
 }
 
 /** The simulated database state: live tables by JSON-encoded identity, plus sequences. */
@@ -352,6 +357,7 @@ const stateOf = (model: Model): SimulatedState => {
       uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
       checkConstraints: source.checkConstraints.map(copyCheckConstraint),
       indexes: source.indexes.map(copyIndex),
+      persistence: source.persistence,
     });
   }
   const sequences = new Map<string, Mutable<Sequence>>();
@@ -458,6 +464,7 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         uniqueConstraints: [],
         checkConstraints: [],
         indexes: [],
+        persistence: step.table.persistence,
       });
       return;
     }
@@ -578,6 +585,18 @@ const applyStep = (state: SimulatedState, step: Step): void => {
             if (field.after === undefined) delete altered.default;
             else altered.default = field.after;
             break;
+          case 'collation':
+            if (field.after === undefined) delete altered.collation;
+            else altered.collation = field.after;
+            break;
+          case 'storage':
+            if (field.after === undefined) delete altered.storage;
+            else altered.storage = field.after;
+            break;
+          case 'compression':
+            if (field.after === undefined) delete altered.compression;
+            else altered.compression = field.after;
+            break;
           default:
             // `case 'default':` above is the column field named 'default'; this `default:` is
             // the exhaustiveness guard and neither shadows the other.
@@ -616,6 +635,13 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       );
       altered.notNull = true;
       if (step.name !== undefined) altered.notNullName = step.name;
+      return;
+    }
+    case 'alter-persistence': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `alter-persistence on missing table ${key}`);
+      table.persistence = step.persistence;
       return;
     }
     case 'add-identity': {
@@ -871,6 +897,7 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       );
     }
     assert.deepStrictEqual(actual.primaryKey, expected.primaryKey, `primary key of ${key}`);
+    assert.deepStrictEqual(actual.persistence, expected.persistence, `persistence of ${key}`);
     assert.deepStrictEqual(
       actual.foreignKeys.map(foreignKeyKey).sort(),
       expected.foreignKeys.map(foreignKeyKey).sort(),
@@ -1839,6 +1866,7 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'alter-column',
     'drop-not-null',
     'add-not-null',
+    'alter-persistence',
     'add-identity',
     'drop-identity',
     'alter-identity',
@@ -1859,7 +1887,7 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'alter-sequence',
   ];
 
-  assert.equal(kinds.length, 25);
+  assert.equal(kinds.length, 26);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -2608,7 +2636,7 @@ test('a primary-key change splits into a drop before column work and an add afte
   ]);
 });
 
-test('a changed foreign key drops in phase 1 and adds in phase 17, around column work', () => {
+test('a changed foreign key drops in phase 1 and adds in phase 18, around column work', () => {
   const parent = identity('parent');
   const before = foreignKey(['parent_id'], parent, {
     name: 't_parent_id_fkey',
@@ -2723,6 +2751,7 @@ test('a mixed type and not-null-name change keeps the alter-column name-free', (
       table: identity('t'),
       name: 'id',
       fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+      attributes: { type: 'bigint' },
     },
     { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
   ]);
@@ -2756,6 +2785,7 @@ test('the not-null steps bracket the column alterations in phase order', () => {
       table: identity('t'),
       name: 'id',
       fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+      attributes: { type: 'bigint' },
     },
     {
       kind: 'alter-column',
@@ -2798,6 +2828,7 @@ test('no alter-column step ever carries a not-null name', () => {
           { field: 'type', before: 'integer', after: 'bigint' },
           { field: 'default', after: '0' },
         ],
+        attributes: { type: 'bigint' },
       },
     ],
   );
@@ -2986,6 +3017,7 @@ test('column payloads keep their exact contents', () => {
         { field: 'notNull', before: false, after: true },
         { field: 'default', after: "'x'" },
       ],
+      attributes: { type: 'character varying(12)' },
     },
   ]);
 });
@@ -3151,6 +3183,7 @@ test('a mixed migration pins the exact step sequence across the nine original ta
       table: identity('users'),
       name: 'name',
       fields: [{ field: 'type', before: 'character varying(12)', after: 'text' }],
+      attributes: { type: 'text' },
     },
     {
       kind: 'add-primary-key',
@@ -3412,7 +3445,7 @@ test('an index flag-only difference produces no plan', () => {
   assertPlan(model(concurrent), model(lazy), []);
 });
 
-test('a mixed migration pins the exact step sequence across all seventeen table phases', () => {
+test('a mixed migration pins the exact step sequence across all eighteen table phases', () => {
   const parent = table('parent', {
     columns: [column('id', { type: 'integer', notNull: true })],
     primaryKey: { name: 'parent_pkey', columns: ['id'] },
@@ -3471,6 +3504,7 @@ test('a mixed migration pins the exact step sequence across all seventeen table 
     uniqueConstraints: [liveKey],
     checkConstraints: [liveCheck],
     indexes: [liveIndex],
+    persistence: 'unlogged',
   });
 
   const freshForeignKey = foreignKey(['parent_id'], identity('parent'), {
@@ -3543,27 +3577,149 @@ test('a mixed migration pins the exact step sequence across all seventeen table 
       table: identity('kept'),
       name: 'note',
       fields: [{ field: 'type', before: 'text', after: 'character varying(12)' }],
+      attributes: { type: 'character varying(12)' },
     },
-    // Phase 13: add-primary-key.
+    // Phase 13: alter-persistence.
+    { kind: 'alter-persistence', table: identity('kept'), persistence: 'unlogged' },
+    // Phase 14: add-primary-key.
     {
       kind: 'add-primary-key',
       table: identity('kept'),
       primaryKey: { name: 'kept_pkey', columns: ['id', 'fresh'] },
     },
-    // Phase 14: add-unique-constraint, in diff order (fresh before kept).
+    // Phase 15: add-unique-constraint, in diff order (fresh before kept).
     { kind: 'add-unique-constraint', table: identity('fresh'), uniqueConstraint: freshKey },
     { kind: 'add-unique-constraint', table: identity('kept'), uniqueConstraint: liveKey },
-    // Phase 15: add-check-constraint.
+    // Phase 16: add-check-constraint.
     { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: freshCheck },
     { kind: 'add-check-constraint', table: identity('kept'), checkConstraint: liveCheck },
-    // Phase 16: create-index.
+    // Phase 17: create-index.
     { kind: 'create-index', table: identity('fresh'), index: freshIndex },
     { kind: 'create-index', table: identity('kept'), index: liveIndex },
-    // Phase 17: add-foreign-key.
+    // Phase 18: add-foreign-key.
     { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: freshForeignKey },
     { kind: 'add-foreign-key', table: identity('kept'), foreignKey: liveForeignKey },
   ]);
   simulate(baseline, target);
+});
+
+test('alter-persistence lands between add-not-null and add-primary-key', () => {
+  const baseline = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+      persistence: 'unlogged',
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'alter-persistence', table: identity('t'), persistence: 'unlogged' },
+    {
+      kind: 'add-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a persistence flip back to logged carries no persistence payload', () => {
+  const unlogged = model(table('t', { columns: [column('c')], persistence: 'unlogged' }));
+  const logged = model(table('t', { columns: [column('c')] }));
+
+  assertPlan(unlogged, logged, [{ kind: 'alter-persistence', table: identity('t') }]);
+  simulate(unlogged, logged);
+});
+
+test('an alter-column step keeps the diff order and carries the target attributes', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          default: '0',
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'bigint',
+          notNull: true,
+          default: '1',
+          collation: 'pg_catalog."en_US"',
+          storage: 'main',
+        }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [
+        { field: 'type', before: 'text', after: 'bigint' },
+        { field: 'notNull', before: false, after: true },
+        { field: 'default', before: '0', after: '1' },
+        { field: 'collation', before: 'pg_catalog."C"', after: 'pg_catalog."en_US"' },
+        { field: 'storage', before: 'extended', after: 'main' },
+        { field: 'compression', before: 'lz4' },
+      ],
+      attributes: {
+        type: 'bigint',
+        collation: 'pg_catalog."en_US"',
+        storage: 'main',
+      },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a create-table step carries the added table persistence as a copy', () => {
+  const source = table('t', {
+    columns: [
+      column('c', {
+        collation: 'pg_catalog."C"',
+        storage: 'main',
+        compression: 'pglz',
+      }),
+    ],
+    persistence: 'unlogged',
+  });
+
+  const { steps } = plan(model(), model(source));
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'create-table',
+      table: table('t', {
+        columns: [
+          column('c', {
+            collation: 'pg_catalog."C"',
+            storage: 'main',
+            compression: 'pglz',
+          }),
+        ],
+        persistence: 'unlogged',
+      }),
+    },
+  ]);
+
+  const step = steps[0];
+  if (step?.kind !== 'create-table') throw new Error('expected a create-table step');
+  assert.notEqual(step.table, source);
+  assert.equal(step.table.persistence, 'unlogged');
 });
 
 test('a deep-frozen model with constraints and indexes can be planned, and steps carry copies', () => {
@@ -4817,6 +4973,42 @@ test('applyChange writes each table change kind into its buckets', () => {
       },
     },
     {
+      name: 'column-changed (attributes carrier)',
+      change: tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'storage', before: 'extended', after: 'main' }],
+        attributes: { type: 'text', storage: 'main' },
+      }),
+      buckets: {
+        columnAlters: [
+          {
+            kind: 'alter-column',
+            table: identity('t'),
+            name: 'c',
+            fields: [{ field: 'storage', before: 'extended', after: 'main' }],
+            attributes: { type: 'text', storage: 'main' },
+          },
+        ],
+      },
+    },
+    {
+      name: 'persistence-changed (to unlogged)',
+      change: tableChanged({ kind: 'persistence-changed', after: 'unlogged' }),
+      buckets: {
+        persistenceAlters: [
+          { kind: 'alter-persistence', table: identity('t'), persistence: 'unlogged' },
+        ],
+      },
+    },
+    {
+      name: 'persistence-changed (back to logged)',
+      change: tableChanged({ kind: 'persistence-changed', before: 'unlogged' }),
+      buckets: {
+        persistenceAlters: [{ kind: 'alter-persistence', table: identity('t') }],
+      },
+    },
+    {
       name: 'primary-key-added',
       change: tableChanged({ kind: 'primary-key-added', primaryKey: afterPrimaryKey }),
       buckets: {
@@ -5167,6 +5359,17 @@ const aliasCases: readonly AliasCase[] = [
     payload: (application) => onlyFieldPayload(application.columnAlters),
   },
   {
+    name: 'column attributes carrier',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'storage', after: 'main' }],
+        attributes: { type: 'text', nested } as unknown as ColumnAttributes,
+      }),
+    payload: (application) => onlyPayload(application.columnAlters, 'attributes'),
+  },
+  {
     name: 'column identity field change',
     build: (nested) =>
       tableChanged({
@@ -5349,7 +5552,7 @@ test('seeded pairs keep diff and plan deterministic and order-independent', () =
   }
 });
 
-/** The 22 array buckets of a `ChangeApplication`, in interface order. */
+/** The 23 array buckets of a `ChangeApplication`, in interface order. */
 const applicationArrays = [
   'foreignKeyDrops',
   'primaryKeyDrops',
@@ -5358,6 +5561,7 @@ const applicationArrays = [
   'tableCreates',
   'columnAdds',
   'columnAlters',
+  'persistenceAlters',
   'primaryKeyAdds',
   'foreignKeyAdds',
   'uniqueConstraintDrops',
@@ -5400,6 +5604,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     tableCreates: 0,
     columnAdds: 0,
     columnAlters: 0,
+    persistenceAlters: 0,
     primaryKeyAdds: 0,
     foreignKeyAdds: 0,
     uniqueConstraintDrops: 0,
@@ -5520,6 +5725,9 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
               count('indexDrops');
               count('indexCreates');
               break;
+            case 'persistence-changed':
+              count('persistenceAlters');
+              break;
             default:
               assertNever(tableChange, 'table change kind');
           }
@@ -5558,6 +5766,7 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.tableCreates.push(...source.tableCreates);
   target.columnAdds.push(...source.columnAdds);
   target.columnAlters.push(...source.columnAlters);
+  target.persistenceAlters.push(...source.persistenceAlters);
   target.primaryKeyAdds.push(...source.primaryKeyAdds);
   target.foreignKeyAdds.push(...source.foreignKeyAdds);
   target.uniqueConstraintDrops.push(...source.uniqueConstraintDrops);
@@ -5625,7 +5834,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 25, 'every step kind must be classified');
+  assert.equal(kinds.length, 26, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
