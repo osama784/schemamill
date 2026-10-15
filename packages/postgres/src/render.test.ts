@@ -968,7 +968,8 @@ test('merges a type and collation change into exactly one TYPE statement', () =>
 test('restates target storage and compression after the merged TYPE statement', () => {
   // A TYPE statement resets storage and compression to the type's defaults, so the target's
   // explicit values ride after it; a target that states none needs nothing, the reset already
-  // matching it. The restatements keep the bare `ALTER TABLE` form, no `ONLY`.
+  // matching it. The restatements carry the dump's post-data `ONLY` form; only the merged
+  // TYPE statement stays bare.
   const baseline = model(
     table('t', {
       columns: [
@@ -996,8 +997,8 @@ test('restates target storage and compression after the merged TYPE statement', 
     [
       'BEGIN;',
       'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(12) COLLATE pg_catalog."C";',
-      'ALTER TABLE public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
-      'ALTER TABLE public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
       'ALTER TABLE public.t ALTER COLUMN reset TYPE character varying(24);',
       'COMMIT;',
       '',
@@ -1006,9 +1007,9 @@ test('restates target storage and compression after the merged TYPE statement', 
 });
 
 test('renders standalone storage and compression changes, resets included', () => {
-  // With no type or collation change, a storage or compression field states one bare `SET`
+  // With no type or collation change, a storage or compression field states one `SET`
   // statement; an absent target restores the default (`SET STORAGE DEFAULT`, `SET COMPRESSION
-  // default`), and no statement carries `ONLY`.
+  // default`), and every statement carries the dump's post-data `ONLY` form.
   const baseline = model(
     table('t', {
       columns: [
@@ -1037,16 +1038,21 @@ test('renders standalone storage and compression changes, resets included', () =
     sql,
     [
       'BEGIN;',
-      'ALTER TABLE public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
-      'ALTER TABLE public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
-      'ALTER TABLE public.t ALTER COLUMN moved SET STORAGE PLAIN;',
-      'ALTER TABLE public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
-      'ALTER TABLE public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN moved SET STORAGE PLAIN;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
       'COMMIT;',
       '',
     ].join('\n'),
   );
-  assert.ok(!sql.includes(' ONLY '), 'a standalone SET never carries ONLY');
+  const setStatements = sql.split('\n').filter((line) => line.includes(' SET '));
+  assert.equal(setStatements.length, 5);
+  assert.ok(
+    setStatements.every((line) => line.startsWith('ALTER TABLE ONLY ')),
+    'every standalone SET carries ONLY',
+  );
 });
 
 test('orders a merged TYPE before the per-field and attribute statements', () => {
@@ -1076,8 +1082,8 @@ test('orders a merged TYPE before the per-field and attribute statements', () =>
       'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(9);',
       'ALTER TABLE public.t ALTER COLUMN c SET NOT NULL;',
       "ALTER TABLE public.t ALTER COLUMN c SET DEFAULT 'x';",
-      'ALTER TABLE public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
-      'ALTER TABLE public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
       'COMMIT;',
       '',
     ].join('\n'),

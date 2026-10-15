@@ -104,12 +104,12 @@ import {
  * because PostgreSQL rejects two `TYPE` clauses for one change. A `TYPE` statement resets the
  * column's storage and compression to the type's defaults, so the carrier's explicit values
  * are restated after it; a standalone storage or compression change states its `SET` statement
- * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. The
- * target restatements use the bare `ALTER TABLE` form, like the merged statement; only the
- * `CREATE TABLE`/`ADD COLUMN` tails carry `ONLY`, matching the dump's post-data form. A plan
- * that reaches the renderer malformed — a `type` or `collation` field whose step carries no
- * `attributes` carrier, or any attribute field reaching the per-field renderer — throws rather
- * than render a guess.
+ * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. Every
+ * `SET STORAGE`/`SET COMPRESSION` statement — create tail, add tail, post-`TYPE` restatement,
+ * or standalone — carries the dump's post-data `ONLY` form; only the merged `TYPE` statement
+ * stays bare. A plan that reaches the renderer malformed — a `type` or `collation` field whose
+ * step carries no `attributes` carrier, or any attribute field reaching the per-field renderer
+ * — throws rather than render a guess.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -595,44 +595,42 @@ function renderColumn(column: Column): string {
 function renderColumnAttributeStatements(table: TableIdentity, column: Column): string[] {
   const statements: string[] = [];
   if (column.storage !== undefined) {
-    statements.push(renderSetStorage(table, column.name, column.storage, true));
+    statements.push(renderSetStorage(table, column.name, column.storage));
   }
   if (column.compression !== undefined) {
-    statements.push(renderSetCompression(table, column.name, column.compression, true));
+    statements.push(renderSetCompression(table, column.name, column.compression));
   }
   return statements;
 }
 
 /**
  * One `SET STORAGE` statement for a column: the explicit method in PostgreSQL's upper-case
- * word, or `DEFAULT` when the target states none (the storage removal). `only` states the
- * post-data `ONLY` form of a `CREATE TABLE`/`ADD COLUMN` tail; an alter uses the bare form.
+ * word, or `DEFAULT` when the target states none (the storage removal). Every form — the
+ * `CREATE TABLE`/`ADD COLUMN` tail, the post-`TYPE` restatement, and the standalone change —
+ * carries the dump's post-data `ONLY` form; inheritance is out of scope.
  */
 function renderSetStorage(
   table: TableIdentity,
   name: string,
   storage: ColumnStorage | undefined,
-  only: boolean,
 ): string {
-  const relation = only ? `ONLY ${renderTable(table)}` : renderTable(table);
   const target = storage === undefined ? 'DEFAULT' : storage.toUpperCase();
-  return `ALTER TABLE ${relation} ALTER COLUMN ${quoteIdentifier(name)} SET STORAGE ${target};`;
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET STORAGE ${target};`;
 }
 
 /**
  * One `SET COMPRESSION` statement for a column: the explicit method, or `default` when the
- * target states none (the compression removal). `only` states the post-data `ONLY` form of a
- * `CREATE TABLE`/`ADD COLUMN` tail; an alter uses the bare form.
+ * target states none (the compression removal). Every form — the `CREATE TABLE`/`ADD COLUMN`
+ * tail, the post-`TYPE` restatement, and the standalone change — carries the dump's post-data
+ * `ONLY` form; inheritance is out of scope.
  */
 function renderSetCompression(
   table: TableIdentity,
   name: string,
   compression: ColumnCompression | undefined,
-  only: boolean,
 ): string {
-  const relation = only ? `ONLY ${renderTable(table)}` : renderTable(table);
   const target = compression === undefined ? 'default' : compression;
-  return `ALTER TABLE ${relation} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
 }
 
 /** A primary-key constraint clause, with its name and attributes when it has them. */
@@ -752,7 +750,9 @@ function renderDropIndex(table: TableIdentity, index: Index, concurrently: boole
  * when it has one; a `TYPE` statement resets storage and compression to the type's defaults,
  * so the carrier's explicit values are restated after it. With no type or collation change, a
  * storage or compression field states its own `SET` statement, the absent target restoring the
- * default. A `type` or `collation` field without its carrier is a malformed plan and throws.
+ * default. Every `SET` statement carries the dump's post-data `ONLY` form; only the merged
+ * `TYPE` statement stays bare. A `type` or `collation` field without its carrier is a
+ * malformed plan and throws.
  */
 function renderAlterColumn(
   table: TableIdentity,
@@ -777,17 +777,17 @@ function renderAlterColumn(
     // The TYPE statement's reset matches a target that states no value, so only the explicit
     // ones restate.
     if (carrier.storage !== undefined) {
-      statements.push(renderSetStorage(table, name, carrier.storage, false));
+      statements.push(renderSetStorage(table, name, carrier.storage));
     }
     if (carrier.compression !== undefined) {
-      statements.push(renderSetCompression(table, name, carrier.compression, false));
+      statements.push(renderSetCompression(table, name, carrier.compression));
     }
   } else {
     for (const field of fields) {
       if (field.field === 'storage') {
-        statements.push(renderSetStorage(table, name, field.after, false));
+        statements.push(renderSetStorage(table, name, field.after));
       } else if (field.field === 'compression') {
-        statements.push(renderSetCompression(table, name, field.after, false));
+        statements.push(renderSetCompression(table, name, field.after));
       }
     }
   }
