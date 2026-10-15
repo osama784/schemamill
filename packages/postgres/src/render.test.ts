@@ -18,6 +18,7 @@ import type {
   Step,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
 } from '@schemamill/core';
 
@@ -25,7 +26,7 @@ import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin ten whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin twelve whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -42,6 +43,7 @@ const column = (name: string, fields: Partial<Omit<Column, 'name'>> = {}): Colum
 
 interface TableParts {
   schema?: string;
+  persistence?: TablePersistence;
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
@@ -54,6 +56,7 @@ interface TableParts {
 const table = (name: string, parts: TableParts = {}): Table => ({
   schema: parts.schema ?? 'public',
   name,
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
@@ -801,6 +804,328 @@ test('renders a named not-null constraint inline, unnamed unchanged', () => {
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('renders an explicit collation inline after the type, before the constraints', () => {
+  // PostgreSQL's grammar order: the collation follows the type, then the not-null clause (its
+  // name inside `CONSTRAINT`), then the default. The model's collation text is opaque and
+  // emitted exactly as stored, quoted or qualified.
+  const users = table('users', {
+    columns: [
+      column('c', { collation: 'pg_catalog."C"', notNull: true, default: "'x'" }),
+      column('named', {
+        collation: 'pg_catalog."C"',
+        notNull: true,
+        notNullName: 'users_named_not_null',
+      }),
+      column('bare', { collation: 'app."User_C"' }),
+    ],
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(users))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.users (',
+      '    c text COLLATE pg_catalog."C" NOT NULL DEFAULT \'x\',',
+      '    named text COLLATE pg_catalog."C" CONSTRAINT users_named_not_null NOT NULL,',
+      '    bare text COLLATE app."User_C"',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-column',
+        table: identity('t'),
+        column: column('c', { collation: 'pg_catalog."C"', notNull: true }),
+      }),
+    ),
+    'BEGIN;\nALTER TABLE public.t ADD COLUMN c text COLLATE pg_catalog."C" NOT NULL;\nCOMMIT;\n',
+  );
+});
+
+test('renders CREATE UNLOGGED TABLE for an unlogged table', () => {
+  assert.equal(
+    renderSql(
+      plan(model(), model(table('logs', { persistence: 'unlogged', columns: [column('id')] }))),
+    ),
+    ['BEGIN;', 'CREATE UNLOGGED TABLE public.logs (', '    id text', ');', 'COMMIT;', ''].join(
+      '\n',
+    ),
+  );
+  assert.equal(
+    renderSql(plan(model(), model(table('empty', { persistence: 'unlogged' })))),
+    'BEGIN;\nCREATE UNLOGGED TABLE public.empty ();\nCOMMIT;\n',
+  );
+});
+
+test("states a created or added column's storage and compression as post-data ONLY tails", () => {
+  // The inline `STORAGE`/`COMPRESSION` qualifiers are recent grammar and never rendered; the
+  // explicit values follow the statement that creates or adds the column, storage before
+  // compression, each under the dump's post-data `ONLY` form.
+  assert.equal(
+    renderSql(
+      plan(
+        model(),
+        model(
+          table('t', {
+            columns: [
+              column('id', { type: 'integer' }),
+              column('c', {
+                collation: 'pg_catalog."C"',
+                storage: 'external',
+                compression: 'pglz',
+              }),
+            ],
+          }),
+        ),
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.t (',
+      '    id integer,',
+      '    c text COLLATE pg_catalog."C"',
+      ');',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION pglz;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-column',
+        table: identity('t'),
+        column: column('c', {
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      }),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD COLUMN c text COLLATE pg_catalog."C";',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTENDED;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('merges a type and collation change into exactly one TYPE statement', () => {
+  // The pinned naive failure mode is two `TYPE` clauses for one change set; the merged
+  // statement reads both halves from the step's target carrier, so a type change on a collated
+  // column restates the unchanged collation, a collation removal renders the bare target type,
+  // and a collation-only add restates the unchanged type.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('changed', { collation: 'pg_catalog."C"' }),
+        column('drop', { collation: 'pg_catalog."C"' }),
+        column('keep', { collation: 'pg_catalog."C"' }),
+        column('gain'),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('changed', { type: 'character varying(12)', collation: 'pg_catalog."POSIX"' }),
+        column('drop', { type: 'character varying(24)' }),
+        column('keep', { type: 'character varying(36)', collation: 'pg_catalog."C"' }),
+        column('gain', { collation: 'pg_catalog."C"' }),
+      ],
+    }),
+  );
+  const sql = renderSql(plan(baseline, target));
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN changed TYPE character varying(12) COLLATE pg_catalog."POSIX";',
+      'ALTER TABLE public.t ALTER COLUMN drop TYPE character varying(24);',
+      'ALTER TABLE public.t ALTER COLUMN keep TYPE character varying(36) COLLATE pg_catalog."C";',
+      'ALTER TABLE public.t ALTER COLUMN gain TYPE text COLLATE pg_catalog."C";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  // One merged statement per changed column: one `TYPE` clause each, never two statements.
+  assert.equal(sql.match(/TYPE /g)?.length, 4);
+  assert.equal(sql.match(/ALTER TABLE public\.t ALTER COLUMN /g)?.length, 4);
+});
+
+test('restates target storage and compression after the merged TYPE statement', () => {
+  // A TYPE statement resets storage and compression to the type's defaults, so the target's
+  // explicit values ride after it; a target that states none needs nothing, the reset already
+  // matching it. The restatements keep the bare `ALTER TABLE` form, no `ONLY`.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', { collation: 'pg_catalog."C"', storage: 'main', compression: 'pglz' }),
+        column('reset', { storage: 'external', compression: 'pglz' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(12)',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+        column('reset', { type: 'character varying(24)' }),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(12) COLLATE pg_catalog."C";',
+      'ALTER TABLE public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'ALTER TABLE public.t ALTER COLUMN reset TYPE character varying(24);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders standalone storage and compression changes, resets included', () => {
+  // With no type or collation change, a storage or compression field states one bare `SET`
+  // statement; an absent target restores the default (`SET STORAGE DEFAULT`, `SET COMPRESSION
+  // default`), and no statement carries `ONLY`.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('stored'),
+        column('unstored', { storage: 'main' }),
+        column('moved', { storage: 'external' }),
+        column('compressed'),
+        column('uncompressed', { compression: 'pglz' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('stored', { storage: 'external' }),
+        column('unstored'),
+        column('moved', { storage: 'plain' }),
+        column('compressed', { compression: 'lz4' }),
+        column('uncompressed'),
+      ],
+    }),
+  );
+  const sql = renderSql(plan(baseline, target));
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
+      'ALTER TABLE public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
+      'ALTER TABLE public.t ALTER COLUMN moved SET STORAGE PLAIN;',
+      'ALTER TABLE public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
+      'ALTER TABLE public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.ok(!sql.includes(' ONLY '), 'a standalone SET never carries ONLY');
+});
+
+test('orders a merged TYPE before the per-field and attribute statements', () => {
+  // Inside one step the fixed order is: merged TYPE, the not-null and default statements, then
+  // SET STORAGE, then SET COMPRESSION.
+  const baseline = model(
+    table('t', { columns: [column('c', { storage: 'main', compression: 'pglz' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(9)',
+          notNull: true,
+          default: "'x'",
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(9);',
+      'ALTER TABLE public.t ALTER COLUMN c SET NOT NULL;',
+      "ALTER TABLE public.t ALTER COLUMN c SET DEFAULT 'x';",
+      'ALTER TABLE public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a merged TYPE or COLLATE change without its attributes carrier is malformed', () => {
+  // The merged statement reads its type and collation from the step's target carrier, so a
+  // hand-built step that carries the field without the carrier cannot render; the throw
+  // mirrors the not-null-name guard.
+  assert.throws(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'alter-column',
+          table: identity('t'),
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'integer' }],
+        }),
+      ),
+    /alter-column on public\.t\.c must carry the target attributes of a type or collation change/,
+  );
+  assert.throws(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'alter-column',
+          table: identity('t'),
+          name: 'c',
+          fields: [{ field: 'collation', before: 'pg_catalog."C"' }],
+        }),
+      ),
+    /alter-column on public\.t\.c must carry the target attributes of a type or collation change/,
+  );
+
+  // With the carrier present the same type-only field renders the merged statement, never the
+  // per-field renderer's malformed-plan guard.
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'c',
+        fields: [{ field: 'type', before: 'text', after: 'integer' }],
+        attributes: { type: 'integer' },
+      }),
+    ),
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN c TYPE integer;\nCOMMIT;\n',
   );
 });
 
@@ -2052,4 +2377,59 @@ test('golden: a mixed multi-group plan separates its groups with blank lines', (
   });
 
   assertGolden('multi-group', model(parent, child), model(parent, childTarget));
+});
+
+test('golden: renders column attributes and table persistence', () => {
+  const attrs = table('attrs', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('label', { collation: 'pg_catalog."C"' }),
+      column('code', { collation: 'pg_catalog."C"' }),
+      column('bare'),
+      column('s_add'),
+      column('s_reset', { storage: 'main' }),
+      column('comp_add'),
+      column('comp_reset', { compression: 'pglz' }),
+      column('merged', { collation: 'pg_catalog."C"', storage: 'external' }),
+    ],
+  });
+  const attrsTarget = table('attrs', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('label', { collation: 'pg_catalog."POSIX"' }),
+      column('code'),
+      column('bare', { collation: 'pg_catalog."C"' }),
+      column('s_add', { storage: 'external' }),
+      column('s_reset'),
+      column('comp_add', { compression: 'lz4' }),
+      column('comp_reset'),
+      column('merged', {
+        type: 'character varying(12)',
+        collation: 'pg_catalog."POSIX"',
+        storage: 'external',
+      }),
+      column('added', {
+        collation: 'pg_catalog."C"',
+        storage: 'extended',
+        compression: 'pglz',
+      }),
+    ],
+  });
+  const created = table('created', {
+    persistence: 'unlogged',
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('fresh', { collation: 'pg_catalog."C"', storage: 'external', compression: 'pglz' }),
+    ],
+  });
+  const columns = [column('id', { type: 'integer' })];
+  const flipped = table('flipped', { columns });
+  const flippedTarget = table('flipped', { persistence: 'unlogged', columns });
+  const backed = table('backed', { persistence: 'unlogged', columns });
+
+  assertGolden(
+    'column-attributes',
+    model(attrs, flipped, backed),
+    model(attrsTarget, flippedTarget, table('backed', { columns }), created),
+  );
 });
