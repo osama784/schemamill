@@ -1,0 +1,19 @@
+~ table public.attrs
+    + column fresh text collation pg_catalog."C" storage extended compression lz4
+    ~ column d_add: default (none) → 1
+    ~ column d_change: default 1 → 2
+    ~ column d_remove: default 7 → (none)
+    ~ column c_add: collation (none) → pg_catalog."C"
+    ~ column c_change: collation pg_catalog."C" → pg_catalog."POSIX"
+    ~ column c_remove: collation pg_catalog."C" → (none)
+    ~ column s_add: storage (none) → external
+    ~ column s_remove: storage main → (none)
+    ~ column comp_add: compression (none) → pglz
+    ~ column comp_remove: compression pglz → (none)
+    ~ column merged: type text → character varying(12), collation pg_catalog."C" → pg_catalog."POSIX"
+
+~ table public.backed
+    persistence unlogged → logged
+
+~ table public.flipped
+    persistence logged → unlogged
