@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -15,17 +15,49 @@ import { version } from '@schemamill/core';
  *
  * Every test spawns the built CLI in `dist/` (the package's test script builds first): the
  * compare and plan scenes pass fixture dumps written into a fresh temp directory — except the
- * render refusal, which reads the checked-in pair under `test/fixtures` — the init scenes pass
- * a fresh temp directory as the workspace target, and the usage tests pass their arguments
- * bare. Each asserts the exact stdout, stderr, and exit code: stdout carries only the artifact
- * — or the help and version text — while stderr carries only diagnostics, failures, and usage
- * errors.
+ * render refusal, which reads the checked-in pair under `test/fixtures` — or run inside a temp
+ * workspace whose `model.json` resolves the side a lone path leaves open, with the spawned
+ * cwd deciding which workspace root wins; the init scenes pass a fresh temp directory as the
+ * workspace target, and the usage tests pass their arguments bare. Each asserts the exact
+ * stdout, stderr, and exit code: stdout carries only the artifact — or the help and version
+ * text — while stderr carries only diagnostics, failures, and usage errors.
  */
 
 const execFileAsync = promisify(execFile);
 
 /** The built entry point. */
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+
+/** The pinned init default bytes: a workspace `model.json` with no tables and no sequences. */
+const EMPTY_MODEL = '{\n  "tables": [],\n  "sequences": []\n}\n';
+
+/**
+ * A workspace model naming one table none of the dump fixtures carry, so a run that resolves
+ * the workspace where it must not is visible in the output.
+ */
+const STALE_MODEL = [
+  '{',
+  '  "tables": [',
+  '    {',
+  '      "schema": "public",',
+  '      "name": "stale",',
+  '      "columns": [',
+  '        {',
+  '          "name": "id",',
+  '          "type": "integer",',
+  '          "notNull": true',
+  '        }',
+  '      ],',
+  '      "foreignKeys": [],',
+  '      "uniqueConstraints": [],',
+  '      "checkConstraints": [],',
+  '      "indexes": []',
+  '    }',
+  '  ],',
+  '  "sequences": []',
+  '}',
+  '',
+].join('\n');
 
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
@@ -114,6 +146,43 @@ const EXPECTED_PLAN = [
   '',
 ].join('\n');
 
+/** The target dump against the empty model, reversed: the workspace as the target. */
+const EXPECTED_REVERSED_COMPARE = [
+  '- table public.accounts',
+  '    id integer NOT NULL',
+  '    email text NOT NULL',
+  '    org_id integer',
+  '    created_at timestamptz NOT NULL DEFAULT now()',
+  '    primary key (id)',
+  '    foreign key (org_id) → public.orgs (id) on delete CASCADE',
+  '',
+  '- table public.orgs',
+  '    id integer NOT NULL',
+  '    name text NOT NULL',
+  '    primary key (id)',
+  '',
+  '- table public.projects',
+  '    id integer NOT NULL',
+  '    name text NOT NULL',
+  '    primary key (id)',
+  '',
+].join('\n');
+
+/** The same reversal as a plan: every table in the target dump is dropped. */
+const EXPECTED_REVERSED_PLAN = [
+  '3 steps in one transaction:',
+  ' 1. drop-table  public.accounts',
+  ' 2. drop-table  public.orgs',
+  ' 3. drop-table  public.projects',
+  '',
+  'BEGIN;',
+  'DROP TABLE public.accounts;',
+  'DROP TABLE public.orgs;',
+  'DROP TABLE public.projects;',
+  'COMMIT;',
+  '',
+].join('\n');
+
 const PARSE_FAILURE_BASELINE = [
   'CREATE TABLE public.users (',
   '    id integer NOT NULL',
@@ -190,10 +259,50 @@ const USAGE = [
   '  -h, --help                             display help for command',
   '',
   'Commands:',
-  '  compare [options] <baseline> <target>  Print the diff and any hazards between two DDL dumps.',
+  '  compare [options] [baseline] [target]  Print the diff and any hazards between a baseline and a target.',
   '  init [path]                            Create a workspace in a directory.',
-  '  plan [options] <baseline> <target>     Print the migration plan and its SQL between two DDL dumps.',
+  '  plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.',
   '  help [command]                         display help for command',
+  '',
+].join('\n');
+
+/** What `compare --help` prints to stdout. */
+const COMPARE_HELP = [
+  'Usage: schemamill compare [options] [baseline] [target]',
+  '',
+  'Print the diff and any hazards between a baseline and a target.',
+  '',
+  'Arguments:',
+  '  baseline              path to the baseline DDL dump',
+  '  target                path to the target DDL dump',
+  '',
+  'Options:',
+  '  --baseline-workspace  resolve the baseline from the workspace',
+  '  --target-workspace    resolve the target from the workspace',
+  '  --verbose             list every import diagnostic',
+  '  -h, --help            display help for command',
+  '',
+  'A single path is the target; the workspace fills the baseline.',
+  '',
+].join('\n');
+
+/** What `plan --help` prints to stdout. */
+const PLAN_HELP = [
+  'Usage: schemamill plan [options] [baseline] [target]',
+  '',
+  'Print the migration plan and its SQL between a baseline and a target.',
+  '',
+  'Arguments:',
+  '  baseline              path to the baseline DDL dump',
+  '  target                path to the target DDL dump',
+  '',
+  'Options:',
+  '  --baseline-workspace  resolve the baseline from the workspace',
+  '  --target-workspace    resolve the target from the workspace',
+  '  --verbose             list every import diagnostic',
+  '  -h, --help            display help for command',
+  '',
+  'A single path is the target; the workspace fills the baseline.',
   '',
 ].join('\n');
 
@@ -219,16 +328,36 @@ async function writeDump(dir: string, name: string, contents: string): Promise<s
   return path;
 }
 
+/** Writes `contents` as `<root>/.schemamill/model.json`, creating the marker directory. */
+async function writeWorkspaceModel(root: string, contents: string): Promise<void> {
+  const marker = join(root, '.schemamill');
+  await mkdir(marker, { recursive: true });
+  await writeFile(join(marker, 'model.json'), contents, 'utf8');
+}
+
 /** A checked-in fixture dump under `test/fixtures`, as a filesystem path. */
 function fixturePath(fileName: string): string {
   return fileURLToPath(new URL(`../test/fixtures/${fileName}`, import.meta.url));
 }
 
-/** Spawns the built CLI and captures both streams and the exit code, success or failure. */
-async function runCli(...args: readonly string[]): Promise<CliResult> {
+interface RunOptions {
+  /** Working directory for the spawned CLI; defaults to the test process's own. */
+  readonly cwd?: string;
+}
+
+/**
+ * Spawns the built CLI and captures both streams and the exit code, success or failure.
+ * A trailing options object sets the spawned cwd — a workspace above it decides what a
+ * workspace-resolved side reads.
+ */
+async function runCli(...args: readonly (string | RunOptions)[]): Promise<CliResult> {
+  const last = args.at(-1);
+  const options: RunOptions = typeof last === 'object' ? last : {};
+  const argv = (typeof last === 'object' ? args.slice(0, -1) : args) as readonly string[];
   try {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...argv], {
       encoding: 'utf8',
+      cwd: options.cwd,
     });
     return { stdout, stderr, code: 0 };
   } catch (error) {
@@ -250,6 +379,20 @@ function canRead(path: string): boolean {
 /** Escapes `value` so a RegExp matches its characters literally. */
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * The reason `JSON.parse` reports for `text`. The V8 wording is version-dependent, so the pin
+ * mirrors it by parsing the same bytes in this process instead of hardcoding a message; the
+ * spawned CLI runs the same Node binary, so the texts match.
+ */
+function jsonParseFailure(text: string): string {
+  try {
+    JSON.parse(text);
+  } catch (error) {
+    return (error as Error).message;
+  }
+  throw new Error('expected invalid JSON');
 }
 
 test('compare prints the diff, and only the diff, when there are no hazards', async (t) => {
@@ -467,6 +610,357 @@ test('plan --verbose adds the skip line', async (t) => {
   assert.equal(result.code, 0);
 });
 
+test('a lone compare path is the target and the workspace fills the baseline', async (t) => {
+  // The workspace model is the pinned init default, so it reads as an empty dump: the run
+  // must be byte-identical to the same pair with a written-out empty baseline.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  const workspaceRun = await runCli('compare', target, { cwd: root });
+  const dumpRun = await runCli('compare', empty, target);
+
+  assert.equal(dumpRun.stderr, '');
+  assert.equal(dumpRun.code, 0);
+  assert.equal(workspaceRun.stdout, dumpRun.stdout);
+  assert.equal(workspaceRun.stderr, '');
+  assert.equal(workspaceRun.code, 0);
+});
+
+test('a lone plan path is the target and the workspace fills the baseline', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  const workspaceRun = await runCli('plan', target, { cwd: root });
+  const dumpRun = await runCli('plan', empty, target);
+
+  assert.equal(dumpRun.stderr, '');
+  assert.equal(dumpRun.code, 0);
+  assert.equal(workspaceRun.stdout, dumpRun.stdout);
+  assert.equal(workspaceRun.stderr, '');
+  assert.equal(workspaceRun.code, 0);
+});
+
+test('--target-workspace reverses compare: the path is the baseline, pinned', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  const workspaceRun = await runCli('compare', '--target-workspace', target, { cwd: root });
+  const reversedRun = await runCli('compare', target, empty);
+
+  assert.equal(workspaceRun.stdout, EXPECTED_REVERSED_COMPARE);
+  assert.equal(workspaceRun.stdout, reversedRun.stdout);
+  assert.equal(workspaceRun.stderr, '');
+  assert.equal(workspaceRun.code, 0);
+});
+
+test('--target-workspace reverses plan: the path is the baseline, pinned', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  const workspaceRun = await runCli('plan', '--target-workspace', target, { cwd: root });
+  const reversedRun = await runCli('plan', target, empty);
+
+  assert.equal(workspaceRun.stdout, EXPECTED_REVERSED_PLAN);
+  assert.equal(workspaceRun.stdout, reversedRun.stdout);
+  assert.equal(workspaceRun.stderr, '');
+  assert.equal(workspaceRun.code, 0);
+});
+
+test('--baseline-workspace is the explicit form of the one-path default', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const implicit = await runCli(command, target, { cwd: root });
+    const explicit = await runCli(command, '--baseline-workspace', target, { cwd: root });
+
+    assert.equal(implicit.stdout, explicit.stdout);
+    assert.equal(explicit.stderr, '');
+    assert.equal(explicit.code, 0);
+  }
+});
+
+test('the nearest workspace root wins from a nested directory', async (t) => {
+  const outer = await fixtureDir(t);
+  await writeWorkspaceModel(outer, STALE_MODEL);
+  const inner = join(outer, 'inner');
+  await writeWorkspaceModel(inner, EMPTY_MODEL);
+  const cwd = join(inner, 'nested');
+  await mkdir(cwd, { recursive: true });
+
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  const nestedRun = await runCli('compare', target, { cwd });
+  const emptyRun = await runCli('compare', empty, target);
+  const outerRun = await runCli('compare', target, { cwd: outer });
+
+  // The inner (empty) model won; the outer (stale) model would have changed the output.
+  assert.equal(nestedRun.stdout, emptyRun.stdout);
+  assert.notEqual(outerRun.stdout, nestedRun.stdout);
+  assert.equal(nestedRun.stderr, '');
+  assert.equal(nestedRun.code, 0);
+});
+
+test('two explicit paths never resolve the workspace', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, STALE_MODEL);
+  const dumps = await fixtureDir(t);
+  const baseline = await writeDump(dumps, 'baseline.sql', BASELINE_DUMP);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+  const outside = await fixtureDir(t);
+
+  const insideCompare = await runCli('compare', baseline, target, { cwd: root });
+  const outsideCompare = await runCli('compare', baseline, target, { cwd: outside });
+  assert.equal(insideCompare.stdout, EXPECTED_COMPARE);
+  assert.equal(insideCompare.stdout, outsideCompare.stdout);
+  assert.equal(insideCompare.stderr, '');
+  assert.equal(insideCompare.code, 0);
+
+  const insidePlan = await runCli('plan', baseline, target, { cwd: root });
+  const outsidePlan = await runCli('plan', baseline, target, { cwd: outside });
+  assert.equal(insidePlan.stdout, EXPECTED_PLAN);
+  assert.equal(insidePlan.stdout, outsidePlan.stdout);
+  assert.equal(insidePlan.stderr, '');
+  assert.equal(insidePlan.code, 0);
+});
+
+test('a one-path run outside any workspace reports no workspace found, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const target = await writeDump(dir, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: dir });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, `schemamill: no workspace found from ${dir}\n`);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a marker file reports workspace-marker-invalid, exit 1', async (t) => {
+  // `.schemamill` as a regular file: stat succeeds and isDirectory is false, so the nearest
+  // marker is reported, never walked past.
+  const root = await fixtureDir(t);
+  const marker = join(root, '.schemamill');
+  await writeFile(marker, 'not a directory', 'utf8');
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, `schemamill: ${marker} is not a directory\n`);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a self-referential marker symlink reports workspace-inaccessible, exit 1', async (t) => {
+  // `.schemamill -> .schemamill` makes stat fail with ELOOP — not a missing marker, so core
+  // reports it as workspace-inaccessible with the marker path and the reason (root-robust,
+  // unlike a chmod recipe).
+  const root = await fixtureDir(t);
+  const marker = join(root, '.schemamill');
+  await symlink('.schemamill', marker);
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      `schemamill: cannot access ${marker}: ELOOP: too many symbolic links encountered, stat '${marker}'\n`,
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a marker without a model reports workspace-model-missing, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  const marker = join(root, '.schemamill');
+  await mkdir(marker);
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, `schemamill: no model file at ${join(marker, 'model.json')}\n`);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a model path that is a directory reports workspace-model-unreadable, exit 1', async (t) => {
+  // `model.json` as a directory: readFile fails EISDIR on every user (a chmod recipe would be
+  // ignored by root), and core maps it to workspace-model-unreadable with path and reason.
+  const root = await fixtureDir(t);
+  const modelPath = join(root, '.schemamill', 'model.json');
+  await mkdir(modelPath, { recursive: true });
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    // Node 24 ends the message at "read"; Node 26 appends the quoted path.
+    assert.match(
+      result.stderr,
+      new RegExp(
+        `^schemamill: cannot read ${escapeRegExp(modelPath)}: EISDIR: illegal operation on a directory, read(?: '${escapeRegExp(modelPath)}')?\\n$`,
+      ),
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('corrupt model JSON reports workspace-model-invalid, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  const modelPath = join(root, '.schemamill', 'model.json');
+  const corrupt = '{"tables": ';
+  await writeWorkspaceModel(root, corrupt);
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      `schemamill: cannot parse ${modelPath}: ${jsonParseFailure(corrupt)}\n`,
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('an unknown model field reports workspace-model-invalid, exit 1', async (t) => {
+  // The canonical model carries no version field; the reader fails closed on unknown keys.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, '{"tables": [], "sequences": [], "version": 1}\n');
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'schemamill: invalid model: unknown field version\n');
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a corrupt nearest marker is reported, never skipped for a healthy outer workspace, exit 1', async (t) => {
+  // The outer workspace would resolve (its stale model differs from the dumps), so an inner
+  // failure that skipped the corrupt marker would change the run: nearest wins, corrupt or not.
+  const outer = await fixtureDir(t);
+  await writeWorkspaceModel(outer, STALE_MODEL);
+  const inner = join(outer, 'inner');
+  await mkdir(inner);
+  const marker = join(inner, '.schemamill');
+  await writeFile(marker, 'not a directory', 'utf8');
+  const dumps = await fixtureDir(t);
+  const target = await writeDump(dumps, 'target.sql', TARGET_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, target, { cwd: inner });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, `schemamill: ${marker} is not a directory\n`);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('when both sides fail, the baseline failure is the only report, exit 1', async (t) => {
+  // The baseline path is read first; the target's workspace has no marker anywhere above it,
+  // and must never be resolved — exactly one stderr line, and no artifact.
+  const dumps = await fixtureDir(t);
+  const missing = join(dumps, 'missing.sql');
+  const outside = await fixtureDir(t);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, '--target-workspace', missing, { cwd: outside });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      `schemamill: cannot read ${missing}: ENOENT: no such file or directory, open '${missing}'\n`,
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a workspace side contributes no import diagnostics, even with --verbose', async (t) => {
+  // The workspace model is the pinned init default, so the run equals the same pair with a
+  // written-out empty baseline: stderr carries only the target dump's skip lines.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const dump = await writeDump(dumps, 'dump.sql', PARTIAL_INDEX_DUMP);
+  const expectedStderr = [
+    'target: 1 skipped',
+    'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+    '',
+  ].join('\n');
+
+  for (const command of ['compare', 'plan'] as const) {
+    const workspaceRun = await runCli(command, dump, '--verbose', { cwd: root });
+    const dumpRun = await runCli(command, empty, dump, '--verbose');
+
+    assert.equal(dumpRun.stderr, expectedStderr);
+    assert.equal(dumpRun.code, 0);
+    assert.equal(workspaceRun.stdout, dumpRun.stdout);
+    assert.equal(workspaceRun.stderr, expectedStderr);
+    assert.equal(workspaceRun.code, 0);
+  }
+});
+
+test('each side is resolved or read before the next, and the first failure is the only report', async (t) => {
+  // The marker root and the missing path both fail: whichever side is processed first decides
+  // the single stderr line. The fix case has the baseline workspace resolved first; the
+  // --target-workspace case has the baseline path read first.
+  const root = await fixtureDir(t);
+  const marker = join(root, '.schemamill');
+  await writeFile(marker, 'not a directory', 'utf8');
+  const dumps = await fixtureDir(t);
+  const missing = join(dumps, 'missing.sql');
+
+  const workspaceBaseline = await runCli('compare', missing, { cwd: root });
+
+  assert.equal(workspaceBaseline.stdout, '');
+  assert.equal(workspaceBaseline.stderr, `schemamill: ${marker} is not a directory\n`);
+  assert.equal(workspaceBaseline.code, 1);
+
+  const pathBaseline = await runCli('compare', '--target-workspace', missing, { cwd: root });
+
+  assert.equal(pathBaseline.stdout, '');
+  assert.equal(
+    pathBaseline.stderr,
+    `schemamill: cannot read ${missing}: ENOENT: no such file or directory, open '${missing}'\n`,
+  );
+  assert.equal(pathBaseline.code, 1);
+});
+
 test('init creates a workspace in a directory, exit 0', async (t) => {
   const dir = await fixtureDir(t);
 
@@ -475,10 +969,7 @@ test('init creates a workspace in a directory, exit 0', async (t) => {
   assert.equal(result.stdout, `Initialized workspace at ${dir}\n`);
   assert.equal(result.stderr, '');
   assert.equal(result.code, 0);
-  assert.equal(
-    await readFile(join(dir, '.schemamill', 'model.json'), 'utf8'),
-    '{\n  "tables": [],\n  "sequences": []\n}\n',
-  );
+  assert.equal(await readFile(join(dir, '.schemamill', 'model.json'), 'utf8'), EMPTY_MODEL);
 });
 
 test('a second init refuses the existing workspace with the repair hint, exit 1', async (t) => {
@@ -515,6 +1006,20 @@ test('--help prints the usage to stdout, exit 0', async () => {
   assert.equal(result.code, 0);
 });
 
+test('compare and plan --help document the workspace surface', async () => {
+  const compare = await runCli('compare', '--help');
+
+  assert.equal(compare.stdout, COMPARE_HELP);
+  assert.equal(compare.stderr, '');
+  assert.equal(compare.code, 0);
+
+  const plan = await runCli('plan', '--help');
+
+  assert.equal(plan.stdout, PLAN_HELP);
+  assert.equal(plan.stderr, '');
+  assert.equal(plan.code, 0);
+});
+
 test('--version prints the version to stdout, exit 0', async () => {
   const result = await runCli('--version');
 
@@ -531,12 +1036,59 @@ test('no command prints the usage to stderr, exit 1', async () => {
   assert.equal(result.code, 1);
 });
 
-test('a missing argument is a usage error on stderr, exit 1', async () => {
-  const result = await runCli('compare', 'baseline.sql');
+test('naming no dump path is a usage error naming the workspace alternative, exit 1', async () => {
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['compare'],
+    ['plan'],
+    ['compare', '--baseline-workspace'],
+    ['plan', '--target-workspace'],
+  ];
 
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr, "error: missing required argument 'target'\n");
-  assert.equal(result.code, 1);
+  for (const args of cases) {
+    const result = await runCli(...args);
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'error: name at least one dump path (the workspace can fill the other side)\n',
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('both workspace flags are a usage error before any file access, exit 1', async () => {
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['compare', 'missing-baseline.sql', 'missing-target.sql'],
+    ['compare', 'missing-target.sql'],
+    ['compare'],
+    ['plan', 'missing-baseline.sql'],
+  ];
+
+  for (const base of cases) {
+    const result = await runCli(...base, '--baseline-workspace', '--target-workspace');
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'error: --baseline-workspace and --target-workspace cannot be combined\n',
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a workspace flag with two paths is a usage error naming the flag, exit 1', async () => {
+  const cases = [
+    ['--baseline-workspace', 'error: --baseline-workspace cannot be combined with two paths\n'],
+    ['--target-workspace', 'error: --target-workspace cannot be combined with two paths\n'],
+  ] as const;
+
+  for (const [flag, message] of cases) {
+    const result = await runCli('compare', 'missing-baseline.sql', 'missing-target.sql', flag);
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, message);
+    assert.equal(result.code, 1);
+  }
 });
 
 test('an extra argument is a usage error naming every argument, exit 1', async () => {
