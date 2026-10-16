@@ -13,12 +13,12 @@ A model lives in exactly one place on disk inside a workspace root; any command 
 **In:**
 
 - The workspace directory layout: the root marker that identifies a workspace (a hidden `.schemamill/` directory), the files it holds at the root (`model.json`), and how a workspace directory is distinguished from an arbitrary one.
-- Root resolution: an explicit path where the caller gives one, else walk up from the current working directory to the nearest workspace root; a named diagnostic when none is found (the exit-code mapping lands with the first consuming command, now planned in [workspace consumption](./workspace-consumption.md)).
+- Root resolution: an explicit path where the caller gives one, else walk up from the current working directory to the nearest workspace root; a named diagnostic when none is found (the exit-code mapping shipped with the first consuming command, in the [workspace consumption slice](./workspace-consumption.md)).
 - `init`: create a workspace at a given path; refuse to half-overwrite or silently merge into an existing workspace.
 - The minimal read/write surface the CLI needs to load the model from a resolved root; the model's on-disk representation stays governed by [ADR 0002](../adr/0002-canonical-model.md)'s one-canonical-model rule.
 - Package placement: layout and resolution logic sits framework-free (the later studio and the CLI both consume it); CLI wording stays in `@schemamill/cli`.
 
-**Out, named — never silent:** command surfaces that consume the workspace beyond locating the model (no import/diff/plan rewiring beyond what finding the model requires), lock files, and file-format versioning or migrations. Consumption is now planned in [workspace consumption](./workspace-consumption.md).
+**Out, named — never silent:** command surfaces that consume the workspace beyond locating the model (no import/diff/plan rewiring beyond what finding the model requires), lock files, and file-format versioning or migrations. Consumption has since shipped in the [workspace consumption slice](./workspace-consumption.md).
 
 **Deliberately shallow for now:** the brief settled the marker name and format, the model serialization shape, behavior on a corrupt or empty root, and whether resolution crosses filesystem boundaries; the structural decisions that survived review landed in ADR 0010.
 
@@ -44,4 +44,4 @@ Named for the slices that own them, never silent:
 - **Persistence beyond the container** — migration history, apply logs, caches, and lock files; the workspace holds the model, not a product database.
 - **Workspace file-format versioning** — migrating older workspace files forward; addressed when a format actually changes.
 
-The first follow-up — command consumption — is planned in [workspace consumption](./workspace-consumption.md); the rest remain deferred in this plan for future supply passes.
+The first follow-up — command consumption — has since shipped in the [workspace consumption slice](./workspace-consumption.md); the rest remain deferred in this plan for future supply passes.
