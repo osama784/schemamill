@@ -30,7 +30,7 @@ interface CompareOptions {
 export function registerCompare(program: Command): void {
   program
     .command('compare')
-    .description('Print the diff and any hazards between two DDL dumps.')
+    .description('Print the diff and any hazards between a baseline and a target.')
     .argument('[baseline]', 'path to the baseline DDL dump')
     .argument('[target]', 'path to the target DDL dump')
     .option('--baseline-workspace', 'resolve the baseline from the workspace')

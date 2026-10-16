@@ -29,7 +29,7 @@ interface PlanOptions {
 export function registerPlan(program: Command): void {
   program
     .command('plan')
-    .description('Print the migration plan and its SQL between two DDL dumps.')
+    .description('Print the migration plan and its SQL between a baseline and a target.')
     .argument('[baseline]', 'path to the baseline DDL dump')
     .argument('[target]', 'path to the target DDL dump')
     .option('--baseline-workspace', 'resolve the baseline from the workspace')

@@ -259,9 +259,9 @@ const USAGE = [
   '  -h, --help                             display help for command',
   '',
   'Commands:',
-  '  compare [options] [baseline] [target]  Print the diff and any hazards between two DDL dumps.',
+  '  compare [options] [baseline] [target]  Print the diff and any hazards between a baseline and a target.',
   '  init [path]                            Create a workspace in a directory.',
-  '  plan [options] [baseline] [target]     Print the migration plan and its SQL between two DDL dumps.',
+  '  plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.',
   '  help [command]                         display help for command',
   '',
 ].join('\n');
@@ -270,7 +270,7 @@ const USAGE = [
 const COMPARE_HELP = [
   'Usage: schemamill compare [options] [baseline] [target]',
   '',
-  'Print the diff and any hazards between two DDL dumps.',
+  'Print the diff and any hazards between a baseline and a target.',
   '',
   'Arguments:',
   '  baseline              path to the baseline DDL dump',
@@ -290,7 +290,7 @@ const COMPARE_HELP = [
 const PLAN_HELP = [
   'Usage: schemamill plan [options] [baseline] [target]',
   '',
-  'Print the migration plan and its SQL between two DDL dumps.',
+  'Print the migration plan and its SQL between a baseline and a target.',
   '',
   'Arguments:',
   '  baseline              path to the baseline DDL dump',
