@@ -1,0 +1,33 @@
+name: Closes
+
+# Native closing-keyword auto-close only fires for the default branch (main), so a `Closes #N`
+# in a PR merged into dev is handled here instead.
+on:
+  pull_request:
+    types: [closed]
+
+# The repository's default workflow token is read-only; closing issues needs the explicit grant.
+# PRs from forks get a read-only token regardless and are out of scope — same-repo branches are
+# the practice in this repository.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  closes:
+    name: closes
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'dev'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Close linked issues
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { closeIssues } = await import(
+              pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/closes.mjs`).href
+            );
+            await closeIssues({ github, context, core });
