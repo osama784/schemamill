@@ -21,9 +21,10 @@ import { analyzeHazards, hazardAnalyzer } from './index.ts';
 
 /**
  * Tests for PostgreSQL hazard analysis: the definite checks pin every self-inconsistent shape
- * and its fix, the conditional checks pin the tightened bounds and where they attach, and the
- * determinism and suppression tests pin that state analysis is a pure, ordered read of the
- * models and the plan.
+ * and its fix, the conditional checks pin the tightened bounds and where they attach, the
+ * certain-cost checks pin persistence rewrites and their step attachment, and the determinism
+ * and suppression tests pin that state analysis is a pure, ordered read of the models and the
+ * plan.
  */
 
 /** A table identity: `public` unless another schema is given. */
@@ -92,6 +93,143 @@ test('binds the HazardAnalyzer seam and reports nothing for a clean plan', () =>
 
   assert.deepEqual(analyzeHazards(baseline, target, planned), []);
   assert.deepEqual(hazardAnalyzer.analyze(baseline, target, planned), []);
+});
+
+test('a logged-to-unlogged flip reports a table rewrite on its alter-persistence step', () => {
+  const baseline = model(table('t'));
+  const target = model({ ...table('t'), persistence: 'unlogged' });
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-persistence');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-persistence'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'table-rewrite',
+      step,
+      entity: { kind: 'table', table: identity('t') },
+      persistence: 'unlogged',
+    },
+  ]);
+});
+
+test('an unlogged-to-logged flip reports the rewrite with no persistence payload', () => {
+  const baseline = model({ ...table('t'), persistence: 'unlogged' });
+  const target = model(table('t'));
+  const planned = plan(baseline, target);
+  const step = stepIndex(planned, (candidate) => candidate.kind === 'alter-persistence');
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['alter-persistence'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'table-rewrite',
+      step,
+      entity: { kind: 'table', table: identity('t') },
+    },
+  ]);
+});
+
+test('two flips in one plan report both rewrites in plan order', () => {
+  const baseline = model(table('a'), { ...table('b'), persistence: 'unlogged' });
+  const target = model({ ...table('a'), persistence: 'unlogged' }, table('b'));
+  const planned = plan(baseline, target);
+  const first = stepIndex(
+    planned,
+    (candidate) => candidate.kind === 'alter-persistence' && candidate.table.name === 'a',
+  );
+  const second = stepIndex(
+    planned,
+    (candidate) => candidate.kind === 'alter-persistence' && candidate.table.name === 'b',
+  );
+
+  assert.ok(first < second);
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'table-rewrite',
+      step: first,
+      entity: { kind: 'table', table: identity('a') },
+      persistence: 'unlogged',
+    },
+    {
+      kind: 'table-rewrite',
+      step: second,
+      entity: { kind: 'table', table: identity('b') },
+    },
+  ]);
+});
+
+test('a created unlogged table reports no rewrite hazard', () => {
+  const baseline = model();
+  const target = model({ ...table('t'), persistence: 'unlogged' });
+  const planned = plan(baseline, target);
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['create-table'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), []);
+});
+
+test('a dropped unlogged table reports no rewrite hazard', () => {
+  const baseline = model({ ...table('t'), persistence: 'unlogged' });
+  const target = model();
+  const planned = plan(baseline, target);
+
+  assert.deepEqual(
+    planned.steps.map((entry) => entry.kind),
+    ['drop-table'],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, planned), []);
+});
+
+test('an alter-persistence step on a table absent from both models still reports', () => {
+  const planned: Plan = {
+    steps: [
+      { kind: 'alter-persistence', table: identity('ghost', 'app'), persistence: 'unlogged' },
+    ],
+    groups: [{ start: 0, end: 1, transactional: true }],
+  };
+
+  assert.deepEqual(analyzeHazards(model(), model(), planned), [
+    {
+      kind: 'table-rewrite',
+      step: 0,
+      entity: { kind: 'table', table: identity('ghost', 'app') },
+      persistence: 'unlogged',
+    },
+  ]);
+});
+
+test('a mixed plan keeps sequence and table hazards in plan order', () => {
+  const baseline = sequenceModel([sequence('s')], table('t'));
+  const target = sequenceModel([sequence('s', { increment: '0' })], {
+    ...table('t'),
+    persistence: 'unlogged',
+  });
+  const planned = plan(baseline, target);
+  const persistenceStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-persistence');
+  const sequenceStep = stepIndex(planned, (candidate) => candidate.kind === 'alter-sequence');
+
+  assert.ok(persistenceStep < sequenceStep, 'the persistence flip precedes the sequence alter');
+  assert.deepEqual(analyzeHazards(baseline, target, planned), [
+    {
+      kind: 'table-rewrite',
+      step: persistenceStep,
+      entity: { kind: 'table', table: identity('t') },
+      persistence: 'unlogged',
+    },
+    {
+      kind: 'increment-zero',
+      step: sequenceStep,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      increment: '0',
+    },
+  ]);
 });
 
 test('a target-only sequence reports every definite violation in check order', () => {

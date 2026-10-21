@@ -159,7 +159,7 @@ A migration-plan step whose statement PostgreSQL refuses to run inside a transac
 _Avoid_: unsafe step, autocommit step
 
 **Hazard**:
-A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled.
+A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled. A certain-cost hazard — a persistence flip — rewrites the table under an ACCESS EXCLUSIVE lock at apply.
 _Avoid_: warning, danger
 
 **Expand/contract**:

@@ -48,9 +48,10 @@ import type {
  * the details align, and a step's details expose every payload field it carries. A hazards
  * block renders as a `Hazards:` header and one two-space-indented
  * `step <n> <kind> <entity>: <clause>` line per hazard, numbered by the step it belongs to, in
- * the payload's order; the entity names the sequence (`schema.name`) or the identity column
- * (`schema.table.column`) the hazard belongs to, and each clause states the failure PostgreSQL
- * would hit at apply. SQL is not rendered here: the `plan` command prints the plan, then the
+ * the payload's order; the entity names the sequence (`schema.name`), the identity column
+ * (`schema.table.column`), or the table (`schema.table`) the hazard belongs to, and each
+ * clause states the failure PostgreSQL would hit at apply, the failure it may hit, or the
+ * certain cost it pays. SQL is not rendered here: the `plan` command prints the plan, then the
  * hazards block when the analysis finds any, then `renderSql`'s output, blank-line separated.
  */
 
@@ -135,17 +136,25 @@ export function formatHazards(hazards: readonly Hazard[]): string {
   return `${lines.join('\n')}\n`;
 }
 
-/** The hazard entity's label: `schema.name` for a sequence, `schema.table.column` for a column. */
+/**
+ * The hazard entity's label: `schema.name` for a sequence or table, `schema.table.column` for
+ * a column.
+ */
 function formatEntity(entity: HazardEntity): string {
   switch (entity.kind) {
     case 'sequence':
       return formatIdentity(entity.sequence);
     case 'identity-column':
       return `${formatIdentity(entity.table)}.${entity.column}`;
+    case 'table':
+      return formatIdentity(entity.table);
   }
 }
 
-/** One hazard's clause: the definite failure PostgreSQL hits at apply, or the conditional one. */
+/**
+ * One hazard's clause: the definite failure PostgreSQL hits at apply, the conditional one it
+ * may hit, or the certain cost of a table rewrite.
+ */
 function formatHazard(hazard: Hazard): string {
   switch (hazard.kind) {
     case 'increment-zero':
@@ -162,6 +171,8 @@ function formatHazard(hazard: Hazard): string {
       return `${formatBoundField(hazard.field)} ${hazard.value} is out of range for sequence data type ${hazard.dataType} — PostgreSQL rejects this at apply.`;
     case 'bound-tightened':
       return `${formatBoundField(hazard.field, true)} ${hazard.before} → ${hazard.after} — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.`;
+    case 'table-rewrite':
+      return `${hazard.persistence === undefined ? 'SET LOGGED' : 'SET UNLOGGED'} rewrites the table under an ACCESS EXCLUSIVE lock.`;
   }
 }
 

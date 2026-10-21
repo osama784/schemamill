@@ -20,13 +20,15 @@ import type {
  * PostgreSQL hazard analysis: the state edge of a migration plan.
  *
  * `analyzeHazards` reads the baseline and target models together with the plan and reports what
- * PostgreSQL would reject when the plan is applied. It never changes the plan: a hazard is a
- * fact beside it, and every hazard carries the index of the step it belongs to and the entity
- * the step applies to — a sequence identity or an identity column's table and name. Entities
- * are sequences — matched by schema and name — and identity columns — matched by table and
- * column name. Each side's options are read as stored, already effective from import. A
- * baseline-only entity is a drop with nothing to apply, and an entity the plan carries no step
- * for reports nothing; the plan is the only source of step indices.
+ * PostgreSQL would reject, what may fail, and what will certainly cost when the plan is
+ * applied. It never changes the plan: a hazard is a fact beside it, and every hazard carries
+ * the index of the step it belongs to and the entity the step applies to — a sequence identity,
+ * an identity column's table and name, or a table. Entities are sequences — matched by schema
+ * and name — identity columns — matched by table and column name — and tables, read from the
+ * plan step rather than matched between the models. Each side's options are read as stored,
+ * already effective from import. A baseline-only entity is a drop with nothing to apply, and an
+ * entity the plan carries no step for reports nothing; the plan is the only source of step
+ * indices.
  *
  * Definite hazards are self-inconsistent targets, rejected at apply regardless of stored state.
  * Each entity is checked in PostgreSQL's order and every violation is reported: `increment-zero`
@@ -45,6 +47,14 @@ import type {
  * values, `min` before `max` when both tightened. An entity with any definite hazard reports
  * none of its conditional ones: the definite failure happens first.
  *
+ * The one certain-cost kind is `table-rewrite`: a persistence flip rewrites the table under an
+ * ACCESS EXCLUSIVE lock at apply — neither a rejection nor a state-dependent failure. This
+ * family reads the plan rather than the models: one hazard attaches to each
+ * `alter-persistence` step, carrying the step's target persistence; an absent persistence is
+ * the `LOGGED` default. A created or dropped unlogged table carries no `alter-persistence` step
+ * and reports nothing. Because the plan is the only source, a hand-built `alter-persistence`
+ * step on a table absent from both models still reports.
+ *
  * A target-only sequence attaches to its `create-sequence` step; a matched one to the first
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
  * whose bounds PostgreSQL applies; an ownership-only alter applies no options at all and so
@@ -62,9 +72,10 @@ import type {
  * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
  * the column's type conversion moves attaches to the same `alter-column` type step unless the
  * `alter-identity` step restates that bound as its own field: the restatement is the statement
- * that applies the final bound, so it keeps the hazard. Hazards come
- * back in plan order — step index ascending, then the entity's fixed check order. Entities are
- * iterated in sorted identity order, so neither model's array order can affect the result.
+ * that applies the final bound, so it keeps the hazard. A table's persistence rewrite attaches
+ * to its `alter-persistence` step. Hazards come back in plan order — step index ascending, then
+ * the entity's fixed check order. Entities are iterated in sorted identity order, so neither
+ * model's array order can affect the result.
  * Returned hazards are fresh objects: the models and the plan are never mutated.
  *
  * `hazardAnalyzer` binds `analyzeHazards` to core's `HazardAnalyzer` seam.
@@ -79,6 +90,15 @@ export function analyzeHazards(baseline: Model, target: Model, plan: Plan): read
   }
   for (const entry of identityEntries(baseline, target)) {
     hazards.push(...identityHazards(entry, steps));
+  }
+  for (const [index, step] of steps.entries()) {
+    if (step.kind !== 'alter-persistence') continue;
+    hazards.push({
+      kind: 'table-rewrite',
+      step: index,
+      entity: { kind: 'table', table: step.table },
+      ...(step.persistence === undefined ? {} : { persistence: step.persistence }),
+    });
   }
   return inPlanOrder(hazards);
 }

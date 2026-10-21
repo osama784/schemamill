@@ -840,3 +840,29 @@ test('mixed sequence and identity column hazards print two- and three-part label
     ].join('\n'),
   );
 });
+
+test('a table-rewrite hazard labels the table and states the certain cost in both directions', () => {
+  const hazards: readonly Hazard[] = [
+    {
+      kind: 'table-rewrite',
+      step: 0,
+      entity: { kind: 'table', table: { schema: 'public', name: 'flipped' } },
+      persistence: 'unlogged',
+    },
+    {
+      kind: 'table-rewrite',
+      step: 1,
+      entity: { kind: 'table', table: { schema: 'public', name: 'backed' } },
+    },
+  ];
+
+  assert.equal(
+    formatHazards(hazards),
+    [
+      'Hazards:',
+      '  step 1 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.',
+      '  step 2 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.',
+      '',
+    ].join('\n'),
+  );
+});

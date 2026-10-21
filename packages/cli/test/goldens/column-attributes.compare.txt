@@ -17,3 +17,7 @@
 
 ~ table public.flipped
     persistence logged → unlogged
+
+Hazards:
+  step 13 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 14 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
