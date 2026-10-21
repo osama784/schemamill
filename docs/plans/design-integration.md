@@ -15,7 +15,7 @@ The locked kit lives outside the repo at `/home/lenovo/projects/schemamill-desig
 ## Scope
 
 1. **Assets into `docs/brand/`** — masters, the shipped `squarecut` wordmark, the export tree with its manifest, the brand sheet, and the font licence.
-2. **`DESIGN.md` at the repo root** — the kit's conventions file, with every `kit/`-relative pointer rewritten to its repository path. Content otherwise unchanged, including the Known Gaps section.
+2. **`DESIGN.md` at the repo root** — the kit's conventions file, with every kit-relative path rewritten to its repository path. That includes bare paths written without the `kit/` prefix (`masters/…`, `exports/manifest.json`, `favicon-32-light.png`, `avatar-512-…`). `kit/README.md` names a file that is not shipped: point it at the new `docs/brand/README.md`. `_tooling` and `_verify` pointers become plain text. Content is otherwise unchanged, including the Known Gaps section.
 3. **README header** — a centered `<picture>`: dark and light sources at 1x and 2x, transparent PNGs, a light `img` fallback, `alt="schemamill"`. The `# schemamill` H1 is replaced by the lockup; the wordmark carries the name.
 4. **`AGENTS.md` pointer** — one sentence after the `CONTEXT.md` paragraph: read `DESIGN.md` before writing or reviewing any studio surface; brand assets live in `docs/brand/`.
 5. **`docs/brand/README.md`** — a short index: what each folder holds, the provenance rule, the OFL note, and the recorded gaps.
@@ -61,7 +61,7 @@ docs/brand/brand-sheet/brand-sheet@2x.png
 ## Acceptance
 
 - Every `docs/brand/exports/**` file matches `manifest.json` byte count and sha256.
-- `rg 'kit/' DESIGN.md` returns nothing, and every relative link in `DESIGN.md` resolves to a file in the tree.
+- No kit-relative path survives in `DESIGN.md`: every `masters/`, `exports/`, `wordmark/`, `brand-sheet/`, `favicon-*` and `avatar-512-*` occurrence is prefixed `docs/brand/`, or is prose naming the external kit. Check the rendered file, not just `rg 'kit/'`.
 - The README `<picture>` declares dark and light `source` elements at 1x and 2x, each pointing at an existing PNG, with a light `img` fallback and `alt`.
 - `AGENTS.md` names `DESIGN.md` and `docs/brand/`.
 - All five gates green; an `[Unreleased]` entry is present.
