@@ -14,6 +14,10 @@
  13. alter-persistence  public.backed: persistence logged
  14. alter-persistence  public.flipped: persistence unlogged
 
+Hazards:
+  step 13 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 14 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+
 BEGIN;
 ALTER TABLE public.attrs ADD COLUMN fresh text COLLATE pg_catalog."C";
 ALTER TABLE ONLY public.attrs ALTER COLUMN fresh SET STORAGE EXTENDED;
