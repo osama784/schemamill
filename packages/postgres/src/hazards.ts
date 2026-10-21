@@ -24,10 +24,11 @@ import type {
  * applied. It never changes the plan: a hazard is a fact beside it, and every hazard carries
  * the index of the step it belongs to and the entity the step applies to — a sequence identity,
  * an identity column's table and name, or a table. Entities are sequences — matched by schema
- * and name — and identity columns — matched by table and column name. Each side's options are
- * read as stored, already effective from import. A baseline-only entity is a drop with nothing
- * to apply, and an entity the plan carries no step for reports nothing; the plan is the only
- * source of step indices.
+ * and name — identity columns — matched by table and column name — and tables, read from the
+ * plan step rather than matched between the models. Each side's options are read as stored,
+ * already effective from import. A baseline-only entity is a drop with nothing to apply, and an
+ * entity the plan carries no step for reports nothing; the plan is the only source of step
+ * indices.
  *
  * Definite hazards are self-inconsistent targets, rejected at apply regardless of stored state.
  * Each entity is checked in PostgreSQL's order and every violation is reported: `increment-zero`
@@ -71,9 +72,10 @@ import type {
  * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
  * the column's type conversion moves attaches to the same `alter-column` type step unless the
  * `alter-identity` step restates that bound as its own field: the restatement is the statement
- * that applies the final bound, so it keeps the hazard. Hazards come
- * back in plan order — step index ascending, then the entity's fixed check order. Entities are
- * iterated in sorted identity order, so neither model's array order can affect the result.
+ * that applies the final bound, so it keeps the hazard. A table's persistence rewrite attaches
+ * to its `alter-persistence` step. Hazards come back in plan order — step index ascending, then
+ * the entity's fixed check order. Entities are iterated in sorted identity order, so neither
+ * model's array order can affect the result.
  * Returned hazards are fresh objects: the models and the plan are never mutated.
  *
  * `hazardAnalyzer` binds `analyzeHazards` to core's `HazardAnalyzer` seam.
