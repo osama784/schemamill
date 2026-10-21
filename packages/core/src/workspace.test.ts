@@ -480,6 +480,147 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     { tables: [tablePayload({ persistence: 'temporary' })], sequences: [] },
     'invalid model: tables[0].persistence',
   ],
+  [
+    'a column name that is not a string',
+    {
+      tables: [tablePayload({ columns: [{ name: 1, type: 'text', notNull: false }] })],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].name is not a string',
+  ],
+  [
+    'a column notNull flag that is not a boolean',
+    {
+      tables: [tablePayload({ columns: [{ name: 'c', type: 'text', notNull: 1 }] })],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].notNull is not a boolean',
+  ],
+  [
+    'a column default that is not a string',
+    {
+      tables: [
+        tablePayload({ columns: [{ name: 'c', type: 'text', notNull: false, default: 1 }] }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].columns[0].default is not a string',
+  ],
+  [
+    'a primary-key name that is not a string',
+    { tables: [tablePayload({ primaryKey: { name: 1, columns: ['id'] } })], sequences: [] },
+    'invalid model: tables[0].primaryKey.name is not a string',
+  ],
+  [
+    'a primary-key columns field that is not an array',
+    { tables: [tablePayload({ primaryKey: { columns: 'x' } })], sequences: [] },
+    'invalid model: tables[0].primaryKey.columns is not an array',
+  ],
+  [
+    'a check-constraint name that is not a string',
+    {
+      tables: [tablePayload({ checkConstraints: [{ name: 1, expression: 'a > 0' }] })],
+      sequences: [],
+    },
+    'invalid model: tables[0].checkConstraints[0].name is not a string',
+  ],
+  [
+    'a check-constraint expression that is not a string',
+    { tables: [tablePayload({ checkConstraints: [{ expression: 1 }] })], sequences: [] },
+    'invalid model: tables[0].checkConstraints[0].expression is not a string',
+  ],
+  [
+    'a foreign-key name that is not a string',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              name: 1,
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].name is not a string',
+  ],
+  [
+    'a foreign-key columns field that is not an array',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: 'x',
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].columns is not an array',
+  ],
+  [
+    'a foreign-key referencedTable that is not an object',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: 1,
+              referencedColumns: ['id'],
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].referencedTable is not an object',
+  ],
+  [
+    'a foreign-key referencedColumns field that is not an array',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: 'x',
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].referencedColumns is not an array',
+  ],
+  [
+    'a foreign-key onUpdate outside the union',
+    {
+      tables: [
+        tablePayload({
+          foreignKeys: [
+            {
+              columns: ['org_id'],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+              onUpdate: 'NO ACTION',
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'invalid model: tables[0].foreignKeys[0].onUpdate is not a valid referential action',
+  ],
 ];
 
 for (const [name, payload, prefix] of SHAPE_FAILURES) {
