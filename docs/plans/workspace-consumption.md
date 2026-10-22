@@ -17,7 +17,7 @@
 - Diagnostic mapping: every `WorkspaceDiagnostic` code that can surface maps to one `schemamill: <message>` stderr line and exit 1, `workspace-not-found` included — the mapping ADR 0010 deferred to the first consuming command.
 - CLI pins: spawn tests for the one-path runs (stdout byte-equal to the equivalent two-dump pair), the not-found path, and the six surfacing codes; usage errors and `--help` bytes pinned beside them.
 
-**Out, named — never silent:** writing the workspace model — importing a dump into a workspace, an `init --from`, or any other population path is a later slice; a public writer API; snapshots; studio consumption; multi-workspace selection; and file-format versioning. Dump-only population is scheduled in [workspace-population.md](./workspace-population.md); live-database population remains deferred.
+**Out, named — never silent:** writing the workspace model into an existing workspace, a public writer API, snapshots, studio consumption, multi-workspace selection, and file-format versioning. Dump-only population shipped in [workspace-population.md](./workspace-population.md) ([#113](https://github.com/osama784/schemamill/issues/113)): `init --from` imports a DDL dump into a new workspace; live-database population remains deferred.
 
 **Deliberately shallow for now:** resolution semantics themselves are ADR 0010's and are not re-litigated here; the surface answers the brief's three questions narrowly — the flag set above, at most one workspace side per invocation, and no side names in any output, so a workspace-backed run's stdout is byte-identical to the equivalent dump-backed run.
 
@@ -64,7 +64,7 @@ The nearest marker always wins — a corrupt inner marker is reported, never ski
 
 Named for the slices that own them, never silent:
 
-- **Populating the workspace model** — writing the model into a workspace from a dump or a live database (an `init --from`, or any other population path); this slice reads the model, it never writes it. Dump-only population is scheduled in [workspace-population.md](./workspace-population.md); live-database population remains deferred.
+- **Populating the workspace model** — writing the model into an existing workspace from a dump or a live database; this slice reads the model, it never writes it. Dump-only population shipped in [workspace-population.md](./workspace-population.md) ([#113](https://github.com/osama784/schemamill/issues/113)): `init --from` imports a DDL dump into a new workspace; live-database population remains deferred.
 - **A public writer API** — internal to `init` today; a consumer that writes the model needs its own design.
 - **Snapshots, studio consumption, multi-workspace handling** — each its own slice per the [workspace plan](./workspace.md) §Deferred.
 - **File-format versioning and the `docs/architecture.md` persistence sync** — still deferred by ADR 0010.
