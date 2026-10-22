@@ -40,10 +40,10 @@ import type {
  * `initWorkspace` refuses to overwrite an existing marker (the repair for a crash between
  * the marker and the model is to remove `.schemamill/` and re-run), refuses to nest a
  * workspace inside an existing one, claims the marker with an atomic `mkdir`, and then
- * writes the empty canonical model.
+ * writes the canonical model it is given — the empty model unless the caller supplies one.
  *
- * `serializeModel` is internal to this module — `init` uses it, and tests pin its exact
- * bytes — because a public writer is deferred until a slice needs one.
+ * `serializeModel` is internal to this module — `initWorkspace` uses it, and tests pin its
+ * exact bytes — because a public writer is deferred until a slice needs one.
  */
 
 /** The hidden marker directory a workspace root contains. */
@@ -93,7 +93,7 @@ export type WorkspaceInitResult =
   | { readonly ok: true; readonly root: string }
   | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
 
-/** The model a fresh workspace holds: no tables and no sequences. */
+/** The model `initWorkspace` writes when the caller supplies none: no tables and no sequences. */
 const EMPTY_MODEL: Model = { tables: [], sequences: [] };
 
 /**
@@ -131,7 +131,8 @@ export async function resolveWorkspace(startPath: string): Promise<WorkspaceReso
 }
 
 /**
- * Creates a workspace rooted at `targetPath` with an empty canonical model.
+ * Creates a workspace rooted at `targetPath` holding `model` as its canonical model,
+ * defaulting to the empty model.
  *
  * The target is created when absent (recursively). An existing `.schemamill` refuses with a
  * repair hint, and the nearest ancestor holding a `.schemamill` directory refuses nesting —
@@ -141,7 +142,10 @@ export async function resolveWorkspace(startPath: string): Promise<WorkspaceReso
  * `workspace-model-missing` and `init` repairs after `remove <target>/.schemamill`. A failed
  * model write removes the marker it just created before reporting.
  */
-export async function initWorkspace(targetPath: string): Promise<WorkspaceInitResult> {
+export async function initWorkspace(
+  targetPath: string,
+  model: Model = EMPTY_MODEL,
+): Promise<WorkspaceInitResult> {
   const target = resolve(targetPath);
   const marker = join(target, WORKSPACE_DIR_NAME);
 
@@ -194,7 +198,7 @@ export async function initWorkspace(targetPath: string): Promise<WorkspaceInitRe
 
   const modelPath = join(marker, WORKSPACE_MODEL_FILE_NAME);
   try {
-    await writeFile(modelPath, serializeModel(EMPTY_MODEL), 'utf8');
+    await writeFile(modelPath, serializeModel(model), 'utf8');
   } catch (error) {
     try {
       await rm(marker, { recursive: true, force: true });

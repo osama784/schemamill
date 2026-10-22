@@ -4,7 +4,7 @@ import type { Diagnostic, Model, ReadResult } from '@schemamill/core';
 import { resolveWorkspace } from '@schemamill/core';
 import { importDump } from '@schemamill/postgres';
 
-import { formatDiagnostics, type Side } from './diagnostics.ts';
+import { formatDiagnostics, hasErrors, type Side } from './diagnostics.ts';
 
 /**
  * Shared command plumbing: turn each side of a comparison into a canonical model — reading and
@@ -165,7 +165,7 @@ async function sideModel(source: SideSource): Promise<SidedModel | null> {
 }
 
 /** The dump text, or `null` after one stderr line naming the path and the reason. */
-async function readDump(path: string): Promise<string | null> {
+export async function readDump(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8');
   } catch (error) {
@@ -174,8 +174,28 @@ async function readDump(path: string): Promise<string | null> {
   }
 }
 
+/**
+ * The complete standard input as text, or `null` after one stderr line naming the reason.
+ *
+ * Reads to EOF: the encoding is fixed to UTF-8, and every chunk is appended in arrival order.
+ * An immediate EOF therefore resolves the empty string — a successful, empty import.
+ */
+export async function readStdin(): Promise<string | null> {
+  try {
+    process.stdin.setEncoding('utf8');
+    let text = '';
+    for await (const chunk of process.stdin) {
+      text += chunk;
+    }
+    return text;
+  } catch (error) {
+    process.stderr.write(`schemamill: cannot read stdin: ${reason(error)}\n`);
+    return null;
+  }
+}
+
 /** The import result, or `null` after one stderr line carrying the failure message. */
-async function importSide(ddl: string): Promise<ReadResult<Model, Diagnostic> | null> {
+export async function importSide(ddl: string): Promise<ReadResult<Model, Diagnostic> | null> {
   try {
     return await importDump(ddl);
   } catch (error) {
@@ -186,10 +206,7 @@ async function importSide(ddl: string): Promise<ReadResult<Model, Diagnostic> | 
 
 /** Whether an imported side carried an `error` diagnostic; a workspace side never does. */
 function carriesError(imported: SidedModel): boolean {
-  return (
-    imported.result !== null &&
-    imported.result.diagnostics.some((diagnostic) => diagnostic.kind === 'error')
-  );
+  return imported.result !== null && hasErrors(imported.result.diagnostics);
 }
 
 /** The message of a thrown value, stringified when it is not an `Error`. */

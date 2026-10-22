@@ -17,9 +17,9 @@ import { serializeModel } from './workspace.ts';
 
 /**
  * Tests for the workspace container: the `.schemamill/model.json` layout, resolution's walk
- * and marker-state table, init's refusals and exact empty model, and the internal writer's
- * byte-level determinism. Layout paths and bytes are pinned literally beside the exported
- * constants so a renamed marker cannot pass silently.
+ * and marker-state table, init's refusals and the canonical model bytes it writes, and the
+ * internal writer's byte-level determinism. Layout paths and bytes are pinned literally
+ * beside the exported constants so a renamed marker cannot pass silently.
  */
 
 /** The empty model's exact file bytes: two-space JSON and a trailing newline. */
@@ -1142,6 +1142,22 @@ test('initWorkspace creates the target directory and the exact empty model', asy
     await readFile(join(target, '.schemamill', 'model.json'), 'utf8'),
     EMPTY_MODEL_BYTES,
   );
+});
+
+test('initWorkspace writes a supplied model as canonical bytes and resolveWorkspace round-trips it', async (t) => {
+  const dir = await fixtureDir(t);
+  const target = join(dir, 'workspace');
+
+  const result = await initWorkspace(target, POPULATED_MODEL);
+  if (!result.ok) assert.fail(`expected init to succeed: ${result.diagnostic.message}`);
+
+  const bytes = await readFile(modelPath(target), 'utf8');
+  assert.equal(bytes, serializeModel(POPULATED_MODEL));
+  assert.notEqual(bytes, EMPTY_MODEL_BYTES);
+
+  const resolved = await resolveOk(target);
+  assert.equal(resolved.root, target);
+  assert.deepStrictEqual(resolved.model, POPULATED_MODEL);
 });
 
 test('initWorkspace refuses a target that is a file', async (t) => {
