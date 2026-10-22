@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import type { Diagnostic, Index, Model, TableIdentity } from '@schemamill/core';
 
-import { canonicalizeIndexNames, mapCatalog } from './catalog.ts';
+import { canonicalizeConstraintNames, canonicalizeIndexNames, mapCatalog } from './catalog.ts';
 import { importDump } from './import.ts';
 
 /**
@@ -54,14 +54,135 @@ const column = (
   ...rest,
 });
 
-/** A `primaryKeys` row. */
+/** A `primaryKeys` row: not deferrable and not temporal unless overridden. */
 const key = (
   schema: string,
   tableName: string,
   conname: string,
   ordinal: number,
   attname: string,
-) => ({ schema, tableName, conname, ordinal, attname });
+  rest: Record<string, unknown> = {},
+) => ({
+  schema,
+  tableName,
+  conname,
+  ordinal,
+  attname,
+  deferrable: false,
+  deferred: false,
+  period: false,
+  ...rest,
+});
+
+/** A uniform `constraints` row: every key present, null unless the kind or test states it. */
+const constraint = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  kind: 'unique' | 'check' | 'foreign-key' | 'exclusion',
+  rest: Record<string, unknown> = {},
+) => ({
+  schema,
+  tableName,
+  conname,
+  kind,
+  columns: null,
+  expression: null,
+  referencedSchema: null,
+  referencedTable: null,
+  referencedColumns: null,
+  onUpdate: null,
+  onDelete: null,
+  matchType: null,
+  deleteSetColumnList: null,
+  deferrable: null,
+  deferred: null,
+  validated: null,
+  enforced: null,
+  noInherit: null,
+  nullsNotDistinct: null,
+  including: null,
+  period: null,
+  ...rest,
+});
+
+/** A `unique` constraint row with the kind's required fields and default attributes. */
+const uniqueConstraint = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  columns: readonly string[],
+  rest: Record<string, unknown> = {},
+) =>
+  constraint(schema, tableName, conname, 'unique', {
+    columns,
+    deferrable: false,
+    deferred: false,
+    validated: true,
+    nullsNotDistinct: false,
+    including: false,
+    period: false,
+    ...rest,
+  });
+
+/** A `check` constraint row with the kind's required fields and default attributes. */
+const checkConstraint = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  expression: string,
+  rest: Record<string, unknown> = {},
+) =>
+  constraint(schema, tableName, conname, 'check', {
+    expression,
+    validated: true,
+    enforced: true,
+    noInherit: false,
+    deferrable: false,
+    deferred: false,
+    ...rest,
+  });
+
+/** A `foreign-key` constraint row with the kind's required fields and default attributes. */
+const foreignKey = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  columns: readonly string[],
+  referencedSchema: string,
+  referencedTable: string,
+  referencedColumns: readonly string[],
+  rest: Record<string, unknown> = {},
+) =>
+  constraint(schema, tableName, conname, 'foreign-key', {
+    columns,
+    referencedSchema,
+    referencedTable,
+    referencedColumns,
+    onUpdate: 'a',
+    onDelete: 'a',
+    matchType: 's',
+    deleteSetColumnList: false,
+    deferrable: false,
+    deferred: false,
+    validated: true,
+    enforced: true,
+    period: false,
+    ...rest,
+  });
+
+/** An `exclusion` constraint row: identity only, every other key null. */
+const exclusionConstraint = (schema: string, tableName: string, conname: string) =>
+  constraint(schema, tableName, conname, 'exclusion');
+
+/** A `notNullConstraints` row: validated, inheriting, and conventionally named unless overridden. */
+const notNull = (
+  schema: string,
+  tableName: string,
+  columnName: string,
+  conname: string,
+  rest: Record<string, unknown> = {},
+) => ({ schema, tableName, columnName, conname, validated: true, noInherit: false, ...rest });
 
 /** An `indexes` row: a valid, ready, default-tablespace index unless overridden. */
 const index = (
@@ -97,7 +218,17 @@ const payload = (sections: {
   readonly columns?: readonly unknown[];
   readonly primaryKeys?: readonly unknown[];
   readonly indexes?: readonly unknown[];
-}) => ({ tables: [], columns: [], primaryKeys: [], indexes: [], ...sections });
+  readonly constraints?: readonly unknown[];
+  readonly notNullConstraints?: readonly unknown[];
+}) => ({
+  tables: [],
+  columns: [],
+  primaryKeys: [],
+  indexes: [],
+  constraints: [],
+  notNullConstraints: [],
+  ...sections,
+});
 
 test('maps a shuffled payload into the canonical model, order-significant', async () => {
   const read = await mapCatalog(
@@ -867,8 +998,18 @@ test('throws on malformed payloads', async () => {
     ['an array payload', [], /catalog payload must be an object/],
     ['a missing section', { tables: [] }, /catalog payload\.columns must be an array/],
     [
-      'a missing indexes section',
+      'a missing constraints section',
       { tables: [], columns: [], primaryKeys: [] },
+      /catalog payload\.constraints must be an array/,
+    ],
+    [
+      'a missing not-null section',
+      { tables: [], columns: [], primaryKeys: [], constraints: [] },
+      /catalog payload\.notNullConstraints must be an array/,
+    ],
+    [
+      'a missing indexes section',
+      { tables: [], columns: [], primaryKeys: [], constraints: [], notNullConstraints: [] },
       /catalog payload\.indexes must be an array/,
     ],
     [
@@ -1172,4 +1313,936 @@ test('throws on duplicate rows', async () => {
     /catalog payload: duplicate index "public\.shared_idx"/,
     'one index name on two tables of one schema',
   );
+});
+
+test('maps every constraint kind with its attributes and strips every conventional name', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'parent'), table('public', 'names')],
+      columns: [
+        column('public', 'parent', 1, 'id', { type: 'integer', attnotnull: true }),
+        column('public', 'names', 1, 'a', { type: 'integer', attnotnull: true }),
+        column('public', 'names', 2, 'b', { type: 'integer', attnotnull: true }),
+        column('public', 'names', 3, 'ref', { type: 'integer' }),
+      ],
+      primaryKeys: [key('public', 'names', 'names_pkey', 1, 'a')],
+      constraints: [
+        uniqueConstraint('public', 'names', 'names_a_key', ['a'], {
+          deferrable: true,
+          deferred: true,
+        }),
+        checkConstraint('public', 'names', 'names_b_check', 'b > 0'),
+        foreignKey('public', 'names', 'names_ref_fkey', ['ref'], 'public', 'parent', ['id'], {
+          onUpdate: 'c',
+          onDelete: 'n',
+          deferrable: true,
+          deferred: true,
+        }),
+      ],
+      notNullConstraints: [notNull('public', 'names', 'a', 'names_a_not_null')],
+    }),
+  );
+
+  const names = read.model.tables.find((candidate) => candidate.name === 'names');
+  assert.ok(names, 'the table is mapped with its constraints');
+  assert.deepEqual(names.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: true },
+    { name: 'ref', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(names.primaryKey, { columns: ['a'] });
+  assert.deepEqual(names.uniqueConstraints, [
+    { columns: ['a'], deferrable: true, initiallyDeferred: true },
+  ]);
+  assert.deepEqual(names.checkConstraints, [{ expression: 'b > 0' }]);
+  assert.deepEqual(names.foreignKeys, [
+    {
+      columns: ['ref'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      onUpdate: 'CASCADE',
+      onDelete: 'SET NULL',
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('strips every conventional constraint formula, truncated server forms included', async () => {
+  const long = 'w'.repeat(60);
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'parent'), table('public', 'names'), table('public', 'other')],
+      columns: [
+        column('public', 'parent', 1, 'id', { type: 'integer' }),
+        column('public', 'names', 1, 'a', { type: 'integer', attnotnull: true }),
+        column('public', 'names', 2, 'b', { type: 'integer', attnotnull: true }),
+        column('public', 'names', 3, long, { type: 'integer', attnotnull: true }),
+        column('public', 'other', 1, 'id', { type: 'integer', attnotnull: true }),
+      ],
+      primaryKeys: [
+        key('public', 'names', 'names_pkey', 1, 'a'),
+        key('public', 'other', 'names_pkey', 1, 'id'),
+      ],
+      constraints: [
+        uniqueConstraint('public', 'names', 'names_a_key', ['a']),
+        uniqueConstraint('public', 'names', 'names_b_key', ['b']),
+        uniqueConstraint('public', 'names', 'names_custom_key', ['b']),
+        uniqueConstraint('public', 'names', `names_${'w'.repeat(53)}_key`, [long]),
+        checkConstraint('public', 'names', 'names_a_check', 'a > 0'),
+        checkConstraint('public', 'names', 'names_ab_check', 'a > b'),
+        checkConstraint('public', 'names', `names_${'w'.repeat(51)}_check`, `${long} > 0`),
+        foreignKey('public', 'names', 'names_a_fkey', ['a'], 'public', 'parent', ['id']),
+        foreignKey('public', 'names', 'names_custom_fkey', ['b'], 'public', 'parent', ['id']),
+        foreignKey('public', 'names', `names_${'w'.repeat(52)}_fkey`, [long], 'public', 'parent', [
+          'id',
+        ]),
+      ],
+      notNullConstraints: [
+        notNull('public', 'names', 'a', 'names_a_not_null'),
+        notNull('public', 'names', 'b', 'custom_nn'),
+        notNull('public', 'names', long, `names_${'w'.repeat(48)}_not_null`),
+        notNull('public', 'other', 'id', 'names_pkey_not_null'),
+      ],
+    }),
+  );
+
+  const names = read.model.tables.find((candidate) => candidate.name === 'names');
+  const other = read.model.tables.find((candidate) => candidate.name === 'other');
+  assert.ok(names, 'the names table is mapped');
+  assert.ok(other, 'the other table is mapped');
+  assert.deepEqual(
+    names.uniqueConstraints,
+    [
+      { columns: ['a'] },
+      { columns: ['b'] },
+      { name: 'names_custom_key', columns: ['b'] },
+      { columns: [long] },
+    ],
+    'unique names strip against their own formula; a foreign formula stays named',
+  );
+  assert.deepEqual(
+    names.checkConstraints,
+    [
+      { expression: 'a > 0' },
+      { name: 'names_ab_check', expression: 'a > b' },
+      { expression: `${long} > 0` },
+    ],
+    'check names strip against the expression formula; a foreign formula stays named',
+  );
+  assert.deepEqual(
+    names.foreignKeys,
+    [
+      {
+        columns: ['a'],
+        referencedTable: { schema: 'public', name: 'parent' },
+        referencedColumns: ['id'],
+      },
+      {
+        name: 'names_custom_fkey',
+        columns: ['b'],
+        referencedTable: { schema: 'public', name: 'parent' },
+        referencedColumns: ['id'],
+      },
+      {
+        columns: [long],
+        referencedTable: { schema: 'public', name: 'parent' },
+        referencedColumns: ['id'],
+      },
+    ],
+    'foreign-key names strip against their own formula; custom names stay',
+  );
+  assert.deepEqual(names.primaryKey, { columns: ['a'] });
+  assert.deepEqual(
+    other.primaryKey,
+    { name: 'names_pkey', columns: ['id'] },
+    'a conventional name for another table stays named',
+  );
+  assert.deepEqual(
+    names.columns.map((column) => column.notNullName ?? '(unnamed)'),
+    ['(unnamed)', 'custom_nn', '(unnamed)'],
+    'generated not-null names strip; a custom name travels the model',
+  );
+  assert.deepEqual(other.columns[0], {
+    name: 'id',
+    type: 'integer',
+    notNull: true,
+    notNullName: 'names_pkey_not_null',
+  });
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('strips truncated conventional names for every formula', async () => {
+  const columnName = 'w'.repeat(60);
+  const tableName = 'x'.repeat(60);
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't'), table('public', tableName)],
+      columns: [
+        column('public', 't', 1, columnName, { attnotnull: true }),
+        column('public', tableName, 1, 'id', { attnotnull: true }),
+      ],
+      primaryKeys: [key('public', tableName, `${'x'.repeat(58)}_pkey`, 1, 'id')],
+      constraints: [
+        uniqueConstraint('public', 't', `t_${'w'.repeat(57)}_key`, [columnName]),
+        checkConstraint('public', 't', `t_${'w'.repeat(55)}_check`, `${columnName} > 0`),
+        foreignKey('public', 't', `t_${'w'.repeat(56)}_fkey`, [columnName], 'public', 't', ['id']),
+      ],
+      notNullConstraints: [notNull('public', 't', columnName, `t_${'w'.repeat(52)}_not_null`)],
+    }),
+  );
+
+  const mappedTable = read.model.tables.find((candidate) => candidate.name === 't');
+  const longTable = read.model.tables.find((candidate) => candidate.name === tableName);
+  assert.ok(mappedTable, 'the short table is mapped');
+  assert.ok(longTable, 'the long table is mapped');
+  assert.deepEqual(mappedTable.uniqueConstraints, [{ columns: [columnName] }]);
+  assert.deepEqual(mappedTable.checkConstraints, [{ expression: `${columnName} > 0` }]);
+  assert.deepEqual(mappedTable.foreignKeys, [
+    {
+      columns: [columnName],
+      referencedTable: { schema: 'public', name: 't' },
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(mappedTable.columns[0]?.notNullName, undefined);
+  assert.deepEqual(longTable.primaryKey, { columns: ['id'] });
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('keeps a conventional name when stripping would duplicate an unnamed twin, in both orders', () => {
+  const identity: TableIdentity = { schema: 'public', name: 't' };
+  const unique = { columns: ['b'] };
+  const check = { expression: 'b > 0' };
+  const foreign = {
+    columns: ['b'],
+    referencedTable: { schema: 'public', name: 'p' },
+    referencedColumns: ['id'],
+  };
+  const options = [
+    {
+      uniqueConstraints: [{ name: 't_b_key', ...unique }, unique],
+      checkConstraints: [{ name: 't_b_check', ...check }, check],
+      foreignKeys: [{ name: 't_b_fkey', ...foreign }, foreign],
+    },
+    {
+      uniqueConstraints: [unique, { name: 't_b_key', ...unique }],
+      checkConstraints: [check, { name: 't_b_check', ...check }],
+      foreignKeys: [foreign, { name: 't_b_fkey', ...foreign }],
+    },
+  ];
+  for (const constraints of options) {
+    const canonical = canonicalizeConstraintNames(identity, constraints);
+    assert.deepEqual(
+      canonical.uniqueConstraints.filter((entry) => entry.name !== undefined),
+      [{ name: 't_b_key', ...unique }],
+      'the named twin keeps its name',
+    );
+    assert.deepEqual(
+      canonical.checkConstraints.filter((entry) => entry.name !== undefined),
+      [{ name: 't_b_check', ...check }],
+      'the named check twin keeps its name',
+    );
+    assert.deepEqual(
+      canonical.foreignKeys.filter((entry) => entry.name !== undefined),
+      [{ name: 't_b_fkey', ...foreign }],
+      'the named foreign-key twin keeps its name',
+    );
+  }
+});
+
+test('maps primary-key deferrability and period, and reports the temporal drop', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a', { type: 'integer' })],
+      primaryKeys: [
+        key('public', 't', 't_pkey', 1, 'a', { deferrable: true, deferred: true, period: true }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.primaryKey, {
+    columns: ['a'],
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+  ]);
+  assert.equal('position' in read.diagnostics[0]!, false);
+});
+
+test('maps the enforcement tri-state from 16- and 18-shaped rows', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a', { type: 'integer' })],
+      constraints: [
+        checkConstraint('public', 't', 't_enforced', 'a > 0'),
+        checkConstraint('public', 't', 't_not_valid', 'a > 1', { validated: false }),
+        checkConstraint('public', 't', 't_not_enforced', 'a > 2', {
+          validated: false,
+          enforced: false,
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.checkConstraints, [
+    { name: 't_enforced', expression: 'a > 0' },
+    { name: 't_not_valid', expression: 'a > 1', enforcement: 'not-valid' },
+    { name: 't_not_enforced', expression: 'a > 2', enforcement: 'not-enforced' },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          tables: [table('public', 't')],
+          columns: [column('public', 't', 1, 'a')],
+          constraints: [
+            checkConstraint('public', 't', 't_unreachable', 'a > 0', { enforced: false }),
+          ],
+        }),
+      ),
+    /catalog payload: constraint "public\.t\.t_unreachable" is validated but not enforced/,
+    'validated but not enforced is unreachable',
+  );
+});
+
+test('normalizes check text with the importer rules and keeps the inner text verbatim', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a'), column('public', 't', 2, 'b')],
+      constraints: [
+        checkConstraint('public', 't', 'c1', 'a  >   0'),
+        checkConstraint('public', 't', 'c2', '((a > 0) AND (a < 10))'),
+        checkConstraint('public', 't', 'c3', 'EXTRACT(epoch FROM now())'),
+        checkConstraint('public', 't', 'c4', '(a)::text = b'),
+        checkConstraint('public', 't', 'c5', '"Mixed Case" > 0'),
+        checkConstraint('public', 't', 'c6', '(t.* IS NOT NULL)'),
+        checkConstraint('public', 't', 'c7', 'a /* note */ > 0'),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.tables[0]?.checkConstraints.map((constraint) => constraint.expression),
+    [
+      '"Mixed Case" > 0',
+      '((a > 0) AND(a < 10))',
+      '(a)::text = b',
+      '(t.* IS NOT NULL)',
+      'EXTRACT(epoch FROM now())',
+      'a > 0',
+      'a > 0',
+    ],
+    'the deparsed inner text is whitespace-normalized and otherwise kept verbatim',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('reports every constraint diagnostic with the exact line, object, and order', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'a', { type: 'integer', attnotnull: true }),
+        column('public', 't', 2, 'b', { type: 'integer' }),
+        column('public', 't', 3, 'c', { type: 'integer' }),
+        column('public', 't', 4, 'ref', { type: 'integer' }),
+        column('public', 't', 5, 'nn1', { attnotnull: true }),
+        column('public', 't', 6, 'nn2', { attnotnull: true }),
+        column('public', 't', 7, 'nn3', { attnotnull: true }),
+      ],
+      primaryKeys: [key('public', 't', 't_pkey', 1, 'a', { period: true })],
+      constraints: [
+        checkConstraint('public', 't', 'c_both', 'a > 0', {
+          noInherit: true,
+          deferrable: true,
+          deferred: true,
+        }),
+        checkConstraint('public', 't', 'c_defer', 'b > 0', { deferrable: true }),
+        checkConstraint('public', 't', 'c_inherit', 'c > 0', { noInherit: true }),
+        exclusionConstraint('public', 't', 'ex_skip'),
+        foreignKey('public', 't', 'f_all', ['ref'], 'public', 'p', ['id'], {
+          matchType: 'f',
+          deleteSetColumnList: true,
+          period: true,
+        }),
+        foreignKey('public', 't', 'f_cols', ['ref'], 'public', 'p', ['id'], {
+          deleteSetColumnList: true,
+        }),
+        foreignKey('public', 't', 'f_full', ['ref'], 'public', 'p', ['id'], { matchType: 'f' }),
+        foreignKey('public', 't', 'f_partial', ['ref'], 'public', 'p', ['id'], {
+          matchType: 'p',
+        }),
+        foreignKey('public', 't', 'f_period', ['ref'], 'public', 'p', ['id'], { period: true }),
+        uniqueConstraint('public', 't', 'u_all', ['a', 'b'], {
+          nullsNotDistinct: true,
+          including: true,
+          period: true,
+          validated: false,
+        }),
+        uniqueConstraint('public', 't', 't_b_key', ['b'], { including: true }),
+        uniqueConstraint('public', 't', 'u_nulls', ['a'], { nullsNotDistinct: true }),
+        uniqueConstraint('public', 't', 'u_period', ['c'], { period: true }),
+        uniqueConstraint('public', 't', 'u_valid', ['a', 'b'], { validated: false }),
+      ],
+      notNullConstraints: [
+        notNull('public', 't', 'nn1', 'nn_valid', { validated: false }),
+        notNull('public', 't', 'nn2', 'nn_inherit', { noInherit: true }),
+        notNull('public', 't', 'nn3', 'nn_all', { validated: false, noInherit: true }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NOT VALID on not-null constraint nn_valid from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on not-null constraint nn_inherit from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NOT VALID on not-null constraint nn_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on not-null constraint nn_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on check constraint c_both from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped deferrability on check constraint c_both from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped deferrability on check constraint c_defer from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on check constraint c_inherit from public.t',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.ex_skip',
+      message: 'skipped exclusion constraint public.ex_skip',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped MATCH FULL on foreign key f_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped column list on foreign key f_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped PERIOD on foreign key f_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped column list on foreign key f_cols from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped MATCH FULL on foreign key f_full from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped MATCH PARTIAL on foreign key f_partial from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped PERIOD on foreign key f_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on unique constraint t_b_key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NULLS NOT DISTINCT on unique constraint u_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on unique constraint u_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on unique constraint u_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NOT VALID on unique constraint u_all from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NULLS NOT DISTINCT on unique constraint u_nulls from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NOT VALID on unique constraint u_valid from public.t',
+    },
+  ]);
+  for (const diagnostic of read.diagnostics) {
+    assert.equal('position' in diagnostic, false, 'introspection diagnostics carry no position');
+  }
+
+  assert.deepEqual(
+    read.model.tables[0]?.uniqueConstraints.filter(
+      (constraint) => constraint.columns.length === 1 && constraint.columns[0] === 'b',
+    ),
+    [{ columns: ['b'] }],
+    'the diagnostic keeps the stored name while the model strips it',
+  );
+
+  assert.deepEqual(
+    read.model.tables[0]?.checkConstraints,
+    [
+      { name: 'c_both', expression: 'a > 0' },
+      { name: 'c_defer', expression: 'b > 0' },
+      { name: 'c_inherit', expression: 'c > 0' },
+    ],
+    'check attributes are flagged and dropped, not modeled',
+  );
+});
+
+test('orders constraints with core comparators and presence-aware names', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't'), table('public', 'parent')],
+      columns: [
+        column('public', 't', 1, 'a'),
+        column('public', 't', 2, 'b'),
+        column('public', 't', 3, 'c'),
+        column('public', 'parent', 1, 'id'),
+      ],
+      constraints: [
+        uniqueConstraint('public', 't', 'z_key', ['c']),
+        uniqueConstraint('public', 't', 'b_key', ['b']),
+        uniqueConstraint('public', 't', 'a_key', ['b']),
+        uniqueConstraint('public', 't', 't_a_key', ['a']),
+        checkConstraint('public', 't', 'b_check', 'b > 0'),
+        checkConstraint('public', 't', 't_a_check', 'a > 0'),
+        foreignKey('public', 't', 'z_fkey', ['b'], 'public', 'parent', ['id']),
+        foreignKey('public', 't', 'a_fkey', ['b'], 'public', 'parent', ['id']),
+        foreignKey('public', 't', 't_a_fkey', ['a'], 'public', 'parent', ['id']),
+      ],
+    }),
+  );
+
+  const mappedTable = read.model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(mappedTable, 'the table is mapped');
+  assert.deepEqual(mappedTable.uniqueConstraints, [
+    { columns: ['a'] },
+    { name: 'a_key', columns: ['b'] },
+    { name: 'b_key', columns: ['b'] },
+    { name: 'z_key', columns: ['c'] },
+  ]);
+  assert.deepEqual(mappedTable.checkConstraints, [
+    { expression: 'a > 0' },
+    { name: 'b_check', expression: 'b > 0' },
+  ]);
+  assert.deepEqual(mappedTable.foreignKeys, [
+    {
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 'a_fkey',
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 'z_fkey',
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+  ]);
+});
+
+test('is independent of payload row order for constraints and not-null rows', async () => {
+  const sections = {
+    tables: [table('public', 'parent'), table('public', 't')],
+    columns: [
+      column('public', 'parent', 1, 'id', { type: 'integer' }),
+      column('public', 't', 1, 'a', { type: 'integer', attnotnull: true }),
+      column('public', 't', 2, 'b', { type: 'integer', attnotnull: true }),
+    ],
+    primaryKeys: [key('public', 't', 't_pkey', 1, 'a', { deferrable: true })],
+    constraints: [
+      uniqueConstraint('public', 't', 'u_b', ['b'], { nullsNotDistinct: true }),
+      uniqueConstraint('public', 't', 't_a_key', ['a']),
+      checkConstraint('public', 't', 't_b_check', 'b > 0'),
+      foreignKey('public', 't', 't_b_fkey', ['b'], 'public', 'parent', ['id'], {
+        onDelete: 'c',
+      }),
+      exclusionConstraint('public', 't', 't_excl'),
+    ],
+    notNullConstraints: [
+      notNull('public', 't', 'a', 't_a_not_null'),
+      notNull('public', 't', 'b', 'custom_b'),
+    ],
+  };
+  const forward = await mapCatalog(payload(sections));
+  const reversed = await mapCatalog(
+    payload({
+      ...sections,
+      columns: [...sections.columns].reverse(),
+      primaryKeys: [...sections.primaryKeys].reverse(),
+      constraints: [...sections.constraints].reverse(),
+      notNullConstraints: [...sections.notNullConstraints].reverse(),
+    }),
+  );
+
+  assert.deepEqual(forward, reversed, 'the mapper does not depend on payload row order');
+});
+
+test('rejects rows that violate the per-kind matrix or the table contract', async () => {
+  const base = {
+    tables: [table('public', 't')],
+    columns: [column('public', 't', 1, 'a')],
+  };
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [constraint('public', 't', 'u', 'unique', { columns: null })],
+        }),
+      ),
+    /catalog payload: unique constraint "public\.t\.u" is missing columns/,
+    'a required field missing from its kind',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [uniqueConstraint('public', 't', 'u', ['a'], { expression: 'a > 0' })],
+        }),
+      ),
+    /catalog payload: unique constraint "public\.t\.u" carries expression outside its kind/,
+    'an irrelevant field stated for its kind',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [checkConstraint('public', 't', 'c', 'a > 0', { columns: ['a'] })],
+        }),
+      ),
+    /catalog payload: check constraint "public\.t\.c" carries columns outside its kind/,
+    'a check row resolving columns',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [checkConstraint('public', 't', 'c', 'a > 0', { period: true })],
+        }),
+      ),
+    /catalog payload: check constraint "public\.t\.c" carries period outside its kind/,
+    'a check row carrying the temporal flag',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [
+            exclusionConstraint('public', 't', 'x'),
+            { ...exclusionConstraint('public', 't', 'y'), period: true },
+          ],
+        }),
+      ),
+    /catalog payload: exclusion constraint "public\.t\.y" carries period outside its kind/,
+    'an exclusion row carrying an attribute',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [
+            {
+              ...uniqueConstraint('public', 't', 'u', ['a']),
+              kind: 'primary',
+            },
+          ],
+        }),
+      ),
+    /catalog payload\.constraints\[0\]\.kind must be "unique", "check", "foreign-key", or "exclusion"/,
+    'an unknown constraint kind',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [
+            uniqueConstraint('public', 't', 'u', ['a']),
+            uniqueConstraint('public', 't', 'u', ['a']),
+          ],
+        }),
+      ),
+    /catalog payload: duplicate constraint "public\.t\.u"/,
+    'two constraint rows for one name',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [uniqueConstraint('public', 'missing', 'u', ['a'])],
+        }),
+      ),
+    /catalog payload: constraint row for "public\.missing" references an unknown table/,
+    'a constraint row without its table',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [uniqueConstraint('public', 't', 'u', ['a'])],
+          columns: [],
+          tables: [{ ...table('public', 't'), relkind: 'p' }],
+        }),
+      ),
+    /catalog payload: constraint row for "public\.t" belongs to a partitioned relation/,
+    'a constraint row for a partitioned table',
+  );
+});
+
+test('rejects not-null rows that do not match their column or repeat it', async () => {
+  const base = {
+    tables: [table('public', 't')],
+    columns: [column('public', 't', 1, 'a'), column('public', 't', 2, 'b', { attnotnull: true })],
+  };
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          notNullConstraints: [
+            notNull('public', 't', 'b', 'nn_one'),
+            notNull('public', 't', 'b', 'nn_two'),
+          ],
+        }),
+      ),
+    /catalog payload: duplicate not-null constraint for "public\.t\.b"/,
+    'two not-null rows for one column',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          notNullConstraints: [notNull('public', 't', 'missing', 'nn_missing')],
+        }),
+      ),
+    /catalog payload: not-null constraint for "public\.t\.missing" names a column the table does not carry/,
+    'a not-null row on an orphan column',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          notNullConstraints: [notNull('public', 't', 'a', 'nn_a')],
+        }),
+      ),
+    /catalog payload: not-null constraint "public\.t\.a" is on a column that is not NOT NULL/,
+    'a not-null row on a nullable column',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          notNullConstraints: [notNull('public', 'missing', 'a', 'nn_a')],
+        }),
+      ),
+    /catalog payload: not-null constraint row for "public\.missing" references an unknown table/,
+    'a not-null row without its table',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          columns: [],
+          tables: [{ ...table('public', 't'), relispartition: true }],
+          notNullConstraints: [notNull('public', 't', 'b', 'nn_b')],
+        }),
+      ),
+    /catalog payload: not-null constraint row for "public\.t" belongs to a partitioned relation/,
+    'a not-null row for a partition child',
+  );
+});
+
+test('rejects primary-key rows that disagree on their attributes', async () => {
+  const base = {
+    tables: [table('public', 't')],
+    columns: [column('public', 't', 1, 'a'), column('public', 't', 2, 'b')],
+  };
+  for (const [label, second] of [
+    ['deferrability', key('public', 't', 't_pkey', 2, 'b', { deferrable: true })],
+    ['deferred', key('public', 't', 't_pkey', 2, 'b', { deferred: true })],
+    ['period', key('public', 't', 't_pkey', 2, 'b', { period: true })],
+  ] as const) {
+    await assert.rejects(
+      () =>
+        mapCatalog(
+          payload({
+            ...base,
+            primaryKeys: [key('public', 't', 't_pkey', 1, 'a'), second],
+          }),
+        ),
+      /catalog payload: primary-key rows of "public\.t" disagree on their attributes/,
+      `primary-key rows disagree on ${label}`,
+    );
+  }
+});
+
+test('rejects malformed constraint and not-null rows', async () => {
+  const base = {
+    tables: [table('public', 't')],
+    columns: [column('public', 't', 1, 'a', { attnotnull: true })],
+  };
+  const cases: readonly (readonly [string, unknown, RegExp])[] = [
+    [
+      'an unknown constraint field',
+      payload({
+        ...base,
+        constraints: [{ ...uniqueConstraint('public', 't', 'u', ['a']), extra: true }],
+      }),
+      /catalog payload\.constraints\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'a wrong-typed constraint field',
+      payload({
+        ...base,
+        constraints: [uniqueConstraint('public', 't', 'u', ['a'], { validated: 'yes' })],
+      }),
+      /catalog payload\.constraints\[0\]\.validated must be a boolean or null/,
+    ],
+    [
+      'a wrong-typed column list',
+      payload({
+        ...base,
+        constraints: [uniqueConstraint('public', 't', 'u', ['a'], { columns: 'a' })],
+      }),
+      /catalog payload\.constraints\[0\]\.columns must be an array of strings or null/,
+    ],
+    [
+      'an unknown not-null field',
+      payload({
+        ...base,
+        notNullConstraints: [{ ...notNull('public', 't', 'a', 'nn'), extra: true }],
+      }),
+      /catalog payload\.notNullConstraints\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'a wrong-typed not-null flag',
+      payload({
+        ...base,
+        notNullConstraints: [notNull('public', 't', 'a', 'nn', { noInherit: 'no' })],
+      }),
+      /catalog payload\.notNullConstraints\[0\]\.noInherit must be a boolean/,
+    ],
+    [
+      'a primary-key row missing its attributes',
+      payload({
+        ...base,
+        primaryKeys: [
+          { schema: 'public', tableName: 't', conname: 't_pkey', ordinal: 1, attname: 'a' },
+        ],
+      }),
+      /catalog payload\.primaryKeys\[0\]\.deferrable must be a boolean/,
+    ],
+  ];
+  for (const [label, malformed, pattern] of cases) {
+    await assert.rejects(() => mapCatalog(malformed), pattern, label);
+  }
 });
