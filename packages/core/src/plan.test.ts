@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  assertNever,
   canonicalIntType,
   diff,
   effectiveIdentity,
@@ -39,7 +40,6 @@ import type {
 import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
 import {
   applyChange,
-  assertNever,
   emptyChangeApplication,
   groupSteps,
   TRANSACTIONAL,
