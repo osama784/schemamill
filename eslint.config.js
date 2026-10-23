@@ -88,6 +88,35 @@ export default tseslint.config(
     },
   },
   {
+    // Core production code must stay portable (ADR 0005). Tests may use node:test/node:assert,
+    // and workspace.ts is core's explicit filesystem boundary.
+    files: ['packages/core/src/**/*.ts'],
+    ignores: ['**/*.test.ts', 'packages/core/src/workspace.ts'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['@schemamill/*'],
+              message: '@schemamill/core must not import other schemamill packages.',
+            },
+            {
+              group: ['@nestjs/*', 'reflect-metadata'],
+              message:
+                '@schemamill/core must stay framework-free (ADR 0005): no @nestjs/* or reflect-metadata imports',
+            },
+            {
+              group: ['node:*'],
+              message:
+                'core production code must stay portable (ADR 0005): node:* imports are allowed only in workspace.ts (the filesystem boundary) and tests',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     // Boundaries: postgres may import only core.
     files: ['packages/postgres/**/*.ts'],
     rules: {
@@ -178,6 +207,17 @@ export default tseslint.config(
               message: '@schemamill/server must not import @schemamill/cli.',
             },
           ],
+        },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "ImportExpression > Literal[value='@schemamill/cli']",
+          message: '@schemamill/server must not import @schemamill/cli.',
+        },
+        {
+          selector: "TSImportType > Literal[value='@schemamill/cli']",
+          message: '@schemamill/server must not import @schemamill/cli.',
         },
       ],
     },

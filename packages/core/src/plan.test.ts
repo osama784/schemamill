@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  assertNever,
   canonicalIntType,
   diff,
   effectiveIdentity,
@@ -37,13 +38,7 @@ import type {
   UniqueConstraint,
 } from './model.ts';
 import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
-import {
-  applyChange,
-  assertNever,
-  emptyChangeApplication,
-  groupSteps,
-  TRANSACTIONAL,
-} from './plan.ts';
+import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
  * Tests for the migration plan: the eight global phases with the eighteen table phases at their

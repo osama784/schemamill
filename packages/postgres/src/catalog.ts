@@ -410,6 +410,7 @@ export const catalogReader: CatalogReader<string, Model, Diagnostic> = { introsp
 /** Spawns `psql` for the one read; a failure carries the exit code and the trimmed stderr. */
 async function runPsql(connection: string): Promise<string> {
   try {
+    // Credentials stay on argv; password-free URIs are the supported posture (ADR 0017, #71).
     const { stdout } = await execFileAsync(
       'psql',
       ['-X', '-q', '-w', '-tA', '-v', 'ON_ERROR_STOP=1', '-d', connection, '-c', CATALOG_SQL],
