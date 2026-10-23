@@ -97,6 +97,18 @@ import { renderSql } from './render.ts';
  * `introspection-flags-nulls-not-distinct` pins the `NULLS NOT DISTINCT` skip gated on
  * PostgreSQL 15 or newer.
  *
+ * The constraint-introspection scenes prove the catalog read and the dump importer agree on
+ * every representable constraint shape: `introspection-constraints` carries named, unnamed,
+ * composite, and deferrable unique constraints, a deparse-congruent check-expression battery,
+ * composite and self-referencing foreign keys, every non-default referential action,
+ * deferrability, and `NOT VALID` on a check and a foreign key, and two foreign keys whose
+ * referenced columns are a standalone unique index — one on the same table, which pins the
+ * read's `contype` filter. `introspection-flags-constraints` pins the diagnostics for the
+ * unrepresentable attributes (an exclusion constraint, check `NO INHERIT`, unique `INCLUDE`,
+ * foreign-key `MATCH FULL`), its PostgreSQL 15 companion adds `NULLS NOT DISTINCT` and the
+ * foreign-key delete-column list, and its PostgreSQL 18 companion adds named not-null
+ * `NOT VALID`/`NO INHERIT` and the temporal `WITHOUT OVERLAPS`/`PERIOD` grammar.
+ *
  * The render-refusal scenes cover generated-name truncation and omitted declarations:
  * `truncated-name-round-trip` builds a table whose unnamed index, unique constraint, check
  * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
@@ -2760,6 +2772,351 @@ const constraintCreateScene = (): LiveScene => {
 };
 
 /**
+ * The constraint-introspection round trip: every representable constraint shape on tables the
+ * model creates whole. The unique constraints cover named, unnamed, composite, and deferrable
+ * declarations; the check battery is pinned to the spellings `pg_get_expr` returns on the
+ * server (the outer parentheses included), so the authored target and both dumps' imports carry
+ * the same text. The foreign keys cover a composite reference, a self-reference, all four
+ * non-default referential actions, `DEFERRABLE INITIALLY DEFERRED`, and `NOT VALID`, and two of
+ * them reference a standalone unique index rather than a primary key: `children`' composite key
+ * points at `parents`' unique index (the `conrelid` guard), and `nodes`' self-reference points
+ * at a unique index on its own table (a foreign key's `conindid` is that index, so only the
+ * `contype` filter keeps the read from consuming it). The live read must return no diagnostics
+ * and a model deep-equal to the applied dump's import.
+ */
+const introspectionConstraintsScene = (): LiveScene => {
+  const parents = table('parents', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('code', { notNull: true }),
+      column('variant', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { columns: ['id'] },
+    uniqueConstraints: [
+      { name: 'parents_code_named_key', columns: ['code'], deferrable: true },
+      { columns: ['variant', 'code'] },
+    ],
+    indexes: [{ name: 'parents_code_variant_unique', unique: true, columns: ['code', 'variant'] }],
+  });
+  const children = table('children', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('parent_code'),
+      column('parent_variant', { type: 'integer' }),
+      column('parent_id', { type: 'bigint' }),
+      column('parent_default', { type: 'bigint', default: '0' }),
+      column('parent_plain', { type: 'bigint' }),
+      column('parent_deferred', { type: 'bigint' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    foreignKeys: [
+      foreignKey(['parent_code', 'parent_variant'], identity('parents'), {
+        referencedColumns: ['code', 'variant'],
+        onDelete: 'RESTRICT',
+        onUpdate: 'CASCADE',
+      }),
+      foreignKey(['parent_id'], identity('parents'), {
+        name: 'children_fk_parent_id',
+        referencedColumns: ['id'],
+        onDelete: 'SET NULL',
+      }),
+      foreignKey(['parent_default'], identity('parents'), {
+        name: 'children_fk_parent_default',
+        referencedColumns: ['id'],
+        onUpdate: 'SET DEFAULT',
+      }),
+      foreignKey(['parent_plain'], identity('parents'), {
+        name: 'children_fk_parent_plain',
+        referencedColumns: ['id'],
+      }),
+      foreignKey(['parent_deferred'], identity('parents'), {
+        name: 'children_fk_parent_deferred',
+        referencedColumns: ['id'],
+        deferrable: true,
+        initiallyDeferred: true,
+        enforcement: 'not-valid',
+      }),
+    ],
+  });
+  const nodes = table('nodes', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { notNull: true }),
+      column('variant', { type: 'integer', notNull: true }),
+      column('parent_code'),
+      column('parent_variant', { type: 'integer' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    indexes: [{ name: 'nodes_code_variant_unique', unique: true, columns: ['code', 'variant'] }],
+    foreignKeys: [
+      foreignKey(['parent_code', 'parent_variant'], identity('nodes'), {
+        name: 'nodes_parent_fkey',
+        referencedColumns: ['code', 'variant'],
+      }),
+    ],
+  });
+  const checks = table('checks', {
+    columns: [
+      column('a', { type: 'integer' }),
+      column('b', { type: 'integer' }),
+      column('c', { type: 'integer' }),
+      column('Mixed Case'),
+      column('ts', { type: 'timestamp with time zone' }),
+    ],
+    checkConstraints: [
+      { name: 'checks_age_check', expression: '(a > 0)' },
+      { name: 'checks_nested_check', expression: '((a > 0) AND(b > 0))' },
+      {
+        name: 'checks_epoch_check',
+        expression: '(EXTRACT(epoch FROM ts) =(0)::numeric)',
+      },
+      { name: 'checks_cast_check', expression: '((b)::bigint > 0)' },
+      { name: 'checks_quoted_check', expression: '("Mixed Case" <> \'\'::text)' },
+      { name: 'checks_whole_row_check', expression: '(checks.* IS NOT NULL)' },
+      { name: 'checks_not_valid_check', expression: '(a < 1000)', enforcement: 'not-valid' },
+      { expression: '(c > 0)' },
+    ],
+  });
+  const target = model(checks, children, nodes, parents);
+
+  return {
+    name: 'introspection-constraints',
+    baseline: model(),
+    target,
+    baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'checks,children,nodes,parents' },
+      {
+        description: 'the foreign-key names, including the unnamed composite reference',
+        sql: constraintNames('children', 'f'),
+        expected:
+          'children_fk_parent_default,children_fk_parent_deferred,children_fk_parent_id,' +
+          'children_fk_parent_plain,children_parent_code_parent_variant_fkey',
+      },
+      {
+        description: 'the named and unnamed unique constraints',
+        sql: constraintNames('parents', 'u'),
+        expected: 'parents_code_named_key,parents_variant_code_key',
+      },
+      {
+        description: 'the check-constraint names, including the unnamed single-column check',
+        sql: constraintNames('checks', 'c'),
+        expected:
+          'checks_age_check,checks_c_check,checks_cast_check,checks_epoch_check,' +
+          'checks_nested_check,checks_not_valid_check,checks_quoted_check,' +
+          'checks_whole_row_check',
+      },
+      {
+        description: 'the parents indexes: two constraint-backed, one standalone, one primary key',
+        sql: indexesOf('parents'),
+        expected:
+          'parents_code_named_key,parents_code_variant_unique,parents_pkey,parents_variant_code_key',
+      },
+      {
+        description: 'the nodes standalone unique index beside its primary key',
+        sql: indexesOf('nodes'),
+        expected: 'nodes_code_variant_unique,nodes_pkey',
+      },
+      {
+        description: 'the standalone unique index beside its referencing foreign key',
+        sql: indexIsUnique('nodes_code_variant_unique'),
+        expected: 't',
+      },
+      {
+        description: 'the other-table standalone unique index',
+        sql: indexIsUnique('parents_code_variant_unique'),
+        expected: 't',
+      },
+      {
+        description: 'the composite foreign key with its referential actions',
+        sql: constraintDef('children_parent_code_parent_variant_fkey'),
+        expected:
+          'FOREIGN KEY (parent_code, parent_variant) REFERENCES parents(code, variant)' +
+          ' ON UPDATE CASCADE ON DELETE RESTRICT',
+      },
+      {
+        description: 'the self-referencing foreign key over the standalone unique index',
+        sql: constraintDef('nodes_parent_fkey'),
+        expected: 'FOREIGN KEY (parent_code, parent_variant) REFERENCES nodes(code, variant)',
+      },
+      {
+        description: 'the ON DELETE SET NULL foreign key',
+        sql: constraintDef('children_fk_parent_id'),
+        expected: 'FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE SET NULL',
+      },
+      {
+        description: 'the ON UPDATE SET DEFAULT foreign key',
+        sql: constraintDef('children_fk_parent_default'),
+        expected: 'FOREIGN KEY (parent_default) REFERENCES parents(id) ON UPDATE SET DEFAULT',
+      },
+      {
+        description: 'the deferrable and not-valid foreign key',
+        sql: constraintDef('children_fk_parent_deferred'),
+        expected:
+          'FOREIGN KEY (parent_deferred) REFERENCES parents(id)' +
+          ' DEFERRABLE INITIALLY DEFERRED NOT VALID',
+      },
+      {
+        description: 'the named deferrable unique constraint',
+        sql: constraintDef('parents_code_named_key'),
+        expected: 'UNIQUE (code) DEFERRABLE',
+      },
+      {
+        description: 'the unnamed composite unique constraint',
+        sql: constraintDef('parents_variant_code_key'),
+        expected: 'UNIQUE (variant, code)',
+      },
+      {
+        description: 'the simple deparse-congruent check',
+        sql: constraintDef('checks_age_check'),
+        expected: 'CHECK ((a > 0))',
+      },
+      {
+        description: 'the nested-AND deparse-congruent check',
+        sql: constraintDef('checks_nested_check'),
+        expected: 'CHECK (((a > 0) AND (b > 0)))',
+      },
+      {
+        description: 'the EXTRACT deparse-congruent check',
+        sql: constraintDef('checks_epoch_check'),
+        expected: 'CHECK ((EXTRACT(epoch FROM ts) = (0)::numeric))',
+      },
+      {
+        description: 'the cast deparse-congruent check',
+        sql: constraintDef('checks_cast_check'),
+        expected: 'CHECK (((b)::bigint > 0))',
+      },
+      {
+        description: 'the quoted-identifier deparse-congruent check',
+        sql: constraintDef('checks_quoted_check'),
+        expected: 'CHECK (("Mixed Case" <> \'\'::text))',
+      },
+      {
+        description: 'the whole-row deparse-congruent check',
+        sql: constraintDef('checks_whole_row_check'),
+        expected: 'CHECK ((checks.* IS NOT NULL))',
+      },
+      {
+        description: 'the unnamed single-column check',
+        sql: constraintDef('checks_c_check'),
+        expected: 'CHECK ((c > 0))',
+      },
+      {
+        description: 'the not-valid check',
+        sql: constraintDef('checks_not_valid_check'),
+        expected: 'CHECK ((a < 1000)) NOT VALID',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'the unnamed unique and foreign keys canonicalize back to unnamed; named ones stay named',
+        failure: (imported) => {
+          const parentsTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'parents',
+          );
+          const childrenTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'children',
+          );
+          if (parentsTable === undefined || childrenTable === undefined) {
+            return 'parents or children is not imported';
+          }
+          const unique = parentsTable.uniqueConstraints
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}:` +
+                `${String(constraint.deferrable)}:${String(constraint.initiallyDeferred)}`,
+            )
+            .join(' ');
+          if (
+            unique !==
+            'parents_code_named_key:code:true:undefined <unnamed>:variant,code:undefined:undefined'
+          ) {
+            return `unique constraints: ${unique}`;
+          }
+          const foreign = childrenTable.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}->` +
+                `${constraint.referencedTable.name}(${constraint.referencedColumns.join(',')}):` +
+                `${constraint.onUpdate ?? '-'}:${constraint.onDelete ?? '-'}:` +
+                `${String(constraint.deferrable)}:${String(constraint.initiallyDeferred)}:` +
+                `${constraint.enforcement ?? 'valid'}`,
+            )
+            .join(' ');
+          const expected =
+            '<unnamed>:parent_code,parent_variant->parents(code,variant):CASCADE:RESTRICT:' +
+            'undefined:undefined:valid' +
+            ' children_fk_parent_default:parent_default->parents(id):SET DEFAULT:-:' +
+            'undefined:undefined:valid' +
+            ' children_fk_parent_deferred:parent_deferred->parents(id):-:-:true:true:not-valid' +
+            ' children_fk_parent_id:parent_id->parents(id):-:SET NULL:undefined:undefined:valid' +
+            ' children_fk_parent_plain:parent_plain->parents(id):-:-:undefined:undefined:valid';
+          return foreign === expected ? undefined : `foreign keys: ${foreign}`;
+        },
+      },
+      {
+        description:
+          'the standalone unique indexes stay modeled beside the foreign keys that reference them',
+        failure: (imported) => {
+          const facts = ['parents', 'nodes']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              if (found === undefined) return `${name}:not imported`;
+              const indexes = found.indexes
+                .map(
+                  (index) =>
+                    `${index.name ?? '<unnamed>'}:${index.unique ? 'unique' : 'plain'}:` +
+                    `${index.columns.join(',')}`,
+                )
+                .join(';');
+              const foreign = found.foreignKeys
+                .map(
+                  (constraint) =>
+                    `${constraint.columns.join(',')}->${constraint.referencedColumns.join(',')}`,
+                )
+                .join(';');
+              return `${name}:${indexes}:${foreign}`;
+            })
+            .join(' ');
+          const expected =
+            'parents:parents_code_variant_unique:unique:code,variant: ' +
+            'nodes:nodes_code_variant_unique:unique:code,variant:parent_code,parent_variant->code,variant';
+          return facts === expected ? undefined : `indexes: ${facts}`;
+        },
+      },
+      {
+        description: 'both dumps equal the authored target, check battery included',
+        failure: (imported, source) => {
+          const checksTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'checks',
+          );
+          if (checksTable === undefined) return 'checks is not imported';
+          const expressions = checksTable.checkConstraints
+            .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
+            .join(' ');
+          const expected =
+            'checks_quoted_check:("Mixed Case" <> \'\'::text)' +
+            ' checks_nested_check:((a > 0) AND(b > 0))' +
+            ' checks_cast_check:((b)::bigint > 0)' +
+            ' checks_epoch_check:(EXTRACT(epoch FROM ts) =(0)::numeric)' +
+            ' checks_not_valid_check:(a < 1000)' +
+            ' checks_age_check:(a > 0)' +
+            ' <unnamed>:(c > 0)' +
+            ' checks_whole_row_check:(checks.* IS NOT NULL)';
+          if (expressions !== expected) return `${source}: check constraints: ${expressions}`;
+          const changes = diff(target, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the import diffs as ${changes.map((change) => change.kind).join(',')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
  * The constraint-attribute round trip: a target changing the enforcement and deferrability of
  * constraints of every kind PostgreSQL 18 lets carry them. The primary key gains `DEFERRABLE
  * INITIALLY DEFERRED`, the unique constraint `DEFERRABLE`, one foreign key `NOT VALID`, the
@@ -2934,6 +3291,7 @@ const constraintAttributesScene = (): LiveScene => {
         },
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -3065,6 +3423,7 @@ const notNullConstraintNamesScene = (): LiveScene => {
         },
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -4046,6 +4405,161 @@ const introspectionFlagsNullsNotDistinctScene = (): LiveScene => ({
 });
 
 /**
+ * The constraint flags scene: the constraint states the model cannot carry stay flagged, one
+ * per table so the canonical table order is part of the pin. Raw setup SQL creates an
+ * exclusion constraint (no model shape, skipped whole and named by its constraint object), a
+ * check marked `NO INHERIT`, a unique constraint with an `INCLUDE` column list, and a foreign
+ * key with `MATCH FULL`; the model and target are empty, so the diagnostics are the whole
+ * claim. The generated names are PostgreSQL 16.15's conventional ones, pinned exactly.
+ */
+const introspectionFlagsConstraintsScene = (): LiveScene => ({
+  name: 'introspection-flags-constraints',
+  setupSql: [
+    'CREATE TABLE public.flag_check (a integer);',
+    'ALTER TABLE public.flag_check ADD CHECK (a > 0) NO INHERIT;',
+    'CREATE TABLE public.flag_excl (id integer, during tsrange, EXCLUDE USING gist (during WITH &&));',
+    'CREATE TABLE public.flag_parent (id integer PRIMARY KEY);',
+    'CREATE TABLE public.flag_fk (parent_id integer REFERENCES public.flag_parent (id) MATCH FULL);',
+    'CREATE TABLE public.flag_unique (a integer, b integer, UNIQUE (a) INCLUDE (b));',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_check',
+        message: 'dropped NO INHERIT on check constraint flag_check_a_check from public.flag_check',
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.flag_excl_during_excl',
+        message: 'skipped exclusion constraint public.flag_excl_during_excl',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fk',
+        message: 'dropped MATCH FULL on foreign key flag_fk_parent_id_fkey from public.flag_fk',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_unique',
+        message: 'dropped INCLUDE on unique constraint flag_unique_a_b_key from public.flag_unique',
+      },
+    ],
+  },
+});
+
+/**
+ * The PostgreSQL 15 constraint flags companion: `NULLS NOT DISTINCT` on a unique constraint
+ * and a foreign key whose `ON DELETE SET NULL` names a column list. Both attributes arrived in
+ * PostgreSQL 15, so the scene is skipped with a named reason on older servers; the diagnostic
+ * order is canonical table order.
+ */
+const introspectionFlagsConstraints15Scene = (): LiveScene => ({
+  name: 'introspection-flags-constraints-15',
+  minServerMajor: 15,
+  setupSql: [
+    'CREATE TABLE public.flag_parent (id integer PRIMARY KEY);',
+    'CREATE TABLE public.flag_fkcols (parent_id integer REFERENCES public.flag_parent (id) ON DELETE SET NULL (parent_id));',
+    'CREATE TABLE public.flag_nnd (a integer, UNIQUE NULLS NOT DISTINCT (a));',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fkcols',
+        message:
+          'dropped column list on foreign key flag_fkcols_parent_id_fkey from public.flag_fkcols',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nnd',
+        message:
+          'dropped NULLS NOT DISTINCT on unique constraint flag_nnd_a_key from public.flag_nnd',
+      },
+    ],
+  },
+});
+
+/**
+ * The PostgreSQL 18 constraint flags scene: the attributes only the PostgreSQL 18 grammar can
+ * state. A not-null constraint carries `NOT VALID` on one column and `NO INHERIT` on another;
+ * a primary key and a unique constraint use `WITHOUT OVERLAPS`; and a `PERIOD` foreign key
+ * references the primary key's temporal key. Every statement is checked against the
+ * PostgreSQL 18 grammar (`gram.y`: `NOT NULL_P ColId ConstraintAttributeSpec`,
+ * `columnList opt_without_overlaps`, and `columnList optionalPeriodName`), and the generated
+ * names are written explicitly so the pinned diagnostics do not depend on a naming rule the
+ * local server cannot exercise. Local PostgreSQL 16 runs skip this scene by name; CI's
+ * PostgreSQL 18 runs it.
+ */
+const introspectionFlagsConstraints18Scene = (): LiveScene => ({
+  name: 'introspection-flags-constraints-18',
+  minServerMajor: 18,
+  setupSql: [
+    'CREATE EXTENSION IF NOT EXISTS btree_gist;',
+    'CREATE TABLE public.flag_nn (c integer, d integer);',
+    'ALTER TABLE public.flag_nn ADD CONSTRAINT flag_nn_c_not_null NOT NULL c NOT VALID;',
+    'ALTER TABLE public.flag_nn ADD CONSTRAINT flag_nn_d_not_null NOT NULL d NO INHERIT;',
+    'CREATE TABLE public.flag_pk (id integer, during tsrange);',
+    'ALTER TABLE public.flag_pk ADD CONSTRAINT flag_pk_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);',
+    'CREATE TABLE public.flag_unique_period (id integer NOT NULL, during tsrange NOT NULL);',
+    'ALTER TABLE public.flag_unique_period ADD CONSTRAINT flag_unique_period_key UNIQUE (id, during WITHOUT OVERLAPS);',
+    'CREATE TABLE public.flag_fk_period (parent_id integer, parent_during tsrange);',
+    'ALTER TABLE public.flag_fk_period ADD CONSTRAINT flag_fk_period_fkey FOREIGN KEY (parent_id, PERIOD parent_during) REFERENCES public.flag_pk (id, PERIOD during);',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fk_period',
+        message: 'dropped PERIOD on foreign key flag_fk_period_fkey from public.flag_fk_period',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nn',
+        message: 'dropped NOT VALID on not-null constraint flag_nn_c_not_null from public.flag_nn',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nn',
+        message: 'dropped NO INHERIT on not-null constraint flag_nn_d_not_null from public.flag_nn',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_pk',
+        message: 'dropped WITHOUT OVERLAPS on primary key flag_pk_pkey from public.flag_pk',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_unique_period',
+        message:
+          'dropped WITHOUT OVERLAPS on unique constraint flag_unique_period_key' +
+          ' from public.flag_unique_period',
+      },
+    ],
+  },
+});
+
+/**
  * The truncated-name round trip: a table whose unnamed index, unique constraint, check
  * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
  * limit, plus an unnamed baseline index the target drops. The sizes are qualified so the
@@ -4369,6 +4883,7 @@ export const scenes: readonly LiveScene[] = [
   identityToSequenceScene(),
   sequenceToIdentityScene(),
   constraintCreateScene(),
+  introspectionConstraintsScene(),
   constraintAttributesScene(),
   notNullConstraintNamesScene(),
   indexCreateScene(),
@@ -4380,6 +4895,9 @@ export const scenes: readonly LiveScene[] = [
   columnAttributesScene(),
   introspectionFlagsScene(),
   introspectionFlagsNullsNotDistinctScene(),
+  introspectionFlagsConstraintsScene(),
+  introspectionFlagsConstraints15Scene(),
+  introspectionFlagsConstraints18Scene(),
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
 ];

@@ -2415,8 +2415,12 @@ function attachAlteredUniqueConstraint(
   attachUniqueConstraint(draft, uniqueConstraint);
 }
 
-/** Maps PostgreSQL's single-letter action codes; `NO ACTION` (the default) is absent. */
-function referentialAction(code: string | undefined): ReferentialAction | undefined {
+/**
+ * Maps PostgreSQL's single-letter action codes; `NO ACTION` (the default) is absent. Shared
+ * with the live-catalog mapper; exported for `catalog.ts`, deliberately not re-exported from
+ * `index.ts`.
+ */
+export function referentialAction(code: string | undefined): ReferentialAction | undefined {
   switch (code) {
     case 'r':
       return 'RESTRICT';
@@ -2630,8 +2634,12 @@ export function indexStructureKey(index: Index): string {
   return JSON.stringify([index.unique, index.columns]);
 }
 
-/** The duplicate guard's key for a unique constraint: the ordered columns and the attributes. */
-function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): string {
+/**
+ * The duplicate guard's key for a unique constraint: the ordered columns and the attributes.
+ * Shared with the live-catalog mapper's name canonicalization, so both inbound paths guard on
+ * the same structure; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
+ */
+export function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): string {
   return JSON.stringify([
     uniqueConstraint.columns,
     uniqueConstraint.deferrable ?? false,
@@ -2639,8 +2647,12 @@ function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): strin
   ]);
 }
 
-/** The duplicate guard's key for a check constraint: the expression and the enforcement. */
-function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
+/**
+ * The duplicate guard's key for a check constraint: the expression and the enforcement. Shared
+ * with the live-catalog mapper's name canonicalization; exported for `catalog.ts` and
+ * deliberately not re-exported from `index.ts`.
+ */
+export function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
   return JSON.stringify([checkConstraint.expression, checkConstraint.enforcement ?? null]);
 }
 
@@ -2651,9 +2663,10 @@ function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
  * equality-minus-name: a name is kept only beside a twin identical modulo name; a twin
  * differing in referenced columns, actions, or attributes has a different key, the guard does
  * not fire, and the name is stripped. The core diff matches foreign keys more narrowly
- * (`foreignKeyIdentity`: columns and target only).
+ * (`foreignKeyIdentity`: columns and target only). Shared with the live-catalog mapper's name
+ * canonicalization; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
  */
-function foreignKeyStructureKey(foreignKey: ForeignKey): string {
+export function foreignKeyStructureKey(foreignKey: ForeignKey): string {
   return JSON.stringify([
     foreignKey.columns,
     foreignKey.referencedTable.schema,
