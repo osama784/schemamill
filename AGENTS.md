@@ -4,6 +4,8 @@ Schemamill is a local-first studio for database schemas: one canonical model, im
 
 `CONTEXT.md` is the vocabulary law: use its terms in code, docs, issues, and commits; when a term is missing or wrong, fix `CONTEXT.md` rather than coining a synonym. Deeper material lives in `docs/domain/` (vision, principles, context map), `docs/adr/` (durable decisions), and `docs/plans/` (slice plans and deferred items).
 
+Read `DESIGN.md` before writing or reviewing any studio surface; brand assets live in `docs/brand/`.
+
 ## Repository map
 
 - `packages/core` — the canonical model, diff, plan, and hazard analysis; framework-free ([ADR 0005](docs/adr/0005-framework-free-core.md)).
