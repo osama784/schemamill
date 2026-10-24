@@ -110,6 +110,9 @@ test('ignores changelog-like snapshots and non-scanned files', () => {
     ),
     [],
   );
+  // A live claim must relate tests and scenes: a count snapshot with tests and skips but no
+  // scenes is not one, so `source: 2 skipped, 1 flagged` prose stays out.
+  assert.deepEqual(claimsOf('The workspace ran 315 tests; 2 skipped on PostgreSQL 16.15.'), []);
   assert.equal(isScannedDoc('CHANGELOG.md'), false);
   assert.equal(isScannedDoc('docs/adr/0016-catalog-constraint-canonicalization.md'), false);
   assert.equal(isScannedDoc('docs/plans/identity.md'), true);
