@@ -18,7 +18,7 @@ Sequence steps sit in six global phases around the first slice's table phases, i
 
 1. **Creates** — one `create-sequence` per added sequence, in identity order.
 2. **Detaches** — `ALTER SEQUENCE … OWNED BY NONE` for a kept sequence whose baseline owner the plan removes and whose ownership the target changes. The detach runs before the owner's drop: PostgreSQL cascades an owned sequence away with its table or column, so a later detach would find it gone.
-3. **Table operations** — the first slice's nine phases, unchanged.
+3. **Table operations** — the first slice's nine phases have grown to eighteen table phases.
 4. **Attaches and re-owns** — ownership changes whose baseline owner survives: a first owner, a re-own, or a detach when the target drops ownership but keeps the owner.
 5. **Option alters** — one `alter-sequence` per changed sequence, carrying its non-ownership changes.
 6. **Drops** — every removed sequence whose owner the plan does not remove, last. A `DROP SEQUENCE` is suppressed exactly when the plan also removes the table or column that owned it, because PostgreSQL cascades it; otherwise the drop comes after the table phases, so a column's `DROP DEFAULT` has already released the sequence. A surviving default that still references a dropped sequence is a self-inconsistent target: the drop is emitted and fails loudly at apply (round 2, decision 8).
