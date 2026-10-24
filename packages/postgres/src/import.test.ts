@@ -995,6 +995,30 @@ test('merges duplicate not-null declarations in either order, flagging only real
   });
   assert.deepEqual(formulaDuplicate.diagnostics, []);
 
+  // A generated formula name and a custom name are not a conflict: the formula reads as
+  // unnamed, so the custom name wins in either order.
+  for (const statements of [
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    ],
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+    ],
+  ]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+
   // Two different real names keep the first declaration and are flagged, never silent.
   for (const [names, kept] of [
     [['first_nn', 'second_nn'], 'first_nn'],

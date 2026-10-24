@@ -2839,7 +2839,9 @@ function finalizeTable(draft: TableDraft): Table {
  * nothing else — a name PostgreSQL truncated at 63 bytes strips, a collision-suffixed name
  * stays named — and it has no twin guard, because one not-null fact per column is the only
  * shape the model carries: the duplicate declaration is already collapsed by
- * `mergeNotNullDeclaration` in either statement order.
+ * `mergeNotNullDeclaration` in either statement order. That comparison normalizes both sides
+ * through `normalizedNotNullName`, so no DDL-import path stores the generated formula name; this
+ * strip stays as defense-in-depth for a direct or future path that stores one.
  */
 function canonicalizeNotNullNames(draft: TableDraft): void {
   draft.columns = draft.columns.map((column) => {
