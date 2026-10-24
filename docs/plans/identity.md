@@ -19,7 +19,7 @@ Identity steps open and close the plan's eight global phases, in this exact orde
 1. **drop-identity** — every removed identity whose column survives, in diff order. First, always: it must precede the `DROP NOT NULL`/`SET DEFAULT` the table phases put on the same column, and it frees the default sequence name for the replacement sequence the identity→serial conversion creates in phase 2 — or for the replacement identity's own sequence in phase 8.
 2. **create-sequence** — one per added sequence, in identity order.
 3. **Ownership detaches** — `ALTER SEQUENCE … OWNED BY NONE` where a kept sequence's baseline owner is removed, before the owner's drop.
-4. **Table operations** — the nine table phases, unchanged.
+4. **Table operations** — the eighteen table phases, unchanged.
 5. **Ownership attaches and re-owns** — the ownership changes whose baseline owner survives.
 6. **Option alters** — one `alter-sequence` per changed sequence.
 7. **drop-sequence** — every removed sequence whose owner the plan does not remove; a column's `DROP DEFAULT` has already released it.
@@ -66,7 +66,7 @@ Three levels pin the slice:
   - Each scene also checks that the identity columns come back column by column: the harness's retention guard matches every target identity against the re-imported model by `schema.table.column`, rejects an invented or moved identity, and fails the scene on any import diagnostic that names identity.
 - **Dogfood** — the sequences slice's 24-table corpus across `public`, `app`, and `"Sales"` (bigserial primary keys, a standalone `public.invoice_seq START WITH 1000`), plus a target that converts `public.audit_log.id` from `bigserial` to `GENERATED ALWAYS AS IDENTITY` reusing `public.audit_log_id_seq` and adds `public.identity_events` with a nameless identity: plan → apply the plan SQL verbatim → re-dump → import → `No changes.`, with no `audit_log_id_seq1` collision, the engine-chosen `public.identity_events_id_seq` for the nameless identity, and `attidentity` `a`/`d` after the migration. Commands and output on [#20](https://github.com/osama784/schemamill/issues/20#issuecomment-5913091302).
 
-On PostgreSQL 16.15 the live suite is 315 tests across 45 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 45 run.
+On PostgreSQL 16.15 the live suite is 317 tests across 45 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 45 run.
 
 ## Done means
 
