@@ -241,6 +241,180 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'psql-meta-command', object: String.raw`\unrestrict` },
 ] as const;
 
+/**
+ * The long-tail families in the order a dump emits them, captured from the #59 fact report:
+ * every statement is skipped with a family-named description, and the two `CREATE TABLE`
+ * attribute leftovers import partially and are flagged. The two plain `CREATE TABLE`s
+ * (`app.t`, `app.rls`) are present for the statements that reference them and produce nothing.
+ */
+const LONG_TAIL_DUMP = [
+  `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
+  '',
+  `CREATE VIEW app.v AS SELECT 1;`,
+  '',
+  `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 WITH NO DATA;`,
+  '',
+  `CREATE TABLE app.ctas AS SELECT 1;`,
+  '',
+  `REFRESH MATERIALIZED VIEW app.mv;`,
+  '',
+  `CREATE TABLE app.t (id integer);`,
+  '',
+  `CREATE TRIGGER trg AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();`,
+  '',
+  `CREATE FUNCTION app.f(a integer) RETURNS integer LANGUAGE sql AS $$SELECT a + 1$$;`,
+  '',
+  `CREATE PROCEDURE app.p() LANGUAGE sql AS $$ SELECT 1 $$;`,
+  '',
+  `CREATE RULE r AS ON INSERT TO app.t DO NOTHING;`,
+  '',
+  `CREATE POLICY pol ON app.t FOR SELECT USING ((id > 0));`,
+  '',
+  `ALTER POLICY pol ON app.t USING (false);`,
+  '',
+  `CREATE TABLE app.rls (id integer);`,
+  '',
+  `ALTER TABLE app.rls ENABLE ROW LEVEL SECURITY;`,
+  '',
+  `CREATE FOREIGN TABLE app.ft (id integer) SERVER s;`,
+  '',
+  `COMMENT ON MATERIALIZED VIEW app.mv IS 'x';`,
+  '',
+  `GRANT SELECT ON TABLE app.t TO app;`,
+  '',
+  `REVOKE SELECT ON TABLE app.t FROM app;`,
+  '',
+  `REVOKE ALL ON TABLE app.t FROM app;`,
+  '',
+  `CREATE TABLE app.like (LIKE app.t INCLUDING ALL);`,
+  '',
+  `CREATE TABLE app.child (b integer) INHERITS (app.parent);`,
+].join('\n');
+
+/** The complete diagnostic contract for `LONG_TAIL_DUMP`, in dump order. */
+const LONG_TAIL_DIAGNOSTICS = [
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'pgcrypto',
+    message: 'skipped CREATE EXTENSION pgcrypto',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.v',
+    message: 'skipped CREATE VIEW app.v',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.mv',
+    message: 'skipped CREATE MATERIALIZED VIEW app.mv',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.ctas',
+    message: 'skipped CREATE TABLE AS app.ctas',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.mv',
+    message: 'skipped REFRESH MATERIALIZED VIEW app.mv',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'trg',
+    message: 'skipped CREATE TRIGGER trg',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.f',
+    message: 'skipped CREATE FUNCTION app.f',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.p',
+    message: 'skipped CREATE PROCEDURE app.p',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'r',
+    message: 'skipped CREATE RULE r ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'pol',
+    message: 'skipped CREATE POLICY pol ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'pol',
+    message: 'skipped ALTER POLICY pol ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.rls',
+    message: 'skipped ALTER TABLE app.rls ENABLE ROW LEVEL SECURITY',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.ft',
+    message: 'skipped CREATE FOREIGN TABLE app.ft',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.mv',
+    message: 'skipped COMMENT ON MATERIALIZED VIEW app.mv',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'GRANT',
+    message: 'skipped GRANT statement',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'REVOKE',
+    message: 'skipped REVOKE statement',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'REVOKE',
+    message: 'skipped REVOKE statement',
+  },
+  {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'app.like',
+    message: 'dropped LIKE clause from app.like',
+  },
+  {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'app.child',
+    message: 'dropped inheritance from app.child',
+  },
+] as const;
+
+/** A diagnostic's pinned fields: kind, code, object, and message, with `position` stripped. */
+const describeDiagnostic = (diagnostic: Diagnostic) => ({
+  ...summarize(diagnostic),
+  message: diagnostic.message,
+});
+
 test('imports a pg_dump-shaped dump into the canonical model', async () => {
   const { model } = await importDump(DUMP);
 
@@ -345,6 +519,45 @@ test('reports skips, flags, and failures in dump order', async () => {
     line: 68,
     column: 39,
   });
+});
+
+test('names every long-tail family in dump order', async () => {
+  const { diagnostics } = await importDump(LONG_TAIL_DUMP);
+
+  assert.deepEqual(diagnostics.map(describeDiagnostic), LONG_TAIL_DIAGNOSTICS);
+});
+
+test('imports LIKE and INHERITS tables partially, flagging the dropped clauses', async () => {
+  const { model, diagnostics } = await importDump(LONG_TAIL_DUMP);
+
+  assert.deepEqual(
+    diagnostics.filter((diagnostic) => diagnostic.kind === 'flag').map(describeDiagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'app.like',
+        message: 'dropped LIKE clause from app.like',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'app.child',
+        message: 'dropped inheritance from app.child',
+      },
+    ],
+  );
+
+  const like = model.tables.find((table) => table.schema === 'app' && table.name === 'like');
+  assert.ok(like, 'the LIKE table imports');
+  assert.deepEqual(like.columns, []);
+
+  const child = model.tables.find((table) => table.schema === 'app' && table.name === 'child');
+  assert.ok(child, 'the INHERITS table imports');
+  assert.deepEqual(
+    child.columns.map((column) => column.name),
+    ['b'],
+  );
 });
 
 test('records only stated referential actions and flags foreign-key extras', async () => {
