@@ -1503,6 +1503,24 @@ function alterObjectKind(objtype: string): string {
   return ALTER_OBJECT_KINDS[objtype] ?? objtype.replace(/^OBJECT_/, '');
 }
 
+/** The SQL phrase an `AlterTableCmd.subtype` names, where it reads as SQL rather than a node. */
+const ALTER_TABLE_ACTION_PHRASES: Readonly<Record<string, string>> = {
+  AT_EnableRowSecurity: 'ENABLE ROW LEVEL SECURITY',
+  AT_DisableRowSecurity: 'DISABLE ROW LEVEL SECURITY',
+  AT_ForceRowSecurity: 'FORCE ROW LEVEL SECURITY',
+  AT_NoForceRowSecurity: 'NO FORCE ROW LEVEL SECURITY',
+};
+
+/**
+ * Describes an unhandled `ALTER TABLE` command: the row-security phrases read as SQL, and every
+ * other subtype keeps the node-named `action <subtype>` wording.
+ */
+function alterTableActionDescription(subtype: string | undefined, identity: string): string {
+  const phrase = subtype === undefined ? undefined : ALTER_TABLE_ACTION_PHRASES[subtype];
+  if (phrase !== undefined) return `ALTER TABLE ${identity} ${phrase}`;
+  return `ALTER TABLE action ${subtype ?? 'unknown'} on ${identity}`;
+}
+
 function translateAlterTable(
   statement: ParsedStatement,
   alter: AlterTableStmt,
@@ -1664,11 +1682,7 @@ function translateAlterTableCommand(
   }
 
   diagnostics.push(
-    skipStatement(
-      statement,
-      `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
-      identity,
-    ),
+    skipStatement(statement, alterTableActionDescription(command.subtype, identity), identity),
   );
 }
 
@@ -1814,11 +1828,7 @@ function attachColumnDefault(
 ): void {
   if (command.def === undefined) {
     diagnostics.push(
-      skipStatement(
-        statement,
-        `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
-        identity,
-      ),
+      skipStatement(statement, alterTableActionDescription(command.subtype, identity), identity),
     );
     return;
   }
@@ -2483,11 +2493,34 @@ function describeStatement(node: Node): StatementDescription {
   }
   if ('CreateTableAsStmt' in node) {
     const object = rangeVarName(node.CreateTableAsStmt.into?.rel) ?? 'table';
-    return { description: `CREATE TABLE AS ${object}`, object };
+    const kind =
+      node.CreateTableAsStmt.objtype === 'OBJECT_MATVIEW'
+        ? 'CREATE MATERIALIZED VIEW'
+        : 'CREATE TABLE AS';
+    return { description: `${kind} ${object}`, object };
+  }
+  if ('RefreshMatViewStmt' in node) {
+    const object = rangeVarName(node.RefreshMatViewStmt.relation) ?? 'materialized view';
+    return { description: `REFRESH MATERIALIZED VIEW ${object}`, object };
+  }
+  if ('RuleStmt' in node) {
+    const object = node.RuleStmt.rulename ?? 'rule';
+    const table = rangeVarName(node.RuleStmt.relation) ?? 'table';
+    return { description: `CREATE RULE ${object} ON ${table}`, object };
+  }
+  if ('CreatePolicyStmt' in node) {
+    const object = node.CreatePolicyStmt.policy_name ?? 'policy';
+    const table = rangeVarName(node.CreatePolicyStmt.table) ?? 'table';
+    return { description: `CREATE POLICY ${object} ON ${table}`, object };
+  }
+  if ('AlterPolicyStmt' in node) {
+    const object = node.AlterPolicyStmt.policy_name ?? 'policy';
+    const table = rangeVarName(node.AlterPolicyStmt.table) ?? 'table';
+    return { description: `ALTER POLICY ${object} ON ${table}`, object };
   }
   if ('CommentStmt' in node) {
     const object = commentObject(node.CommentStmt.object) ?? 'object';
-    const kind = (node.CommentStmt.objtype ?? 'OBJECT').replace(/^OBJECT_/, '');
+    const kind = alterObjectKind(node.CommentStmt.objtype ?? 'OBJECT');
     return { description: `COMMENT ON ${kind} ${object}`, object };
   }
   if ('VariableSetStmt' in node) {
@@ -2498,7 +2531,11 @@ function describeStatement(node: Node): StatementDescription {
     const setval = describeSetval(node.SelectStmt);
     return setval ?? { description: 'SELECT statement', object: 'SELECT' };
   }
-  if ('GrantStmt' in node) return { description: 'GRANT statement', object: 'GRANT' };
+  if ('GrantStmt' in node) {
+    return node.GrantStmt.is_grant === true
+      ? { description: 'GRANT statement', object: 'GRANT' }
+      : { description: 'REVOKE statement', object: 'REVOKE' };
+  }
   if ('CreateExtensionStmt' in node) {
     const object = node.CreateExtensionStmt.extname ?? 'extension';
     return { description: `CREATE EXTENSION ${object}`, object };
