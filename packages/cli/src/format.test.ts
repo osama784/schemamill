@@ -558,6 +558,96 @@ test('constraint and index member changes print in the diff vocabulary', () => {
   );
 });
 
+test('constraint attribute changes print their enforcement and deferrability', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { columns: ['id'] },
+          after: { columns: ['id'], deferrable: true, initiallyDeferred: true },
+        },
+        {
+          kind: 'primary-key-changed',
+          before: { name: 'u_pkey', columns: ['id'] },
+          after: { name: 'u_pkey', columns: ['id', 'org_id'] },
+        },
+        {
+          kind: 'primary-key-changed',
+          before: { columns: ['id'], deferrable: false },
+          after: { columns: ['id'], deferrable: true },
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: { columns: ['email'] },
+          after: { columns: ['email'], deferrable: true },
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: { name: 'u1', columns: ['email'], deferrable: true },
+          after: { name: 'u2', columns: ['email'] },
+        },
+        {
+          kind: 'check-constraint-changed',
+          before: { expression: 'x > 0' },
+          after: { name: 'c2', expression: 'x > 0', enforcement: 'not-enforced' },
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          },
+          after: {
+            name: 'fk2',
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            enforcement: 'not-enforced',
+            deferrable: true,
+            initiallyDeferred: true,
+          },
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            onDelete: 'RESTRICT',
+          },
+          after: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            onDelete: 'CASCADE',
+          },
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    ~ primary key (id) → (id): deferrable (none) → true, initially deferred (none) → true',
+      '    ~ primary key u_pkey (id) → u_pkey (id, org_id)',
+      '    ~ primary key (id) → (id): deferrable false → true',
+      '    ~ unique constraint (email): name (none) → (none), deferrable (none) → true',
+      '    ~ unique constraint (email): name u1 → u2, deferrable true → (none)',
+      '    ~ check constraint (x > 0): name (none) → c2, enforcement (none) → not-enforced',
+      '    ~ foreign key (team_id) → public.teams: name (none) → fk2, enforcement not-valid → not-enforced, deferrable (none) → true, initially deferred (none) → true',
+      '    ~ foreign key (team_id) → public.teams: on delete RESTRICT → CASCADE',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('added and removed tables list their constraints and indexes', () => {
   const changes: readonly Change[] = [
     {

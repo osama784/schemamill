@@ -37,7 +37,11 @@ import type {
  * A diff renders as one block per change, blank-line separated: `+`, `-`, or `~` then
  * `table <schema>.<name>`, followed by four-space-indented member lines; a changed column
  * carries its scalar fields on the `~ column` line and one `identity:` sub-line per identity
- * change after it; sequences render the same way after the table changes, as
+ * change after it; a changed primary key, unique constraint, check constraint, or foreign key
+ * appends the attribute fields that differ — `enforcement`, `deferrable`, `initially deferred`,
+ * in that order — as raw model values (`true`/`false`, with `(none)` for an absent side),
+ * comma-joined after `: ` on the same line and omitted when none differ, so no sub-lines are
+ * added; sequences render the same way after the table changes, as
  * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
  * and one line per step: a plan that is a single transactional group covering every step
  * reads `N steps in one transaction:` (singular `1 step in one transaction:`); a plan whose
@@ -45,7 +49,8 @@ import type {
  * reads `N steps in M groups:` with a `group k of M:` or `group k of M (standalone):` section
  * per group, its steps indented four spaces and numbered continuously; and an empty plan
  * reads `No changes.`. A step's kind label is padded to the longest label in the plan so
- * the details align, and a step's details expose every payload field it carries. A hazards
+ * the details align; the details print the member spellings, and the rendered SQL carries a
+ * constraint's attributes. A hazards
  * block renders as a `Hazards:` header and one two-space-indented
  * `step <n> <kind> <entity>: <clause>` line per hazard, numbered by the step it belongs to, in
  * the payload's order; the entity names the sequence (`schema.name`), the identity column
@@ -241,34 +246,100 @@ function formatTableChange(change: TableChange): string {
       return `+ ${formatPrimaryKey(change.primaryKey)}`;
     case 'primary-key-removed':
       return `- ${formatPrimaryKey(change.primaryKey)}`;
-    case 'primary-key-changed':
-      return `~ primary key ${formatPrimaryKeySide(change.before)} → ${formatPrimaryKeySide(
+    case 'primary-key-changed': {
+      const fields: string[] = [];
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      const sides = `~ primary key ${formatPrimaryKeySide(change.before)} → ${formatPrimaryKeySide(
         change.after,
       )}`;
+      return fields.length === 0 ? sides : `${sides}: ${fields.join(', ')}`;
+    }
     case 'foreign-key-added':
       return `+ ${formatForeignKey(change.foreignKey)}`;
     case 'foreign-key-removed':
       return `- ${formatForeignKey(change.foreignKey)}`;
-    case 'foreign-key-changed':
-      return `~ foreign key (${change.before.columns.join(', ')}) → ${formatIdentity(
+    case 'foreign-key-changed': {
+      const fields = formatForeignKeyChanges(change.before, change.after);
+      if (change.before.enforcement !== change.after.enforcement) {
+        fields.push(
+          `enforcement ${formatOptional(change.before.enforcement)} → ${formatOptional(
+            change.after.enforcement,
+          )}`,
+        );
+      }
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      const base = `~ foreign key (${change.before.columns.join(', ')}) → ${formatIdentity(
         change.before.referencedTable,
-      )}: ${formatForeignKeyChanges(change.before, change.after)}`;
+      )}`;
+      return fields.length === 0 ? base : `${base}: ${fields.join(', ')}`;
+    }
     case 'unique-constraint-added':
       return `+ ${formatUniqueConstraint(change.uniqueConstraint)}`;
     case 'unique-constraint-removed':
       return `- ${formatUniqueConstraint(change.uniqueConstraint)}`;
-    case 'unique-constraint-changed':
-      return `~ unique constraint (${change.before.columns.join(
-        ', ',
-      )}): name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`;
+    case 'unique-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      return `~ unique constraint (${change.before.columns.join(', ')}): ${fields.join(', ')}`;
+    }
     case 'check-constraint-added':
       return `+ ${formatCheckConstraint(change.checkConstraint)}`;
     case 'check-constraint-removed':
       return `- ${formatCheckConstraint(change.checkConstraint)}`;
-    case 'check-constraint-changed':
-      return `~ check constraint (${change.before.expression}): name ${formatOptional(
-        change.before.name,
-      )} → ${formatOptional(change.after.name)}`;
+    case 'check-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.enforcement !== change.after.enforcement) {
+        fields.push(
+          `enforcement ${formatOptional(change.before.enforcement)} → ${formatOptional(
+            change.after.enforcement,
+          )}`,
+        );
+      }
+      return `~ check constraint (${change.before.expression}): ${fields.join(', ')}`;
+    }
     case 'index-added':
       return `+ ${formatIndex(change.index)}`;
     case 'index-removed':
@@ -558,10 +629,10 @@ function formatGeneration(generation: IdentityGeneration): string {
 
 /**
  * A changed foreign-key pair's differing fields — name, referenced columns, `ON UPDATE`,
- * `ON DELETE`, in that order, joined `, `. The pairing identity (referencing columns →
- * referenced table) anchors the line and is never repeated here.
+ * `ON DELETE`, in that order. The pairing identity (referencing columns → referenced table)
+ * anchors the line and is never repeated here.
  */
-function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string {
+function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string[] {
   const fields: string[] = [];
   if (before.name !== after.name) {
     fields.push(`name ${formatOptional(before.name)} → ${formatOptional(after.name)}`);
@@ -579,7 +650,7 @@ function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string 
   if (before.onDelete !== after.onDelete) {
     fields.push(`on delete ${formatOptional(before.onDelete)} → ${formatOptional(after.onDelete)}`);
   }
-  return fields.join(', ');
+  return fields;
 }
 
 /**
@@ -606,6 +677,11 @@ function formatPersistence(persistence: TablePersistence | undefined): string {
 /** The value when present, `(none)` when the payload omits it. */
 function formatOptional(value: string | undefined): string {
   return value === undefined ? '(none)' : value;
+}
+
+/** A boolean as stored, `(none)` when the payload omits it. */
+function formatBooleanOptional(value: boolean | undefined): string {
+  return value === undefined ? '(none)' : String(value);
 }
 
 /** Whether two column-name arrays hold exactly the same names in the same order. */
