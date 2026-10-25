@@ -1,6 +1,6 @@
 # Design integration
 
-Status: planned · Last updated: 2026-10-22
+Status: built · Last updated: 2026-10-25
 
 Land the project's brand identity and design conventions in the repository. The brand kit is finished, internally audited and hash-verified, and has never been integrated. This slice is documentation and assets only: no product behavior, no studio surface, no code paths.
 
