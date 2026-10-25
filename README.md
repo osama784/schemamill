@@ -1,4 +1,10 @@
-# schemamill
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/brand/exports/readme/lockup-horizontal-480-transparent-dark.png 1x, ./docs/brand/exports/readme/lockup-horizontal-960-transparent-dark.png 2x">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/brand/exports/readme/lockup-horizontal-480-transparent-light.png 1x, ./docs/brand/exports/readme/lockup-horizontal-960-transparent-light.png 2x">
+    <img alt="schemamill" src="./docs/brand/exports/readme/lockup-horizontal-480-transparent-light.png" width="480">
+  </picture>
+</p>
 
 > Model your database. Change it safely. Keep it local.
 
@@ -18,6 +24,7 @@ PostgreSQL-only, local, and deliberate about its limits: not a database client, 
 - [`docs/domain/`](./docs/domain/) — five one-pagers: the vision, the core domain, the ubiquitous language, the context map, and principles & refusals.
 - [`docs/adr/`](./docs/adr/) — the accepted architecture decisions.
 - [`docs/plans/`](./docs/plans/) — the slice plans: what each slice set out to do, and where it landed.
+- [`docs/brand/`](./docs/brand/) — the brand kit: marks, wordmark, exports and the brand sheet; conventions in [`DESIGN.md`](./DESIGN.md).
 - [`CHANGELOG.md`](./CHANGELOG.md) — the release history: what shipped, version by version.
 
 **License:** MIT
