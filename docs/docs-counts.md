@@ -15,7 +15,7 @@ Counts repeated across the plans drift every time the plan or the live suite gro
 | Postgres tests | line-anchored top-level `test(` calls across `packages/postgres/src/*.test.ts` |
 | Always-on live subtests | `t.test(` calls after the `for (const scene of scenes)` loop in `live-pg.test.ts` |
 
-The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this slice it is 269 + 45 + 3 = 317 on PostgreSQL 16.15; the three PostgreSQL 18 scenes skip there and all 45 run in CI.
+The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this slice it is 278 + 46 + 3 = 327 on PostgreSQL 16.15; the three PostgreSQL 18 scenes skip there and all 46 run in CI.
 
 `live-scenes.ts` resolves `@schemamill/core` through the workspace link to `packages/core/dist`, so run `pnpm build` first. A failed import or parse is reported as `docs-counts: error …`; report mode still exits 0.
 
