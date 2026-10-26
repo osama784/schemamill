@@ -1,8 +1,8 @@
 # Third-party notices
 
 The agent skills under `.agents/skills/` are vendored from five upstream repositories. All five are
-MIT licensed. Each copyright line below is copied verbatim from that upstream's `LICENSE`, and the
-upstream path of every vendored skill is recorded in `skills-lock.json`.
+MIT licensed. Each copyright line below is copied verbatim from that upstream's licence file, and
+the upstream path of every vendored skill is recorded in `skills-lock.json`.
 
 ## Vendored skills
 
@@ -19,15 +19,18 @@ upstream path of every vendored skill is recorded in `skills-lock.json`.
 
 ## MIT licence
 
-The MIT terms are identical in all five upstream licences, so the single copy below covers all 25
-vendored skills. Only the copyright lines differ; the `wshobson/agents` copy ends with a trailing
-space and no final newline, which changes no terms.
+The MIT terms are identical in all five upstream licences and in `humanlayer/skills`, so the single
+copy below covers the 25 vendored skills and the `show-me` material reproduced in the `pr` skill.
+Only the copyright lines differ; the `wshobson/agents` copy ends with a trailing space and no final
+newline, which changes no terms. The `Copyright (c) 2026 HumanLayer` line governs that `show-me`
+prose, not a vendored skill directory.
 
 Copyright (c) 2026 Matt Pocock
 Copyright (c) 2026 Emil Kowalski
 Copyright (c) 2026 Jakub Krehel
 Copyright (c) 2024 Seth Hobson
 Copyright (c) 2026 Matthew Blode
+Copyright (c) 2026 HumanLayer
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -52,15 +55,14 @@ SOFTWARE.
 `branch-pr-flow` and `changelog-flow` under `.agents/skills/` were written in this repository and are
 covered by this repository's [LICENSE](LICENSE), not by any notice above.
 
-## Third-party material under other licences
+## Third-party material in the pr skill
 
 `.agents/skills/pr/SKILL.md` reproduces prose from the `show-me` skill in
-[humanlayer/humanlayer](https://github.com/humanlayer/humanlayer), by Dex Horthy
-([@dexhorthy](https://github.com/dexhorthy)). The Summary section's menu of visuals (pseudocode,
-call trees, component trees, file trees, Mermaid, diffs) and its placement guidance come from that
-skill, reproduced almost word for word and aimed at a diff instead of a live conversation.
+[humanlayer/skills](https://github.com/humanlayer/skills/blob/main/plugins/show-me/skills/show-me/SKILL.md),
+by Dex Horthy. The Summary section's menu of visuals (pseudocode, call trees, component trees, file
+trees, Mermaid, diffs) and its placement guidance come from that skill, reproduced almost word for
+word and aimed at a diff instead of a live conversation.
 
-That material is Apache-2.0 licensed. The licence text is vendored at
-[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt) and published upstream at
-<https://github.com/humanlayer/humanlayer/blob/main/LICENSE>. The specific change is disclosed in
-[`.agents/skills/pr/CREDITS.md`](.agents/skills/pr/CREDITS.md).
+That material is MIT licensed — `Copyright (c) 2026 HumanLayer` — and is covered by the licence copy
+above. The specific change is disclosed in [`.agents/skills/pr/CREDITS.md`](.agents/skills/pr/CREDITS.md),
+whose own metadata points at this path rather than the one its link text names.
