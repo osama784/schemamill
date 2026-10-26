@@ -37,6 +37,18 @@
       "skillPath": "skills/better-ui/SKILL.md",
       "computedHash": "6f69968c0d1ed034753d64aa22f2bf4332f1471164f110db720d05faf76c3551"
     },
+    "branch-pr-flow": {
+      "source": "local",
+      "sourceType": "local",
+      "skillPath": ".agents/skills/branch-pr-flow/SKILL.md",
+      "computedHash": "2f6caee9cc1b709f85ad52145d7a6ceb49985e214ff439ec53ae5aa43a0c8fab"
+    },
+    "changelog-flow": {
+      "source": "local",
+      "sourceType": "local",
+      "skillPath": ".agents/skills/changelog-flow/SKILL.md",
+      "computedHash": "08eb35594a983fdeba15f0e2f05c92c06ed136c3807edb1d6cba0377abaccd16"
+    },
     "codebase-design": {
       "source": "mattpocock/skills",
       "sourceType": "github",

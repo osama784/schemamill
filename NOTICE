@@ -1,8 +1,9 @@
 # Third-party notices
 
-The agent skills under `.agents/skills/` are vendored from five upstream repositories. All five are
-MIT licensed. Each copyright line below is copied verbatim from that upstream's licence file, and
-the upstream path of every vendored skill is recorded in `skills-lock.json`.
+Most of the agent skills under `.agents/skills/` are vendored from five upstream repositories; two
+are authored in this repository and listed separately below. All five are MIT licensed. Each
+copyright line below is copied verbatim from that upstream's licence file, and the upstream path of
+every vendored skill is recorded in `skills-lock.json`.
 
 ## Vendored skills
 
