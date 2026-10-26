@@ -12,6 +12,8 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
+Live catalog reading shipped in [#80](https://github.com/osama784/schemamill/issues/80), recorded in [ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md): standalone and owned sequences read back from `pg_class`/`pg_sequence`/`pg_depend` with their effective options and ownership, while identity sequences attach only to their column's identity descriptor and never appear as `Sequence` entries. Sequence state, renames, and unlogged or temporary persistence modeling stay deferred.
+
 ## Plan ordering
 
 Sequence steps sit in six global phases around the first slice's table phases, in this exact order:

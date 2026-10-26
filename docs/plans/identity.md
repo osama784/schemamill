@@ -10,7 +10,7 @@ Identity columns as first-class column properties in the model: the DDL forms a 
 
 **Out, named in diagnostics — never silent:** identity state — `RESTART`, `setval`, and `last_value`; sequence renames and `SET SCHEMA`; `LOGGED`/`UNLOGGED` persistence; `AS` and `OWNED BY` inside identity options; a cross-schema `SEQUENCE NAME` (flagged by name, and the identity is modeled without one); identity on a non-integer column; and partitioned, inheritance, typed, and foreign tables, which stay fenced by the existing table-level flags. An identity action on a column the import did not model as an identity is skipped and named.
 
-**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
+**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is read as part of the column's identity descriptor ([#80](https://github.com/osama784/schemamill/issues/80), [ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md)) and is not renamed or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
 ## Plan ordering
 
@@ -66,7 +66,7 @@ Three levels pin the slice:
   - Each scene also checks that the identity columns come back column by column: the harness's retention guard matches every target identity against the re-imported model by `schema.table.column`, rejects an invented or moved identity, and fails the scene on any import diagnostic that names identity.
 - **Dogfood** — the sequences slice's 24-table corpus across `public`, `app`, and `"Sales"` (bigserial primary keys, a standalone `public.invoice_seq START WITH 1000`), plus a target that converts `public.audit_log.id` from `bigserial` to `GENERATED ALWAYS AS IDENTITY` reusing `public.audit_log_id_seq` and adds `public.identity_events` with a nameless identity: plan → apply the plan SQL verbatim → re-dump → import → `No changes.`, with no `audit_log_id_seq1` collision, the engine-chosen `public.identity_events_id_seq` for the nameless identity, and `attidentity` `a`/`d` after the migration. Commands and output on [#20](https://github.com/osama784/schemamill/issues/20#issuecomment-5913091302).
 
-On PostgreSQL 16.15 the live suite is 317 tests across 45 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 45 run.
+On PostgreSQL 16.15 the live suite is 327 tests across 46 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 46 run.
 
 ## Done means
 
@@ -76,4 +76,4 @@ On PostgreSQL 16.15 the live suite is 317 tests across 45 scenes, 3 skipped — 
 
 ## Non-goals
 
-Introspection of identity columns from a live catalog; state-aware planning; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md); hazards, likewise listed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
+Identity introspection shipped in [#80](https://github.com/osama784/schemamill/issues/80) ([ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md)); state-aware planning; sequence renames and `SET SCHEMA`; identity persistence modeling; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md); hazards, likewise listed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
