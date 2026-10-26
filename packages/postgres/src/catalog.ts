@@ -1187,7 +1187,7 @@ function mapSequences(
 
   findings.sort(compareSequenceFindings);
   return {
-    sequences: sequences.sort(compareSequences),
+    sequences,
     identities,
     diagnostics: findings.map((finding) => finding.diagnostic),
   };
@@ -1314,11 +1314,6 @@ function sequenceOwnerKey(schema: string, name: string, column: string): string 
 
 /** Payload sequence order, the order the duplicate and contract checks walk. */
 function compareSequenceRows(left: SequenceRow, right: SequenceRow): number {
-  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
-}
-
-/** Canonical sequence order, mirroring the dump importer's `compareSequences`. */
-function compareSequences(left: Sequence, right: Sequence): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 
