@@ -64,5 +64,6 @@ trees, Mermaid, diffs) and its placement guidance come from that skill, reproduc
 word and aimed at a diff instead of a live conversation.
 
 That material is MIT licensed — `Copyright (c) 2026 HumanLayer` — and is covered by the licence copy
-above. The specific change is disclosed in [`.agents/skills/pr/CREDITS.md`](.agents/skills/pr/CREDITS.md),
-whose own metadata points at this path rather than the one its link text names.
+above. The specific change is disclosed in [`.agents/skills/pr/CREDITS.md`](.agents/skills/pr/CREDITS.md);
+the skill's own metadata records this path, while the link text in that file names a different
+repository.
