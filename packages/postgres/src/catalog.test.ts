@@ -212,6 +212,28 @@ const definition = (
 ) =>
   `CREATE ${unique ? 'UNIQUE ' : ''}INDEX ${indexName} ON ${schema}.${tableName} USING btree (${columns})`;
 
+/**
+ * A `sequences` row: a standalone permanent ascending bigint sequence unless overridden. The
+ * numeric fields are the payload's exact decimal strings, never JSON numbers.
+ */
+const sequence = (schema: string, name: string, rest: Record<string, unknown> = {}) => ({
+  schema,
+  name,
+  dataType: 'bigint',
+  start: '1',
+  increment: '1',
+  minValue: '1',
+  maxValue: '9223372036854775807',
+  cache: '1',
+  cycle: false,
+  persistence: 'p',
+  ownerKind: null,
+  ownerSchema: null,
+  ownerTable: null,
+  ownerColumn: null,
+  ...rest,
+});
+
 /** The sections of a payload, with the empty array default for sections a test does not use. */
 const payload = (sections: {
   readonly tables?: readonly unknown[];
@@ -220,6 +242,7 @@ const payload = (sections: {
   readonly indexes?: readonly unknown[];
   readonly constraints?: readonly unknown[];
   readonly notNullConstraints?: readonly unknown[];
+  readonly sequences?: readonly unknown[];
 }) => ({
   tables: [],
   columns: [],
@@ -227,6 +250,7 @@ const payload = (sections: {
   indexes: [],
   constraints: [],
   notNullConstraints: [],
+  sequences: [],
   ...sections,
 });
 
@@ -381,7 +405,7 @@ test('strips only the conventional primary-key name and keeps every other', asyn
   );
 });
 
-test('keeps the deferred column flags byte-stable and never reads a generated default', async () => {
+test('flags generation, attaches identity without a flag, and never reads a generated default', async () => {
   const read = await mapCatalog(
     payload({
       tables: [table('app', 'flags')],
@@ -391,8 +415,18 @@ test('keeps the deferred column flags byte-stable and never reads a generated de
           atthasdef: true,
           default: '(2 * 3)',
         }),
-        column('app', 'flags', 2, 'ident', { attidentity: 'a' }),
+        column('app', 'flags', 2, 'ident', { type: 'integer', attidentity: 'a' }),
         column('app', 'flags', 3, 'clean'),
+      ],
+      sequences: [
+        sequence('app', 'flags_ident_seq', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          ownerKind: 'identity',
+          ownerSchema: 'app',
+          ownerTable: 'flags',
+          ownerColumn: 'ident',
+        }),
       ],
     }),
   );
@@ -404,12 +438,6 @@ test('keeps the deferred column flags byte-stable and never reads a generated de
       object: 'app.flags',
       message: 'column gen is generated; generation is not represented yet',
     },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'app.flags',
-      message: 'column ident is an identity column; identity is not read yet',
-    },
   ];
   assert.deepEqual(read.diagnostics, expected);
   for (const diagnostic of read.diagnostics) {
@@ -417,12 +445,660 @@ test('keeps the deferred column flags byte-stable and never reads a generated de
   }
 
   // A generated column carries `atthasdef` and an attrdef row for its generation expression;
-  // the flag suppresses the default read, and the covered states carry no flag at all.
+  // the flag suppresses the default read. The identity column attaches its internal sequence
+  // with no diagnostic of its own; the covered states carry no flag at all.
   assert.deepEqual(read.model.tables[0]?.columns, [
     { name: 'gen', type: 'text', notNull: false },
-    { name: 'ident', type: 'text', notNull: false },
+    {
+      name: 'ident',
+      type: 'integer',
+      notNull: false,
+      identity: {
+        generated: 'always',
+        sequenceName: { schema: 'app', name: 'flags_ident_seq' },
+        increment: '1',
+        minValue: '1',
+        maxValue: '2147483647',
+        start: '1',
+        cache: '1',
+        cycle: false,
+      },
+    },
     { name: 'clean', type: 'text', notNull: false },
   ]);
+  assert.deepEqual(read.model.sequences, []);
+});
+
+test('maps standalone sequences with exact effective values, bigint bounds included', async () => {
+  const read = await mapCatalog(
+    payload({
+      sequences: [
+        sequence('zoo', 'tiny', {
+          dataType: 'smallint',
+          start: '-5',
+          increment: '-2',
+          minValue: '-32768',
+          maxValue: '-1',
+          cache: '7',
+          cycle: true,
+        }),
+        sequence('app', 'wide', {
+          start: '-9223372036854775808',
+          minValue: '-9223372036854775808',
+          maxValue: '9223372036854775807',
+          cache: '9007199254740993',
+        }),
+        sequence('app', 'mid', {
+          dataType: 'integer',
+          start: '10',
+          increment: '3',
+          minValue: '-2147483648',
+          maxValue: '2147483647',
+          cache: '2',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.sequences, [
+    {
+      schema: 'app',
+      name: 'mid',
+      dataType: 'integer',
+      increment: '3',
+      minValue: '-2147483648',
+      maxValue: '2147483647',
+      start: '10',
+      cache: '2',
+      cycle: false,
+    },
+    {
+      schema: 'app',
+      name: 'wide',
+      dataType: 'bigint',
+      increment: '1',
+      minValue: '-9223372036854775808',
+      maxValue: '9223372036854775807',
+      start: '-9223372036854775808',
+      cache: '9007199254740993',
+      cycle: false,
+    },
+    {
+      schema: 'zoo',
+      name: 'tiny',
+      dataType: 'smallint',
+      increment: '-2',
+      minValue: '-32768',
+      maxValue: '-1',
+      start: '-5',
+      cache: '7',
+      cycle: true,
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+  for (const value of read.model.sequences.flatMap((entry) => [
+    entry.increment,
+    entry.minValue,
+    entry.maxValue,
+    entry.start,
+    entry.cache,
+  ])) {
+    assert.equal(typeof value, 'string', 'every numeric option travels as an exact string');
+  }
+});
+
+test('maps an owned sequence with its schema-qualified owner', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'users')],
+      columns: [column('public', 'users', 1, 'id', { type: 'integer', attnotnull: true })],
+      sequences: [
+        sequence('public', 'users_id_seq', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          ownerKind: 'owned',
+          ownerSchema: 'public',
+          ownerTable: 'users',
+          ownerColumn: 'id',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.sequences, [
+    {
+      schema: 'public',
+      name: 'users_id_seq',
+      dataType: 'integer',
+      increment: '1',
+      minValue: '1',
+      maxValue: '2147483647',
+      start: '1',
+      cache: '1',
+      cycle: false,
+      ownedBy: { table: { schema: 'public', name: 'users' }, column: 'id' },
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('skips sequences whose owner relation or column is unread', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't'), table('public', 'part', { relkind: 'p' })],
+      columns: [column('public', 't', 1, 'id', { type: 'integer' })],
+      sequences: [
+        sequence('public', 'part_id_seq', {
+          dataType: 'integer',
+          persistence: 'u',
+          ownerKind: 'owned',
+          ownerSchema: 'public',
+          ownerTable: 'part',
+          ownerColumn: 'id',
+        }),
+        sequence('public', 't_dropped_seq', {
+          dataType: 'integer',
+          ownerKind: 'owned',
+          ownerSchema: 'public',
+          ownerTable: 't',
+          ownerColumn: null,
+        }),
+        sequence('public', 'view_id_seq', {
+          dataType: 'integer',
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 'missing_view',
+          ownerColumn: 'id',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.sequences, []);
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.part',
+      message: 'table public.part is partitioned; partitioning is not represented yet',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.part_id_seq',
+      message:
+        'sequence public.part_id_seq belongs to unread relation public.part; it is not represented',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t_dropped_seq',
+      message:
+        'sequence public.t_dropped_seq belongs to unread relation public.t; it is not represented',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.view_id_seq',
+      message:
+        'sequence public.view_id_seq belongs to unread relation public.missing_view; it is not represented',
+    },
+  ]);
+});
+
+test('attaches identity always and by default with the real sequence name and options', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'users')],
+      columns: [
+        column('public', 'users', 1, 'id', {
+          type: 'integer',
+          attnotnull: true,
+          attidentity: 'a',
+        }),
+        column('public', 'users', 2, 'legacy_id', { type: 'bigint', attidentity: 'd' }),
+      ],
+      sequences: [
+        sequence('public', 'users_id_seq', {
+          dataType: 'integer',
+          start: '100',
+          increment: '5',
+          minValue: '10',
+          maxValue: '2000',
+          cache: '20',
+          cycle: true,
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 'users',
+          ownerColumn: 'id',
+        }),
+        sequence('public', 'users_legacy_id_seq', {
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 'users',
+          ownerColumn: 'legacy_id',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    {
+      name: 'id',
+      type: 'integer',
+      notNull: true,
+      identity: {
+        generated: 'always',
+        sequenceName: { schema: 'public', name: 'users_id_seq' },
+        increment: '5',
+        minValue: '10',
+        maxValue: '2000',
+        start: '100',
+        cache: '20',
+        cycle: true,
+      },
+    },
+    {
+      name: 'legacy_id',
+      type: 'bigint',
+      notNull: false,
+      identity: {
+        generated: 'by default',
+        sequenceName: { schema: 'public', name: 'users_legacy_id_seq' },
+        increment: '1',
+        minValue: '1',
+        maxValue: '9223372036854775807',
+        start: '1',
+        cache: '1',
+        cycle: false,
+      },
+    },
+  ]);
+  assert.deepEqual(read.model.sequences, []);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('rejects identity and ownership contract violations', async () => {
+  const identityBase = {
+    tables: [table('public', 't')],
+    columns: [column('public', 't', 1, 'id', { type: 'integer', attidentity: 'a' })],
+  };
+  await assert.rejects(
+    () => mapCatalog(payload(identityBase)),
+    /catalog payload: identity column "public\.t\.id" has no internal sequence/,
+    'an identity column without an internal sequence',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          tables: [table('public', 't')],
+          columns: [column('public', 't', 1, 'x', { type: 'integer' })],
+          sequences: [
+            sequence('public', 't_id_seq', {
+              dataType: 'integer',
+              ownerKind: 'identity',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'x',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: internal sequence "public\.t_id_seq" is owned by column "public\.t\.x", which is not an identity column/,
+    'an internal sequence on a non-identity column',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...identityBase,
+          sequences: [
+            sequence('public', 't_id_seq', {
+              dataType: 'integer',
+              ownerKind: 'identity',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'id',
+            }),
+            sequence('public', 't_id_seq2', {
+              dataType: 'integer',
+              ownerKind: 'identity',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'id',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: identity column "public\.t\.id" has more than one internal sequence/,
+    'two internal sequences for one column',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          tables: [table('public', 't')],
+          columns: [column('public', 't', 1, 'id', { type: 'text', attidentity: 'a' })],
+          sequences: [
+            sequence('public', 't_id_seq', {
+              ownerKind: 'identity',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'id',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: identity column "public\.t\.id" has type "text", which is not an integer type/,
+    'an identity column of a non-integer type',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          tables: [table('public', 't')],
+          columns: [column('public', 't', 1, 'id', { type: 'integer' })],
+          sequences: [
+            sequence('public', 't_id_seq', {
+              dataType: 'integer',
+              ownerKind: 'owned',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'missing',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: sequence "public\.t_id_seq" is owned by column "public\.t\.missing", which is not a read column of its table/,
+    'an owner column on an otherwise-read ordinary table',
+  );
+  await assert.rejects(
+    () => mapCatalog(payload({ sequences: [sequence('public', 's', { ownerKind: 'owned' })] })),
+    /catalog payload: sequence "public\.s" is owned but carries no owner table/,
+    'an owned row without an owner table',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          tables: [table('public', 't')],
+          columns: [column('public', 't', 1, 'id', { type: 'integer', attidentity: 'x' })],
+          sequences: [
+            sequence('public', 't_id_seq', {
+              dataType: 'integer',
+              ownerKind: 'identity',
+              ownerSchema: 'public',
+              ownerTable: 't',
+              ownerColumn: 'id',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: identity column "public\.t\.id" has unknown attidentity "x"/,
+    'an unknown attidentity letter',
+  );
+});
+
+test('rejects duplicate and malformed sequence rows', async () => {
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          sequences: [sequence('public', 's'), sequence('public', 's', { increment: '2' })],
+        }),
+      ),
+    /catalog payload: duplicate sequence "public\.s"/,
+    'two sequence rows for one identity',
+  );
+
+  const cases: readonly (readonly [string, unknown, RegExp])[] = [
+    [
+      'a missing sequences section',
+      {
+        tables: [],
+        columns: [],
+        primaryKeys: [],
+        indexes: [],
+        constraints: [],
+        notNullConstraints: [],
+      },
+      /catalog payload\.sequences must be an array/,
+    ],
+    [
+      'a non-array sequences section',
+      {
+        tables: [],
+        columns: [],
+        primaryKeys: [],
+        indexes: [],
+        constraints: [],
+        notNullConstraints: [],
+        sequences: {},
+      },
+      /catalog payload\.sequences must be an array/,
+    ],
+    [
+      'an unknown sequence field',
+      payload({ sequences: [{ ...sequence('public', 's'), extra: true }] }),
+      /catalog payload\.sequences\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'a non-string sequence field',
+      payload({ sequences: [{ ...sequence('public', 's'), start: 1 }] }),
+      /catalog payload\.sequences\[0\]\.start must be a string/,
+    ],
+    [
+      'a non-boolean cycle',
+      payload({ sequences: [sequence('public', 's', { cycle: 'yes' })] }),
+      /catalog payload\.sequences\[0\]\.cycle must be a boolean/,
+    ],
+    [
+      'an unsupported data type',
+      payload({ sequences: [sequence('public', 's', { dataType: 'numeric' })] }),
+      /catalog payload\.sequences\[0\]\.dataType must be "smallint", "integer", or "bigint"/,
+    ],
+    [
+      'an unsupported owner kind',
+      payload({ sequences: [sequence('public', 's', { ownerKind: 'serial' })] }),
+      /catalog payload\.sequences\[0\]\.ownerKind must be "owned", "identity", or null/,
+    ],
+    [
+      'an unsupported persistence',
+      payload({ sequences: [sequence('public', 's', { persistence: 'x' })] }),
+      /catalog payload\.sequences\[0\]\.persistence must be "p", "u", or "t"/,
+    ],
+  ];
+  for (const [label, malformed, pattern] of cases) {
+    await assert.rejects(() => mapCatalog(malformed), pattern, label);
+  }
+});
+
+test('flags ordinary and identity sequence persistence and keeps the model state', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't'), table('public', 'u', { relpersistence: 'u' })],
+      columns: [
+        column('public', 't', 1, 'id', { type: 'integer', attidentity: 'a' }),
+        column('public', 'u', 1, 'id', { type: 'integer', attidentity: 'a' }),
+      ],
+      indexes: [
+        index('public', 't', 't_bad_idx', definition('public', 't', 't_bad_idx', 'id'), {
+          valid: false,
+        }),
+      ],
+      sequences: [
+        sequence('public', 'plain_unlogged', { persistence: 'u' }),
+        sequence('public', 'plain_temp', { persistence: 't' }),
+        sequence('public', 't_id_seq', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          persistence: 'u',
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 't',
+          ownerColumn: 'id',
+        }),
+        sequence('public', 'u_id_seq', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          persistence: 'p',
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 'u',
+          ownerColumn: 'id',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.sequences.map((entry) => `${entry.schema}.${entry.name}`),
+    ['public.plain_temp', 'public.plain_unlogged'],
+    'unlogged and temporary ordinary sequences still map plain',
+  );
+  assert.equal(
+    read.model.tables[0]?.columns[0]?.identity?.sequenceName?.name,
+    't_id_seq',
+    'the unlogged identity sequence still attaches',
+  );
+  assert.equal(
+    read.model.tables[1]?.columns[0]?.identity?.sequenceName?.name,
+    'u_id_seq',
+    'the logged identity sequence on an unlogged table still attaches',
+  );
+
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t_bad_idx',
+      message:
+        'index public.t_bad_idx is not valid and ready; invalid indexes are not represented yet',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.plain_temp',
+      message:
+        'sequence public.plain_temp is temporary; temporary sequence persistence is not represented yet',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.plain_unlogged',
+      message:
+        'sequence public.plain_unlogged is unlogged; unlogged sequence persistence is not represented yet',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        "column id's identity sequence public.t_id_seq has unlogged persistence; identity persistence is not represented yet",
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.u',
+      message:
+        "column id's identity sequence public.u_id_seq has logged persistence; identity persistence is not represented yet",
+    },
+  ]);
+  for (const diagnostic of read.diagnostics) {
+    assert.equal('position' in diagnostic, false, 'introspection diagnostics carry no position');
+  }
+});
+
+test('sorts sequences independently of payload order and keeps identity on its column', async () => {
+  const sections = {
+    tables: [table('public', 't')],
+    columns: [
+      column('public', 't', 1, 'id', { type: 'integer', attidentity: 'a' }),
+      column('public', 't', 2, 'note'),
+    ],
+    sequences: [
+      sequence('public', 'z_seq'),
+      sequence('app', 'b_seq'),
+      sequence('app', 'a_seq'),
+      sequence('public', 't_id_seq', {
+        dataType: 'integer',
+        maxValue: '2147483647',
+        ownerKind: 'identity',
+        ownerSchema: 'public',
+        ownerTable: 't',
+        ownerColumn: 'id',
+      }),
+    ],
+  };
+  const forward = await mapCatalog(payload(sections));
+  const reversed = await mapCatalog(
+    payload({ ...sections, sequences: [...sections.sequences].reverse() }),
+  );
+
+  assert.deepEqual(forward, reversed, 'the mapper does not depend on sequence payload order');
+  assert.deepEqual(
+    forward.model.sequences.map((entry) => `${entry.schema}.${entry.name}`),
+    ['app.a_seq', 'app.b_seq', 'public.z_seq'],
+    'sequences come back in schema-then-name order, identity rows never among them',
+  );
+  assert.deepEqual(
+    forward.model.tables[0]?.columns.map((column) => column.name),
+    ['id', 'note'],
+    'columns keep attribute order',
+  );
+  assert.equal(
+    forward.model.tables[0]?.columns[0]?.identity?.sequenceName?.name,
+    't_id_seq',
+    'the identity stays attached to its column',
+  );
+});
+
+test('maps a serial-owned sequence beside an identity column on the same column', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'id', { type: 'integer', attidentity: 'a' })],
+      sequences: [
+        sequence('public', 't_id_seq', {
+          dataType: 'integer',
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 't',
+          ownerColumn: 'id',
+        }),
+        sequence('public', 't_id_seq1', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          ownerKind: 'owned',
+          ownerSchema: 'public',
+          ownerTable: 't',
+          ownerColumn: 'id',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.sequences, [
+    {
+      schema: 'public',
+      name: 't_id_seq1',
+      dataType: 'integer',
+      increment: '1',
+      minValue: '1',
+      maxValue: '2147483647',
+      start: '1',
+      cache: '1',
+      cycle: false,
+      ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' },
+    },
+  ]);
+  assert.equal(
+    read.model.tables[0]?.columns[0]?.identity?.sequenceName?.name,
+    't_id_seq',
+    'the internal sequence attaches as identity, the leftover owned sequence stays a sequence',
+  );
+  assert.deepEqual(read.diagnostics, []);
 });
 
 test('reads defaults whitespace-normalized, only with atthasdef and an attrdef row', async () => {

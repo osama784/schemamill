@@ -3,9 +3,9 @@
  *
  * The transport is the `psql` binary — the live harness's choice, so no client-library
  * dependency is added. One `-c` batch carries one `SELECT` returning one `json` document with
- * the `tables`, `columns`, `primaryKeys`, `indexes`, `constraints`, and `notNullConstraints`
- * sections; `psql` runs a single `-c` batch as one implicit transaction, so the sections share
- * one snapshot. The child
+ * the `tables`, `columns`, `primaryKeys`, `indexes`, `constraints`, `notNullConstraints`, and
+ * `sequences` sections; `psql` runs a single `-c` batch as one implicit transaction, so the
+ * sections share one snapshot. The child
  * environment's `PGOPTIONS` sets `search_path=''` — the congruence with `pg_dump`, which
  * reads the catalog under the same empty path, so `format_type`'s spelling matches the dumped
  * DDL — and `default_transaction_read_only=on` as read-only posture. The read itself is the
@@ -21,20 +21,27 @@
  * Failure handling is a split. Transport failures (spawn error, non-zero exit, unparseable
  * JSON output) and any violation of the `SELECT`'s own payload contract — a missing or
  * wrong-typed field, an unknown or duplicate relation, orphan column, primary-key, index,
- * constraint, or not-null rows, a duplicate `(schema, table, conname)` constraint row, a
- * duplicate not-null row for one column, a row-shape violation against its constraint kind, a
- * primary key whose rows disagree, a not-null row whose column is not read or not `NOT NULL`,
- * an unknown storage or compression letter behind an explicit setting, or an index definition
- * that does not parse to one `CREATE INDEX` — throw an `Error` carrying the reason.
+ * constraint, not-null, or sequence rows, a duplicate `(schema, table, conname)` constraint
+ * row, a duplicate not-null row for one column, a row-shape violation against its constraint
+ * kind, a primary key whose rows disagree, a not-null row whose column is not read or not
+ * `NOT NULL`, an unknown storage or compression letter behind an explicit setting, an index
+ * definition that does not parse to one `CREATE INDEX`, an owner column missing from an
+ * otherwise-read table, or an identity attachment that is missing, duplicated, or on a
+ * non-identity or non-integer column — throw an `Error` carrying the reason.
  * Diagnostics are only for sane-but-deferred catalog state: a partitioned relation is skipped
- * and named, temporary persistence is flagged on an imported table, the column features the
- * model does not carry — generation and identity — are each flagged and named, the constraint
- * attributes the model does not carry are flagged and named, an exclusion constraint is
+ * and named, temporary persistence is flagged on an imported table, generation — the column
+ * feature the model does not carry — is flagged and named, a sequence owned by an unread
+ * relation is skipped and named, ordinary sequence persistence is flagged and named while the
+ * sequence still maps, identity sequence persistence differing from its table's is flagged and
+ * named while the identity still attaches, the constraint attributes the model does not carry
+ * are flagged and named, an exclusion constraint is
  * skipped whole, and an index outside the importer's envelope or not valid and ready is
  * skipped and named while one on a non-default tablespace is kept and flagged. Every
  * diagnostic keeps the import module's grammar: `object` is `<schema>.<table>` — for an index
- * finding, `<schema>.<indexName>`, and for an exclusion skip, `<schema>.<conname>` — and the
- * column or object, when relevant, is named in `message`; `position` is never set.
+ * or sequence finding, `<schema>.<indexName>` or `<schema>.<sequenceName>`, for an
+ * identity-persistence flag `<schema>.<table>`, and for an exclusion skip
+ * `<schema>.<conname>` — and the column or object, when relevant, is named in `message`;
+ * `position` is never set.
  *
  * The pure half, `mapCatalog`, takes the parsed payload to the model and diagnostics; it is
  * exported for the unit suite but deliberately not re-exported from `index.ts`, which carries
@@ -53,15 +60,21 @@ import type {
   ConstraintEnforcement,
   Diagnostic,
   ForeignKey,
+  Identity,
+  IdentityGeneration,
   Index,
   Model,
   PrimaryKey,
   ReadResult,
+  Sequence,
+  SequenceDataType,
+  SequenceOwner,
   Table,
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
 } from '@schemamill/core';
+import { canonicalIntType, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import { parse, type IndexStmt } from 'libpg-query';
 
 import {
@@ -94,9 +107,10 @@ const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
 
 /**
- * The one read: a single `json` document with the tables, columns, primary keys, indexes, and
- * constraint sections of every user schema, system schemas excluded. Tables carry what the
- * deferred-states pass needs (`relkind`, `relispartition`, `relpersistence`); columns are read
+ * The one read: a single `json` document with the tables, columns, primary keys, indexes,
+ * constraints, and sequences sections of every user schema, system schemas excluded. Tables
+ * carry what the deferred-states pass needs (`relkind`, `relispartition`, `relpersistence`);
+ * columns are read
  * for ordinary tables only, in attribute order, with the type spelling `format_type` gives,
  * the `pg_attrdef` default expression `pg_get_expr` renders (null when there is none), the
  * explicit collation's `pg_dump` spelling (`format('%I.%I', …)` over `pg_collation` and its
@@ -121,6 +135,13 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * empty), and `indnullsnotdistinct` (15; `false`) — so the query parses and runs on PostgreSQL
  * 13. Every section orders deterministically for the payload, but the mapper does not depend on
  * row order.
+ *
+ * The `sequences` section reads every sequence relation in the same schema scope. Each row
+ * carries `pg_sequence`'s declared options as exact decimal text (never a JSON number, so a
+ * bigint bound survives the trip), the relation's persistence, and the optional owning column
+ * that `pg_depend` names: `deptype 'a'` is `OWNED BY`, `'i'` is an identity column's internal
+ * sequence. Every owner-side join is a left join, so a standalone sequence carries nulls there
+ * and does not multiply; the inner `pg_sequence` join follows `relkind = 'S'`.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -384,6 +405,52 @@ SELECT json_build_object(
         AND c.oid IS NULL
       ORDER BY namespace.nspname, relation.relname, index_relation.relname
     ) AS index_row
+  ), '[]'::json),
+  'sequences', COALESCE((
+    SELECT json_agg(row_to_json(sequence_row))
+    FROM (
+      SELECT
+        sequence_namespace.nspname AS schema,
+        sequence_relation.relname AS name,
+        pg_catalog.format_type(sequence_data.seqtypid, NULL) AS "dataType",
+        sequence_data.seqstart::text AS start,
+        sequence_data.seqincrement::text AS increment,
+        sequence_data.seqmin::text AS "minValue",
+        sequence_data.seqmax::text AS "maxValue",
+        sequence_data.seqcache::text AS cache,
+        sequence_data.seqcycle AS cycle,
+        sequence_relation.relpersistence AS persistence,
+        CASE dependency.deptype
+          WHEN 'a' THEN 'owned'
+          WHEN 'i' THEN 'identity'
+        END AS "ownerKind",
+        owner_namespace.nspname AS "ownerSchema",
+        owner_relation.relname AS "ownerTable",
+        owner_attribute.attname AS "ownerColumn"
+      FROM pg_catalog.pg_class AS sequence_relation
+      JOIN pg_catalog.pg_namespace AS sequence_namespace
+        ON sequence_namespace.oid = sequence_relation.relnamespace
+      JOIN pg_catalog.pg_sequence AS sequence_data
+        ON sequence_data.seqrelid = sequence_relation.oid
+      LEFT JOIN pg_catalog.pg_depend AS dependency
+        ON dependency.classid = 'pg_class'::regclass
+       AND dependency.objid = sequence_relation.oid
+       AND dependency.objsubid = 0
+       AND dependency.refclassid = 'pg_class'::regclass
+       AND dependency.deptype IN ('a', 'i')
+      LEFT JOIN pg_catalog.pg_class AS owner_relation
+        ON owner_relation.oid = dependency.refobjid
+      LEFT JOIN pg_catalog.pg_namespace AS owner_namespace
+        ON owner_namespace.oid = owner_relation.relnamespace
+      LEFT JOIN pg_catalog.pg_attribute AS owner_attribute
+        ON owner_attribute.attrelid = owner_relation.oid
+       AND owner_attribute.attnum = dependency.refobjsubid
+       AND NOT owner_attribute.attisdropped
+      WHERE sequence_relation.relkind = 'S'
+        AND sequence_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND sequence_namespace.nspname NOT LIKE 'pg\\_%'
+      ORDER BY sequence_namespace.nspname, sequence_relation.relname
+    ) AS sequence_row
   ), '[]'::json)
 ) AS document
 `.trim();
@@ -539,17 +606,57 @@ interface IndexRow {
 }
 
 /**
+ * One `sequences` row of the payload after validation: the sequence's declared options as
+ * exact decimal strings, its persistence, and the owning column `pg_depend` names — all owner
+ * fields null for a standalone sequence, `ownerColumn` null when the owner's attribute is
+ * dropped or unread.
+ */
+interface SequenceRow {
+  readonly schema: string;
+  readonly name: string;
+  readonly dataType: SequenceDataType;
+  readonly start: string;
+  readonly increment: string;
+  readonly minValue: string;
+  readonly maxValue: string;
+  readonly cache: string;
+  readonly cycle: boolean;
+  readonly persistence: 'p' | 'u' | 't';
+  readonly ownerKind: 'owned' | 'identity' | null;
+  readonly ownerSchema: string | null;
+  readonly ownerTable: string | null;
+  readonly ownerColumn: string | null;
+}
+
+/** One identity sequence attached to its mapped table and column. */
+interface MappedIdentity {
+  readonly row: SequenceRow;
+  readonly table: TableRow;
+  readonly column: ColumnRow;
+}
+
+/** The `sequences` section resolved into the model's sequences, identity map, and findings. */
+interface SequenceMapping {
+  readonly sequences: readonly Sequence[];
+  readonly identities: ReadonlyMap<string, MappedIdentity>;
+  readonly diagnostics: readonly Diagnostic[];
+}
+
+/**
  * The pure mapper: a validated payload — the `SELECT`'s parsed `json` document — to the
  * canonical model and its diagnostics. Tables come back in canonical order (schema, then name,
  * plain string comparison) and columns in attribute order regardless of payload order, since
- * the model's ordering contract is the mapper's, not SQL's collation's. Contract violations
- * throw; only the deferred catalog states become diagnostics, in canonical table order with
- * table-level flags before a table's column flags, columns in attribute order, not-null flags
- * in the same attribute order, constraint findings in stored `conname` order, and index
- * findings after them in stored-name order. Index definitions parse through libpg-query, so the
- * mapper is async; its output does not depend on payload row order: index and constraint rows
- * sort by stored name before the conventional-name strip, and the entries stable-sort by
- * `name ?? ''` exactly as `finalizeTable` sorts the importer's.
+ * the model's ordering contract is the mapper's, not SQL's collation's. Sequences come back in
+ * the same schema-then-name order as the importer; identity sequences attach to their columns
+ * and never enter `Model.sequences`. Contract violations throw; only the deferred catalog
+ * states become diagnostics, in canonical table order with table-level flags before a table's
+ * column flags, columns in attribute order, not-null flags in the same attribute order,
+ * constraint findings in stored `conname` order, index findings after them in stored-name
+ * order, and sequence/identity findings last in their own schema-then-name order. Index
+ * definitions parse through libpg-query, so the mapper is async; its output does not depend on
+ * payload row order: index and constraint rows sort by stored name before the
+ * conventional-name strip, and the entries stable-sort by `name ?? ''` exactly as
+ * `finalizeTable` sorts the importer's.
  */
 export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Diagnostic>> {
   const document = expectObject(payload, 'catalog payload');
@@ -560,6 +667,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     'indexes',
     'constraints',
     'notNullConstraints',
+    'sequences',
   ]);
   const tables = expectArray(document, 'tables', 'catalog payload').map((row, index) =>
     parseTableRow(row, `catalog payload.tables[${index}]`),
@@ -580,6 +688,9 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   for (const [index, row] of expectArray(document, 'indexes', 'catalog payload').entries()) {
     indexRows.push(await parseIndexRow(row, `catalog payload.indexes[${index}]`));
   }
+  const sequenceRows = expectArray(document, 'sequences', 'catalog payload').map((row, index) =>
+    parseSequenceRow(row, `catalog payload.sequences[${index}]`),
+  );
 
   const tablesByKey = new Map<string, TableRow>();
   for (const table of tables) {
@@ -737,6 +848,8 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     }
     tableIndexes.push(row);
   }
+
+  const sequenceMapping = mapSequences(sequenceRows, tablesByKey, columnsByTable);
 
   const diagnostics: Diagnostic[] = [];
   const modelTables: Table[] = [];
@@ -907,11 +1020,13 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           notNullRow.conname === synthesizedNotNullName(row.name, column.name)
             ? undefined
             : notNullRow.conname;
+        const identity = identityFor(row, column, sequenceMapping.identities);
         return {
           name: column.name,
           type: column.type,
           notNull: column.attnotnull,
           ...(notNullName === undefined ? {} : { notNullName }),
+          ...(identity === undefined ? {} : { identity }),
           ...columnAttributes(column),
         };
       }),
@@ -924,7 +1039,12 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     });
   }
 
-  return { model: { tables: modelTables, sequences: [] }, diagnostics };
+  diagnostics.push(...sequenceMapping.diagnostics);
+
+  return {
+    model: { tables: modelTables, sequences: sequenceMapping.sequences },
+    diagnostics,
+  };
 }
 
 /** The ordinary table a column, key, index, constraint, or not-null row must reference. */
@@ -950,10 +1070,11 @@ function requireOrdinaryTable(
 }
 
 /**
- * The deferred-state flags of one ordinary table's column, in the pinned cause order:
- * generation, then identity. The default expression, the explicit collation, storage, and
- * compression now travel the model and carry no flag; a generated column keeps its flag and
- * never reads the generation expression its `atthasdef` marks as a default.
+ * The deferred-state flags of one ordinary table's column: generation, the one remaining
+ * unmodeled column feature. Identity now attaches from the `sequences` section; the default
+ * expression, the explicit collation, storage, and compression travel the model and carry no
+ * flag. A generated column keeps its flag and never reads the generation expression its
+ * `atthasdef` marks as a default.
  */
 function columnDiagnostics(object: string, column: ColumnRow): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
@@ -968,10 +1089,242 @@ function columnDiagnostics(object: string, column: ColumnRow): Diagnostic[] {
   if (column.attgenerated !== '') {
     flag('is generated; generation is not represented yet');
   }
-  if (column.attidentity !== '') {
-    flag('is an identity column; identity is not read yet');
-  }
   return diagnostics;
+}
+
+/** One sequence finding: its sequence row orders it among the section's findings. */
+interface SequenceFinding {
+  readonly row: SequenceRow;
+  readonly diagnostic: Diagnostic;
+}
+
+/** One sequence owner resolved against the payload's tables. */
+type ResolvedSequenceOwner =
+  | { readonly kind: 'mapped'; readonly table: TableRow; readonly column: ColumnRow }
+  | { readonly kind: 'unread'; readonly schema: string; readonly table: string };
+
+/**
+ * The `sequences` section to the model's sequences, the identity attachments its rows name,
+ * and the section's deferred-state findings. Identity rows never become model sequences; a row
+ * owned by an unread relation or a dropped attribute is consumed with a skip finding, which
+ * takes precedence over its persistence flag. Duplicate names, an owner column a read table
+ * does not carry, and a missing, duplicated, non-identity, or non-integer identity attachment
+ * are payload-contract throws.
+ */
+function mapSequences(
+  rows: readonly SequenceRow[],
+  tablesByKey: ReadonlyMap<string, TableRow>,
+  columnsByTable: ReadonlyMap<string, readonly ColumnRow[]>,
+): SequenceMapping {
+  const ordered = [...rows].sort(compareSequenceRows);
+  const seen = new Set<string>();
+  for (const row of ordered) {
+    const key = tableKey(row.schema, row.name);
+    if (seen.has(key)) {
+      throw new Error(`catalog payload: duplicate sequence "${row.schema}.${row.name}"`);
+    }
+    seen.add(key);
+  }
+
+  const identities = new Map<string, MappedIdentity>();
+  const sequences: Sequence[] = [];
+  const findings: SequenceFinding[] = [];
+
+  for (const row of ordered) {
+    if (row.ownerKind === null) {
+      sequences.push(sequenceFromRow(row));
+      const finding = ordinarySequencePersistenceFinding(row);
+      if (finding !== undefined) findings.push({ row, diagnostic: finding });
+      continue;
+    }
+
+    const owner = resolveSequenceOwner(row, tablesByKey, columnsByTable);
+    if (owner.kind === 'unread') {
+      const object = `${row.schema}.${row.name}`;
+      findings.push({
+        row,
+        diagnostic: {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object,
+          message: `sequence ${object} belongs to unread relation ${owner.schema}.${owner.table}; it is not represented`,
+        },
+      });
+      continue;
+    }
+
+    if (row.ownerKind === 'owned') {
+      sequences.push(
+        sequenceFromRow(row, {
+          table: { schema: owner.table.schema, name: owner.table.name },
+          column: owner.column.name,
+        }),
+      );
+      const finding = ordinarySequencePersistenceFinding(row);
+      if (finding !== undefined) findings.push({ row, diagnostic: finding });
+      continue;
+    }
+
+    const place = `${owner.table.schema}.${owner.table.name}.${owner.column.name}`;
+    if (owner.column.attidentity === '') {
+      throw new Error(
+        `catalog payload: internal sequence "${row.schema}.${row.name}" is owned by column "${place}", which is not an identity column`,
+      );
+    }
+    const columnKey = sequenceOwnerKey(owner.table.schema, owner.table.name, owner.column.name);
+    if (identities.has(columnKey)) {
+      throw new Error(
+        `catalog payload: identity column "${place}" has more than one internal sequence`,
+      );
+    }
+    identities.set(columnKey, { row, table: owner.table, column: owner.column });
+  }
+
+  for (const mapped of identities.values()) {
+    if (mapped.row.persistence === mapped.table.relpersistence) continue;
+    findings.push({ row: mapped.row, diagnostic: identityPersistenceFinding(mapped) });
+  }
+
+  findings.sort(compareSequenceFindings);
+  return {
+    sequences: sequences.sort(compareSequences),
+    identities,
+    diagnostics: findings.map((finding) => finding.diagnostic),
+  };
+}
+
+/**
+ * A sequence row's owner reference: a mapped ordinary table with a read column, or an unread
+ * relation — absent, partitioned, or with a dropped attribute. A named owner column that an
+ * otherwise-read ordinary table does not carry is contract drift, as is an owned row with no
+ * owner table at all.
+ */
+function resolveSequenceOwner(
+  row: SequenceRow,
+  tablesByKey: ReadonlyMap<string, TableRow>,
+  columnsByTable: ReadonlyMap<string, readonly ColumnRow[]>,
+): ResolvedSequenceOwner {
+  if (row.ownerSchema === null || row.ownerTable === null) {
+    throw new Error(
+      `catalog payload: sequence "${row.schema}.${row.name}" is owned but carries no owner table`,
+    );
+  }
+  const table = tablesByKey.get(tableKey(row.ownerSchema, row.ownerTable));
+  if (table === undefined || table.relkind !== 'r' || table.relispartition) {
+    return { kind: 'unread', schema: row.ownerSchema, table: row.ownerTable };
+  }
+  if (row.ownerColumn === null) {
+    return { kind: 'unread', schema: row.ownerSchema, table: row.ownerTable };
+  }
+  const column = (columnsByTable.get(tableKey(table.schema, table.name)) ?? []).find(
+    (candidate) => candidate.name === row.ownerColumn,
+  );
+  if (column === undefined) {
+    throw new Error(
+      `catalog payload: sequence "${row.schema}.${row.name}" is owned by column "${table.schema}.${table.name}.${row.ownerColumn}", which is not a read column of its table`,
+    );
+  }
+  return { kind: 'mapped', table, column };
+}
+
+/** One ordinary sequence row, with its owner when it has one, in effective values. */
+function sequenceFromRow(row: SequenceRow, ownedBy?: SequenceOwner): Sequence {
+  return effectiveSequence({
+    schema: row.schema,
+    name: row.name,
+    dataType: row.dataType,
+    increment: row.increment,
+    minValue: row.minValue,
+    maxValue: row.maxValue,
+    start: row.start,
+    cache: row.cache,
+    cycle: row.cycle,
+    ...(ownedBy === undefined ? {} : { ownedBy }),
+  });
+}
+
+/** The flag an ordinary sequence's non-default persistence carries; the sequence still maps. */
+function ordinarySequencePersistenceFinding(row: SequenceRow): Diagnostic | undefined {
+  if (row.persistence === 'p') return undefined;
+  const word = row.persistence === 'u' ? 'unlogged' : 'temporary';
+  return flagDiagnostic(
+    `${row.schema}.${row.name}`,
+    `sequence ${row.schema}.${row.name} is ${word}; ${word} sequence persistence is not represented yet`,
+  );
+}
+
+/**
+ * The flag an identity sequence whose persistence differs from its owning table's carries: the
+ * object is the table (the column-flag grammar), and the column is named in the message. The
+ * identity still attaches.
+ */
+function identityPersistenceFinding(identity: MappedIdentity): Diagnostic {
+  const persistence = identity.row.persistence === 'u' ? 'unlogged' : 'logged';
+  return flagDiagnostic(
+    `${identity.table.schema}.${identity.table.name}`,
+    `column ${identity.column.name}'s identity sequence ${identity.row.schema}.${identity.row.name} has ${persistence} persistence; identity persistence is not represented yet`,
+  );
+}
+
+/**
+ * The identity descriptor a mapped column's `attidentity` and its internal sequence row state,
+ * in effective values. The row's actual name is always carried, as `pg_dump` states it; a
+ * missing attachment or a non-integer column type is contract drift.
+ */
+function identityFor(
+  table: TableRow,
+  column: ColumnRow,
+  identities: ReadonlyMap<string, MappedIdentity>,
+): Identity | undefined {
+  if (column.attidentity === '') return undefined;
+  const place = `${table.schema}.${table.name}.${column.name}`;
+  const mapped = identities.get(sequenceOwnerKey(table.schema, table.name, column.name));
+  if (mapped === undefined) {
+    throw new Error(`catalog payload: identity column "${place}" has no internal sequence`);
+  }
+  const dataType = canonicalIntType(column.type);
+  if (dataType === undefined) {
+    throw new Error(
+      `catalog payload: identity column "${place}" has type "${column.type}", which is not an integer type`,
+    );
+  }
+  return effectiveIdentity(dataType, {
+    generated: identityGeneration(column.attidentity, place),
+    sequenceName: { schema: mapped.row.schema, name: mapped.row.name },
+    increment: mapped.row.increment,
+    minValue: mapped.row.minValue,
+    maxValue: mapped.row.maxValue,
+    start: mapped.row.start,
+    cache: mapped.row.cache,
+    cycle: mapped.row.cycle,
+  });
+}
+
+/** The model mode an `attidentity` letter states (`'a'` always, `'d'` by default). */
+function identityGeneration(value: string, place: string): IdentityGeneration {
+  if (value === 'a') return 'always';
+  if (value === 'd') return 'by default';
+  throw new Error(`catalog payload: identity column "${place}" has unknown attidentity "${value}"`);
+}
+
+/** The key an identity attachment groups by: table identity plus column name. */
+function sequenceOwnerKey(schema: string, name: string, column: string): string {
+  return `${tableKey(schema, name)}\u0000${column}`;
+}
+
+/** Payload sequence order, the order the duplicate and contract checks walk. */
+function compareSequenceRows(left: SequenceRow, right: SequenceRow): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** Canonical sequence order, mirroring the dump importer's `compareSequences`. */
+function compareSequences(left: Sequence, right: Sequence): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** Sequence findings' order: the finding sequence's schema, then name. */
+function compareSequenceFindings(left: SequenceFinding, right: SequenceFinding): number {
+  return compareSequenceRows(left.row, right.row);
 }
 
 /** PostgreSQL's `attstorage` letters, as the model spells them. */
@@ -1805,6 +2158,55 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     ready: expectBoolean(row, path, 'ready'),
     tablespace: expectNullableString(row, path, 'tablespace'),
     create: await parseIndexDefinition(definition, path),
+  };
+}
+
+/** A `sequences` row, validated field by field; the mapper resolves its owner references. */
+function parseSequenceRow(value: unknown, path: string): SequenceRow {
+  const row = expectObject(value, path);
+  expectFields(row, path, [
+    'schema',
+    'name',
+    'dataType',
+    'start',
+    'increment',
+    'minValue',
+    'maxValue',
+    'cache',
+    'cycle',
+    'persistence',
+    'ownerKind',
+    'ownerSchema',
+    'ownerTable',
+    'ownerColumn',
+  ]);
+  const dataType = expectString(row, path, 'dataType');
+  if (dataType !== 'smallint' && dataType !== 'integer' && dataType !== 'bigint') {
+    throw new Error(`${path}.dataType must be "smallint", "integer", or "bigint"`);
+  }
+  const persistence = expectString(row, path, 'persistence');
+  if (persistence !== 'p' && persistence !== 'u' && persistence !== 't') {
+    throw new Error(`${path}.persistence must be "p", "u", or "t"`);
+  }
+  const ownerKind = expectNullableString(row, path, 'ownerKind');
+  if (ownerKind !== null && ownerKind !== 'owned' && ownerKind !== 'identity') {
+    throw new Error(`${path}.ownerKind must be "owned", "identity", or null`);
+  }
+  return {
+    schema: expectString(row, path, 'schema'),
+    name: expectString(row, path, 'name'),
+    dataType,
+    start: expectString(row, path, 'start'),
+    increment: expectString(row, path, 'increment'),
+    minValue: expectString(row, path, 'minValue'),
+    maxValue: expectString(row, path, 'maxValue'),
+    cache: expectString(row, path, 'cache'),
+    cycle: expectBoolean(row, path, 'cycle'),
+    persistence,
+    ownerKind,
+    ownerSchema: expectNullableString(row, path, 'ownerSchema'),
+    ownerTable: expectNullableString(row, path, 'ownerTable'),
+    ownerColumn: expectNullableString(row, path, 'ownerColumn'),
   };
 }
 
