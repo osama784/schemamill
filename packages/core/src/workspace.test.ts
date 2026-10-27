@@ -658,6 +658,16 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     'invalid model: views[0].definition is not a string',
   ],
   [
+    'a view whose schema is not a string',
+    { tables: [], sequences: [], views: [viewPayload({ schema: 1 })] },
+    'invalid model: views[0].schema is not a string',
+  ],
+  [
+    'a view whose name is not a string',
+    { tables: [], sequences: [], views: [viewPayload({ name: 1 })] },
+    'invalid model: views[0].name is not a string',
+  ],
+  [
     'a view check option outside the union',
     { tables: [], sequences: [], views: [viewPayload({ checkOption: 'strict' })] },
     'invalid model: views[0].checkOption is not a valid view check option',

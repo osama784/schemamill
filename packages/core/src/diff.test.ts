@@ -4006,6 +4006,8 @@ test('views in different insertion orders compare as identical', () => {
   const publicView = view('z', { materialized: true });
 
   assertDiff(viewModel([publicView, appView]), viewModel([appView, publicView]), []);
+  // The target side sorts independently too: an unsorted target is not a different schema.
+  assertDiff(viewModel([appView, publicView]), viewModel([publicView, appView]), []);
 });
 
 test('removed and added views follow the sequence changes, in identity order', () => {
