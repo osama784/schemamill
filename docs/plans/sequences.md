@@ -16,7 +16,7 @@ Live catalog reading shipped in [#80](https://github.com/osama784/schemamill/iss
 
 ## Plan ordering
 
-Sequence steps sit in six global phases around the first slice's table phases, in this exact order:
+Sequence steps sit in ten global phases around the first slice's table phases. The numbered list below is the six-phase historical numbering and stays as written; the view phases now sit immediately before and after its table-operations step:
 
 1. **Creates** — one `create-sequence` per added sequence, in identity order.
 2. **Detaches** — `ALTER SEQUENCE … OWNED BY NONE` for a kept sequence whose baseline owner the plan removes and whose ownership the target changes. The detach runs before the owner's drop: PostgreSQL cascades an owned sequence away with its table or column, so a later detach would find it gone.
