@@ -30,6 +30,7 @@ const SCENES = [
   'identity',
   'schema-edges',
   'sequences',
+  'views',
 ] as const;
 
 /** Every command whose stdout a golden pins. */
