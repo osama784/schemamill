@@ -27,7 +27,7 @@ import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin twelve whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin thirteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -2568,4 +2568,102 @@ test('a materialized replace-view is refused with a pinned message', () => {
       error.message ===
         'refusing to render: replace-view on public.m cannot replace a materialized view',
   );
+});
+
+test('golden: drops, creates, and replaces views and materialized views', () => {
+  // The view drops land before the table work, the creates and replaces after it, and both
+  // view buckets keep identity order: a kind change contributes its baseline-kind drop and its
+  // target-kind create, a changed matview is recreated WITH NO DATA, and a changed plain view
+  // is replaced in place, check option included.
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email'),
+      column('active', { type: 'boolean', notNull: true }),
+      column('balance', { type: 'integer', notNull: true }),
+    ],
+  });
+  const stale = table('stale', { columns: [column('id', { type: 'integer' })] });
+  const ledger = table('ledger', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+  });
+
+  const baseline = viewModel(
+    [
+      view(
+        'demote',
+        {
+          materialized: true,
+          definition: 'SELECT team_id,count(*) AS n FROM app.events GROUP BY team_id',
+        },
+        'app',
+      ),
+      view(
+        'gone_totals',
+        { materialized: true, definition: 'SELECT count(*) AS n FROM app.events' },
+        'app',
+      ),
+      view('gone_view', { definition: 'SELECT id FROM app.events' }, 'app'),
+      view('promote', { definition: 'SELECT id,count(*) AS n FROM app.events GROUP BY id' }, 'app'),
+      view('active', {
+        definition: 'SELECT id,email FROM public.accounts WHERE active',
+      }),
+      view('checked', {
+        definition: 'SELECT id FROM public.accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+      view('kept', { definition: 'SELECT id FROM public.accounts' }),
+      view('totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+      }),
+    ],
+    accounts,
+    stale,
+  );
+  const target = viewModel(
+    [
+      view(
+        'demote',
+        {
+          definition: 'SELECT team_id,count(*) AS n FROM app.events GROUP BY team_id',
+        },
+        'app',
+      ),
+      view(
+        'promote',
+        {
+          materialized: true,
+          definition: 'SELECT id,count(*) AS n FROM app.events GROUP BY id',
+        },
+        'app',
+      ),
+      view('active', {
+        definition:
+          'SELECT id,email,active FROM public.accounts WHERE active AND email IS NOT NULL',
+      }),
+      view('added', { definition: 'SELECT id FROM public.ledger' }),
+      view('checked', {
+        definition: 'SELECT id FROM public.accounts WHERE balance > 0',
+        checkOption: 'cascaded',
+      }),
+      view('kept', { definition: 'SELECT id FROM public.accounts' }),
+      view('new_totals', {
+        materialized: true,
+        definition: 'SELECT team_id,count(*) AS n FROM public.accounts GROUP BY team_id',
+      }),
+      view('positive', {
+        definition: 'SELECT id FROM public.accounts WHERE balance >= 0',
+        checkOption: 'local',
+      }),
+      view('totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts WHERE active',
+      }),
+    ],
+    accounts,
+    ledger,
+  );
+
+  assertGolden('views', baseline, target);
 });
