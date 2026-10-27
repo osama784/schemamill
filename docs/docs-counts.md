@@ -9,7 +9,7 @@ Counts repeated across the plans drift every time the plan or the live suite gro
 | Class | Source |
 | --- | --- |
 | Step kinds, transactional, non-transactional | `TRANSACTIONAL` imported from `packages/core/src/plan.ts` |
-| Table phases | the numbered `1.`–`N.` list inside plan phase 4 in `plan.ts`; the list must be contiguous from 1 |
+| Table phases | the numbered `1.`–`N.` list inside plan phase 5 in `plan.ts`; the list must be contiguous from 1 |
 | Live scenes | `scenes` imported from `packages/postgres/src/live-scenes.ts` |
 | Scenes skipped on PostgreSQL 16 | scenes whose `minServerMajor` is above 16 (absent means 13) |
 | Postgres tests | line-anchored top-level `test(` calls across `packages/postgres/src/*.test.ts` |

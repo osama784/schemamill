@@ -16,6 +16,9 @@ import type { Identity } from './identity.ts';
  *   it references; a constraint `name` travels with it when the source has one but is not part
  *   of its identity. An index is identified by its name.
  * - A sequence is identified by its schema and its name together, like a table.
+ * - A view is identified by its schema and its name together, like a table. A view and a
+ *   materialized view share one namespace, so the `materialized` discriminator is part of the
+ *   entity's shape, not of its identity.
  *
  * Ordering — deterministic, so two models of the same schema compare structurally:
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
@@ -31,6 +34,7 @@ import type { Identity } from './identity.ts';
  *   unnamed first).
  * - `indexes` are sorted by name (`name ?? ''`, so unnamed first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
+ * - `views` are sorted by schema, then name (JavaScript string comparison).
  *
  * `Index.concurrently` is apply metadata, not structure: it is excluded from structural
  * identity and equality, and only steers how a create or drop is applied — the target index's
@@ -55,6 +59,11 @@ import type { Identity } from './identity.ts';
  * carries its effective descriptor on the column (`Column.identity`) and never among
  * `Model.sequences`.
  *
+ * `View.definition` is the SQL body after `AS`, whitespace-normalized and opaque to the model,
+ * exactly like a check expression or a default: core never parses or reconstructs it. A view's
+ * `checkOption` is explicit-only; absent means the view accepts rows without a check option.
+ * The check option never travels on a materialized view.
+ *
  * This module declares shapes only; it holds no behavior.
  */
 
@@ -66,12 +75,14 @@ export interface TableIdentity {
   readonly name: string;
 }
 
-/** The canonical model: the whole schema, as tables and sequences. */
+/** The canonical model: the whole schema, as tables, sequences, and views. */
 export interface Model {
   /** Every imported table, in the model's deterministic order. */
   readonly tables: readonly Table[];
   /** Every imported sequence, in the model's deterministic order. */
   readonly sequences: readonly Sequence[];
+  /** Every imported view and materialized view, in the model's deterministic order. */
+  readonly views: readonly View[];
 }
 
 /** A table and its imported structure. */
@@ -310,4 +321,39 @@ export interface Sequence extends SequenceIdentity {
   readonly cycle: boolean;
   /** The owning table and column, when the sequence is owned. */
   readonly ownedBy?: SequenceOwner;
+}
+
+/** Identifies a view in the model: the schema-qualified name, e.g. `public.active_users`. */
+export interface ViewIdentity {
+  /** The namespace that qualifies the view, e.g. `public`. */
+  readonly schema: string;
+  /** The view's name, as written without quoting. */
+  readonly name: string;
+}
+
+/**
+ * A view's check option: `local` checks only the view's own `WHERE` clause, `cascaded` also
+ * checks the views it reads through. Absent means no `WITH CHECK OPTION`.
+ */
+export type ViewCheckOption = 'local' | 'cascaded';
+
+/**
+ * A view or materialized view and its definition. One array holds both kinds and one identity
+ * names either, so a view and a materialized view never coexist under one name; `materialized`
+ * is the discriminator that decides how a migration recreates it.
+ */
+export interface View extends ViewIdentity {
+  /** Whether the view is materialized (`CREATE MATERIALIZED VIEW`). */
+  readonly materialized: boolean;
+  /**
+   * The SQL body after `AS` — the statement terminator and any trailing `WITH … CHECK OPTION`
+   * or `WITH [NO] DATA` clause stripped, whitespace-normalized. Opaque to the model, like a
+   * check expression or a default: core never parses it.
+   */
+  readonly definition: string;
+  /**
+   * The view's check option when it declares one; absent means none. Views only: a
+   * materialized view cannot carry one.
+   */
+  readonly checkOption?: ViewCheckOption;
 }

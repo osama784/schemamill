@@ -178,12 +178,13 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
 
 /** A model of the given tables and sequences together. */
 const withSequences = (tables: readonly Table[], sequences: readonly Sequence[]): Model => ({
   tables,
   sequences,
+  views: [],
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */

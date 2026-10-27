@@ -21,6 +21,8 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
 } from './model.ts';
 
 /**
@@ -93,8 +95,8 @@ export type WorkspaceInitResult =
   | { readonly ok: true; readonly root: string }
   | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
 
-/** The model `initWorkspace` writes when the caller supplies none: no tables and no sequences. */
-const EMPTY_MODEL: Model = { tables: [], sequences: [] };
+/** The model `initWorkspace` writes when the caller supplies none: no tables, sequences, or views. */
+const EMPTY_MODEL: Model = { tables: [], sequences: [], views: [] };
 
 /**
  * Resolves the workspace nearest `startPath` and reads its model.
@@ -212,9 +214,10 @@ export async function initWorkspace(
 
 /**
  * `model` as the canonical model file text: entities rebuilt in their declaration order with
- * `undefined` optionals omitted, `tables` and `sequences` re-sorted into canonical order
- * (schema then name, JavaScript string comparison), nested arrays kept as stored, two-space
- * JSON, and a trailing newline. Deterministic: one model always serializes to the same bytes.
+ * `undefined` optionals omitted, `tables`, `sequences`, and `views` re-sorted into canonical
+ * order (schema then name, JavaScript string comparison), nested arrays kept as stored,
+ * two-space JSON, and a trailing newline. `views` always follows `sequences`. Deterministic:
+ * one model always serializes to the same bytes.
  *
  * Exported for tests; no public writer is re-exported from `index.ts`.
  */
@@ -222,6 +225,7 @@ export function serializeModel(model: Model): string {
   const value = {
     tables: [...model.tables].sort(compareNames).map(serializeTable),
     sequences: [...model.sequences].sort(compareNames).map(serializeSequence),
+    views: [...model.views].sort(compareNames).map(serializeView),
   };
   return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -308,13 +312,13 @@ function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Any schema-qualified name: a table, sequence, or identity sequence name. */
+/** Any schema-qualified name: a table, sequence, view, or identity sequence name. */
 interface QualifiedName {
   readonly schema: string;
   readonly name: string;
 }
 
-/** Tables and sequences in canonical order: schema, then name, both plain string comparison. */
+/** Tables, sequences, and views in canonical order: schema, then name, plain string comparison. */
 function compareNames(left: QualifiedName, right: QualifiedName): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
@@ -438,6 +442,16 @@ function serializeOwner(owner: SequenceOwner): object {
   return { table: serializeName(owner.table), column: owner.column };
 }
 
+function serializeView(view: View): object {
+  return {
+    schema: view.schema,
+    name: view.name,
+    materialized: view.materialized,
+    definition: view.definition,
+    ...(view.checkOption === undefined ? {} : { checkOption: view.checkOption }),
+  };
+}
+
 /**
  * The reader's shape check result: the rebuilt value, or the first failing path-named
  * message.
@@ -457,7 +471,7 @@ function invalid(message: string): ParseFailure {
   return { ok: false, message };
 }
 
-const MODEL_KEYS = ['tables', 'sequences'] as const;
+const MODEL_KEYS = ['tables', 'sequences', 'views'] as const;
 const TABLE_KEYS = [
   'schema',
   'name',
@@ -517,6 +531,7 @@ const SEQUENCE_KEYS = [
   'ownedBy',
 ] as const;
 const OWNER_KEYS = ['table', 'column'] as const;
+const VIEW_KEYS = ['schema', 'name', 'materialized', 'definition', 'checkOption'] as const;
 const NAME_KEYS = ['schema', 'name'] as const;
 
 const REFERENTIAL_ACTIONS: readonly ReferentialAction[] = [
@@ -529,6 +544,7 @@ const CONSTRAINT_ENFORCEMENTS: readonly ConstraintEnforcement[] = ['not-valid', 
 const SEQUENCE_DATA_TYPES: readonly SequenceDataType[] = ['smallint', 'integer', 'bigint'];
 const IDENTITY_GENERATIONS: readonly IdentityGeneration[] = ['always', 'by default'];
 const TABLE_PERSISTENCES: readonly TablePersistence[] = ['unlogged'];
+const VIEW_CHECK_OPTIONS: readonly ViewCheckOption[] = ['local', 'cascaded'];
 const COLUMN_STORAGES: readonly ColumnStorage[] = ['plain', 'external', 'extended', 'main'];
 const COLUMN_COMPRESSIONS: readonly ColumnCompression[] = ['pglz', 'lz4'];
 
@@ -549,7 +565,14 @@ function parseModel(value: unknown): Parsed<Model> {
     if (!tables.ok) return tables;
     const sequences = parseArrayOf(object.sequences, 'sequences', parseSequence);
     if (!sequences.ok) return sequences;
-    return parsed({ tables: tables.value, sequences: sequences.value });
+    // Older model files have no views section: an absent `views` is no views, while an explicit
+    // `null` or non-array still fails closed.
+    const views =
+      object.views === undefined
+        ? parsed<View[]>([])
+        : parseArrayOf(object.views, 'views', parseView);
+    if (!views.ok) return views;
+    return parsed({ tables: tables.value, sequences: sequences.value, views: views.value });
   });
 }
 
@@ -992,6 +1015,44 @@ function parseOwner(value: unknown, path: string): Parsed<SequenceOwner> {
     if (!column.ok) return column;
     return parsed({ table: table.value, column: column.value });
   });
+}
+
+/**
+ * A view or materialized view: the identity, the `materialized` discriminator, the opaque
+ * definition, and the optional check option. A materialized view cannot carry a check option,
+ * so the pair fails closed rather than reaching a plan that would drop it silently.
+ */
+function parseView(value: unknown, path: string): Parsed<View> {
+  return parseObject(value, path, VIEW_KEYS, (object) => {
+    const schema = parseString(object.schema, fieldPath(path, 'schema'));
+    if (!schema.ok) return schema;
+    const name = parseString(object.name, fieldPath(path, 'name'));
+    if (!name.ok) return name;
+    const materialized = parseBoolean(object.materialized, fieldPath(path, 'materialized'));
+    if (!materialized.ok) return materialized;
+    const definition = parseString(object.definition, fieldPath(path, 'definition'));
+    if (!definition.ok) return definition;
+    const checkOption = parseOptional(
+      object.checkOption,
+      fieldPath(path, 'checkOption'),
+      parseViewCheckOption,
+    );
+    if (!checkOption.ok) return checkOption;
+    if (checkOption.value !== undefined && materialized.value) {
+      return invalid(`${fieldPath(path, 'checkOption')} is not valid on a materialized view`);
+    }
+    return parsed({
+      schema: schema.value,
+      name: name.value,
+      materialized: materialized.value,
+      definition: definition.value,
+      ...(checkOption.value === undefined ? {} : { checkOption: checkOption.value }),
+    });
+  });
+}
+
+function parseViewCheckOption(value: unknown, path: string): Parsed<ViewCheckOption> {
+  return parseEnum(value, path, VIEW_CHECK_OPTIONS, 'view check option');
 }
 
 /**

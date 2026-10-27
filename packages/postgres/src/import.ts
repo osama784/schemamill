@@ -234,6 +234,8 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
+      // View and materialized-view statements are still skipped with a named diagnostic.
+      views: [],
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };

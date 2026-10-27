@@ -18,6 +18,9 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
+  ViewIdentity,
 } from './model.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
@@ -25,7 +28,8 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * The diff: what changed between a baseline model and a target model.
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
- * column, primary key, foreign key, unique constraint, check constraint, index, or sequence.
+ * column, primary key, foreign key, unique constraint, check constraint, index, sequence, or
+ * view.
  * It never guesses a rename: a table or column under a new name is a removal and an addition,
  * a primary key with a different column list is a primary-key change, a foreign key pointing
  * at a different table is a removal and an addition, and so are a unique constraint with a
@@ -48,6 +52,12 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * its name, so a rename is a removal and an addition, and an unnamed index by its structure —
  * `unique` and ordered columns — with a missing name itself distinct in a diff; a sequence is
  * its schema and name, like a table.
+ *
+ * A view is identified by its schema and name, like a sequence, and one identity names either
+ * a view or a materialized view: a change between the two kinds is a `view-changed` carrying
+ * the `materialized` field, never a removal and an addition. The definition is compared
+ * exactly as stored, like any other opaque text, and the check option compares as an optional
+ * enum whose absent side is reported by omission.
  *
  * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
  * whose only stated difference is its flag is not a change, and an added or removed index
@@ -122,6 +132,12 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    `dataType` change, `minValue`/`maxValue` compare the bounds the engine's `AS` conversion
  *    would leave, so a bound that only differs from the target after the conversion is still
  *    reported.
+ * 5. View identities are merge-walked the same way, after every sequence change, and reported
+ *    as a group in identity order: a baseline-only identity is `view-removed`, a target-only
+ *    identity `view-added`, and a shared identity is compared on `materialized`, `definition`,
+ *    and `checkOption`, in that fixed order. A changed view carries both stored sides —
+ *    `before` and `after` — because the plan recreates a materialized view from its target
+ *    payload; an absent check option is reported by omission.
  *
  * Duplicate identities — several foreign keys with the same referencing columns and referenced
  * table, unique constraints with the same columns, check constraints with the same expression,
@@ -155,6 +171,22 @@ export type Change =
       kind: 'sequence-changed';
       sequence: SequenceIdentity;
       changes: readonly SequenceFieldChange[];
+    }
+  /** The target has a view or materialized view the baseline does not. */
+  | { kind: 'view-added'; view: View }
+  /** The baseline has a view or materialized view the target does not. */
+  | { kind: 'view-removed'; view: View }
+  /**
+   * Both sides have the view identity, and at least one field differs. `before` and `after`
+   * carry the stored views — the plan recreates a materialized view or a kind change from
+   * them — while `changes` reports only the differing fields.
+   */
+  | {
+      kind: 'view-changed';
+      view: ViewIdentity;
+      changes: readonly ViewFieldChange[];
+      before: View;
+      after: View;
     };
 
 /** One difference within a changed table. */
@@ -281,6 +313,16 @@ export type SequenceFieldChange =
   | { field: 'ownedBy'; before?: SequenceOwner; after?: SequenceOwner };
 
 /**
+ * One differing field of a changed view; only fields that differ are reported, in the fixed
+ * order `materialized`, `definition`, `checkOption`. A `checkOption` change omits the side
+ * that states none.
+ */
+export type ViewFieldChange =
+  | { field: 'materialized'; before: boolean; after: boolean }
+  | { field: 'definition'; before: string; after: string }
+  | { field: 'checkOption'; before?: ViewCheckOption; after?: ViewCheckOption };
+
+/**
  * The changes from `baseline` to `target`, in the module's deterministic order. Returned
  * payloads are independent copies: mutating them never affects the caller's models, and
  * neither input is mutated.
@@ -331,7 +373,7 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     changes.push({ kind: 'table-added', table: copyTable(targetTables[targetIndex]!) });
   }
 
-  return [...changes, ...diffSequences(baseline, target)];
+  return [...changes, ...diffSequences(baseline, target), ...diffViews(baseline, target)];
 }
 
 /**
@@ -382,6 +424,77 @@ function diffSequences(baseline: Model, target: Model): readonly Change[] {
   }
 
   return changes;
+}
+
+/**
+ * The view group of the diff, in identity order. A changed view reports the fields that differ
+ * in the fixed order `materialized`, `definition`, `checkOption`, and carries both stored sides
+ * for the plan's recreate.
+ */
+function diffViews(baseline: Model, target: Model): readonly Change[] {
+  const baselineViews = [...baseline.views].sort(compareViews);
+  const targetViews = [...target.views].sort(compareViews);
+
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineViews.length && targetIndex < targetViews.length) {
+    const baselineView = baselineViews[baselineIndex]!;
+    const targetView = targetViews[targetIndex]!;
+    const comparison = compareViews(baselineView, targetView);
+    if (comparison < 0) {
+      changes.push({ kind: 'view-removed', view: copyView(baselineView) });
+      baselineIndex += 1;
+    } else if (comparison > 0) {
+      changes.push({ kind: 'view-added', view: copyView(targetView) });
+      targetIndex += 1;
+    } else {
+      const fields = diffViewFields(baselineView, targetView);
+      if (fields.length > 0) {
+        changes.push({
+          kind: 'view-changed',
+          view: { schema: baselineView.schema, name: baselineView.name },
+          changes: fields,
+          before: copyView(baselineView),
+          after: copyView(targetView),
+        });
+      }
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+
+  for (; baselineIndex < baselineViews.length; baselineIndex += 1) {
+    changes.push({ kind: 'view-removed', view: copyView(baselineViews[baselineIndex]!) });
+  }
+  for (; targetIndex < targetViews.length; targetIndex += 1) {
+    changes.push({ kind: 'view-added', view: copyView(targetViews[targetIndex]!) });
+  }
+
+  return changes;
+}
+
+function diffViewFields(baseline: View, target: View): ViewFieldChange[] {
+  const fields: ViewFieldChange[] = [];
+  if (baseline.materialized !== target.materialized) {
+    fields.push({
+      field: 'materialized',
+      before: baseline.materialized,
+      after: target.materialized,
+    });
+  }
+  if (baseline.definition !== target.definition) {
+    fields.push({ field: 'definition', before: baseline.definition, after: target.definition });
+  }
+  if (baseline.checkOption !== target.checkOption) {
+    fields.push({
+      field: 'checkOption',
+      ...(baseline.checkOption === undefined ? {} : { before: baseline.checkOption }),
+      ...(target.checkOption === undefined ? {} : { after: target.checkOption }),
+    });
+  }
+  return fields;
 }
 
 function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceFieldChange[] {
@@ -525,6 +638,11 @@ function copySequence(sequence: Sequence): Sequence {
     ...sequence,
     ...(sequence.ownedBy === undefined ? {} : { ownedBy: copyOwner(sequence.ownedBy) }),
   };
+}
+
+/** A copy of `view`, independent of the caller's model. */
+function copyView(view: View): View {
+  return { ...view };
 }
 
 /**
@@ -1248,6 +1366,10 @@ function compareTables(left: TableIdentity, right: TableIdentity): number {
 }
 
 function compareSequences(left: SequenceIdentity, right: SequenceIdentity): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareViews(left: ViewIdentity, right: ViewIdentity): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 

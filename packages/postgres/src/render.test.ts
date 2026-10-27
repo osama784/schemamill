@@ -20,6 +20,7 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
 
 import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
@@ -96,7 +97,7 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -133,6 +134,27 @@ const identityColumn = (fields: Partial<IdentityInput> = {}): Identity =>
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
 });
 
 /** A plan of the given steps as one transactional group, for renderer edge cases. */
@@ -2092,6 +2114,7 @@ test('renders both identity conversions in policy order', () => {
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
+    views: [],
   };
   const identityTarget = model(
     table('t', {
@@ -2124,6 +2147,7 @@ test('renders both identity conversions in policy order', () => {
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
   };
 
   assert.equal(
@@ -2437,5 +2461,111 @@ test('golden: renders column attributes and table persistence', () => {
     'column-attributes',
     model(attrs, flipped, backed),
     model(attrsTarget, flippedTarget, table('backed', { columns }), created),
+  );
+});
+
+test('a view addition renders CREATE VIEW, with its check option when it has one', () => {
+  const plain = view('active', { definition: 'SELECT id FROM public.accounts WHERE active' });
+  const checked = view('positive', {
+    definition: 'SELECT id FROM public.accounts',
+    checkOption: 'local',
+  });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([plain, checked]))),
+    [
+      'BEGIN;',
+      'CREATE VIEW public.active AS SELECT id FROM public.accounts WHERE active;',
+      'CREATE VIEW public.positive AS SELECT id FROM public.accounts WITH LOCAL CHECK OPTION;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a cascaded check option renders its own words', () => {
+  const checked = view('v', { checkOption: 'cascaded' });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([checked]))),
+    'BEGIN;\nCREATE VIEW public.v AS SELECT 1 WITH CASCADED CHECK OPTION;\nCOMMIT;\n',
+  );
+});
+
+test('a materialized view addition renders WITH NO DATA', () => {
+  const totals = view('totals', { materialized: true, definition: 'SELECT count(*) FROM t' });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([totals]))),
+    'BEGIN;\nCREATE MATERIALIZED VIEW public.totals AS SELECT count(*) FROM t WITH NO DATA;\nCOMMIT;\n',
+  );
+});
+
+test('a view removal renders the DROP matching its kind', () => {
+  const plain = view('active');
+  const totals = view('totals', { materialized: true });
+
+  assert.equal(
+    renderSql(plan(viewModel([plain, totals]), model())),
+    [
+      'BEGIN;',
+      'DROP VIEW public.active;',
+      'DROP MATERIALIZED VIEW public.totals;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a changed plain view renders one CREATE OR REPLACE statement', () => {
+  const baseline = viewModel([view('v')]);
+  const target = viewModel([view('v', { definition: 'SELECT 2', checkOption: 'cascaded' })]);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'CREATE OR REPLACE VIEW public.v AS SELECT 2 WITH CASCADED CHECK OPTION;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a changed materialized view drops it before the table work and recreates it after', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('m', { materialized: true })], t);
+  const target = viewModel([view('m', { materialized: true, definition: 'SELECT 2' })], t);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'DROP MATERIALIZED VIEW public.m;',
+      'CREATE MATERIALIZED VIEW public.m AS SELECT 2 WITH NO DATA;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('view identifiers quote and the definition renders verbatim on one line', () => {
+  const quoted = view('Order View', { definition: "SELECT 'a b' AS label, 1 + 2 AS total" }, 'app');
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([quoted]))),
+    'BEGIN;\nCREATE VIEW app."Order View" AS SELECT \'a b\' AS label, 1 + 2 AS total;\nCOMMIT;\n',
+  );
+});
+
+test('a materialized replace-view is refused with a pinned message', () => {
+  const materialized = view('m', { materialized: true });
+
+  assert.throws(
+    () => renderSql(planOf({ kind: 'replace-view', view: materialized })),
+    (error: unknown) =>
+      error instanceof RenderRefusalError &&
+      error.message ===
+        'refusing to render: replace-view on public.m cannot replace a materialized view',
   );
 });

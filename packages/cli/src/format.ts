@@ -21,6 +21,9 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewFieldChange,
+  ViewIdentity,
 } from '@schemamill/core';
 
 /**
@@ -42,7 +45,9 @@ import type {
  * in that order — as raw model values (`true`/`false`, with `(none)` for an absent side),
  * comma-joined after `: ` on the same line and omitted when none differ, so no sub-lines are
  * added; sequences render the same way after the table changes, as
- * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
+ * `sequence <schema>.<name>` with one option per line, and views follow the sequences as
+ * `view <schema>.<name>`, a changed view listing its differing `materialized`, `definition`,
+ * and `checkOption` fields. A plan renders as a numbered header
  * and one line per step: a plan that is a single transactional group covering every step
  * reads `N steps in one transaction:` (singular `1 step in one transaction:`); a plan whose
  * only group is non-transactional reads `N steps outside a transaction:`; a multi-group plan
@@ -211,6 +216,12 @@ function formatChange(change: Change): string {
       }
       return lines.join('\n');
     }
+    case 'view-added':
+      return formatView('+', change.view);
+    case 'view-removed':
+      return formatView('-', change.view);
+    case 'view-changed':
+      return formatViewChange(change.view, change.changes);
   }
 }
 
@@ -401,6 +412,10 @@ function formatStep(step: Step): string {
       return formatIdentity(step.sequence);
     case 'alter-sequence':
       return `${formatIdentity(step.sequence)}: ${step.fields.map(formatSequenceField).join(', ')}`;
+    case 'create-view':
+    case 'replace-view':
+    case 'drop-view':
+      return formatIdentity(step.view);
   }
 }
 
@@ -511,6 +526,33 @@ function formatSequenceField(field: SequenceFieldChange): string {
       return `cycle ${String(field.before)} → ${String(field.after)}`;
     case 'ownedBy':
       return `owned by ${formatOptionalOwner(field.before)} → ${formatOptionalOwner(field.after)}`;
+  }
+}
+
+/**
+ * A view's line: `view <schema>.<name>`; an addition or removal prefixes the change sign, and
+ * a changed view's differing fields follow it on their own indented lines.
+ */
+function formatView(sign: string, view: View): string {
+  return `${sign} view ${formatIdentity(view)}`;
+}
+
+/** A changed view: the identity line, then one line per differing field in the diff's order. */
+function formatViewChange(view: ViewIdentity, changes: readonly ViewFieldChange[]): string {
+  const lines = [`~ view ${formatIdentity(view)}`];
+  for (const change of changes) lines.push(`    ${formatViewField(change)}`);
+  return lines.join('\n');
+}
+
+/** One changed view field; an absent check option prints `(none)`. */
+function formatViewField(field: ViewFieldChange): string {
+  switch (field.field) {
+    case 'materialized':
+      return `materialized ${String(field.before)} → ${String(field.after)}`;
+    case 'definition':
+      return `definition ${field.before} → ${field.after}`;
+    case 'checkOption':
+      return `checkOption ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }
 }
 

@@ -36,12 +36,13 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
 } from './model.ts';
 import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
 import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eight global phases with the eighteen table phases at their
+ * Tests for the migration plan: the ten global phases with the eighteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -136,7 +137,7 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -186,6 +187,27 @@ const unowned = (value: Sequence): Sequence => ({
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
 });
 
 /**
@@ -862,6 +884,13 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       }
       return;
     }
+    case 'create-view':
+    case 'drop-view':
+    case 'replace-view':
+      // Views are outside the simulated table/sequence state, and the property generators do
+      // not produce them in this slice; a view step is a no-op here, while the plan tests pin
+      // their buckets and phases.
+      return;
     default:
       // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
       assertNever(step, 'step kind');
@@ -1760,10 +1789,12 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     baseline: {
       tables: shuffle(baselineTables),
       sequences: baselineSequences,
+      views: [],
     },
     target: {
       tables: shuffle([...target.values()].map(toTable)),
       sequences: targetSequences,
+      views: [],
     },
   };
 };
@@ -1880,9 +1911,12 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'create-sequence',
     'drop-sequence',
     'alter-sequence',
+    'create-view',
+    'drop-view',
+    'replace-view',
   ];
 
-  assert.equal(kinds.length, 26);
+  assert.equal(kinds.length, 29);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -3804,6 +3838,7 @@ test('a removed identity precedes DROP NOT NULL and SET DEFAULT on its column', 
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
   };
 
   assertPlan(baseline, target, [
@@ -4054,6 +4089,7 @@ test('serial to identity drops the default, drops the sequence, then adds the id
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
+    views: [],
   };
   const target = model(
     table('t', {
@@ -4105,6 +4141,7 @@ test('identity to serial drops the identity, creates the sequence, then sets the
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
   };
 
   assertPlan(baseline, target, [
@@ -4207,7 +4244,7 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
       kind: 'create-sequence',
       sequence: sequence('f_serial_id_seq', { dataType: 'integer' }),
     },
-    // Phase 4: the table phases.
+    // Phase 5: the table phases.
     {
       kind: 'create-table',
       table: {
@@ -4237,16 +4274,16 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
       name: 'id',
       fields: [{ field: 'default', after: fSerialDefault }],
     },
-    // Phase 5: the replacement sequence's ownership.
+    // Phase 7: the replacement sequence's ownership.
     {
       kind: 'alter-sequence',
       sequence: identity('f_serial_id_seq'),
       fields: [{ field: 'ownedBy', after: owner('f_serial', 'id') }],
     },
-    // Phase 7: sequence drops, after the table phases released them.
+    // Phase 9: sequence drops, after the table phases released them.
     { kind: 'drop-sequence', sequence: identity('b_serial_id_seq') },
     { kind: 'drop-sequence', sequence: identity('gone_seq') },
-    // Phase 8: identity additions, then alters.
+    // Phase 10: identity additions, then alters.
     {
       kind: 'add-identity',
       table: identity('a_keep'),
@@ -4522,7 +4559,7 @@ test('a new owned sequence is created before its table and attached after it', (
   const owned = sequence('fresh_id_seq', { ownedBy: owner('fresh', 'id') });
   const standalone = sequence('standalone');
 
-  // Phase 1 creates both sequences (identity order), phase 3 the table, phase 4 the ownership.
+  // Phase 1 creates both sequences (identity order), phase 3 the table, phase 7 the ownership.
   assertPlan(model(), sequenceModel([standalone, owned], fresh), [
     { kind: 'create-sequence', sequence: unowned(owned) },
     { kind: 'create-sequence', sequence: standalone },
@@ -5504,6 +5541,7 @@ const permutedModel = (source: Model, random: Random): Model => ({
     indexes: shuffleWith(random, table.indexes),
   })),
   sequences: shuffleWith(random, source.sequences),
+  views: shuffleWith(random, source.views),
 });
 
 test('seeded pairs keep diff and plan deterministic and order-independent', () => {
@@ -5547,7 +5585,7 @@ test('seeded pairs keep diff and plan deterministic and order-independent', () =
   }
 });
 
-/** The 23 array buckets of a `ChangeApplication`, in interface order. */
+/** The 26 array buckets of a `ChangeApplication`, in interface order. */
 const applicationArrays = [
   'foreignKeyDrops',
   'primaryKeyDrops',
@@ -5570,6 +5608,9 @@ const applicationArrays = [
   'identityAlters',
   'sequenceCreates',
   'optionAlters',
+  'viewDrops',
+  'viewCreates',
+  'viewReplaces',
   'ownershipChanges',
   'removedSequences',
 ] as const satisfies readonly (keyof ChangeApplication)[];
@@ -5613,6 +5654,9 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     identityAlters: 0,
     sequenceCreates: 0,
     optionAlters: 0,
+    viewDrops: 0,
+    viewCreates: 0,
+    viewReplaces: 0,
     ownershipChanges: 0,
     removedSequences: 0,
   };
@@ -5741,6 +5785,20 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
           (field) => field.field === 'ownedBy',
         ).length;
         break;
+      case 'view-added':
+        count('viewCreates');
+        break;
+      case 'view-removed':
+        count('viewDrops');
+        break;
+      case 'view-changed':
+        if (change.before.materialized === false && change.after.materialized === false) {
+          count('viewReplaces');
+        } else {
+          count('viewDrops');
+          count('viewCreates');
+        }
+        break;
       default:
         assertNever(change, 'change kind');
     }
@@ -5775,6 +5833,9 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.identityAlters.push(...source.identityAlters);
   target.sequenceCreates.push(...source.sequenceCreates);
   target.optionAlters.push(...source.optionAlters);
+  target.viewDrops.push(...source.viewDrops);
+  target.viewCreates.push(...source.viewCreates);
+  target.viewReplaces.push(...source.viewReplaces);
   target.ownershipChanges.push(...source.ownershipChanges);
   target.removedSequences.push(...source.removedSequences);
   for (const key of source.removedTableKeys) target.removedTableKeys.add(key);
@@ -5829,7 +5890,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 26, 'every step kind must be classified');
+  assert.equal(kinds.length, 29, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -6480,4 +6541,122 @@ test('named dependent foreign keys are set aside after unnamed ones', () => {
     { kind: 'add-foreign-key', table: identity('child'), foreignKey: named },
   ]);
   simulate(baseline, target);
+});
+
+test('views are dropped before the table phases and created after them', () => {
+  const gone = table('gone', { columns: [column('id', { type: 'integer' })] });
+  const fresh = table('fresh', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('old'), view('mat', { materialized: true })], gone);
+  const target = viewModel([view('new')], fresh);
+  const newView = view('new');
+
+  assertPlan(baseline, target, [
+    // Global phase 4: view drops, in view identity order.
+    { kind: 'drop-view', view: identity('mat'), materialized: true },
+    { kind: 'drop-view', view: identity('old'), materialized: false },
+    // Global phase 5: the table phases.
+    { kind: 'drop-table', table: identity('gone') },
+    { kind: 'create-table', table: fresh },
+    // Global phase 6: view creates.
+    { kind: 'create-view', view: newView },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed plain view is replaced after the table phases', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const tTarget = table('t', {
+    columns: [column('id', { type: 'integer' }), column('extra')],
+  });
+  const baseline = viewModel([view('v')], t);
+  const target = viewModel([view('v', { definition: 'SELECT 2' })], tTarget);
+
+  assertPlan(baseline, target, [
+    { kind: 'add-column', table: identity('t'), column: column('extra') },
+    // Global phase 6: a plain-view change is a CREATE OR REPLACE, never a drop and create.
+    { kind: 'replace-view', view: view('v', { definition: 'SELECT 2' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed plain view carries the target check option into its replace', () => {
+  const baseline = viewModel([view('v')]);
+  const target = viewModel([view('v', { checkOption: 'local' })]);
+
+  assertPlan(baseline, target, [
+    { kind: 'replace-view', view: view('v', { checkOption: 'local' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed materialized view is dropped before the table phases and recreated after', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('m', { materialized: true })], t);
+  const target = viewModel([view('m', { materialized: true, definition: 'SELECT 2' })], t);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    { kind: 'create-view', view: view('m', { materialized: true, definition: 'SELECT 2' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a view-to-materialized-view change drops and recreates the view', () => {
+  const baseline = viewModel([view('v')]);
+  const materialized = view('v', { materialized: true });
+  const target = viewModel([materialized]);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+    { kind: 'create-view', view: materialized },
+  ]);
+
+  assertPlan(viewModel([materialized]), viewModel([view('v')]), [
+    { kind: 'drop-view', view: identity('v'), materialized: true },
+    { kind: 'create-view', view: view('v') },
+  ]);
+});
+
+test('the change application routes view changes into the view buckets', () => {
+  const baseline = viewModel([
+    view('a'),
+    view('gone', { materialized: true }),
+    view('m', { materialized: true }),
+    view('v'),
+  ]);
+  const target = viewModel([
+    view('a', { definition: 'SELECT 2', checkOption: 'cascaded' }),
+    view('fresh'),
+    view('m', { materialized: true, definition: 'SELECT 3' }),
+    view('v', { materialized: true }),
+  ]);
+
+  const application = emptyChangeApplication();
+  for (const change of diff(baseline, target)) applyChange(application, change);
+
+  assert.deepStrictEqual(application.viewDrops, [
+    { kind: 'drop-view', view: identity('gone'), materialized: true },
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+  ]);
+  assert.deepStrictEqual(application.viewCreates, [
+    { kind: 'create-view', view: view('fresh') },
+    {
+      kind: 'create-view',
+      view: view('m', { materialized: true, definition: 'SELECT 3' }),
+    },
+    { kind: 'create-view', view: view('v', { materialized: true }) },
+  ]);
+  assert.deepStrictEqual(application.viewReplaces, [
+    {
+      kind: 'replace-view',
+      view: view('a', { definition: 'SELECT 2', checkOption: 'cascaded' }),
+    },
+  ]);
+});
+
+test('view steps are classified transactional', () => {
+  assert.equal(TRANSACTIONAL['drop-view'], true);
+  assert.equal(TRANSACTIONAL['create-view'], true);
+  assert.equal(TRANSACTIONAL['replace-view'], true);
 });

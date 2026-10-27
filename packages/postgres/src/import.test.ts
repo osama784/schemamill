@@ -225,6 +225,7 @@ const EXPECTED_MODEL: Model = {
       cycle: false,
     },
   ],
+  views: [],
 };
 
 const EXPECTED_DIAGNOSTICS = [
@@ -1973,6 +1974,7 @@ test('replaces a repeated CREATE TABLE wholesale', async () => {
       },
     ],
     sequences: [],
+    views: [],
   });
   assert.deepEqual(diagnostics, []);
 });
@@ -2074,6 +2076,7 @@ test('binds the DdlImporter seam', async () => {
       },
     ],
     sequences: [],
+    views: [],
   });
 });
 

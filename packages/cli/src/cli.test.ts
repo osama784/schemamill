@@ -31,7 +31,7 @@ const execFileAsync = promisify(execFile);
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 /** The pinned init default bytes: a workspace `model.json` with no tables and no sequences. */
-const EMPTY_MODEL = '{\n  "tables": [],\n  "sequences": []\n}\n';
+const EMPTY_MODEL = '{\n  "tables": [],\n  "sequences": [],\n  "views": []\n}\n';
 
 /**
  * A workspace model naming one table none of the dump fixtures carry, so a run that resolves
@@ -297,7 +297,8 @@ const IMPORTABLE_MODEL = `{
       ]
     }
   ],
-  "sequences": []
+  "sequences": [],
+  "views": []
 }
 `;
 

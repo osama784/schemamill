@@ -23,7 +23,7 @@ import { serializeModel } from './workspace.ts';
  */
 
 /** The empty model's exact file bytes: two-space JSON and a trailing newline. */
-const EMPTY_MODEL_BYTES = '{\n  "tables": [],\n  "sequences": []\n}\n';
+const EMPTY_MODEL_BYTES = '{\n  "tables": [],\n  "sequences": [],\n  "views": []\n}\n';
 
 /** A fresh temp directory removed when the test ends. */
 async function fixtureDir(context: TestContext): Promise<string> {
@@ -112,6 +112,17 @@ function sequencePayload(overrides: Record<string, unknown> = {}): Record<string
     start: '1',
     cache: '1',
     cycle: false,
+    ...overrides,
+  };
+}
+
+/** The minimal valid view payload; `overrides` replace its fields. */
+function viewPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema: 'public',
+    name: 'v',
+    materialized: false,
+    definition: 'SELECT 1',
     ...overrides,
   };
 }
@@ -621,6 +632,45 @@ const SHAPE_FAILURES: ReadonlyArray<readonly [string, unknown, string]> = [
     },
     'invalid model: tables[0].foreignKeys[0].onUpdate is not a valid referential action',
   ],
+  [
+    'a model whose views field is null',
+    { tables: [], sequences: [], views: null },
+    'invalid model: views is not an array',
+  ],
+  [
+    'a model whose views field is not an array',
+    { tables: [], sequences: [], views: {} },
+    'invalid model: views is not an array',
+  ],
+  [
+    'an unknown view key',
+    { tables: [], sequences: [], views: [viewPayload({ bogus: true })] },
+    'invalid model: unknown field views[0].bogus',
+  ],
+  [
+    'a view whose materialized flag is not a boolean',
+    { tables: [], sequences: [], views: [viewPayload({ materialized: 'yes' })] },
+    'invalid model: views[0].materialized is not a boolean',
+  ],
+  [
+    'a view whose definition is not a string',
+    { tables: [], sequences: [], views: [viewPayload({ definition: 1 })] },
+    'invalid model: views[0].definition is not a string',
+  ],
+  [
+    'a view check option outside the union',
+    { tables: [], sequences: [], views: [viewPayload({ checkOption: 'strict' })] },
+    'invalid model: views[0].checkOption is not a valid view check option',
+  ],
+  [
+    'a check option on a materialized view',
+    {
+      tables: [],
+      sequences: [],
+      views: [viewPayload({ materialized: true, checkOption: 'local' })],
+    },
+    'invalid model: views[0].checkOption is not valid on a materialized view',
+  ],
 ];
 
 for (const [name, payload, prefix] of SHAPE_FAILURES) {
@@ -818,6 +868,7 @@ const POPULATED_MODEL: Model = {
       ownedBy: { table: { schema: 'public', name: 'users' }, column: 'id' },
     },
   ],
+  views: [],
 };
 
 test('resolveWorkspace reads back a populated model written literally', async (t) => {
@@ -927,6 +978,7 @@ const ATTRIBUTE_MODEL: Model = {
     },
   ],
   sequences: [],
+  views: [],
 };
 
 test('resolveWorkspace reads back every constraint attribute written literally', async (t) => {
@@ -1046,6 +1098,7 @@ const ROUND_TRIP_MODEL: Model = {
     },
   ],
   sequences: [],
+  views: [],
 };
 
 test('serializeModel round-trips a populated model through resolveWorkspace without loss', async (t) => {
@@ -1084,7 +1137,7 @@ test('resolveWorkspace walks up from a nested directory to the nearest root', as
   const resolved = await resolveOk(nested);
 
   assert.equal(resolved.root, dir);
-  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [] });
+  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
 });
 
 test('resolveWorkspace resolves the root given explicitly', async (t) => {
@@ -1104,7 +1157,7 @@ test('resolution treats a file component as absent and keeps walking to the work
   const resolved = await resolveOk(join(dir, 'blocker', 'sub'));
 
   assert.equal(resolved.root, dir);
-  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [] });
+  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
 });
 
 test('resolveWorkspace returns the nearest of hand-crafted nested workspaces', async (t) => {
@@ -1215,6 +1268,86 @@ test('initWorkspace allows a workspace that contains another', async (t) => {
   assert.equal(await readFile(modelPath(dir), 'utf8'), EMPTY_MODEL_BYTES);
 });
 
+test('resolveWorkspace reads a model without a views field as no views', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, '{"tables":[],"sequences":[]}');
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
+});
+
+test('serializeModel emits views after sequences, sorted, with the check option last', () => {
+  const model: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      { schema: 'public', name: 'z', materialized: true, definition: 'SELECT 2' },
+      {
+        schema: 'public',
+        name: 'c',
+        materialized: false,
+        definition: 'SELECT 3',
+        checkOption: 'local',
+      },
+      { schema: 'app', name: 'a', materialized: false, definition: 'SELECT 1' },
+    ],
+  };
+  const expected = [
+    '{',
+    '  "tables": [],',
+    '  "sequences": [],',
+    '  "views": [',
+    '    {',
+    '      "schema": "app",',
+    '      "name": "a",',
+    '      "materialized": false,',
+    '      "definition": "SELECT 1"',
+    '    },',
+    '    {',
+    '      "schema": "public",',
+    '      "name": "c",',
+    '      "materialized": false,',
+    '      "definition": "SELECT 3",',
+    '      "checkOption": "local"',
+    '    },',
+    '    {',
+    '      "schema": "public",',
+    '      "name": "z",',
+    '      "materialized": true,',
+    '      "definition": "SELECT 2"',
+    '    }',
+    '  ]',
+    '}',
+    '',
+  ].join('\n');
+
+  assert.equal(serializeModel(model), expected);
+});
+
+test('serializeModel round-trips views through resolveWorkspace without loss', async (t) => {
+  const dir = await fixtureDir(t);
+  const model: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      {
+        schema: 'public',
+        name: 'active',
+        materialized: false,
+        definition: 'SELECT 1',
+        checkOption: 'cascaded',
+      },
+      { schema: 'public', name: 'totals', materialized: true, definition: 'SELECT 2' },
+    ],
+  };
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, model);
+});
+
 test('serializeModel pins declaration order and omits undefined optionals', () => {
   const model: Model = {
     tables: [
@@ -1229,6 +1362,7 @@ test('serializeModel pins declaration order and omits undefined optionals', () =
       },
     ],
     sequences: [],
+    views: [],
   };
   const expected = [
     '{',
@@ -1249,7 +1383,8 @@ test('serializeModel pins declaration order and omits undefined optionals', () =
     '      "indexes": []',
     '    }',
     '  ],',
-    '  "sequences": []',
+    '  "sequences": [],',
+    '  "views": []',
     '}',
     '',
   ].join('\n');
@@ -1264,10 +1399,12 @@ test('serializeModel is deterministic and re-sorts tables and sequences canonica
       effectiveSequence({ schema: 'public', name: 'z' }),
       effectiveSequence({ schema: 'public', name: 'a' }),
     ],
+    views: [],
   };
   const reordered: Model = {
     tables: [...model.tables].reverse(),
     sequences: [...model.sequences].reverse(),
+    views: [],
   };
 
   assert.equal(serializeModel(model), serializeModel(reordered));
