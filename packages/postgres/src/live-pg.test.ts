@@ -48,7 +48,8 @@ import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
  * the modeled sequences and identity columns must come back exactly (see
  * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
- * against both imported models (see `assertImportChecks`), and `diff` between the imported
+ * against both imported models (see `assertImportChecks`), its cross-import checks compare the
+ * two imports to each other (see `assertCrossImportChecks`), and `diff` between the imported
  * models must be exactly empty. A scene that declares an `introspection` assertion is then read
  * back through the production `catalogReader` (see `assertIntrospection`). Databases are
  * dropped best-effort, so a failed scene still cleans up after itself.
@@ -265,6 +266,7 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       expected,
       'target',
     );
+    assertCrossImportChecks(scene, applied, expected);
 
     assert.deepEqual(
       diff(applied.model, expected.model),
@@ -641,6 +643,41 @@ function assertImportChecks(
     assert.ok(
       failure === undefined,
       `${scene.name}: ${what}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
+    );
+  }
+}
+
+/**
+ * Asserts every cross-import fact in order against both dumps' imports. Cross-import facts are
+ * the server-derived equality evidence: both reads come from the same server, each from its own
+ * database's dump, so a check can compare them without pinning deparse text. Both reads must be
+ * clean first — a scene that declares cross-import checks cannot pass on two failed imports.
+ */
+function assertCrossImportChecks(
+  scene: LiveScene,
+  applied: ReadResult<Model, Diagnostic>,
+  target: ReadResult<Model, Diagnostic>,
+): void {
+  const checks = scene.crossImportChecks ?? [];
+  if (checks.length === 0) return;
+  for (const [side, result] of [
+    ['applied', applied],
+    ['target', target],
+  ] as const) {
+    const errors = result.diagnostics
+      .filter((diagnostic) => diagnostic.kind === 'error')
+      .map((diagnostic) => diagnostic.message);
+    assert.deepEqual(
+      errors,
+      [],
+      `${scene.name}: the ${side} import reported errors; cross-import checks need two clean imports`,
+    );
+  }
+  for (const check of checks) {
+    const failure = check.failure(applied, target);
+    assert.ok(
+      failure === undefined,
+      `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
     );
   }
 }
