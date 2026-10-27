@@ -244,9 +244,10 @@ const EXPECTED_DIAGNOSTICS = [
 
 /**
  * The long-tail families in the order a dump emits them, captured from the #59 fact report:
- * every statement is skipped with a family-named description, and the two `CREATE TABLE`
- * attribute leftovers import partially and are flagged. The two plain `CREATE TABLE`s
- * (`app.t`, `app.rls`) are present for the statements that reference them and produce nothing.
+ * every unmodeled statement is skipped with a family-named description, the plain view and
+ * materialized view import, and the two `CREATE TABLE` attribute leftovers import partially
+ * and are flagged. The two plain `CREATE TABLE`s (`app.t`, `app.rls`) are present for the
+ * statements that reference them and produce nothing.
  */
 const LONG_TAIL_DUMP = [
   `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
@@ -307,18 +308,6 @@ const LONG_TAIL_DIAGNOSTICS = [
     code: 'unsupported-statement',
     object: 'pgcrypto',
     message: 'skipped CREATE EXTENSION pgcrypto',
-  },
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'app.v',
-    message: 'skipped CREATE VIEW app.v',
-  },
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'app.mv',
-    message: 'skipped CREATE MATERIALIZED VIEW app.mv',
   },
   {
     kind: 'skip',
@@ -2852,6 +2841,478 @@ test('reads the pg_dump attribute spellings captured live (PostgreSQL 16.15)', a
       checkConstraints: [],
       indexes: [],
       persistence: 'unlogged',
+    },
+  ]);
+});
+
+test('imports plain views and materialized views, sorted by identity', async () => {
+  const dump = [
+    `CREATE VIEW public.upper AS SELECT 1 AS one;`,
+    '',
+    `CREATE MATERIALIZED VIEW app.totals AS`,
+    ` SELECT team_id, count(*) AS n FROM app.t GROUP BY team_id WITH NO DATA;`,
+    '',
+    `CREATE VIEW app.plain AS`,
+    ` SELECT a, b /* keep columns */, 'AS' AS label`,
+    `   FROM app.t WHERE a <> 'x' AND b IS NOT NULL;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The body is the source text after the top-level AS, whitespace-normalized: commas tighten,
+  // comments drop, and a quoted 'AS' is body text, not the terminator. Views sort like tables.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'plain',
+      materialized: false,
+      definition: "SELECT a,b,'AS' AS label FROM app.t WHERE a <> 'x' AND b IS NOT NULL",
+    },
+    {
+      schema: 'app',
+      name: 'totals',
+      materialized: true,
+      definition: 'SELECT team_id,count(*) AS n FROM app.t GROUP BY team_id',
+    },
+    { schema: 'public', name: 'upper', materialized: false, definition: 'SELECT 1 AS one' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads view check options from the clause and from a check_option reloption', async () => {
+  const dump = [
+    `CREATE VIEW app.local AS SELECT id FROM app.t WITH LOCAL CHECK OPTION;`,
+    `CREATE VIEW app.implicit AS SELECT id FROM app.t WITH CHECK OPTION;`,
+    `CREATE VIEW app.option WITH (check_option='cascaded') AS SELECT id FROM app.t;`,
+    `CREATE VIEW app.both WITH (check_option='cascaded') AS SELECT id FROM app.t WITH LOCAL CHECK OPTION;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The clause wins over the reloption; a bare WITH CHECK OPTION is cascaded, as the engine
+  // reads it. The overridden option is flagged, never silently dropped.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'both',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'local',
+    },
+    {
+      schema: 'app',
+      name: 'implicit',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'cascaded',
+    },
+    {
+      schema: 'app',
+      name: 'local',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'local',
+    },
+    {
+      schema: 'app',
+      name: 'option',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'cascaded',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.both',
+      message: 'dropped view option check_option=cascaded from app.both',
+    },
+  ]);
+});
+
+test('flags every view reloption by name, still importing the view', async () => {
+  const dump = [
+    `CREATE VIEW app.options WITH (security_barrier, security_invoker=true, fillfactor=70, toast.autovacuum_enabled=false) AS SELECT id FROM app.t;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'options',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option security_barrier from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option security_invoker=true from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option fillfactor=70 from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option toast.autovacuum_enabled=false from app.options',
+    },
+  ]);
+});
+
+test('flags view and materialized-view column lists, keeping the views', async () => {
+  const dump = [
+    `CREATE VIEW app.columns (a, b) AS SELECT 1, 2;`,
+    `CREATE MATERIALIZED VIEW app.mv_columns (a) AS SELECT 1 WITH NO DATA;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'columns',
+      materialized: false,
+      definition: 'SELECT 1,2',
+    },
+    {
+      schema: 'app',
+      name: 'mv_columns',
+      materialized: true,
+      definition: 'SELECT 1',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.columns',
+      message: 'dropped view column list from app.columns',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_columns',
+      message: 'dropped materialized view column list from app.mv_columns',
+    },
+  ]);
+});
+
+test('flags the materialized-view access method, tablespace, IF NOT EXISTS, and data clause', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW IF NOT EXISTS app.mv_flags (a) USING heap WITH (fillfactor=70, check_option='local') TABLESPACE pg_default AS SELECT 1 WITH DATA;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The options are named but the view imports; a check option cannot travel on a materialized
+  // view, so it stays a dropped option rather than a modeled field.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv_flags',
+      materialized: true,
+      definition: 'SELECT 1',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped IF NOT EXISTS from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view column list from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view access method heap from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped view option fillfactor=70 from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped view option check_option=local from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view tablespace pg_default from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped WITH DATA from app.mv_flags',
+    },
+  ]);
+});
+
+test('distinguishes WITH NO DATA, WITH DATA, and the implicit populated state', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv_no_data AS SELECT 1 WITH NO DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_data AS SELECT 'WITH DATA' AS note WITH DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_none AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The model has no populated state and render always writes WITH NO DATA: an explicit
+  // WITH DATA and a clause-less (server-default populated) statement are both losses, with
+  // distinct names. The body's quoted 'WITH DATA' is untouched.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv_data',
+      materialized: true,
+      definition: "SELECT 'WITH DATA' AS note",
+    },
+    { schema: 'app', name: 'mv_no_data', materialized: true, definition: 'SELECT 1' },
+    { schema: 'app', name: 'mv_none', materialized: true, definition: 'SELECT 1' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_data',
+      message: 'dropped WITH DATA from app.mv_data',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_none',
+      message: 'dropped implicit populated state from app.mv_none',
+    },
+  ]);
+});
+
+test('flags non-default view and materialized-view persistence defensively', async () => {
+  const dump = [
+    `CREATE TEMP VIEW app.temp_view AS SELECT 1;`,
+    `CREATE UNLOGGED VIEW app.unlogged_view AS SELECT 1;`,
+    `CREATE UNLOGGED MATERIALIZED VIEW app.unlogged_mv AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // PostgreSQL rejects unlogged views and materialized views and pg_dump never emits temp
+  // objects, so these forms only arrive hand-authored; they import as plain objects and the
+  // dropped persistence is named rather than normalized away silently.
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'temp_view', materialized: false, definition: 'SELECT 1' },
+    { schema: 'app', name: 'unlogged_mv', materialized: true, definition: 'SELECT 1' },
+    { schema: 'app', name: 'unlogged_view', materialized: false, definition: 'SELECT 1' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.temp_view',
+      message: 'dropped temporary-view persistence from app.temp_view',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_view',
+      message: 'dropped unlogged-view persistence from app.unlogged_view',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_mv',
+      message: 'dropped unlogged-materialized-view persistence from app.unlogged_mv',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_mv',
+      message: 'dropped implicit populated state from app.unlogged_mv',
+    },
+  ]);
+});
+
+test('skips recursive views once, matching the keyword case and ignoring comments and quotes', async () => {
+  const dump = [
+    `CREATE RECURSIVE VIEW app.recursive_view (n) AS SELECT 1;`,
+    `CREATE TEMP RECURSIVE VIEW app.temp_recursive_view (n) AS SELECT 1;`,
+    `CREATE /* not recursive */ VIEW app.not_recursive AS SELECT 1;`,
+    `CREATE VIEW app."Recursive" AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The parser rewrites the form into a view-named recursive CTE with synthetic locations and
+  // the raw body after AS omits the CTE, so it is skipped whole — once, even with TEMP, whose
+  // persistence flag would otherwise also fire. A comment or quoted identifier never matches.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.recursive_view',
+      message:
+        'skipped CREATE RECURSIVE VIEW app.recursive_view (recursive views are not represented yet)',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.temp_recursive_view',
+      message:
+        'skipped CREATE RECURSIVE VIEW app.temp_recursive_view (recursive views are not represented yet)',
+    },
+  ]);
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'Recursive', materialized: false, definition: 'SELECT 1' },
+    { schema: 'app', name: 'not_recursive', materialized: false, definition: 'SELECT 1' },
+  ]);
+});
+
+test('keeps the last definition of a repeated view, including the loop-repair CREATE OR REPLACE', async () => {
+  const dump = [
+    `CREATE VIEW app.loop AS SELECT 1 AS a;`,
+    `CREATE OR REPLACE VIEW app.loop AS SELECT 1 AS a, 2 AS b;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // pg_dump emits a dummy CREATE VIEW and a post-data CREATE OR REPLACE VIEW to break a
+  // dependency loop; the import holds one view and the last definition wins.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'loop',
+      materialized: false,
+      definition: 'SELECT 1 AS a,2 AS b',
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('lets a repeated identity change kind, last definition winning', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.kind AS SELECT 1;`,
+    `CREATE VIEW app.kind AS SELECT 2;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // A duplicate with a different materialized flag is an invalid dump; overwrite keeps the
+  // model single-valued. The first statement's populated-state loss is still reported.
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'kind', materialized: false, definition: 'SELECT 2' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.kind',
+      message: 'dropped implicit populated state from app.kind',
+    },
+  ]);
+});
+
+test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-ASCII text', async () => {
+  const dump = [
+    `CREATE VIEW app.cte AS WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t;`,
+    `CREATE VIEW app.quoted AS SELECT (a + 1) AS "AS" FROM app.t;`,
+    `CREATE VIEW app.dollar AS SELECT a, (b + 1) AS c, $$WITH NO DATA$$ AS d, $tag$ ? AS ? $tag$ AS e FROM app.t;`,
+    `/* café */ CREATE VIEW app.utf8 AS SELECT 'é' AS e;`,
+    `CREATE MATERIALIZED VIEW app.mv_literal AS SELECT 'WITH NO DATA' AS note WITH NO DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_ord AS SELECT * FROM generate_series(1, 2) WITH ORDINALITY WITH NO DATA;`,
+    `CREATE VIEW app.ord_view AS SELECT * FROM generate_series(1, 2) WITH ORDINALITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'cte',
+      materialized: false,
+      definition:
+        'WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t',
+    },
+    {
+      schema: 'app',
+      name: 'dollar',
+      materialized: false,
+      definition: 'SELECT a,(b + 1) AS c,$$WITH NO DATA$$ AS d,$tag$ ? AS ? $tag$ AS e FROM app.t',
+    },
+    {
+      schema: 'app',
+      name: 'mv_literal',
+      materialized: true,
+      definition: "SELECT 'WITH NO DATA' AS note",
+    },
+    {
+      schema: 'app',
+      name: 'mv_ord',
+      materialized: true,
+      definition: 'SELECT * FROM generate_series(1,2) WITH ORDINALITY',
+    },
+    {
+      schema: 'app',
+      name: 'ord_view',
+      materialized: false,
+      definition: 'SELECT * FROM generate_series(1,2) WITH ORDINALITY',
+    },
+    {
+      schema: 'app',
+      name: 'quoted',
+      materialized: false,
+      definition: 'SELECT(a + 1) AS "AS" FROM app.t',
+    },
+    { schema: 'app', name: 'utf8', materialized: false, definition: "SELECT 'é' AS e" },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips a materialized view index as a table that was not imported', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a WITH NO DATA;`,
+    `CREATE UNIQUE INDEX mv_a_idx ON app.mv USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // Matview indexes are not modeled in this slice and the matview is not a table draft, so the
+  // existing missing-table skip names it without manufacturing a phantom table.
+  assert.deepEqual(model.tables, []);
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'mv_a_idx',
+      message: 'skipped CREATE INDEX mv_a_idx (table not imported)',
     },
   ]);
 });
