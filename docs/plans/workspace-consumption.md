@@ -37,7 +37,7 @@
 
 Usage errors are validated before any filesystem access and emitted through commander's error machinery in the pinned shape: the `error: …` message on stderr, exit 1, empty stdout.
 
-**The failure mapping.** Six of the ten `WorkspaceDiagnostic` codes can surface (`workspace-target-not-directory`, `workspace-already-exists`, `workspace-inside-workspace`, and `workspace-io` are `init`-only). Each prints exactly one `schemamill: <message>` line on stderr — core's diagnostic verbatim — and exits 1 with empty stdout: the failure precedes any output, even when an import could otherwise have proceeded. The six, with the construction each pin uses:
+**The failure mapping.** Six of the ten `WorkspaceDiagnostic` codes can surface; `workspace-target-not-directory`, `workspace-already-exists`, and `workspace-inside-workspace` are `init`-only, while `workspace-io` surfaces from `init` or the public writer ([#120](https://github.com/osama784/schemamill/issues/120); [workspace-writer.md](./workspace-writer.md)), which this CLI does not call. Each prints exactly one `schemamill: <message>` line on stderr — core's diagnostic verbatim — and exits 1 with empty stdout: the failure precedes any output, even when an import could otherwise have proceeded. The six, with the construction each pin uses:
 
 - `workspace-not-found` — no marker up to the filesystem root; the message names the start path.
 - `workspace-marker-invalid` — `.schemamill` exists but is not a directory (a regular file pins it).
@@ -65,7 +65,7 @@ The nearest marker always wins — a corrupt inner marker is reported, never ski
 Named for the slices that own them, never silent:
 
 - **Populating the workspace model** — writing the model into an existing workspace from a dump or a live database; this slice reads the model, it never writes it. Dump-only population shipped in [workspace-population.md](./workspace-population.md) ([#113](https://github.com/osama784/schemamill/issues/113)): `init --from` imports a DDL dump into a new workspace; live-database population remains deferred.
-- **A public writer API** — internal to `init` today; a consumer that writes the model needs its own design.
+- **A public writer API** — shipped in [#120](https://github.com/osama784/schemamill/issues/120) ([workspace-writer.md](./workspace-writer.md)): `writeWorkspaceModel` writes a model into an existing workspace atomically. Snapshots and studio consumption remain deferred; this CLI still only reads the model.
 - **Snapshots, studio consumption, multi-workspace handling** — each its own slice per the [workspace plan](./workspace.md) §Deferred.
 - **File-format versioning and the `docs/architecture.md` persistence sync** — still deferred by ADR 0010.
 - **A workspace usage-docs page, Windows path edge cases, and `init`'s EACCES refinement** — each still deferred by [ADR 0010](../adr/0010-workspace-container.md).
