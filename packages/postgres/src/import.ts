@@ -507,7 +507,13 @@ function translateColumn(
   for (const constraint of constraints) {
     switch (constraint.contype) {
       case 'CONSTR_PRIMARY': {
-        const primaryKey = primaryKeyFromConstraint(constraint, [name]) as Mutable<PrimaryKey>;
+        const primaryKey = primaryKeyFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<PrimaryKey>;
         translated.primaryKey = primaryKey;
         fold = { kind: 'primary', value: primaryKey };
         break;
@@ -560,6 +566,11 @@ function translateColumn(
           );
         } else {
           translated.column = merged.column;
+        }
+        if (constraint.is_no_inherit === true) {
+          diagnostics.push(
+            flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
+          );
         }
         break;
       }
@@ -863,7 +874,7 @@ function translateTableConstraint(
       attachPrimaryKey(
         statement,
         draft,
-        primaryKeyFromConstraint(constraint, []),
+        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
         identity,
         diagnostics,
       );
@@ -961,6 +972,12 @@ function attachNotNullConstraint(
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
     diagnostics.push(
       flagAttribute(statement, identity, `NOT VALID on ${constraintLabel(constraint)}`),
+    );
+  }
+
+  if (constraint.is_no_inherit === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
     );
   }
 }
@@ -1630,7 +1647,7 @@ function translateAlterTableCommand(
       attachPrimaryKey(
         statement,
         draft,
-        primaryKeyFromConstraint(constraint, []),
+        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
         identity,
         diagnostics,
       );
@@ -2641,13 +2658,21 @@ function attachIndex(draft: TableDraft, index: Index): void {
 }
 
 function primaryKeyFromConstraint(
+  statement: ParsedStatement,
   constraint: Constraint,
   fallbackColumns: readonly string[],
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
 ): PrimaryKey {
   const keys = stringList(constraint.keys);
   const primaryKey: Mutable<PrimaryKey> = { columns: keys.length > 0 ? keys : fallbackColumns };
   if (constraint.conname !== undefined) primaryKey.name = constraint.conname;
   applyConstraintDeferrability(constraint, primaryKey);
+  if (constraint.without_overlaps === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `WITHOUT OVERLAPS on ${constraintLabel(constraint)}`),
+    );
+  }
   return primaryKey;
 }
 
@@ -2710,6 +2735,7 @@ function foreignKeyFromConstraint(
     flag(`MATCH ${constraint.fk_matchtype === 'f' ? 'FULL' : 'PARTIAL'}`);
   }
   if ((constraint.fk_del_set_cols ?? []).length > 0) flag('column list');
+  if (constraint.fk_with_period === true || constraint.pk_with_period === true) flag('PERIOD');
 
   const enforcement = constraintEnforcement(constraint);
   if (enforcement !== undefined) foreignKey.enforcement = enforcement;
@@ -2834,6 +2860,7 @@ function flagUniqueConstraintAttributes(
   };
   if (constraint.nulls_not_distinct === true) flag('NULLS NOT DISTINCT');
   if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.without_overlaps === true) flag('WITHOUT OVERLAPS');
   if (constraint.is_no_inherit === true) flag('NO INHERIT');
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
     flag('NOT VALID');
