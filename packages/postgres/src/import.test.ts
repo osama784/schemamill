@@ -3559,6 +3559,30 @@ test('flags NO INHERIT beside a not-null merge conflict', async () => {
   );
 });
 
+test('flags NO INHERIT beside an inline not-null merge conflict', async () => {
+  // Two real inline names for one not-null fact: the merge keeps the first and reports the
+  // conflict, and the inline inheritance attribute is dropped either way, after the conflict
+  // flag — the inline twin of the table-level case above.
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT t_a_nn NOT NULL CONSTRAINT t_other NOT NULL NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 't_a_nn' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped additional not-null constraint on public.t.a from public.t',
+      'dropped NO INHERIT on not-null constraint t_other from public.t',
+    ],
+  );
+});
+
 test('drops temporal and inheritance forms whole, leaving the same model', async () => {
   const withForms = [
     `CREATE TABLE public.p (id integer, during tsrange);`,
