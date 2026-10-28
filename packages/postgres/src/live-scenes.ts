@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { diff, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
   CheckConstraint,
@@ -20,6 +22,7 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
 
 import { renderSql } from './render.ts';
@@ -124,6 +127,15 @@ import { renderSql } from './render.ts';
  * referenced table's primary key, and proves the dump's explicit list still diffs empty against
  * the omitting model.
  *
+ * The view scene is the first server-derived equality evidence: `view-round-trip` redefines one
+ * plain view in place (`CREATE OR REPLACE`), rewrites a materialized view (drop and create),
+ * removes a view, adds two views (one with a check option), and changes one view from plain to
+ * materialized. Its `crossImportChecks` compare the applied database's import with the target
+ * database's import — both produced by the same server from its own dumps — so no
+ * `pg_get_viewdef` spelling is pinned and a PostgreSQL 16-authored definition cannot fail a
+ * PostgreSQL 18 run. The target build adds a unique index on the materialized view through raw
+ * SQL, which the import must skip by name because a materialized view is not a table.
+ *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
  * in place — a model that says otherwise would make the migrated database legitimately differ
@@ -178,17 +190,27 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
 
 /** A model of the given tables and sequences together. */
 const withSequences = (tables: readonly Table[], sequences: readonly Sequence[]): Model => ({
   tables,
   sequences,
+  views: [],
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */
 const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence =>
   effectiveSequence({ schema: 'public', name, ...fields });
+
+/** A view named `name`: plain, with an empty definition unless overridden. */
+const view = (name: string, fields: Partial<Omit<View, 'name'>> = {}): View => ({
+  schema: 'public',
+  name,
+  materialized: false,
+  definition: '',
+  ...fields,
+});
 
 /** The owner link for a sequence: `tableName.columnName`, `public` unless overridden. */
 const sequenceOwner = (
@@ -248,6 +270,24 @@ export interface SceneImportCheck {
 }
 
 /**
+ * One cross-import fact: `failure` reads both imports — the migrated database's and the target
+ * database's, each produced by the same server from its own dump — and returns what is wrong,
+ * or `undefined` when the two agree. This is the server-derived equality evidence for an object
+ * family the `matches-import` introspection assertion does not cover: comparing the two
+ * imports catches an asymmetric import loss and is the server-derived equality bar, and it pins
+ * no deparse spelling, so a server-version change cannot fail the scene. The scene's per-source
+ * import checks and its catalog checks on the migrated database keep the comparison from being
+ * vacuous when both imports lose the same thing.
+ */
+export interface SceneCrossImportCheck {
+  readonly description: string;
+  readonly failure: (
+    applied: ReadResult<Model, Diagnostic>,
+    target: ReadResult<Model, Diagnostic>,
+  ) => string | undefined;
+}
+
+/**
  * How a scene's live-introspection assertion is checked: `matches-import` requires an empty
  * diagnostic list, an empty `diff` against the applied dump's import, and a model deep-equal to
  * that import (order-significant — the real order guard); `flags` pins the diagnostics list
@@ -294,6 +334,12 @@ export interface LiveScene {
   readonly checks?: readonly SceneCheck[];
   /** Import facts to assert on both dumps' imports, after the round trip. */
   readonly importChecks?: readonly SceneImportCheck[];
+  /**
+   * Facts about both imports together, asserted after the per-source import facts. The two
+   * imports are server-derived — each database is dumped by the same server and imported by the
+   * same importer — so a check can compare them without pinning the server's deparse spelling.
+   */
+  readonly crossImportChecks?: readonly SceneCrossImportCheck[];
   /**
    * Live-introspection facts: when present, the harness reads the migrated database through
    * `catalogReader` — consumed as `CatalogReader<string, Model, Diagnostic>` — after the
@@ -428,6 +474,22 @@ const compressionModesOf = (tableName: string, schema = 'public'): string =>
 /** One table's `pg_class.relpersistence` letter: `p`, `u`, or `t`. */
 const relPersistenceOf = (tableName: string, schema = 'public'): string =>
   `select relpersistence::text from pg_class where oid = '${schema}.${tableName}'::regclass`;
+
+/** One relation's `pg_class.relkind` code: `r`, `v`, `m`, … */
+const relKindOf = (relationName: string, schema = 'public'): string =>
+  `select relkind::text from pg_class where oid = '${schema}.${relationName}'::regclass`;
+
+/** Whether a materialized view's data is populated: `t` or `f`, via `pg_class.relispopulated`. */
+const relIsPopulated = (relationName: string, schema = 'public'): string =>
+  `select relispopulated from pg_class where oid = '${schema}.${relationName}'::regclass`;
+
+/** Whether the relation named `name` exists, as `t` or `f`: no cast failure for an absent object. */
+const relationExists = (name: string, schema = 'public'): string =>
+  `select to_regclass('${schema}.${name}') is not null`;
+
+/** Whether a view's server deparse contains `fragment`: an anchor with no pinned definition text. */
+const viewDefinitionContains = (viewName: string, fragment: string, schema = 'public'): string =>
+  `select pg_get_viewdef('${schema}.${viewName}'::regclass) LIKE '%${fragment}%'`;
 
 /** `public` sequences in name order, or the empty string when there are none. */
 const SEQUENCES =
@@ -4998,6 +5060,253 @@ const unnamedFkRoundTripScene = (): LiveScene => {
   };
 };
 
+/**
+ * The view round trip: a view redefined in place, a materialized view rewritten, a view removed,
+ * two views added (one with a local check option), and a view changed from plain to
+ * materialized. The tables are identical on both sides, so every step in the plan is a view
+ * step. The target build additionally carries a unique index on the materialized view through
+ * `targetExtraSql`, an object the model cannot declare; the target dump's import must skip it
+ * by name, and the applied database (which never had it) must not report that skip. Neither
+ * dump pins `pg_get_viewdef` text: the anchor checks only ask that the server's own deparse
+ * mentions the column and table the definition names, and the cross-import check compares the
+ * two server-derived imports to each other.
+ */
+const viewRoundTripScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('name', { notNull: true }),
+      column('active', { type: 'boolean', notNull: true }),
+      column('balance', { type: 'integer', notNull: true }),
+      column('team_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+  });
+
+  const baseline: Model = {
+    tables: [accounts],
+    sequences: [],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT id, name, balance FROM accounts WHERE active',
+      }),
+      view('active_accounts', { definition: 'SELECT id, name FROM accounts WHERE active' }),
+      view('obsolete_accounts', { definition: 'SELECT id FROM accounts WHERE NOT active' }),
+      view('promote_me', { definition: 'SELECT id FROM accounts WHERE active' }),
+    ],
+  };
+  const target: Model = {
+    tables: [accounts],
+    sequences: [],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance >= 0',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance > 0',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, name FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+      view('promote_me', {
+        materialized: true,
+        definition: 'SELECT id FROM accounts WHERE balance > 0',
+      }),
+      view('recent_accounts', {
+        definition: 'SELECT id FROM accounts WHERE active AND balance >= 0',
+      }),
+    ],
+  };
+
+  /** The five target views and the `materialized` flag each must import with. */
+  const expectedViews = [
+    ['account_totals', true],
+    ['active_accounts', false],
+    ['positive_accounts', false],
+    ['promote_me', true],
+    ['recent_accounts', false],
+  ] as const;
+
+  /** One view by identity in an imported model, or `undefined`. */
+  const findView = (imported: ReadResult<Model, Diagnostic>, name: string): View | undefined =>
+    imported.model.views.find(
+      (candidate) => candidate.schema === 'public' && candidate.name === name,
+    );
+
+  return {
+    name: 'view-round-trip',
+    baseline,
+    target,
+    targetExtraSql: 'CREATE UNIQUE INDEX account_totals_id_idx ON public.account_totals (id);',
+    baselineChecks: [
+      {
+        description: 'the baseline account_totals is a materialized view',
+        sql: relKindOf('account_totals'),
+        expected: 'm',
+      },
+      {
+        description: 'the baseline promote_me is a plain view',
+        sql: relKindOf('promote_me'),
+        expected: 'v',
+      },
+      {
+        description: 'the baseline account_totals is unpopulated',
+        sql: relIsPopulated('account_totals'),
+        expected: 'f',
+      },
+    ],
+    checks: [
+      {
+        description: 'the applied account_totals is a materialized view',
+        sql: relKindOf('account_totals'),
+        expected: 'm',
+      },
+      {
+        description: 'the applied active_accounts is a plain view',
+        sql: relKindOf('active_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied positive_accounts is a plain view',
+        sql: relKindOf('positive_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied promote_me is a materialized view',
+        sql: relKindOf('promote_me'),
+        expected: 'm',
+      },
+      {
+        description: 'the applied recent_accounts is a plain view',
+        sql: relKindOf('recent_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied account_totals is unpopulated',
+        sql: relIsPopulated('account_totals'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied promote_me is unpopulated',
+        sql: relIsPopulated('promote_me'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied database dropped obsolete_accounts',
+        sql: relationExists('obsolete_accounts'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied active_accounts definition reads balance',
+        sql: viewDefinitionContains('active_accounts', 'balance'),
+        expected: 't',
+      },
+      {
+        description: 'the applied positive_accounts definition reads accounts',
+        sql: viewDefinitionContains('positive_accounts', 'accounts'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'the five target views import with the expected kinds and check option',
+        failure: (imported, source) => {
+          for (const [name, materialized] of expectedViews) {
+            const found = findView(imported, name);
+            if (found === undefined) return `${source}: ${name} is not imported`;
+            if (found.materialized !== materialized) {
+              return `${source}: ${name}.materialized is ${found.materialized}, expected ${materialized}`;
+            }
+            if (found.definition.trim() === '') {
+              return `${source}: ${name} imported an empty definition`;
+            }
+          }
+          const positive = findView(imported, 'positive_accounts');
+          if (positive?.checkOption !== 'local') {
+            return `${source}: positive_accounts.checkOption is ${String(positive?.checkOption)}, expected local`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the server deparse carries the authored columns and tables',
+        failure: (imported, source) => {
+          const active = findView(imported, 'active_accounts');
+          if (active === undefined) return `${source}: active_accounts is not imported`;
+          if (!active.definition.includes('balance')) {
+            return `${source}: active_accounts.definition does not mention balance: ${JSON.stringify(active.definition)}`;
+          }
+          if (!active.definition.includes('accounts')) {
+            return `${source}: active_accounts.definition does not mention accounts: ${JSON.stringify(active.definition)}`;
+          }
+          const positive = findView(imported, 'positive_accounts');
+          if (positive === undefined) return `${source}: positive_accounts is not imported`;
+          if (!positive.definition.includes('accounts')) {
+            return `${source}: positive_accounts.definition does not mention accounts: ${JSON.stringify(positive.definition)}`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'only the target dump reports the matview index skip, by name',
+        failure: (imported, source) => {
+          const named = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.includes('account_totals_id_idx'),
+          );
+          if (source === 'target') {
+            if (named.length !== 1) {
+              return `expected exactly one account_totals_id_idx diagnostic, got ${named.length}`;
+            }
+            const [diagnostic] = named;
+            const expected = 'skipped CREATE INDEX account_totals_id_idx (table not imported)';
+            if (diagnostic?.kind !== 'skip' || diagnostic.message !== expected) {
+              return `expected skip ${JSON.stringify(expected)}, got ${String(diagnostic?.kind)} ${JSON.stringify(diagnostic?.message)}`;
+            }
+            if (diagnostic.object !== 'account_totals_id_idx') {
+              return `the skip names ${String(diagnostic.object)}, expected account_totals_id_idx`;
+            }
+          } else if (named.length !== 0) {
+            return `the applied import must not report the matview index skip: ${named
+              .map((diagnostic) => diagnostic.message)
+              .join('; ')}`;
+          }
+          const otherViewSkips = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' &&
+              diagnostic.message.toLowerCase().includes('view') &&
+              !diagnostic.message.includes('account_totals_id_idx'),
+          );
+          return otherViewSkips.length === 0
+            ? undefined
+            : `unexpected view skips: ${otherViewSkips
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'the applied and target imports are the same server-derived model',
+        failure: (applied, expected) =>
+          isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ:\n${JSON.stringify(
+                {
+                  changes: diff(applied.model, expected.model),
+                  applied: applied.model,
+                  target: expected.model,
+                },
+                null,
+                2,
+              )}`,
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -5043,4 +5352,5 @@ export const scenes: readonly LiveScene[] = [
   introspectionFlagsConstraints18Scene(),
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
+  viewRoundTripScene(),
 ];

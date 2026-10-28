@@ -19,6 +19,7 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
 } from './model.ts';
 
 /**
@@ -94,7 +95,7 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
 
 /** A sequence named `name`: bigint ascending defaults unless overridden. */
 const sequence = (
@@ -136,6 +137,27 @@ const columnIdentity = (fields: Partial<Identity> = {}): Identity => ({
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
 });
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -3977,4 +3999,126 @@ test('added constraints order target-only groups ahead of later baseline-group e
       ],
     },
   ]);
+});
+
+test('views in different insertion orders compare as identical', () => {
+  const appView = view('a', {}, 'app');
+  const publicView = view('z', { materialized: true });
+
+  assertDiff(viewModel([publicView, appView]), viewModel([appView, publicView]), []);
+  // The target side sorts independently too: an unsorted target is not a different schema.
+  assertDiff(viewModel([appView, publicView]), viewModel([publicView, appView]), []);
+});
+
+test('removed and added views follow the sequence changes, in identity order', () => {
+  const gone = view('a');
+  const appView = view('z', {}, 'app');
+  const fresh = view('b');
+  const baseline: Model = { tables: [], sequences: [sequence('s')], views: [gone] };
+  const target: Model = { tables: [], sequences: [], views: [appView, fresh] };
+
+  assertDiff(baseline, target, [
+    { kind: 'sequence-removed', sequence: baseline.sequences[0]! },
+    { kind: 'view-added', view: appView },
+    { kind: 'view-removed', view: gone },
+    { kind: 'view-added', view: fresh },
+  ]);
+});
+
+test('a changed view reports its differing fields in the fixed order', () => {
+  const before = view('v', { definition: 'SELECT 1', checkOption: 'local' });
+  const after = view('v', {
+    materialized: true,
+    definition: 'SELECT 2',
+  });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [
+        { field: 'materialized', before: false, after: true },
+        { field: 'definition', before: 'SELECT 1', after: 'SELECT 2' },
+        { field: 'checkOption', before: 'local' },
+      ],
+      before,
+      after,
+    },
+  ]);
+});
+
+test('a check option addition and change are reported with the absent side omitted', () => {
+  const local = view('v', { checkOption: 'local' });
+  const cascaded = view('v', { checkOption: 'cascaded' });
+
+  assertDiff(viewModel([view('v')]), viewModel([local]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'checkOption', after: 'local' }],
+      before: view('v'),
+      after: local,
+    },
+  ]);
+  assertDiff(viewModel([local]), viewModel([cascaded]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'checkOption', before: 'local', after: 'cascaded' }],
+      before: local,
+      after: cascaded,
+    },
+  ]);
+});
+
+test('a view rematerialization is a change, not a removal and an addition', () => {
+  const plain = view('v');
+  const materialized = view('v', { materialized: true });
+
+  assertDiff(viewModel([plain]), viewModel([materialized]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'materialized', before: false, after: true }],
+      before: plain,
+      after: materialized,
+    },
+  ]);
+  assertDiff(viewModel([materialized]), viewModel([plain]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'materialized', before: true, after: false }],
+      before: materialized,
+      after: plain,
+    },
+  ]);
+});
+
+test('a deep-frozen model with views can be diffed', () => {
+  const baseline = deepFreeze(viewModel([view('v')]));
+  const target = deepFreeze(viewModel([view('v', { definition: 'SELECT 2' })]));
+
+  assert.equal(diff(baseline, target).length, 1);
+});
+
+test('added, removed, and changed views are independent copies', () => {
+  const added = view('added');
+  const target = viewModel([added]);
+  const addedChange = diff(model(), target)[0]!;
+  assert.equal(addedChange.kind, 'view-added');
+  assert.notEqual(addedChange.view, added);
+
+  const removed = view('removed');
+  const removedChange = diff(viewModel([removed]), model())[0]!;
+  assert.equal(removedChange.kind, 'view-removed');
+  assert.notEqual(removedChange.view, removed);
+
+  const before = view('changed');
+  const after = view('changed', { definition: 'SELECT 2' });
+  const changedChange = diff(viewModel([before]), viewModel([after]))[0]!;
+  assert.equal(changedChange.kind, 'view-changed');
+  assert.ok(changedChange.kind === 'view-changed');
+  assert.notEqual(changedChange.before, before);
+  assert.notEqual(changedChange.after, after);
 });

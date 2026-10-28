@@ -55,7 +55,20 @@
  *   sequence, in the order the engine processes them, and are skipped and named when the
  *   sequence was not imported. `RESTART` (sequence state), renames, `SET SCHEMA`, and
  *   `setval` calls are skipped and named; so is a dump-side `DROP SEQUENCE`.
- * - Everything outside the imported subset (schemas, views, functions, comments, grants,
+ * - `CREATE [OR REPLACE] VIEW` and `CREATE MATERIALIZED VIEW` become a `View` of the matching
+ *   kind: the body between the top-level `AS` and the statement terminator, minus a trailing
+ *   `WITH [LOCAL|CASCADED] CHECK OPTION` (views) or `WITH [NO] DATA` (materialized views),
+ *   whitespace-normalized and opaque to the model. The check option is read from the clause or
+ *   from a `check_option` reloption, the clause winning when both are stated; the other
+ *   `WITH (...)` options, a column list, a materialized view's access method or tablespace,
+ *   `IF NOT EXISTS`, a stated or implied populated state, and non-default persistence are
+ *   flagged and dropped, never silently ignored. A repeated definition of one identity replaces
+ *   the earlier view — the last wins, which is how a pg_dump dependency-loop
+ *   `CREATE OR REPLACE VIEW` repairs its dummy — and so does a duplicate whose `materialized`
+ *   flag differs (an invalid dump). A recursive view is skipped and named: the parser rewrites
+ *   it into a view-named recursive CTE and the body after `AS` omits that CTE, so the stored
+ *   definition could not be re-rendered.
+ * - Everything outside the imported subset (schemas, functions, comments, grants,
  *   settings, …) is skipped and named.
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
@@ -84,7 +97,7 @@
  * `model.ts`: tables by schema then name, columns in source order, foreign keys by
  * referencing columns, then referenced table, then constraint name (unnamed first), unique
  * constraints by ordered columns then name (unnamed first), check constraints by expression
- * then name (unnamed first), and indexes by name (unnamed first).
+ * then name (unnamed first), indexes by name (unnamed first), and views by schema then name.
  *
  * This module is internal to the package; `index.ts` re-exports `importDump` and
  * `ddlImporter` as the seam binding.
@@ -118,6 +131,8 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
 } from '@schemamill/core';
 import {
   canonicalIntType,
@@ -137,12 +152,14 @@ import type {
   Constraint,
   CreateSeqStmt,
   CreateStmt,
+  CreateTableAsStmt,
   DefElem,
   IndexElem,
   IndexStmt,
   Node,
   RangeVar,
   SelectStmt,
+  ViewStmt,
 } from 'libpg-query';
 
 import {
@@ -175,6 +192,12 @@ interface TableDraft {
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
 type SequenceDraft = Mutable<Sequence>;
+
+/**
+ * A view being assembled. Views need no incremental mutation: a repeated definition of one
+ * identity replaces the draft wholesale, so the last definition wins.
+ */
+type ViewDraft = Mutable<View>;
 
 interface PositionedDiagnostic {
   readonly offset: number;
@@ -224,8 +247,9 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
 
   const tables = new Map<string, TableDraft>();
   const sequences = new Map<string, SequenceDraft>();
+  const views = new Map<string, ViewDraft>();
   for (const statement of parsed.statements) {
-    translateStatement(statement, tables, sequences, diagnostics);
+    translateStatement(statement, tables, sequences, views, diagnostics);
   }
 
   diagnostics.sort((left, right) => left.offset - right.offset);
@@ -234,6 +258,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
+      views: [...views.values()].sort(compareViews),
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
@@ -267,6 +292,7 @@ function translateStatement(
   statement: ParsedStatement,
   tables: Map<string, TableDraft>,
   sequences: Map<string, SequenceDraft>,
+  views: Map<string, ViewDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
@@ -301,6 +327,14 @@ function translateStatement(
   }
   if ('IndexStmt' in node) {
     translateCreateIndex(statement, node.IndexStmt, tables, diagnostics);
+    return;
+  }
+  if ('ViewStmt' in node) {
+    translateCreateView(statement, node.ViewStmt, views, diagnostics);
+    return;
+  }
+  if ('CreateTableAsStmt' in node && node.CreateTableAsStmt.objtype === 'OBJECT_MATVIEW') {
+    translateCreateMaterializedView(statement, node.CreateTableAsStmt, views, diagnostics);
     return;
   }
 
@@ -1813,6 +1847,451 @@ function indexElementDescription(element: IndexElem): string {
   return 'non-default NULLS ordering';
 }
 
+/** What a materialized view's source states about its populated state after the body. */
+type MaterializedViewDataClause = 'no-data' | 'data' | 'none';
+
+/**
+ * A view statement's extracted source: the recursive form, which cannot be modeled, or the
+ * definition text and (for materialized views) the stated data clause. `undefined` when the
+ * statement yields no top-level `AS` or an empty body.
+ */
+type ViewDefinitionText =
+  | { readonly recursive: true }
+  | {
+      readonly definition: string;
+      readonly dataClause: MaterializedViewDataClause;
+    };
+
+/**
+ * Imports a plain view: the definition text, the check option, and a named flag for every inline
+ * attribute the model cannot carry. A recursive view is skipped whole and named; see
+ * `viewDefinitionText`.
+ */
+function translateCreateView(
+  statement: ParsedStatement,
+  create: ViewStmt,
+  views: Map<string, ViewDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const schema = create.view?.schemaname ?? 'public';
+  const name = create.view?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const clauseCheckOption = viewCheckOption(create.withCheckOption);
+  const extracted = viewDefinitionText(statement, create.view, 'VIEW', clauseCheckOption);
+  if (extracted === undefined) {
+    diagnostics.push(
+      skipStatement(statement, `CREATE VIEW ${identity} (definition text not found)`, identity),
+    );
+    return;
+  }
+  if ('recursive' in extracted) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE RECURSIVE VIEW ${identity} (recursive views are not represented yet)`,
+        identity,
+      ),
+    );
+    return;
+  }
+
+  // Persistence and the column list are not modeled; the view still imports with its body and
+  // check option. `CREATE OR REPLACE` is accepted: a repeat replaces the earlier definition.
+  if (create.view?.relpersistence === 't') {
+    diagnostics.push(flagAttribute(statement, identity, 'temporary-view persistence'));
+  }
+  if (create.view?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-view persistence'));
+  }
+  if ((create.aliases ?? []).length > 0) {
+    diagnostics.push(flagAttribute(statement, identity, 'view column list'));
+  }
+  const checkOption = readViewOptions(
+    statement,
+    create.options ?? [],
+    identity,
+    clauseCheckOption,
+    true,
+    diagnostics,
+  );
+
+  const draft: ViewDraft = {
+    schema,
+    name,
+    materialized: false,
+    definition: extracted.definition,
+  };
+  if (checkOption !== undefined) draft.checkOption = checkOption;
+  views.set(tableKey(schema, name), draft);
+}
+
+/**
+ * Imports a materialized view: the definition text and a named flag for the populated state and
+ * every inline attribute the model cannot carry. A check-option reloption is impossible on a
+ * materialized view and is flagged like any other option.
+ */
+function translateCreateMaterializedView(
+  statement: ParsedStatement,
+  create: CreateTableAsStmt,
+  views: Map<string, ViewDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const into = create.into;
+  const schema = into?.rel?.schemaname ?? 'public';
+  const name = into?.rel?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const extracted = viewDefinitionText(statement, into?.rel, 'MATERIALIZED VIEW', undefined);
+  if (extracted === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE MATERIALIZED VIEW ${identity} (definition text not found)`,
+        identity,
+      ),
+    );
+    return;
+  }
+  if ('recursive' in extracted) {
+    // The grammar does not accept a recursive materialized view; keep the guard total.
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE MATERIALIZED VIEW ${identity} (recursive views are not represented yet)`,
+        identity,
+      ),
+    );
+    return;
+  }
+
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
+  }
+  if (into?.rel?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-materialized-view persistence'));
+  }
+  if ((into?.colNames ?? []).length > 0) {
+    diagnostics.push(flagAttribute(statement, identity, 'materialized view column list'));
+  }
+  if (into?.accessMethod !== undefined) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `materialized view access method ${into.accessMethod}`),
+    );
+  }
+  // A materialized view never carries a check option, so no option maps here.
+  readViewOptions(statement, into?.options ?? [], identity, undefined, false, diagnostics);
+  if (into?.tableSpaceName !== undefined) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `materialized view tablespace ${into.tableSpaceName}`),
+    );
+  }
+  // The model has no populated state and render always writes WITH NO DATA. The flag is keyed
+  // off the source clause, not `skipData`: an explicit WITH DATA and a clause-less statement
+  // (populated by default on the server) are distinct losses with distinct names.
+  if (extracted.dataClause === 'data') {
+    diagnostics.push(flagAttribute(statement, identity, 'WITH DATA'));
+  } else if (extracted.dataClause === 'none') {
+    diagnostics.push(flagAttribute(statement, identity, 'implicit populated state'));
+  }
+
+  views.set(tableKey(schema, name), {
+    schema,
+    name,
+    materialized: true,
+    definition: extracted.definition,
+  });
+}
+
+/**
+ * Reads a view statement's `WITH (...)` options. A `check_option` value maps to the model's
+ * check option when the statement carries no check-option clause and the kind can hold one;
+ * every other option — and a check option the clause overrides — is flagged by name. The
+ * statement's clause, when present, always wins.
+ */
+function readViewOptions(
+  statement: ParsedStatement,
+  elements: readonly Node[],
+  identity: string,
+  clauseCheckOption: ViewCheckOption | undefined,
+  canCarryCheckOption: boolean,
+  diagnostics: PositionedDiagnostic[],
+): ViewCheckOption | undefined {
+  let mapped: ViewCheckOption | undefined;
+  for (const element of elements) {
+    if (!('DefElem' in element) || element.DefElem.defname === undefined) continue;
+    const option = element.DefElem;
+    if (
+      canCarryCheckOption &&
+      clauseCheckOption === undefined &&
+      mapped === undefined &&
+      option.defname === 'check_option'
+    ) {
+      const value = checkOptionValue(option.arg);
+      if (value !== undefined) {
+        mapped = value;
+        continue;
+      }
+    }
+    diagnostics.push(flagAttribute(statement, identity, `view option ${viewOptionText(option)}`));
+  }
+  return clauseCheckOption ?? mapped;
+}
+
+/** Maps the parser's check-option code onto the model's spelling. */
+function viewCheckOption(code: string | undefined): ViewCheckOption | undefined {
+  if (code === 'LOCAL_CHECK_OPTION') return 'local';
+  if (code === 'CASCADED_CHECK_OPTION') return 'cascaded';
+  return undefined;
+}
+
+/** The modeled check option a `check_option` reloption states, when it is one PostgreSQL accepts. */
+function checkOptionValue(argument: Node | undefined): ViewCheckOption | undefined {
+  if (argument === undefined || !('String' in argument)) return undefined;
+  const value = argument.String.sval;
+  return value === 'local' || value === 'cascaded' ? value : undefined;
+}
+
+/** A reloption's `name[=value]` spelling for a flag, namespace included (`toast.fillfactor`). */
+function viewOptionText(option: DefElem): string {
+  const name =
+    option.defnamespace === undefined
+      ? (option.defname ?? 'option')
+      : `${option.defnamespace}.${option.defname ?? 'option'}`;
+  const value = defElemValueText(option.arg);
+  return value === undefined ? name : `${name}=${value}`;
+}
+
+/** A reloption argument as written, when the AST carries a printable scalar. */
+function defElemValueText(argument: Node | undefined): string | undefined {
+  if (argument === undefined) return undefined;
+  if ('String' in argument) return argument.String.sval ?? '';
+  if ('Integer' in argument) return BigInt(argument.Integer.ival ?? 0).toString();
+  if ('Float' in argument) return argument.Float.fval;
+  if ('Boolean' in argument) return argument.Boolean.boolval === true ? 'true' : 'false';
+  return undefined;
+}
+
+/**
+ * Extracts a view statement's body from its source: `ViewStmt.query` carries no location and a
+ * materialized view's `IntoClause` has no span for the body, so the text between the top-level
+ * `AS` after the name (and its options) and the statement terminator is sliced out, minus a
+ * trailing check-option or data clause, and normalized. A recursive view yields the recursive
+ * marker before extraction; `undefined` means the caller skips and names the statement.
+ */
+function viewDefinitionText(
+  statement: ParsedStatement,
+  anchor: RangeVar | undefined,
+  kind: 'VIEW' | 'MATERIALIZED VIEW',
+  checkOption: ViewCheckOption | undefined,
+): ViewDefinitionText | undefined {
+  const sql = statement.sql;
+  const location = anchor?.location ?? -1;
+  if (location < 0) return undefined;
+  const anchorIndex = byteOffsetToUtf16(sql, location);
+
+  // The parser rewrites `CREATE RECURSIVE VIEW` into a view-named recursive CTE with synthetic
+  // locations; the raw body after AS omits the CTE, so the stored definition could not be
+  // re-rendered. RECURSIVE is a keyword only between CREATE and VIEW, where quoted spans and
+  // comments are scanned out.
+  if (findKeyword(sql, 0, anchorIndex, 'RECURSIVE') !== null) return { recursive: true };
+
+  const asIndex = findTopLevelKeyword(sql, anchorIndex, sql.length, 'AS');
+  if (asIndex === null) return undefined;
+  const bodyStart = skipTrivia(sql, asIndex + 'AS'.length);
+  const end = statementTextEnd(sql, bodyStart);
+  if (end <= bodyStart) return undefined;
+
+  let bodyEnd = end;
+  let dataClause: MaterializedViewDataClause = 'none';
+  const withIndex = findLastTopLevelKeyword(sql, bodyStart, end, 'WITH');
+  if (withIndex !== null) {
+    if (kind === 'MATERIALIZED VIEW') {
+      const clause = readDataClause(sql, withIndex, end);
+      if (clause !== undefined) {
+        bodyEnd = withIndex;
+        dataClause = clause;
+      }
+    } else if (checkOption !== undefined && isCheckOptionClause(sql, withIndex, end)) {
+      bodyEnd = withIndex;
+    }
+  }
+
+  const definition = normalizeSourceText(sql.slice(bodyStart, bodyEnd));
+  if (definition === '') return undefined;
+  return { definition, dataClause };
+}
+
+/** Index just past a statement's text: trailing whitespace and one statement semicolon drop. */
+function statementTextEnd(sql: string, floor: number): number {
+  let end = sql.length;
+  while (end > floor && isWhitespaceCharacter(sql[end - 1]!)) end -= 1;
+  if (end > floor && sql[end - 1] === ';') {
+    end -= 1;
+    while (end > floor && isWhitespaceCharacter(sql[end - 1]!)) end -= 1;
+  }
+  return end;
+}
+
+/** The data clause a materialized view's trailing source states, or `undefined` when none. */
+function readDataClause(
+  sql: string,
+  withIndex: number,
+  end: number,
+): MaterializedViewDataClause | undefined {
+  const after = skipTrivia(sql, withIndex + 'WITH'.length);
+  if (isKeywordAt(sql, after, 'NO')) {
+    const data = skipTrivia(sql, after + 'NO'.length);
+    if (isKeywordAt(sql, data, 'DATA') && isTriviaOnly(sql, data + 'DATA'.length, end)) {
+      return 'no-data';
+    }
+    return undefined;
+  }
+  if (isKeywordAt(sql, after, 'DATA') && isTriviaOnly(sql, after + 'DATA'.length, end)) {
+    return 'data';
+  }
+  return undefined;
+}
+
+/**
+ * Whether the trailing top-level `WITH` begins a `WITH [LOCAL|CASCADED] CHECK OPTION` clause.
+ * The bare form is accepted and means `CASCADED`; extraction strips it the same way.
+ */
+function isCheckOptionClause(sql: string, withIndex: number, end: number): boolean {
+  const after = skipTrivia(sql, withIndex + 'WITH'.length);
+  const level = isKeywordAt(sql, after, 'LOCAL')
+    ? 'LOCAL'
+    : isKeywordAt(sql, after, 'CASCADED')
+      ? 'CASCADED'
+      : undefined;
+  const check = skipTrivia(sql, level === undefined ? after : after + level.length);
+  if (!isKeywordAt(sql, check, 'CHECK')) return false;
+  const option = skipTrivia(sql, check + 'CHECK'.length);
+  return isKeywordAt(sql, option, 'OPTION') && isTriviaOnly(sql, option + 'OPTION'.length, end);
+}
+
+/** Whether only whitespace and comments remain between `from` and `end`. */
+function isTriviaOnly(sql: string, from: number, end: number): boolean {
+  return skipTrivia(sql, from) >= end;
+}
+
+/** Index of the first `keyword` in `[from, to)`, skipping quoted spans and comments, or null. */
+function findKeyword(text: string, from: number, to: number, keyword: string): number | null {
+  let index = from;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (isKeywordAt(text, index, keyword)) return index;
+    index += 1;
+  }
+  return null;
+}
+
+/**
+ * Index of the first top-level `keyword` in `[from, to)`: one outside parentheses, brackets,
+ * quoted spans, dollar-quoted strings, and comments. A view's first such `AS` separates the
+ * name (plus options or column list) from the query.
+ */
+function findTopLevelKeyword(
+  text: string,
+  from: number,
+  to: number,
+  keyword: string,
+): number | null {
+  let index = from;
+  let depth = 0;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (character === '(' || character === '[') {
+      depth += 1;
+    } else if (character === ')' || character === ']') {
+      if (depth > 0) depth -= 1;
+    } else if (depth === 0 && isKeywordAt(text, index, keyword)) {
+      return index;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+/** Index of the last top-level `keyword` in `[from, to)`, or null when there is none. */
+function findLastTopLevelKeyword(
+  text: string,
+  from: number,
+  to: number,
+  keyword: string,
+): number | null {
+  let index = from;
+  let depth = 0;
+  let found: number | null = null;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (character === '(' || character === '[') {
+      depth += 1;
+    } else if (character === ')' || character === ']') {
+      if (depth > 0) depth -= 1;
+    } else if (depth === 0 && isKeywordAt(text, index, keyword)) {
+      found = index;
+    }
+    index += 1;
+  }
+  return found;
+}
+
 /**
  * Attaches `ALTER COLUMN … SET DEFAULT` to an imported column — the form pg_dump uses for
  * sequence-backed defaults. `DROP DEFAULT` carries no expression and stays a skip; a different
@@ -2472,10 +2951,6 @@ function describeStatement(node: Node): StatementDescription {
     const object = rangeVarName(node.AlterObjectSchemaStmt.relation) ?? 'sequence';
     return { description: `ALTER SEQUENCE ${object} SET SCHEMA`, object };
   }
-  if ('ViewStmt' in node) {
-    const object = rangeVarName(node.ViewStmt.view) ?? 'view';
-    return { description: `CREATE VIEW ${object}`, object };
-  }
   if ('CreateFunctionStmt' in node) {
     const object = stringList(node.CreateFunctionStmt.funcname).join('.') || 'function';
     const kind =
@@ -2974,6 +3449,10 @@ function compareTables(left: Table, right: Table): number {
 }
 
 function compareSequences(left: Sequence, right: Sequence): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareViews(left: View, right: View): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 

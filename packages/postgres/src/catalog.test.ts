@@ -346,6 +346,7 @@ test('maps a shuffled payload into the canonical model, order-significant', asyn
       },
     ],
     sequences: [],
+    views: [],
   };
 
   assert.deepEqual(read, { model: expected, diagnostics: [] });
@@ -1662,7 +1663,7 @@ test('never sets concurrently, even when a definition states it', async () => {
 
 test('maps an empty catalog to the empty model with no diagnostics', async () => {
   assert.deepEqual(await mapCatalog(payload({})), {
-    model: { tables: [], sequences: [] },
+    model: { tables: [], sequences: [], views: [] },
     diagnostics: [],
   });
 });

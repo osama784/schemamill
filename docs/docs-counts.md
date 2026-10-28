@@ -9,13 +9,13 @@ Counts repeated across the plans drift every time the plan or the live suite gro
 | Class | Source |
 | --- | --- |
 | Step kinds, transactional, non-transactional | `TRANSACTIONAL` imported from `packages/core/src/plan.ts` |
-| Table phases | the numbered `1.`–`N.` list inside plan phase 4 in `plan.ts`; the list must be contiguous from 1 |
+| Table phases | the numbered `1.`–`N.` list inside plan phase 5 in `plan.ts`; the list must be contiguous from 1 |
 | Live scenes | `scenes` imported from `packages/postgres/src/live-scenes.ts` |
 | Scenes skipped on PostgreSQL 16 | scenes whose `minServerMajor` is above 16 (absent means 13) |
 | Postgres tests | line-anchored top-level `test(` calls across `packages/postgres/src/*.test.ts` |
 | Always-on live subtests | `t.test(` calls after the `for (const scene of scenes)` loop in `live-pg.test.ts` |
 
-The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this slice it is 278 + 46 + 3 = 327 on PostgreSQL 16.15; the three PostgreSQL 18 scenes skip there and all 46 run in CI.
+The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this slice it is 299 + 47 + 3 = 349 on PostgreSQL 16.15; the three PostgreSQL 18 scenes skip there and all 47 run in CI.
 
 `live-scenes.ts` resolves `@schemamill/core` through the workspace link to `packages/core/dist`, so run `pnpm build` first. A failed import or parse is reported as `docs-counts: error …`; report mode still exits 0.
 

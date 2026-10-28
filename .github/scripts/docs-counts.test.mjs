@@ -138,7 +138,7 @@ test('parses digits and number words 0 through 99, and errors on unknown words',
 test('table-phase parser requires a contiguous numbered list', () => {
   const contiguous = [
     '/**',
-    ' * The table phases inside phase 4 are numbered as before:',
+    ' * The table phases inside phase 5 are numbered as before:',
     ' *',
     ' * 1. drop-foreign-key',
     ' *    a wrapped description',

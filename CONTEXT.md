@@ -118,6 +118,22 @@ _Avoid_: serial, sequence column
 The internal sequence attached to an identity column. Created with `ADD GENERATED`, dropped with `DROP IDENTITY` or with its column or table; it is never detached, re-owned, or dropped on its own, and never appears as a `Sequence` in `Model.sequences`. PostgreSQL records the link as a `pg_depend` dependency of type `i`.
 _Avoid_: owned sequence, serial sequence
 
+**View**:
+A named query stored in the model, identified by its schema and name, e.g. `public.active_accounts`. A view is a relation with a definition, not a table: it has no modeled columns, and a change is a `CREATE OR REPLACE` or a drop and recreate.
+_Avoid_: virtual table, query object
+
+**Materialized view**:
+A view whose query result is stored. It is the same `View` entity as a plain view, discriminated by `materialized`; PostgreSQL cannot replace one in place, so a change is a drop and recreate, and the model carries no populated state.
+_Avoid_: materialized query table, MV
+
+**View definition**:
+The SQL body after a view's `AS`, carried as opaque, whitespace-normalized canonical text in the server's deparsed spelling. The model never parses or reconstructs it, and the renderer emits it verbatim.
+_Avoid_: view query, view SQL
+
+**View check option**:
+A plain view's `WITH [LOCAL|CASCADED] CHECK OPTION`: `local` or `cascaded` in the model, absent meaning none. A materialized view never carries one.
+_Avoid_: check constraint, validation rule
+
 ### Crossing the boundary
 
 **Import**:

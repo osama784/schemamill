@@ -21,6 +21,8 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewIdentity,
 } from './model.ts';
 
 /**
@@ -29,12 +31,13 @@ import type {
  * `plan` runs the diff between a baseline model and a target model, expands every change into
  * executable steps, and reorders them so the dependencies the model can express are respected:
  * sequences before the tables that own them, referencing tables before the tables they
- * reference, and constraints before the primary keys and columns they depend on. It is the
- * change engine's ordering pass: the plan carries every payload a renderer needs and partitions
- * its steps into transaction groups, telling a renderer what applies as one unit; hazards are a
- * separate analysis.
+ * reference, constraints before the primary keys and columns they depend on, view drops before
+ * the table drops they could block, and view creates after the table work they may read. It is
+ * the change engine's ordering pass: the plan carries every payload a renderer needs and
+ * partitions its steps into transaction groups, telling a renderer what applies as one unit;
+ * hazards are a separate analysis.
  *
- * A step is one of twenty-six kinds. A table addition becomes a create-table step carrying
+ * A step is one of twenty-nine kinds. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -81,44 +84,60 @@ import type {
  * ownership phases, and every other changed field becomes an option alter-sequence step,
  * carrying only the fields that differ.
  *
- * The final sequence is the concatenation of eight global phases, in this exact order:
+ * A view addition becomes a create-view step carrying the view as stored; a view removal
+ * becomes a drop-view step carrying the baseline identity and whether it was materialized. A
+ * changed plain view becomes a replace-view step carrying the target view: `CREATE OR REPLACE
+ * VIEW` keeps grants, ownership, and dependent views, but PostgreSQL requires compatible output
+ * columns. A changed materialized view, or any change between plain and materialized, becomes a
+ * drop-view and a create-view; a materialized view cannot be replaced, and the recreate states
+ * `WITH NO DATA`. View steps carry no column or table payloads.
+ *
+ * The final sequence is the concatenation of ten global phases, in this exact order:
  *
  * 1. drop-identity — every removed identity whose column survives, in the diff's column and
  *    table order. It runs before everything else: it must precede the `DROP NOT NULL` /
  *    `SET DEFAULT` the table phases put on the same column, and it frees the default sequence
  *    name for the replacement sequence the identity→serial conversion creates in phase 2 (or
- *    for the replacement identity's sequence added in phase 8);
+ *    for the replacement identity's sequence added in phase 10);
  * 2. create-sequence — one per added sequence, in sequence identity order;
  * 3. ownership detaches — an ownership alter-sequence step for every kept sequence whose
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 4. table operations — the eighteen table phases listed below, in their exact order;
- * 5. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
+ * 4. drop-view — every removed view and the drop half of every rewritten one, in view identity
+ *    order. View drops precede the table phases so a removed view cannot block a table or
+ *    column drop; a dependency between views is not modeled, so a dependent view may still
+ *    fail the drop at apply;
+ * 5. table operations — the eighteen table phases listed below, in their exact order;
+ * 6. create-view, then replace-view — every added view and the create half of every rewritten
+ *    one, then the changed plain views, each bucket in view identity order. Views come after
+ *    every table phase so a view can reference a newly created table or column; a kept view
+ *    whose definition references a dropped object still fails at apply;
+ * 7. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
  *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
  *    baseline one, or a detach when the target drops ownership but keeps the owner;
- * 6. sequence option alters — one alter-sequence step per changed sequence, carrying its
+ * 8. sequence option alters — one alter-sequence step per changed sequence, carrying its
  *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
  *    statement without passing through an invalid intermediate state;
- * 7. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
+ * 9. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
  *    identity order. Drops come after the table phases, so a column `DROP DEFAULT` has already
  *    released the sequence by the time its drop runs; a surviving default that still
  *    references a dropped sequence is a broken target and fails at apply;
- * 8. add-identity, then alter-identity — the identity additions and option alters, in the
+ * 10. add-identity, then alter-identity — the identity additions and option alters, in the
  *    diff's column and table order, adds before alters. They run last because `ADD GENERATED`
  *    manufactures a fresh sequence: by then the table phases have produced the column, its
- *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 7 have freed the sequence names
+ *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 9 have freed the sequence names
  *    the added identities replace. This placement alone makes both conversions compositions of
- *    ordinary steps: serial→identity is a phase-4 `DROP DEFAULT`, a phase-7 sequence drop, and
- *    a phase-8 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
- *    create-sequence, and a phase-4 `SET DEFAULT`.
+ *    ordinary steps: serial→identity is a phase-5 `DROP DEFAULT`, a phase-9 sequence drop, and
+ *    a phase-10 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
+ *    create-sequence, and a phase-5 `SET DEFAULT`.
  *
  * A `drop-identity` needs no drop-suppression: an identity reaches the plan as its own removal
  * only when its column survives — a removed column or table carries its identity away in that
  * drop — so every collected drop-identity names an owner that still exists.
  *
- * The table phases inside phase 4 are numbered as before (and keep their documented semantics):
+ * The table phases inside phase 5 are numbered as before (and keep their documented semantics):
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -311,7 +330,19 @@ export type Step =
       kind: 'alter-sequence';
       sequence: SequenceIdentity;
       fields: readonly SequenceFieldChange[];
-    };
+    }
+  /** The target has a view the baseline does not; `materialized` decides the rendered keyword. */
+  | { kind: 'create-view'; view: View }
+  /**
+   * The baseline has a view the target does not, or the drop half of a rewritten one;
+   * `materialized` decides the rendered keyword.
+   */
+  | { kind: 'drop-view'; view: ViewIdentity; materialized: boolean }
+  /**
+   * A plain view both sides have with a differing definition or check option:
+   * `CREATE OR REPLACE VIEW`. Never materialized: a materialized view is dropped and created.
+   */
+  | { kind: 'replace-view'; view: View };
 
 /**
  * The exhaustiveness guard for a union `switch`: every `switch` that must understand each member
@@ -358,6 +389,9 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-sequence': true,
   'drop-sequence': true,
   'alter-sequence': true,
+  'create-view': true,
+  'drop-view': true,
+  'replace-view': true,
 };
 
 /**
@@ -453,6 +487,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.identityDrops,
     ...application.sequenceCreates,
     ...ownershipDetaches,
+    ...application.viewDrops,
     ...application.foreignKeyDrops,
     ...dependentKeyDrops,
     ...breaks,
@@ -474,6 +509,8 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.indexCreates,
     ...application.foreignKeyAdds,
     ...dependentKeyAdds,
+    ...application.viewCreates,
+    ...application.viewReplaces,
     ...ownershipAttaches,
     ...application.optionAlters,
     ...sequenceDrops,
@@ -497,7 +534,7 @@ export interface ChangeApplication {
   readonly foreignKeyDrops: Step[];
   readonly primaryKeyDrops: Step[];
   readonly columnDrops: Step[];
-  /** Removed tables, held with their payload until phase 5 orders the drops. */
+  /** Removed tables, held with their payload until table phase 5 orders the drops. */
   readonly removedTables: RemovedTable[];
   readonly tableCreates: Step[];
   readonly columnAdds: Step[];
@@ -521,6 +558,12 @@ export interface ChangeApplication {
   readonly identityAlters: Step[];
   readonly sequenceCreates: Step[];
   readonly optionAlters: Step[];
+  /** Removed views and the drop half of rewritten ones, before the table phases. */
+  readonly viewDrops: Step[];
+  /** Added views and the create half of rewritten ones, after the table phases. */
+  readonly viewCreates: Step[];
+  /** Changed plain views, applied with `CREATE OR REPLACE VIEW` after the table phases. */
+  readonly viewReplaces: Step[];
   /** A changed sequence's ownership, held until the plan knows which owners it removes. */
   readonly ownershipChanges: SequenceOwnershipChange[];
   /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
@@ -560,6 +603,9 @@ export function emptyChangeApplication(): ChangeApplication {
     identityAlters: [],
     sequenceCreates: [],
     optionAlters: [],
+    viewDrops: [],
+    viewCreates: [],
+    viewReplaces: [],
     ownershipChanges: [],
     removedSequences: [],
     removedTableKeys: new Set<string>(),
@@ -956,9 +1002,49 @@ export function applyChange(application: ChangeApplication, change: Change): voi
       }
       break;
     }
+    case 'view-added': {
+      application.viewCreates.push({ kind: 'create-view', view: copyView(change.view) });
+      break;
+    }
+    case 'view-removed': {
+      application.viewDrops.push({
+        kind: 'drop-view',
+        view: copyViewIdentity(change.view),
+        materialized: change.view.materialized,
+      });
+      break;
+    }
+    case 'view-changed': {
+      // A plain view's definition or check-option change is an in-place replace: it keeps
+      // grants, ownership, and dependent views. A materialized view cannot be replaced, and a
+      // kind change is a different object, so both become a drop and a create — which leaves
+      // the recreated matview unpopulated and discards its indexes and dependents (named
+      // residual, ADR 0019).
+      if (change.before.materialized === false && change.after.materialized === false) {
+        application.viewReplaces.push({ kind: 'replace-view', view: copyView(change.after) });
+      } else {
+        application.viewDrops.push({
+          kind: 'drop-view',
+          view: copyViewIdentity(change.before),
+          materialized: change.before.materialized,
+        });
+        application.viewCreates.push({ kind: 'create-view', view: copyView(change.after) });
+      }
+      break;
+    }
     default:
       assertNever(change, 'change kind');
   }
+}
+
+/** A copy of `view`, independent of the diff's change. */
+function copyView(view: View): View {
+  return { ...view };
+}
+
+/** A copy of a view identity, independent of the diff's change. */
+function copyViewIdentity(identity: ViewIdentity): ViewIdentity {
+  return { schema: identity.schema, name: identity.name };
 }
 
 /** A changed sequence's ownership, held until the plan knows which owners it removes. */
@@ -981,7 +1067,7 @@ export interface RemovedTable {
 }
 
 /**
- * Phase 5: orders the removed tables' drops so a table is dropped only once no remaining
+ * Table phase 5: orders the removed tables' drops so a table is dropped only once no remaining
  * removed table references it, breaking reference cycles with explicit drop-foreign-key
  * steps aimed at the table about to be dropped. Returns the drops in execution order and the
  * cycle-breaking steps in discovery order.

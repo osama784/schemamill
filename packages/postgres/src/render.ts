@@ -20,6 +20,7 @@ import type {
   Table,
   TableIdentity,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
 
 import {
@@ -68,6 +69,15 @@ import {
  * never `AS` or a sequence name; as with `alter-sequence`, the engine validates the option set
  * as a whole. `drop-identity` renders `DROP IDENTITY`. A column's identity never renders
  * inline in `create-table` or `add-column`: the plan adds it with its own step.
+ *
+ * `create-view` renders `CREATE [MATERIALIZED] VIEW <qname> AS <definition>` and
+ * `replace-view` renders `CREATE OR REPLACE VIEW <qname> AS <definition>`; a plain view's
+ * check option, when it has one, appends `WITH LOCAL CHECK OPTION` or `WITH CASCADED CHECK
+ * OPTION`, and a materialized view always appends `WITH NO DATA` because its populated state
+ * is not modeled. `drop-view` renders `DROP VIEW` or `DROP MATERIALIZED VIEW` from the step's
+ * `materialized` flag. The definition is emitted exactly as stored, on one line; the renderer
+ * never re-deparses it. A materialized `replace-view` is a hand-built-plan error and refuses
+ * with `RenderRefusalError` rather than render SQL PostgreSQL would reject.
  *
  * `add-unique-constraint` renders `ALTER TABLE … ADD [CONSTRAINT name] UNIQUE (cols)`,
  * `add-check-constraint` renders `… ADD [CONSTRAINT name] CHECK (expr)` with the expression
@@ -406,6 +416,9 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'create-sequence':
     case 'drop-sequence':
     case 'alter-sequence':
+    case 'create-view':
+    case 'drop-view':
+    case 'replace-view':
     default:
       return undefined;
   }
@@ -532,6 +545,14 @@ function renderStep(step: Step): string {
       return `DROP SEQUENCE ${renderSequence(step.sequence)};`;
     case 'alter-sequence':
       return renderAlterSequence(step.sequence, step.fields);
+    case 'create-view':
+      return renderView(step.view, false);
+    case 'replace-view':
+      return renderView(step.view, true);
+    case 'drop-view':
+      return step.materialized
+        ? `DROP MATERIALIZED VIEW ${renderTable(step.view)};`
+        : `DROP VIEW ${renderTable(step.view)};`;
   }
 }
 
@@ -911,6 +932,28 @@ function renderIdentityAlteration(field: IdentityFieldChange): string {
 /** A schema-qualified table reference: `<schema>.<name>`, each part quoted as needed. */
 function renderTable(identity: TableIdentity): string {
   return `${quoteIdentifier(identity.schema)}.${quoteIdentifier(identity.name)}`;
+}
+
+/**
+ * `CREATE [OR REPLACE] [MATERIALIZED] VIEW <qname> AS <definition>[ WITH … CHECK OPTION]`, a
+ * materialized view always ending in `WITH NO DATA`. The definition is emitted exactly as
+ * stored. A `replace-view` step that carries a materialized view cannot render soundly —
+ * PostgreSQL has no `CREATE OR REPLACE MATERIALIZED VIEW` — so the hand-built plan is refused.
+ */
+function renderView(view: View, replace: boolean): string {
+  if (replace && view.materialized) {
+    throw new RenderRefusalError(
+      `refusing to render: replace-view on ${renderTable(view)} cannot replace a materialized view`,
+    );
+  }
+  const kind = view.materialized ? 'MATERIALIZED VIEW' : 'VIEW';
+  const replacement = replace ? 'OR REPLACE ' : '';
+  const checkOption =
+    view.checkOption === undefined
+      ? ''
+      : ` WITH ${view.checkOption === 'local' ? 'LOCAL' : 'CASCADED'} CHECK OPTION`;
+  const data = view.materialized ? ' WITH NO DATA' : '';
+  return `CREATE ${replacement}${kind} ${renderTable(view)} AS ${view.definition}${checkOption}${data};`;
 }
 
 /** A schema-qualified sequence reference, quoted exactly like a table reference. */

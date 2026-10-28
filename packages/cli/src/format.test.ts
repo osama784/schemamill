@@ -956,3 +956,104 @@ test('a table-rewrite hazard labels the table and states the certain cost in bot
     ].join('\n'),
   );
 });
+
+test('view additions and removals print as a view line', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-added',
+      view: { schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' },
+    },
+    {
+      kind: 'view-removed',
+      view: { schema: 'app', name: 'totals', materialized: true, definition: 'SELECT 2' },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    ['+ view public.active', '', '- view app.totals', ''].join('\n'),
+  );
+});
+
+test('a changed view appends its differing fields in the diff order', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-changed',
+      view: { schema: 'public', name: 'active' },
+      changes: [
+        { field: 'materialized', before: false, after: true },
+        { field: 'definition', before: 'SELECT 1', after: 'SELECT 2' },
+        { field: 'checkOption', after: 'local' },
+      ],
+      before: { schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' },
+      after: {
+        schema: 'public',
+        name: 'active',
+        materialized: true,
+        definition: 'SELECT 2',
+      },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ view public.active',
+      '    materialized false → true',
+      '    definition SELECT 1 → SELECT 2',
+      '    checkOption (none) → local',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a check option removal prints the absent target as (none)', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-changed',
+      view: { schema: 'public', name: 'v' },
+      changes: [{ field: 'checkOption', before: 'cascaded' }],
+      before: {
+        schema: 'public',
+        name: 'v',
+        materialized: false,
+        definition: 'SELECT 1',
+        checkOption: 'cascaded',
+      },
+      after: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    ['~ view public.v', '    checkOption cascaded → (none)', ''].join('\n'),
+  );
+});
+
+test('view plan steps print their identity', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'create-view',
+        view: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+      },
+      {
+        kind: 'replace-view',
+        view: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 2' },
+      },
+      { kind: 'drop-view', view: { schema: 'public', name: 'w' }, materialized: false },
+    ],
+    groups: [{ start: 0, end: 3, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '3 steps in one transaction:',
+      ' 1. create-view   public.v',
+      ' 2. replace-view  public.v',
+      ' 3. drop-view     public.w',
+      '',
+    ].join('\n'),
+  );
+});
