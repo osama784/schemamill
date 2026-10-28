@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import { accessSync, constants } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -9,6 +19,7 @@ import {
   effectiveSequence,
   initWorkspace,
   resolveWorkspace,
+  writeWorkspaceModel,
   WORKSPACE_DIR_NAME,
   WORKSPACE_MODEL_FILE_NAME,
 } from './index.ts';
@@ -17,9 +28,10 @@ import { serializeModel } from './workspace.ts';
 
 /**
  * Tests for the workspace container: the `.schemamill/model.json` layout, resolution's walk
- * and marker-state table, init's refusals and the canonical model bytes it writes, and the
- * internal writer's byte-level determinism. Layout paths and bytes are pinned literally
- * beside the exported constants so a renamed marker cannot pass silently.
+ * and marker-state table, init's refusals and the canonical model bytes it writes, the
+ * serializer's byte-level determinism, and the public writer's atomic replacement, repair,
+ * and failure cleanup. Layout paths and bytes are pinned literally beside the exported
+ * constants so a renamed marker cannot pass silently.
  */
 
 /** The empty model's exact file bytes: two-space JSON and a trailing newline. */
@@ -56,6 +68,16 @@ function canRead(path: string): boolean {
   }
 }
 
+/** Whether the current process can write `path`; a mode-0500 directory stays writable for root. */
+function canWrite(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Asserts a resolution succeeded and returns it. */
 async function resolveOk(
   startPath: string,
@@ -84,6 +106,33 @@ async function initFail(target: string): Promise<WorkspaceDiagnostic> {
   const result = await initWorkspace(target);
   if (result.ok) assert.fail(`expected init to fail; got the workspace at ${result.root}`);
   return result.diagnostic;
+}
+
+/** Asserts an init of `model` succeeded and returns the root. */
+async function initWithModel(target: string, model: Model): Promise<string> {
+  const result = await initWorkspace(target, model);
+  if (!result.ok) assert.fail(`expected init to succeed: ${result.diagnostic.message}`);
+  return result.root;
+}
+
+/** Asserts a write succeeded and returns the resolved root. */
+async function writeOk(startPath: string, model: Model): Promise<string> {
+  const result = await writeWorkspaceModel(startPath, model);
+  if (!result.ok) assert.fail(`expected the write to succeed: ${result.diagnostic.message}`);
+  return result.root;
+}
+
+/** Asserts a write failed and returns its diagnostic. */
+async function writeFail(startPath: string, model: Model): Promise<WorkspaceDiagnostic> {
+  const result = await writeWorkspaceModel(startPath, model);
+  if (result.ok)
+    assert.fail(`expected the write to fail; it wrote the workspace at ${result.root}`);
+  return result.diagnostic;
+}
+
+/** The `.tmp` entries a directory holds, to pin that no temp file is left behind. */
+async function tempEntries(dir: string): Promise<string[]> {
+  return (await readdir(dir)).filter((name) => name.endsWith('.tmp'));
 }
 
 /** The minimal valid table payload; `overrides` replace its fields. */
@@ -1276,6 +1325,142 @@ test('initWorkspace allows a workspace that contains another', async (t) => {
 
   assert.equal(root, dir);
   assert.equal(await readFile(modelPath(dir), 'utf8'), EMPTY_MODEL_BYTES);
+});
+
+test('writeWorkspaceModel writes the canonical model bytes and returns the resolved root', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+
+  const result = await writeWorkspaceModel(dir, ROUND_TRIP_MODEL);
+
+  assert.deepStrictEqual(result, { ok: true, root: dir });
+  assert.equal(await readFile(modelPath(dir), 'utf8'), serializeModel(ROUND_TRIP_MODEL));
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
+});
+
+test('writeWorkspaceModel replaces the previous bytes and leaves no temp file', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+  const previous = await readFile(modelPath(dir), 'utf8');
+
+  const root = await writeOk(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(root, dir);
+  const bytes = await readFile(modelPath(dir), 'utf8');
+  assert.equal(bytes, serializeModel(ROUND_TRIP_MODEL));
+  assert.notEqual(bytes, previous);
+  assert.deepStrictEqual(await tempEntries(join(dir, WORKSPACE_DIR_NAME)), []);
+});
+
+test('writeWorkspaceModel replaces the directory entry, not the inode a hard link shares', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+  const backup = join(dir, 'backup.json');
+  try {
+    await link(modelPath(dir), backup);
+  } catch (error) {
+    const code =
+      error instanceof Error && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : undefined;
+    if (code === 'ENOSYS' || code === 'EPERM' || code === 'EACCES' || code === 'EXDEV') {
+      t.skip('hard links are unsupported here');
+      return;
+    }
+    throw error;
+  }
+
+  await writeOk(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(await readFile(backup, 'utf8'), serializeModel(POPULATED_MODEL));
+  assert.equal(await readFile(modelPath(dir), 'utf8'), serializeModel(ROUND_TRIP_MODEL));
+});
+
+test('writeWorkspaceModel resolves the root from a nested start path', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+  const nested = join(dir, 'a', 'b');
+  await mkdir(nested, { recursive: true });
+
+  const root = await writeOk(nested, ROUND_TRIP_MODEL);
+
+  assert.equal(root, dir);
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
+});
+
+test('writeWorkspaceModel reports workspace-not-found and creates nothing', async (t) => {
+  const dir = await fixtureDir(t);
+
+  const diagnostic = await writeFail(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(diagnostic.code, 'workspace-not-found');
+  assert.equal(diagnostic.message, `no workspace found from ${dir}`);
+  await assert.rejects(stat(join(dir, WORKSPACE_DIR_NAME)), { code: 'ENOENT' });
+  assert.deepStrictEqual(await readdir(dir), []);
+});
+
+test('writeWorkspaceModel repairs a corrupt model file', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, '{ not json');
+
+  const root = await writeOk(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(root, dir);
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
+});
+
+test('writeWorkspaceModel writes a model into a marker that has none', async (t) => {
+  const dir = await fixtureDir(t);
+  await mkdir(join(dir, WORKSPACE_DIR_NAME));
+
+  const root = await writeOk(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(root, dir);
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
+});
+
+test('writeWorkspaceModel reports workspace-io when the temp file cannot be created', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+  const marker = join(dir, WORKSPACE_DIR_NAME);
+
+  await chmod(marker, 0o500);
+  try {
+    if (canWrite(marker)) {
+      t.skip('a mode-0500 directory is still writable (running as root)');
+      return;
+    }
+
+    const diagnostic = await writeFail(dir, ROUND_TRIP_MODEL);
+
+    assert.equal(diagnostic.code, 'workspace-io');
+    assert.ok(diagnostic.message.startsWith(`cannot write ${modelPath(dir)}: `));
+    assert.equal(await readFile(modelPath(dir), 'utf8'), serializeModel(POPULATED_MODEL));
+    assert.deepStrictEqual(await tempEntries(marker), []);
+  } finally {
+    await chmod(marker, 0o700);
+  }
+});
+
+test('writeWorkspaceModel reports workspace-io and cleans the temp file when the rename fails', async (t) => {
+  const dir = await fixtureDir(t);
+  await initWithModel(dir, POPULATED_MODEL);
+  const marker = join(dir, WORKSPACE_DIR_NAME);
+  await rm(modelPath(dir));
+  await mkdir(modelPath(dir));
+  await writeFile(join(modelPath(dir), 'keep'), 'x', 'utf8');
+
+  const diagnostic = await writeFail(dir, ROUND_TRIP_MODEL);
+
+  assert.equal(diagnostic.code, 'workspace-io');
+  assert.ok(diagnostic.message.startsWith(`cannot write ${modelPath(dir)}: `));
+  assert.deepStrictEqual(await tempEntries(marker), []);
+  assert.ok((await stat(modelPath(dir))).isDirectory());
+  assert.equal(await readFile(join(modelPath(dir), 'keep'), 'utf8'), 'x');
 });
 
 test('resolveWorkspace reads a model without a views field as no views', async (t) => {

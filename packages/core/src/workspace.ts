@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
@@ -44,8 +45,10 @@ import type {
  * workspace inside an existing one, claims the marker with an atomic `mkdir`, and then
  * writes the canonical model it is given — the empty model unless the caller supplies one.
  *
- * `serializeModel` is internal to this module — `initWorkspace` uses it, and tests pin its
- * exact bytes — because a public writer is deferred until a slice needs one.
+ * `serializeModel` is internal to this module — `initWorkspace` and `writeWorkspaceModel` use
+ * it, and tests pin its exact bytes. `writeWorkspaceModel` is the public writer: it replaces
+ * an existing workspace's model atomically, through a same-directory temp file and a rename,
+ * and never creates a marker, a directory, or a workspace.
  */
 
 /** The hidden marker directory a workspace root contains. */
@@ -65,7 +68,8 @@ export const WORKSPACE_MODEL_FILE_NAME = 'model.json';
  * - `workspace-target-not-directory` — init's target exists but is not a directory;
  * - `workspace-already-exists` — init's target already holds a `.schemamill` marker;
  * - `workspace-inside-workspace` — init's target sits inside an existing workspace;
- * - `workspace-io` — init could not create the target, the marker, or the model file.
+ * - `workspace-io` — init could not create the target, the marker, or the model file, or a
+ *   write could not update an existing model file.
  */
 export type WorkspaceDiagnosticCode =
   | 'workspace-not-found'
@@ -95,18 +99,40 @@ export type WorkspaceInitResult =
   | { readonly ok: true; readonly root: string }
   | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
 
+/** The outcome of `writeWorkspaceModel`: the existing workspace's root, or the failure. */
+export type WorkspaceWriteResult =
+  | { readonly ok: true; readonly root: string }
+  | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
+
+/** The walk's outcome: the nearest workspace root, or the resolution failure. */
+type WorkspaceRootResult =
+  | { readonly ok: true; readonly root: string }
+  | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
+
 /** The model `initWorkspace` writes when the caller supplies none: no tables, sequences, or views. */
 const EMPTY_MODEL: Model = { tables: [], sequences: [], views: [] };
 
 /**
  * Resolves the workspace nearest `startPath` and reads its model.
  *
- * The walk is lexical: each candidate's `.schemamill` is inspected, an absent marker moves
- * the walk to `dirname`, and the walk stops at the fixed point (`dirname(dir) === dir`) after
- * checking the filesystem root. The first marker found wins — including a corrupt one, which
- * is reported rather than skipped over.
+ * Resolution walks lexically from `startPath` to the filesystem root and the first marker
+ * found wins — including a corrupt one, which is reported rather than skipped over.
  */
 export async function resolveWorkspace(startPath: string): Promise<WorkspaceResolution> {
+  const found = await findWorkspaceRoot(startPath);
+  if (!found.ok) return found;
+  return await readWorkspaceModel(found.root, join(found.root, WORKSPACE_DIR_NAME));
+}
+
+/**
+ * The walk behind resolution: the workspace root nearest `startPath`, or the same failures.
+ *
+ * Each candidate's `.schemamill` is inspected, an absent marker moves the walk to `dirname`,
+ * and the walk stops at the fixed point (`dirname(dir) === dir`) after checking the filesystem
+ * root. The marker is only inspected, never read, so a corrupt or missing model does not stop
+ * a caller that intends to write over it.
+ */
+async function findWorkspaceRoot(startPath: string): Promise<WorkspaceRootResult> {
   const start = resolve(startPath);
   let dir = start;
   for (;;) {
@@ -128,8 +154,31 @@ export async function resolveWorkspace(startPath: string): Promise<WorkspaceReso
     if (!stats.isDirectory()) {
       return failure('workspace-marker-invalid', `${marker} is not a directory`);
     }
-    return await readWorkspaceModel(dir, marker);
+    return { ok: true, root: dir };
   }
+}
+
+/**
+ * Writes `model` into the existing workspace nearest `startPath` as its canonical model,
+ * replacing any previous bytes atomically.
+ *
+ * The writer never creates a workspace: it creates no marker, no directory, and no workspace,
+ * and a start path with no marker above it fails with `workspace-not-found`. The model is
+ * serialized with `serializeModel`, written to a uniquely named temp file in the marker
+ * directory, and renamed over `model.json`, so a reader sees either the old or the new
+ * complete file and a failed write leaves the previous model intact. An existing model that
+ * is corrupt or missing is replaced — a write repairs it. Failures stay in the result union;
+ * the writer never throws for an fs failure.
+ */
+export async function writeWorkspaceModel(
+  startPath: string,
+  model: Model,
+): Promise<WorkspaceWriteResult> {
+  const found = await findWorkspaceRoot(startPath);
+  if (!found.ok) return found;
+  const diagnostic = await writeModelFile(join(found.root, WORKSPACE_DIR_NAME), model);
+  if (diagnostic !== null) return { ok: false, diagnostic };
+  return { ok: true, root: found.root };
 }
 
 /**
@@ -198,16 +247,14 @@ export async function initWorkspace(
     return failure('workspace-io', `cannot create ${marker}: ${reason(error)}`);
   }
 
-  const modelPath = join(marker, WORKSPACE_MODEL_FILE_NAME);
-  try {
-    await writeFile(modelPath, serializeModel(model), 'utf8');
-  } catch (error) {
+  const diagnostic = await writeModelFile(marker, model);
+  if (diagnostic !== null) {
     try {
       await rm(marker, { recursive: true, force: true });
     } catch {
-      // Best effort: the write failure below is the diagnostic worth reporting.
+      // Best effort: the write failure is the diagnostic worth reporting.
     }
-    return failure('workspace-io', `cannot write ${modelPath}: ${reason(error)}`);
+    return { ok: false, diagnostic };
   }
   return { ok: true, root: target };
 }
@@ -219,7 +266,7 @@ export async function initWorkspace(
  * two-space JSON, and a trailing newline. `views` always follows `sequences`. Deterministic:
  * one model always serializes to the same bytes.
  *
- * Exported for tests; no public writer is re-exported from `index.ts`.
+ * Exported for tests; `writeWorkspaceModel` is the public writer that persists these bytes.
  */
 export function serializeModel(model: Model): string {
   const value = {
@@ -255,6 +302,31 @@ async function readWorkspaceModel(root: string, marker: string): Promise<Workspa
     return failure('workspace-model-invalid', `invalid model: ${parsed.message}`);
   }
   return { ok: true, root, model: parsed.value };
+}
+
+/**
+ * Writes `model` as `<marker>/model.json` through a same-directory temp file and an atomic
+ * rename, returning the failure or `null`.
+ *
+ * The temp name is unique per call, so concurrent writers cannot clobber each other's temp
+ * file (the last rename wins). A failed write removes only the temp file, never the model
+ * path, so the previous model survives a failure.
+ */
+async function writeModelFile(marker: string, model: Model): Promise<WorkspaceDiagnostic | null> {
+  const modelPath = join(marker, WORKSPACE_MODEL_FILE_NAME);
+  const tempPath = join(marker, `${WORKSPACE_MODEL_FILE_NAME}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, serializeModel(model), 'utf8');
+    await rename(tempPath, modelPath);
+  } catch (error) {
+    try {
+      await rm(tempPath, { force: true });
+    } catch {
+      // Best effort: the write failure is the diagnostic worth reporting.
+    }
+    return { code: 'workspace-io', message: `cannot write ${modelPath}: ${reason(error)}` };
+  }
+  return null;
 }
 
 /** The failure arm both workspace results share. */
