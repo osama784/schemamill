@@ -1621,3 +1621,287 @@ test('serializeModel is deterministic and re-sorts tables and sequences canonica
     ['z', 'b', 'a'],
   );
 });
+
+/** A comment carrying every character class JSON escaping and PostgreSQL text must preserve. */
+const FIDELITY_COMMENT = 'it\'s a \\ backslash\nnewline\ttab "quoted"; $body$ naïve — 終';
+
+/** A model with a comment on every entity kind. */
+const COMMENTED_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 'users',
+      comment: 'user accounts',
+      columns: [
+        { name: 'id', type: 'bigint', notNull: true, comment: 'surrogate key' },
+        { name: 'email', type: 'text', notNull: false },
+      ],
+      primaryKey: { name: 'users_pkey', columns: ['id'], comment: 'primary key' },
+      foreignKeys: [
+        {
+          name: 'users_org_id_fkey',
+          columns: ['org_id'],
+          referencedTable: { schema: 'public', name: 'orgs' },
+          referencedColumns: ['id'],
+          comment: 'owning organisation',
+        },
+      ],
+      uniqueConstraints: [{ columns: ['email'], comment: 'one account per address' }],
+      checkConstraints: [{ expression: 'age >= 0', comment: 'no negative ages' }],
+      indexes: [
+        {
+          name: 'users_email_idx',
+          unique: true,
+          columns: ['email'],
+          comment: 'lookup by email',
+        },
+      ],
+    },
+  ],
+  sequences: [
+    {
+      schema: 'public',
+      name: 'counter',
+      dataType: 'bigint',
+      increment: '1',
+      minValue: '1',
+      maxValue: '9223372036854775807',
+      start: '1',
+      cache: '1',
+      cycle: false,
+      comment: 'shared counter',
+    },
+  ],
+  views: [
+    {
+      schema: 'public',
+      name: 'active',
+      materialized: false,
+      definition: 'SELECT 1',
+      comment: 'active rows',
+    },
+  ],
+};
+
+test('serializeModel round-trips a comment on every entity kind through resolveWorkspace', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(COMMENTED_MODEL));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, COMMENTED_MODEL);
+});
+
+test('serializeModel emits each entity comment as its last key', () => {
+  const payload = JSON.parse(serializeModel(COMMENTED_MODEL)) as {
+    tables: Array<{
+      columns: object[];
+      primaryKey: object;
+      foreignKeys: object[];
+      uniqueConstraints: object[];
+      checkConstraints: object[];
+      indexes: object[];
+    }>;
+    sequences: object[];
+    views: object[];
+  };
+  const table = payload.tables[0]!;
+  const entities: readonly object[] = [
+    table,
+    table.columns[0]!,
+    table.primaryKey,
+    table.uniqueConstraints[0]!,
+    table.checkConstraints[0]!,
+    table.foreignKeys[0]!,
+    table.indexes[0]!,
+    payload.sequences[0]!,
+    payload.views[0]!,
+  ];
+
+  for (const entity of entities) {
+    assert.equal(Object.keys(entity).at(-1), 'comment');
+  }
+});
+
+test('serializeModel round-trips comment text with escapes and unicode byte-exactly', async (t) => {
+  const model: Model = {
+    tables: [
+      {
+        schema: 'public',
+        name: 'notes',
+        comment: FIDELITY_COMMENT,
+        columns: [],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    ],
+    sequences: [],
+    views: [],
+  };
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+
+  assert.equal(resolved.model.tables[0]!.comment, FIDELITY_COMMENT);
+  assert.deepStrictEqual(resolved.model, model);
+});
+
+/**
+ * One valid model payload per entity kind, each carrying `comment` on that kind alone, paired
+ * with the JSON path where a parse failure must name it.
+ */
+function commentPayloads(comment: unknown): ReadonlyArray<readonly [string, unknown]> {
+  return [
+    ['tables[0].comment', { tables: [tablePayload({ comment })], sequences: [], views: [] }],
+    [
+      'tables[0].columns[0].comment',
+      {
+        tables: [tablePayload({ columns: [{ name: 'c', type: 'text', notNull: false, comment }] })],
+        sequences: [],
+        views: [],
+      },
+    ],
+    [
+      'tables[0].primaryKey.comment',
+      {
+        tables: [tablePayload({ primaryKey: { columns: ['c'], comment } })],
+        sequences: [],
+        views: [],
+      },
+    ],
+    [
+      'tables[0].uniqueConstraints[0].comment',
+      {
+        tables: [tablePayload({ uniqueConstraints: [{ columns: ['c'], comment }] })],
+        sequences: [],
+        views: [],
+      },
+    ],
+    [
+      'tables[0].checkConstraints[0].comment',
+      {
+        tables: [tablePayload({ checkConstraints: [{ expression: 'c > 0', comment }] })],
+        sequences: [],
+        views: [],
+      },
+    ],
+    [
+      'tables[0].foreignKeys[0].comment',
+      {
+        tables: [
+          tablePayload({
+            foreignKeys: [
+              {
+                columns: ['org_id'],
+                referencedTable: { schema: 'public', name: 'orgs' },
+                referencedColumns: ['id'],
+                comment,
+              },
+            ],
+          }),
+        ],
+        sequences: [],
+        views: [],
+      },
+    ],
+    [
+      'tables[0].indexes[0].comment',
+      {
+        tables: [tablePayload({ indexes: [{ unique: false, columns: ['c'], comment }] })],
+        sequences: [],
+        views: [],
+      },
+    ],
+    ['sequences[0].comment', { tables: [], sequences: [sequencePayload({ comment })], views: [] }],
+    ['views[0].comment', { tables: [], sequences: [], views: [viewPayload({ comment })] }],
+  ];
+}
+
+test('resolveWorkspace fails closed on an empty comment at every entity kind', async (t) => {
+  for (const [path, payload] of commentPayloads('')) {
+    const diagnostic = await resolvePayload(t, payload);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, `invalid model: ${path} is not a non-empty string`);
+  }
+});
+
+test('resolveWorkspace fails closed on a non-string comment at every entity kind', async (t) => {
+  for (const [path, payload] of commentPayloads(123)) {
+    const diagnostic = await resolvePayload(t, payload);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, `invalid model: ${path} is not a string`);
+  }
+});
+
+test('resolveWorkspace fails closed on a comment containing NUL at every entity kind', async (t) => {
+  for (const [path, payload] of commentPayloads('before\u0000after')) {
+    const diagnostic = await resolvePayload(t, payload);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, `invalid model: ${path} must not contain a NUL character`);
+  }
+});
+
+/** A pre-comment workspace model: all nine entity kinds, no `comment` key anywhere. */
+const OLDER_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 'users',
+      columns: [{ name: 'id', type: 'bigint', notNull: true }],
+      primaryKey: { name: 'users_pkey', columns: ['id'] },
+      foreignKeys: [
+        {
+          name: 'users_org_id_fkey',
+          columns: ['org_id'],
+          referencedTable: { schema: 'public', name: 'orgs' },
+          referencedColumns: ['id'],
+        },
+      ],
+      uniqueConstraints: [{ columns: ['email'] }],
+      checkConstraints: [{ expression: 'age >= 0' }],
+      indexes: [{ name: 'users_email_idx', unique: true, columns: ['email'] }],
+    },
+  ],
+  sequences: [
+    {
+      schema: 'public',
+      name: 'counter',
+      dataType: 'bigint',
+      increment: '1',
+      minValue: '1',
+      maxValue: '9223372036854775807',
+      start: '1',
+      cache: '1',
+      cycle: false,
+    },
+  ],
+  views: [{ schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' }],
+};
+
+test('resolveWorkspace reads a pre-comment model as entities without a comment property', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, JSON.stringify(OLDER_MODEL, null, 2));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, OLDER_MODEL);
+  const table = resolved.model.tables[0]!;
+  const entities: readonly object[] = [
+    table,
+    table.columns[0]!,
+    table.primaryKey!,
+    table.foreignKeys[0]!,
+    table.uniqueConstraints[0]!,
+    table.checkConstraints[0]!,
+    table.indexes[0]!,
+    resolved.model.sequences[0]!,
+    resolved.model.views[0]!,
+  ];
+  for (const entity of entities) assert.equal('comment' in entity, false);
+});

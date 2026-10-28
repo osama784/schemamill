@@ -104,6 +104,11 @@ export interface Table extends TableIdentity {
    * `LOGGED`. Temporary persistence is not modeled and stays flagged by import and introspection.
    */
   readonly persistence?: TablePersistence;
+  /**
+   * The table's PostgreSQL comment, stored verbatim; absent means none. An empty string is not a
+   * comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /**
@@ -153,6 +158,11 @@ export interface Column {
   readonly storage?: ColumnStorage;
   /** The column's explicit compression method; absent means the type's default. */
   readonly compression?: ColumnCompression;
+  /**
+   * The column's PostgreSQL comment, stored verbatim; absent means none. An empty string is not
+   * a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /**
@@ -194,6 +204,11 @@ export interface PrimaryKey {
    * means `INITIALLY IMMEDIATE`.
    */
   readonly initiallyDeferred?: boolean;
+  /**
+   * The primary key's PostgreSQL comment, stored verbatim; absent means none. An empty string is
+   * not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /** A unique constraint: the listed columns must be unique together. */
@@ -209,6 +224,12 @@ export interface UniqueConstraint {
    * means `INITIALLY IMMEDIATE`.
    */
   readonly initiallyDeferred?: boolean;
+  /**
+   * The unique constraint's PostgreSQL comment, stored verbatim; absent means none. An empty
+   * string is not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized,
+   * and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /** A check constraint: every row must satisfy the expression. */
@@ -219,6 +240,12 @@ export interface CheckConstraint {
   readonly expression: string;
   /** The constraint's enforcement when not the default; absent means valid and enforced. */
   readonly enforcement?: ConstraintEnforcement;
+  /**
+   * The check constraint's PostgreSQL comment, stored verbatim; absent means none. An empty
+   * string is not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized,
+   * and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /** A foreign key constraint: columns on this table pointing at columns of another table. */
@@ -244,6 +271,11 @@ export interface ForeignKey {
    * means `INITIALLY IMMEDIATE`.
    */
   readonly initiallyDeferred?: boolean;
+  /**
+   * The foreign key's PostgreSQL comment, stored verbatim; absent means none. An empty string is
+   * not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /**
@@ -265,6 +297,11 @@ export interface Index {
    * drop.
    */
   readonly concurrently?: boolean;
+  /**
+   * The index's PostgreSQL comment, stored verbatim; absent means none. An empty string is not
+   * a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /**
@@ -321,6 +358,11 @@ export interface Sequence extends SequenceIdentity {
   readonly cycle: boolean;
   /** The owning table and column, when the sequence is owned. */
   readonly ownedBy?: SequenceOwner;
+  /**
+   * The sequence's PostgreSQL comment, stored verbatim; absent means none. An empty string is
+   * not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
 
 /** Identifies a view in the model: the schema-qualified name, e.g. `public.active_users`. */
@@ -356,4 +398,9 @@ export interface View extends ViewIdentity {
    * materialized view cannot carry one.
    */
   readonly checkOption?: ViewCheckOption;
+  /**
+   * The view's PostgreSQL comment, stored verbatim; absent means none. An empty string is not a
+   * comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
 }
