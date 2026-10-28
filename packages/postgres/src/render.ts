@@ -419,6 +419,7 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'create-view':
     case 'drop-view':
     case 'replace-view':
+    case 'comment':
     default:
       return undefined;
   }
@@ -553,6 +554,10 @@ function renderStep(step: Step): string {
       return step.materialized
         ? `DROP MATERIALIZED VIEW ${renderTable(step.view)};`
         : `DROP VIEW ${renderTable(step.view)};`;
+    case 'comment':
+      // The `COMMENT ON` renderer lands with the comment SQL workstream (#87); refusing loudly
+      // keeps a comment-carrying plan from rendering SQL that silently drops the statement.
+      throw new Error('comment steps are not rendered yet');
   }
 }
 

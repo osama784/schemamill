@@ -38,11 +38,11 @@ import type {
   UniqueConstraint,
   View,
 } from './model.ts';
-import type { ChangeApplication, Step, TransactionGroup } from './plan.ts';
+import type { ChangeApplication, CommentTarget, Step, TransactionGroup } from './plan.ts';
 import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the ten global phases with the eighteen table phases at their
+ * Tests for the migration plan: the eleven global phases with the eighteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -71,6 +71,7 @@ interface TableParts {
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
   persistence?: TablePersistence;
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -84,6 +85,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
   ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A table with an `integer` primary key column `id` and the given extra members. */
@@ -267,12 +269,14 @@ interface SimulatedTable {
   readonly checkConstraints: Mutable<CheckConstraint>[];
   readonly indexes: Mutable<Index>[];
   persistence: TablePersistence | undefined;
+  comment: string | undefined;
 }
 
-/** The simulated database state: live tables by JSON-encoded identity, plus sequences. */
+/** The simulated database state: live tables by JSON-encoded identity, plus sequences and views. */
 interface SimulatedState {
   readonly tables: Map<string, SimulatedTable>;
   readonly sequences: Map<string, Mutable<Sequence>>;
+  readonly views: Map<string, Mutable<View>>;
 }
 
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
@@ -375,11 +379,14 @@ const stateOf = (model: Model): SimulatedState => {
       checkConstraints: source.checkConstraints.map(copyCheckConstraint),
       indexes: source.indexes.map(copyIndex),
       persistence: source.persistence,
+      comment: source.comment,
     });
   }
   const sequences = new Map<string, Mutable<Sequence>>();
   for (const source of model.sequences) sequences.set(keyOf(source), copySequenceState(source));
-  return { tables, sequences };
+  const views = new Map<string, Mutable<View>>();
+  for (const source of model.views) views.set(keyOf(source), { ...source });
+  return { tables, sequences, views };
 };
 
 /**
@@ -467,6 +474,96 @@ const applySequenceOwner = (
   };
 };
 
+/**
+ * The live node a comment step names, failing the test when the target is not live. A node a
+ * structural change recreated is matched by its structural key, so the step must target the
+ * node the plan actually left behind.
+ */
+const commentTargetNode = (
+  state: SimulatedState,
+  target: CommentTarget,
+): Mutable<{ comment?: string }> => {
+  switch (target.kind) {
+    case 'table': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on missing table ${key}`);
+      return table;
+    }
+    case 'column': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on column of missing table ${key}`);
+      const column = table.columns.get(target.column);
+      assert.ok(column !== undefined, `comment on missing column ${target.column} of ${key}`);
+      return column;
+    }
+    case 'sequence': {
+      const key = keyOf(target.sequence);
+      const sequence = state.sequences.get(key);
+      assert.ok(sequence !== undefined, `comment on missing sequence ${key}`);
+      return sequence;
+    }
+    case 'view': {
+      const key = keyOf(target.view);
+      const view = state.views.get(key);
+      assert.ok(view !== undefined, `comment on missing view ${key}`);
+      assert.equal(view.materialized, target.materialized, `comment on ${key} must carry its kind`);
+      return view;
+    }
+    case 'index': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on index of missing table ${key}`);
+      const found = table.indexes.find((entry) => indexKey(entry) === indexKey(target.index));
+      assert.ok(found !== undefined, `comment on missing ${indexKey(target.index)} on ${key}`);
+      return found;
+    }
+    case 'primary-key': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on primary key of missing table ${key}`);
+      assert.ok(table.primaryKey !== undefined, `comment on missing primary key of ${key}`);
+      assert.deepStrictEqual(
+        table.primaryKey.columns,
+        target.primaryKey.columns,
+        `comment on a different primary key of ${key}`,
+      );
+      return table.primaryKey;
+    }
+    case 'unique-constraint': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.uniqueConstraints.find(
+        (entry) => uniqueConstraintKey(entry) === uniqueConstraintKey(target.uniqueConstraint),
+      );
+      assert.ok(found !== undefined, `comment on missing unique constraint of ${key}`);
+      return found;
+    }
+    case 'check-constraint': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.checkConstraints.find(
+        (entry) => checkConstraintKey(entry) === checkConstraintKey(target.checkConstraint),
+      );
+      assert.ok(found !== undefined, `comment on missing check constraint of ${key}`);
+      return found;
+    }
+    case 'foreign-key': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.foreignKeys.find(
+        (entry) => foreignKeyKey(entry) === foreignKeyKey(target.foreignKey),
+      );
+      assert.ok(found !== undefined, `comment on missing foreign key of ${key}`);
+      return found;
+    }
+  }
+};
+
 /** Applies one step to `state`, failing the test when the step is illegal there. */
 const applyStep = (state: SimulatedState, step: Step): void => {
   switch (step.kind) {
@@ -482,6 +579,7 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         checkConstraints: [],
         indexes: [],
         persistence: step.table.persistence,
+        comment: step.table.comment,
       });
       return;
     }
@@ -885,19 +983,39 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       return;
     }
     case 'create-view':
-    case 'drop-view':
-    case 'replace-view':
-      // Views are outside the simulated table/sequence state, and the property generators do
-      // not produce them in this slice; a view step is a no-op here, while the plan tests pin
-      // their buckets and phases.
+    case 'replace-view': {
+      const key = keyOf(step.view);
+      const live = state.views.get(key);
+      if (step.kind === 'create-view') {
+        assert.equal(live, undefined, `create-view of live view ${key}`);
+      } else {
+        assert.ok(live !== undefined, `replace-view of missing view ${key}`);
+        assert.equal(live.materialized, step.view.materialized, `replace-view of ${key} kind`);
+      }
+      state.views.set(key, { ...step.view });
       return;
+    }
+    case 'drop-view': {
+      const key = keyOf(step.view);
+      const live = state.views.get(key);
+      assert.ok(live !== undefined, `drop-view of missing view ${key}`);
+      assert.equal(live.materialized, step.materialized, `drop-view of ${key} must carry its kind`);
+      state.views.delete(key);
+      return;
+    }
+    case 'comment': {
+      const node = commentTargetNode(state, step.target);
+      if (step.text === undefined) delete node.comment;
+      else node.comment = step.text;
+      return;
+    }
     default:
       // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
       assertNever(step, 'step kind');
   }
 };
 
-/** Asserts the simulated state and the target model hold the same tables, members, and sequences. */
+/** Asserts the simulated state and the target model hold the same tables, members, and relations. */
 const assertSameState = (state: SimulatedState, target: Model): void => {
   assert.deepStrictEqual(
     [...state.tables.keys()].sort(),
@@ -922,6 +1040,7 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
     }
     assert.deepStrictEqual(actual.primaryKey, expected.primaryKey, `primary key of ${key}`);
     assert.deepStrictEqual(actual.persistence, expected.persistence, `persistence of ${key}`);
+    assert.equal(actual.comment, expected.comment, `comment of ${key}`);
     assert.deepStrictEqual(
       actual.foreignKeys.map(foreignKeyKey).sort(),
       expected.foreignKeys.map(foreignKeyKey).sort(),
@@ -942,6 +1061,26 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       expected.indexes.map(indexKey).sort(),
       `indexes of ${key}`,
     );
+    assert.deepStrictEqual(
+      commentPairs(actual.foreignKeys, foreignKeyKey),
+      commentPairs(expected.foreignKeys, foreignKeyKey),
+      `foreign-key comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.uniqueConstraints, uniqueConstraintKey),
+      commentPairs(expected.uniqueConstraints, uniqueConstraintKey),
+      `unique-constraint comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.checkConstraints, checkConstraintKey),
+      commentPairs(expected.checkConstraints, checkConstraintKey),
+      `check-constraint comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.indexes, indexKey),
+      commentPairs(expected.indexes, indexKey),
+      `index comments of ${key}`,
+    );
   }
   assert.deepStrictEqual(
     [...state.sequences.keys()].sort(),
@@ -955,7 +1094,25 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       `sequence ${keyOf(expected)}`,
     );
   }
+  assert.deepStrictEqual(
+    [...state.views.keys()].sort(),
+    target.views.map(keyOf).sort(),
+    'the plan must leave exactly the target views',
+  );
+  for (const expected of target.views) {
+    assert.deepStrictEqual(state.views.get(keyOf(expected)), expected, `view ${keyOf(expected)}`);
+  }
 };
+
+/**
+ * The comments of `entries` paired with their structural key, sorted: a side whose comment is
+ * absent pairs with `null`, so the comparison names every commented and uncommented member.
+ */
+const commentPairs = <T extends { readonly comment?: string }>(
+  entries: readonly T[],
+  key: (entry: T) => string,
+): readonly string[] =>
+  entries.map((entry) => `${key(entry)} => ${entry.comment ?? '(none)'}`).sort();
 
 /** Plans `baseline` to `target` and runs the whole plan through the simulator. */
 const simulate = (baseline: Model, target: Model): void => {
@@ -1914,9 +2071,10 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'create-view',
     'drop-view',
     'replace-view',
+    'comment',
   ];
 
-  assert.equal(kinds.length, 29);
+  assert.equal(kinds.length, 30);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -5585,7 +5743,7 @@ test('seeded pairs keep diff and plan deterministic and order-independent', () =
   }
 });
 
-/** The 26 array buckets of a `ChangeApplication`, in interface order. */
+/** The 27 array buckets of a `ChangeApplication`, in interface order. */
 const applicationArrays = [
   'foreignKeyDrops',
   'primaryKeyDrops',
@@ -5611,6 +5769,7 @@ const applicationArrays = [
   'viewDrops',
   'viewCreates',
   'viewReplaces',
+  'comments',
   'ownershipChanges',
   'removedSequences',
 ] as const satisfies readonly (keyof ChangeApplication)[];
@@ -5657,6 +5816,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     viewDrops: 0,
     viewCreates: 0,
     viewReplaces: 0,
+    comments: 0,
     ownershipChanges: 0,
     removedSequences: 0,
   };
@@ -5723,6 +5883,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'primary-key-changed':
               count('primaryKeyDrops');
               count('primaryKeyAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'foreign-key-added':
               count('foreignKeyAdds');
@@ -5733,6 +5894,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'foreign-key-changed':
               count('foreignKeyDrops');
               count('foreignKeyAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'unique-constraint-added':
               count('uniqueConstraintAdds');
@@ -5743,6 +5905,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'unique-constraint-changed':
               count('uniqueConstraintDrops');
               count('uniqueConstraintAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'check-constraint-added':
               count('checkConstraintAdds');
@@ -5753,6 +5916,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'check-constraint-changed':
               count('checkConstraintDrops');
               count('checkConstraintAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'index-added':
               count('indexCreates');
@@ -5763,6 +5927,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'index-changed':
               count('indexDrops');
               count('indexCreates');
+              if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'persistence-changed':
               count('persistenceAlters');
@@ -5797,7 +5962,11 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
         } else {
           count('viewDrops');
           count('viewCreates');
+          if (change.after.comment !== undefined) count('comments');
         }
+        break;
+      case 'comment-changed':
+        count('comments');
         break;
       default:
         assertNever(change, 'change kind');
@@ -5836,6 +6005,7 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.viewDrops.push(...source.viewDrops);
   target.viewCreates.push(...source.viewCreates);
   target.viewReplaces.push(...source.viewReplaces);
+  target.comments.push(...source.comments);
   target.ownershipChanges.push(...source.ownershipChanges);
   target.removedSequences.push(...source.removedSequences);
   for (const key of source.removedTableKeys) target.removedTableKeys.add(key);
@@ -5890,7 +6060,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 29, 'every step kind must be classified');
+  assert.equal(kinds.length, 30, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -6659,4 +6829,473 @@ test('view steps are classified transactional', () => {
   assert.equal(TRANSACTIONAL['drop-view'], true);
   assert.equal(TRANSACTIONAL['create-view'], true);
   assert.equal(TRANSACTIONAL['replace-view'], true);
+});
+
+test('a comment-only table change is one terminal comment step', () => {
+  const baseline = model(table('t', { columns: [column('id')], comment: 'old' }));
+  const target = model(table('t', { columns: [column('id')], comment: 'new' }));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'table', table: identity('t') }, text: 'new' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an added commented table asserts its comments after every create', () => {
+  const added = table('users', {
+    columns: [column('id', { type: 'integer', comment: 'key' })],
+    comment: 'accounts',
+    primaryKey: { name: 'users_pkey', columns: ['id'], comment: 'pk' },
+    indexes: [index(['id'], { name: 'users_id_idx', comment: 'idx' })],
+  });
+
+  const { steps } = plan(model(), model(added));
+  const firstComment = steps.findIndex((step) => step.kind === 'comment');
+  let lastCreate = -1;
+  steps.forEach((step, index) => {
+    if (step.kind.startsWith('create-')) lastCreate = index;
+  });
+
+  assert.ok(firstComment > lastCreate, 'every comment step must follow every create');
+  assert.deepStrictEqual(steps.slice(firstComment), [
+    {
+      kind: 'comment',
+      target: { kind: 'column', table: identity('users'), column: 'id' },
+      text: 'key',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'index',
+        table: identity('users'),
+        index: index(['id'], { name: 'users_id_idx' }),
+      },
+      text: 'idx',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'primary-key',
+        table: identity('users'),
+        primaryKey: { name: 'users_pkey', columns: ['id'] },
+      },
+      text: 'pk',
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('users') }, text: 'accounts' },
+  ]);
+  simulate(model(), model(added));
+});
+
+test('an index recreate re-asserts an unchanged comment after the create', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['a'], { name: 't_idx', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['b'], { name: 't_idx', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-index',
+      table: identity('t'),
+      index: index(['a'], { name: 't_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'create-index',
+      table: identity('t'),
+      index: index(['b'], { name: 't_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['b'], { name: 't_idx' }) },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a recreated index with a changed comment keeps exactly one comment step', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['a'], { name: 't_idx', comment: 'old' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['b'], { name: 't_idx', comment: 'new' })],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'comment'),
+    [
+      {
+        kind: 'comment',
+        target: { kind: 'index', table: identity('t'), index: index(['b'], { name: 't_idx' }) },
+        text: 'new',
+      },
+    ],
+  );
+  simulate(baseline, target);
+});
+
+test('a primary-key recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'keep' },
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      primaryKey: { name: 't_pkey2', columns: ['id'], comment: 'keep' },
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'keep' },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey2', columns: ['id'], comment: 'keep' },
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'primary-key',
+        table: identity('t'),
+        primaryKey: { name: 't_pkey2', columns: ['id'] },
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a foreign-key recreate re-asserts an unchanged comment', () => {
+  const key = (name: string) =>
+    foreignKey(['pid'], identity('p'), {
+      referencedColumns: ['id'],
+      name,
+      comment: 'keep',
+    });
+  const baseline = model(
+    table('p', { columns: [column('id', { type: 'integer' })] }),
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key('c_old')] }),
+  );
+  const target = model(
+    table('p', { columns: [column('id', { type: 'integer' })] }),
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key('c_new')] }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('c'), foreignKey: key('c_old') },
+    { kind: 'add-foreign-key', table: identity('c'), foreignKey: key('c_new') },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('c'),
+        foreignKey: foreignKey(['pid'], identity('p'), {
+          referencedColumns: ['id'],
+          name: 'c_new',
+        }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a unique-constraint recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      uniqueConstraints: [uniqueConstraint(['id'], { name: 't_old', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      uniqueConstraints: [uniqueConstraint(['id'], { name: 't_new', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_old', comment: 'keep' }),
+    },
+    {
+      kind: 'add-unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_new', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['id'], { name: 't_new' }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a check-constraint recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      checkConstraints: [checkConstraint('id > 0', { name: 't_check', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      checkConstraints: [
+        checkConstraint('id > 0', { name: 't_check', enforcement: 'not-valid', comment: 'keep' }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', { name: 't_check', comment: 'keep' }),
+    },
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', {
+        name: 't_check',
+        enforcement: 'not-valid',
+        comment: 'keep',
+      }),
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('id > 0', {
+          name: 't_check',
+          enforcement: 'not-valid',
+        }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a recreated materialized view re-asserts an unchanged comment', () => {
+  const baseline = viewModel([view('m', { materialized: true, comment: 'keep' })]);
+  const target = viewModel([
+    view('m', { materialized: true, definition: 'SELECT 2', comment: 'keep' }),
+  ]);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    {
+      kind: 'create-view',
+      view: view('m', { materialized: true, definition: 'SELECT 2', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('m'), materialized: true },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a commented foreign key is re-asserted when its referenced primary key changes', () => {
+  const key = foreignKey(['pid'], identity('p'), {
+    referencedColumns: ['id'],
+    name: 'c_pid_fkey',
+    comment: 'link',
+  });
+  const parent = (name: string) =>
+    table('p', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name, columns: ['id'] },
+    });
+  const child = () =>
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key] });
+  const baseline = model(parent('p_pkey'), child());
+  const target = model(parent('p_pkey2'), child());
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('c'), foreignKey: key },
+    {
+      kind: 'drop-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('c'), foreignKey: key },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('c'),
+        foreignKey: foreignKey(['pid'], identity('p'), {
+          referencedColumns: ['id'],
+          name: 'c_pid_fkey',
+        }),
+      },
+      text: 'link',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a comment removal is a comment step with no text', () => {
+  const baseline = model(table('t', { columns: [column('id')], comment: 'old' }));
+  const target = model(table('t', { columns: [column('id')] }));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'table', table: identity('t') } },
+  ]);
+  simulate(baseline, target);
+});
+
+test('every comment step follows every structural step', () => {
+  const baseline = model(
+    table('kept', { columns: [column('id')], comment: 'old' }),
+    table('gone', { columns: [column('id')] }),
+  );
+  const target = model(
+    table('kept', {
+      columns: [column('id'), column('extra')],
+      comment: 'new',
+      indexes: [index(['id'], { name: 'kept_idx', comment: 'idx' })],
+    }),
+    table('fresh', { columns: [column('id')], comment: 'fresh' }),
+  );
+
+  const { steps } = plan(baseline, target);
+  const firstComment = steps.findIndex((step) => step.kind === 'comment');
+  let lastStructural = -1;
+  steps.forEach((step, index) => {
+    if (step.kind !== 'comment') lastStructural = index;
+  });
+
+  assert.ok(firstComment > lastStructural, 'comments close the plan');
+  assert.ok(steps.filter((step) => step.kind === 'comment').length >= 3);
+  simulate(baseline, target);
+});
+
+test('the simulator applies comment steps to all nine target kinds', () => {
+  const live = table('t', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+    foreignKeys: [foreignKey(['id'], identity('p'), { referencedColumns: ['id'], name: 't_fkey' })],
+    uniqueConstraints: [uniqueConstraint(['id'], { name: 't_key' })],
+    checkConstraints: [checkConstraint('id > 0', { name: 't_check' })],
+    indexes: [index(['id'], { name: 't_idx' })],
+  });
+  const state = stateOf({
+    tables: [table('p', { columns: [column('id', { type: 'integer' })] }), live],
+    sequences: [sequence('s')],
+    views: [view('v')],
+  });
+  const targets: readonly CommentTarget[] = [
+    { kind: 'table', table: identity('t') },
+    { kind: 'column', table: identity('t'), column: 'id' },
+    { kind: 'sequence', sequence: identity('s') },
+    { kind: 'view', view: identity('v'), materialized: false },
+    { kind: 'index', table: identity('t'), index: index(['id'], { name: 't_idx' }) },
+    {
+      kind: 'primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_key' }),
+    },
+    {
+      kind: 'check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', { name: 't_check' }),
+    },
+    {
+      kind: 'foreign-key',
+      table: identity('t'),
+      foreignKey: foreignKey(['id'], identity('p'), {
+        referencedColumns: ['id'],
+        name: 't_fkey',
+      }),
+    },
+  ];
+
+  for (const target of targets) applyStep(state, { kind: 'comment', target, text: 'note' });
+
+  const liveTable = state.tables.get(keyOf(identity('t')));
+  assert.ok(liveTable !== undefined);
+  assert.equal(liveTable.comment, 'note');
+  assert.equal(liveTable.columns.get('id')?.comment, 'note');
+  assert.equal(liveTable.primaryKey?.comment, 'note');
+  assert.equal(liveTable.uniqueConstraints[0]?.comment, 'note');
+  assert.equal(liveTable.checkConstraints[0]?.comment, 'note');
+  assert.equal(liveTable.foreignKeys[0]?.comment, 'note');
+  assert.equal(liveTable.indexes[0]?.comment, 'note');
+  assert.equal(state.sequences.get(keyOf(identity('s')))?.comment, 'note');
+  assert.equal(state.views.get(keyOf(identity('v')))?.comment, 'note');
+
+  for (const target of targets) applyStep(state, { kind: 'comment', target });
+
+  assert.equal(liveTable.comment, undefined);
+  assert.equal(liveTable.columns.get('id')?.comment, undefined);
+  assert.equal(liveTable.primaryKey?.comment, undefined);
+  assert.equal(liveTable.uniqueConstraints[0]?.comment, undefined);
+  assert.equal(liveTable.checkConstraints[0]?.comment, undefined);
+  assert.equal(liveTable.foreignKeys[0]?.comment, undefined);
+  assert.equal(liveTable.indexes[0]?.comment, undefined);
+  assert.equal(state.sequences.get(keyOf(identity('s')))?.comment, undefined);
+  assert.equal(state.views.get(keyOf(identity('v')))?.comment, undefined);
+});
+
+test('a comment step strips the target node so its text is the only source', () => {
+  const application = emptyChangeApplication();
+  applyChange(application, {
+    kind: 'comment-changed',
+    target: {
+      kind: 'index',
+      table: identity('t'),
+      index: index(['id'], { name: 't_idx', comment: 'stale' }),
+    },
+    after: 'fresh',
+  });
+
+  const [step] = application.comments;
+  assert.ok(step !== undefined && step.kind === 'comment');
+  assert.ok(step.target.kind === 'index');
+  assert.equal(Object.hasOwn(step.target.index, 'comment'), false);
+  assert.equal(step.text, 'fresh');
+  assert.deepStrictEqual(step.target.index, index(['id'], { name: 't_idx' }));
 });

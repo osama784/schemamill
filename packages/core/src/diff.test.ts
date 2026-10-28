@@ -48,6 +48,7 @@ interface TableParts {
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
   persistence?: TablePersistence;
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -61,6 +62,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
   ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
@@ -4121,4 +4123,319 @@ test('added, removed, and changed views are independent copies', () => {
   assert.ok(changedChange.kind === 'view-changed');
   assert.notEqual(changedChange.before, before);
   assert.notEqual(changedChange.after, after);
+});
+
+test('a table comment appears, changes, and disappears as one comment change', () => {
+  const bare = table('users', { columns: [column('id')] });
+  const commented = table('users', { columns: [column('id')], comment: 'accounts' });
+  const renamed = table('users', { columns: [column('id')], comment: 'people' });
+  const target = { kind: 'table', table: identity('users') } as const;
+
+  assertDiff(model(bare), model(commented), [
+    { kind: 'comment-changed', target, after: 'accounts' },
+  ]);
+  assertDiff(model(commented), model(bare), [
+    { kind: 'comment-changed', target, before: 'accounts' },
+  ]);
+  assertDiff(model(commented), model(renamed), [
+    { kind: 'comment-changed', target, before: 'accounts', after: 'people' },
+  ]);
+});
+
+test('a column comment appears and changes as one comment change', () => {
+  const bare = table('users', { columns: [column('id'), column('email')] });
+  const commented = table('users', {
+    columns: [column('id'), column('email', { comment: 'login' })],
+  });
+  const renamed = table('users', {
+    columns: [column('id'), column('email', { comment: 'sign-in' })],
+  });
+  const target = { kind: 'column', table: identity('users'), column: 'email' } as const;
+
+  assertDiff(model(bare), model(commented), [{ kind: 'comment-changed', target, after: 'login' }]);
+  assertDiff(model(commented), model(renamed), [
+    { kind: 'comment-changed', target, before: 'login', after: 'sign-in' },
+  ]);
+});
+
+test('a sequence comment is a comment change, not a sequence change', () => {
+  const before = sequence('users_id_seq', { comment: 'keys' });
+  const after = sequence('users_id_seq', { comment: 'identifiers' });
+
+  assertDiff(sequenceModel([before]), sequenceModel([after]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'sequence', sequence: identity('users_id_seq') },
+      before: 'keys',
+      after: 'identifiers',
+    },
+  ]);
+});
+
+test('a view comment is a comment change, not a view change', () => {
+  const plain = view('active', { comment: 'live rows' });
+  const replained = view('active', { comment: 'current rows' });
+  const materialized = view('active', { materialized: true, comment: 'live rows' });
+  const rematerialized = view('active', { materialized: true, comment: 'cached rows' });
+
+  assertDiff(viewModel([plain]), viewModel([replained]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('active'), materialized: false },
+      before: 'live rows',
+      after: 'current rows',
+    },
+  ]);
+  assertDiff(viewModel([materialized]), viewModel([rematerialized]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('active'), materialized: true },
+      before: 'live rows',
+      after: 'cached rows',
+    },
+  ]);
+});
+
+test('a comment-only change on a constraint or index never recreates it', () => {
+  const constraint = (comment: string) => ({
+    primaryKey: { name: 't_pkey', columns: ['id'], comment },
+    foreignKeys: [
+      foreignKey(['id'], identity('u'), {
+        name: 't_fkey',
+        referencedColumns: ['id'],
+        comment,
+      }),
+    ],
+    uniqueConstraints: [uniqueConstraint(['id'], { name: 't_key', comment })],
+    checkConstraints: [checkConstraint('id > 0', { name: 't_check', comment })],
+    indexes: [index(['id'], { name: 't_idx', comment })],
+  });
+  const baseline = table('t', { columns: [column('id')], ...constraint('old') });
+  const target = table('t', { columns: [column('id')], ...constraint('new') });
+
+  assertDiff(model(baseline), model(target), [
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('id > 0', { name: 't_check' }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['id'], identity('u'), {
+          name: 't_fkey',
+          referencedColumns: ['id'],
+        }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['id'], { name: 't_idx' }) },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'primary-key',
+        table: identity('t'),
+        primaryKey: { name: 't_pkey', columns: ['id'] },
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['id'], { name: 't_key' }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+  ]);
+});
+
+test('equal comments on every member emit nothing', () => {
+  const build = () =>
+    table('t', {
+      columns: [column('id', { comment: 'key' }), column('email', { comment: 'login' })],
+      comment: 'accounts',
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'pk' },
+      foreignKeys: [
+        foreignKey(['id'], identity('u'), {
+          name: 't_fkey',
+          referencedColumns: ['id'],
+          comment: 'fk',
+        }),
+      ],
+      uniqueConstraints: [uniqueConstraint(['email'], { name: 't_key', comment: 'uq' })],
+      checkConstraints: [checkConstraint('id > 0', { comment: 'ck' })],
+      indexes: [index(['email'], { name: 't_idx', comment: 'idx' })],
+    });
+
+  assertDiff(model(build()), model(build()), []);
+});
+
+test('an added table reports one comment change per commented member', () => {
+  const added = table('users', {
+    columns: [column('id', { type: 'integer', comment: 'key' }), column('email')],
+    comment: 'accounts',
+    primaryKey: { name: 'users_pkey', columns: ['id'], comment: 'pk' },
+    foreignKeys: [
+      foreignKey(['email'], identity('profiles'), {
+        name: 'users_email_fkey',
+        referencedColumns: ['email'],
+        comment: 'fk',
+      }),
+    ],
+    uniqueConstraints: [uniqueConstraint(['email'], { name: 'users_email_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint("email <> ''", { comment: 'ck' })],
+    indexes: [index(['email'], { name: 'users_email_idx', comment: 'idx' })],
+  });
+
+  assertDiff(model(), model(added), [
+    { kind: 'table-added', table: added },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('users'),
+        checkConstraint: checkConstraint("email <> ''"),
+      },
+      after: 'ck',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'column', table: identity('users'), column: 'id' },
+      after: 'key',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'foreign-key',
+        table: identity('users'),
+        foreignKey: foreignKey(['email'], identity('profiles'), {
+          name: 'users_email_fkey',
+          referencedColumns: ['email'],
+        }),
+      },
+      after: 'fk',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'index',
+        table: identity('users'),
+        index: index(['email'], { name: 'users_email_idx' }),
+      },
+      after: 'idx',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'primary-key',
+        table: identity('users'),
+        primaryKey: { name: 'users_pkey', columns: ['id'] },
+      },
+      after: 'pk',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('users') },
+      after: 'accounts',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('users'),
+        uniqueConstraint: uniqueConstraint(['email'], { name: 'users_email_key' }),
+      },
+      after: 'uq',
+    },
+  ]);
+});
+
+test('a removed commented entity emits no comment change', () => {
+  const removed = table('users', {
+    columns: [column('id', { comment: 'key' })],
+    comment: 'accounts',
+    indexes: [index(['id'], { name: 'users_id_idx', comment: 'idx' })],
+  });
+
+  assertDiff(model(removed), model(), [{ kind: 'table-removed', table: removed }]);
+  assertDiff(sequenceModel([sequence('gone', { comment: 'old' })]), sequenceModel([]), [
+    { kind: 'sequence-removed', sequence: sequence('gone') },
+  ]);
+  assertDiff(viewModel([view('gone', { comment: 'old' })]), viewModel([]), [
+    { kind: 'view-removed', view: view('gone', { comment: 'old' }) },
+  ]);
+});
+
+test('comment changes come last, after table, sequence, and view changes, in target order', () => {
+  const baseline: Model = {
+    tables: [
+      table('t', { columns: [column('id')] }),
+      table('u', { columns: [column('id')], comment: 'old u' }),
+    ],
+    sequences: [sequence('s', { comment: 'old s' })],
+    views: [view('v', { comment: 'old v' })],
+  };
+  const target: Model = {
+    tables: [
+      table('t', { columns: [column('id'), column('extra')] }),
+      table('u', { columns: [column('id')], comment: 'new u' }),
+    ],
+    sequences: [sequence('s', { cache: '2', comment: 'new s' })],
+    views: [view('v', { definition: 'SELECT 2', comment: 'new v' })],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'column-added', column: column('extra') }],
+    },
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [{ field: 'cache', before: '1', after: '2' }],
+    },
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'definition', before: 'SELECT 1', after: 'SELECT 2' }],
+      before: view('v', { comment: 'old v' }),
+      after: view('v', { definition: 'SELECT 2', comment: 'new v' }),
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'sequence', sequence: identity('s') },
+      before: 'old s',
+      after: 'new s',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('u') },
+      before: 'old u',
+      after: 'new u',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('v'), materialized: false },
+      before: 'old v',
+      after: 'new v',
+    },
+  ]);
 });

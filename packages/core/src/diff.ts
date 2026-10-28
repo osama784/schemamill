@@ -22,6 +22,7 @@ import type {
   ViewCheckOption,
   ViewIdentity,
 } from './model.ts';
+import type { CommentTarget } from './plan.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
 /**
@@ -29,7 +30,8 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
  * column, primary key, foreign key, unique constraint, check constraint, index, sequence, or
- * view.
+ * view, plus one `comment-changed` per target entity whose comment text differs (or that the
+ * baseline lacks while it states one).
  * It never guesses a rename: a table or column under a new name is a removal and an addition,
  * a primary key with a different column list is a primary-key change, a foreign key pointing
  * at a different table is a removal and an addition, and so are a unique constraint with a
@@ -138,6 +140,12 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    and `checkOption`, in that fixed order. A changed view carries both stored sides —
  *    `before` and `after` — because the plan recreates a materialized view from its target
  *    payload; an absent check option is reported by omission.
+ * 6. Comment changes are walked over the target model, after every view change, and reported
+ *    as a group in target identity order: the schema-qualified relation, then the target kind,
+ *    then the member's name or identity. An entity the target removes contributes nothing —
+ *    dropping it drops its comment — and an entity whose identity fields changed reads as
+ *    absent from the baseline, so its comment is an addition. The payload is a copy without
+ *    the carried node's own `comment`: `before` and `after` are the only text.
  *
  * Duplicate identities — several foreign keys with the same referencing columns and referenced
  * table, unique constraints with the same columns, check constraints with the same expression,
@@ -187,7 +195,16 @@ export type Change =
       changes: readonly ViewFieldChange[];
       before: View;
       after: View;
-    };
+    }
+  /**
+   * A comment differs, or the entity is new: `before`/`after` are the stored texts, a side
+   * that states none omitted (a removal is `COMMENT … IS NULL`). Comment changes come last, in
+   * target identity order, and the target is a copy without any carried node's own `comment`.
+   * An entity the target removes emits nothing — dropping it drops its comment — and a
+   * constraint or index whose identity fields changed reads as absent from the baseline, so
+   * its comment is reported as an addition even when the model held one before.
+   */
+  | { kind: 'comment-changed'; target: CommentTarget; before?: string; after?: string };
 
 /** One difference within a changed table. */
 export type TableChange =
@@ -373,7 +390,12 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     changes.push({ kind: 'table-added', table: copyTable(targetTables[targetIndex]!) });
   }
 
-  return [...changes, ...diffSequences(baseline, target), ...diffViews(baseline, target)];
+  return [
+    ...changes,
+    ...diffSequences(baseline, target),
+    ...diffViews(baseline, target),
+    ...diffComments(baseline, target),
+  ];
 }
 
 /**
@@ -497,6 +519,271 @@ function diffViewFields(baseline: View, target: View): ViewFieldChange[] {
   return fields;
 }
 
+/** A `comment-changed` entry, as the comment pass emits it. */
+type CommentChange = Extract<Change, { kind: 'comment-changed' }>;
+
+/**
+ * The comment group of the diff, in target identity order. The pass walks the target model only:
+ * a target entity whose comment differs from its baseline counterpart's, or that the baseline
+ * lacks while stating a comment, is an entry; a removed entity is not, because dropping it drops
+ * its comment.
+ *
+ * Counterparts match by the model's identity — table, sequence, or view identity, a column's
+ * name, a primary key's or unique constraint's columns, a check constraint's expression, a
+ * foreign key's referencing columns and referenced table, and an index's name (an unnamed index
+ * by its structure) — so a name or attribute change still compares both sides' comments, while
+ * an identity change reads as absent from the baseline and reports an addition. Entries sharing
+ * an identity collapse to one, last-wins, mirroring the plan's target key.
+ */
+function diffComments(baseline: Model, target: Model): readonly CommentChange[] {
+  const changes: CommentChange[] = [];
+  const baselineTables = new Map(baseline.tables.map((table) => [tableKey(table), table]));
+  const baselineSequences = new Map(
+    baseline.sequences.map((sequence) => [tableKey(sequence), sequence]),
+  );
+  const baselineViews = new Map(baseline.views.map((view) => [tableKey(view), view]));
+
+  const emit = (
+    commentTarget: CommentTarget,
+    before: string | undefined,
+    after: string | undefined,
+  ): void => {
+    if (before === after) return;
+    changes.push({
+      kind: 'comment-changed',
+      target: copyTarget(commentTarget),
+      ...(before === undefined ? {} : { before }),
+      ...(after === undefined ? {} : { after }),
+    });
+  };
+
+  for (const table of target.tables) {
+    const before = baselineTables.get(tableKey(table));
+    emit({ kind: 'table', table }, before?.comment, table.comment);
+
+    const beforeColumns = new Map((before?.columns ?? []).map((entry) => [entry.name, entry]));
+    for (const column of table.columns) {
+      emit(
+        { kind: 'column', table, column: column.name },
+        beforeColumns.get(column.name)?.comment,
+        column.comment,
+      );
+    }
+
+    if (table.primaryKey !== undefined) {
+      const prior =
+        before?.primaryKey !== undefined &&
+        sameStrings(before.primaryKey.columns, table.primaryKey.columns)
+          ? before.primaryKey
+          : undefined;
+      emit(
+        { kind: 'primary-key', table, primaryKey: table.primaryKey },
+        prior?.comment,
+        table.primaryKey.comment,
+      );
+    }
+
+    const beforeForeignKeys = new Map(
+      (before?.foreignKeys ?? []).map((entry) => [foreignKeyIdentity(entry), entry]),
+    );
+    for (const foreignKey of table.foreignKeys) {
+      emit(
+        { kind: 'foreign-key', table, foreignKey },
+        beforeForeignKeys.get(foreignKeyIdentity(foreignKey))?.comment,
+        foreignKey.comment,
+      );
+    }
+
+    const beforeUniqueConstraints = new Map(
+      (before?.uniqueConstraints ?? []).map((entry) => [uniqueConstraintIdentity(entry), entry]),
+    );
+    for (const uniqueConstraint of table.uniqueConstraints) {
+      emit(
+        { kind: 'unique-constraint', table, uniqueConstraint },
+        beforeUniqueConstraints.get(uniqueConstraintIdentity(uniqueConstraint))?.comment,
+        uniqueConstraint.comment,
+      );
+    }
+
+    const beforeCheckConstraints = new Map(
+      (before?.checkConstraints ?? []).map((entry) => [checkConstraintIdentity(entry), entry]),
+    );
+    for (const checkConstraint of table.checkConstraints) {
+      emit(
+        { kind: 'check-constraint', table, checkConstraint },
+        beforeCheckConstraints.get(checkConstraintIdentity(checkConstraint))?.comment,
+        checkConstraint.comment,
+      );
+    }
+
+    const beforeIndexes = new Map(
+      (before?.indexes ?? []).map((entry) => [commentIndexIdentity(entry), entry]),
+    );
+    for (const index of table.indexes) {
+      emit(
+        { kind: 'index', table, index },
+        beforeIndexes.get(commentIndexIdentity(index))?.comment,
+        index.comment,
+      );
+    }
+  }
+
+  for (const sequence of target.sequences) {
+    emit(
+      { kind: 'sequence', sequence },
+      baselineSequences.get(tableKey(sequence))?.comment,
+      sequence.comment,
+    );
+  }
+
+  for (const view of target.views) {
+    emit(
+      { kind: 'view', view, materialized: view.materialized },
+      baselineViews.get(tableKey(view))?.comment,
+      view.comment,
+    );
+  }
+
+  changes.sort((left, right) =>
+    compareStrings(commentTargetKey(left.target), commentTargetKey(right.target)),
+  );
+  return changes;
+}
+
+/** The identity key of an index for the comment pass: its name, or an unnamed index's structure. */
+function commentIndexIdentity(index: Index): string {
+  return index.name !== undefined
+    ? indexIdentity(index)
+    : JSON.stringify([null, index.unique, index.columns]);
+}
+
+/** A writable view of a model payload, for the one place a copy is stripped. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * A copy of `target` with every carried node stripped of its `comment` and reduced to what the
+ * variant needs: identities for the identity-carrying variants, whole node copies — less
+ * `comment` — for the constraint and index variants. The change's `before` and `after` are the
+ * single source of the comment text, like the plan's step target.
+ */
+function copyTarget(target: CommentTarget): CommentTarget {
+  switch (target.kind) {
+    case 'table':
+      return { kind: 'table', table: copyTargetIdentity(target.table) };
+    case 'column':
+      return {
+        kind: 'column',
+        table: copyTargetIdentity(target.table),
+        column: target.column,
+      };
+    case 'sequence':
+      return { kind: 'sequence', sequence: copyTargetIdentity(target.sequence) };
+    case 'view':
+      return {
+        kind: 'view',
+        view: copyTargetIdentity(target.view),
+        materialized: target.materialized,
+      };
+    case 'index': {
+      const index: Mutable<Index> = copyIndex(target.index);
+      delete index.comment;
+      return { kind: 'index', table: copyTargetIdentity(target.table), index };
+    }
+    case 'primary-key': {
+      const primaryKey: Mutable<PrimaryKey> = copyPrimaryKey(target.primaryKey);
+      delete primaryKey.comment;
+      return { kind: 'primary-key', table: copyTargetIdentity(target.table), primaryKey };
+    }
+    case 'unique-constraint': {
+      const uniqueConstraint: Mutable<UniqueConstraint> = copyUniqueConstraint(
+        target.uniqueConstraint,
+      );
+      delete uniqueConstraint.comment;
+      return {
+        kind: 'unique-constraint',
+        table: copyTargetIdentity(target.table),
+        uniqueConstraint,
+      };
+    }
+    case 'check-constraint': {
+      const checkConstraint: Mutable<CheckConstraint> = copyCheckConstraint(target.checkConstraint);
+      delete checkConstraint.comment;
+      return {
+        kind: 'check-constraint',
+        table: copyTargetIdentity(target.table),
+        checkConstraint,
+      };
+    }
+    case 'foreign-key': {
+      const foreignKey: Mutable<ForeignKey> = copyForeignKey(target.foreignKey);
+      delete foreignKey.comment;
+      return { kind: 'foreign-key', table: copyTargetIdentity(target.table), foreignKey };
+    }
+  }
+}
+
+/** A copy of a relation identity, independent of the target's node. */
+function copyTargetIdentity(identity: TableIdentity): TableIdentity {
+  return { schema: identity.schema, name: identity.name };
+}
+
+/**
+ * The identity key of a comment target: the relation identity, the target kind, then the
+ * member's name or identity. It mirrors `plan.ts`'s private key so the diff's order and the
+ * plan's terminal phase agree, and it never reads a comment.
+ */
+function commentTargetKey(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
+    case 'column':
+      return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'sequence':
+      return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
+    case 'view':
+      return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'index':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'index',
+        target.index.name ?? [null, target.index.unique, target.index.columns],
+      ]);
+    case 'primary-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'primary-key',
+        target.primaryKey.columns,
+      ]);
+    case 'unique-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'unique-constraint',
+        target.uniqueConstraint.columns,
+      ]);
+    case 'check-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'check-constraint',
+        target.checkConstraint.expression,
+      ]);
+    case 'foreign-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'foreign-key',
+        [
+          target.foreignKey.columns,
+          target.foreignKey.referencedTable.schema,
+          target.foreignKey.referencedTable.name,
+        ],
+      ]);
+  }
+}
+
 function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceFieldChange[] {
   const fields: SequenceFieldChange[] = [];
   const dataTypeChanged = baseline.dataType !== target.dataType;
@@ -582,8 +869,9 @@ function primaryKeyMap(model: Model): PrimaryKeyMap {
 }
 
 /**
- * The map key of a table identity; JSON keeps names — which may contain any character —
- * unambiguous.
+ * The map key of a relation identity; JSON keeps names — which may contain any character —
+ * unambiguous. Tables, sequences, and views all identify by schema and name, so the one key
+ * serves all three.
  */
 function tableKey(identity: TableIdentity): string {
   return JSON.stringify([identity.schema, identity.name]);
