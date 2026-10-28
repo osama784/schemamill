@@ -76,20 +76,22 @@
  * behaviour, tablespace, access method, storage parameters, and temporary persistence. What
  * the model does carry reads instead: a column's `COLLATE` as the written,
  * whitespace-normalized name, its inline `STORAGE` and `COMPRESSION` qualifiers as the
- * model's words, and `CREATE UNLOGGED TABLE` as the table's persistence. A unique or check
- * constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
- * `INCLUDE (…)`, `NO INHERIT`) is still imported, and each unrepresentable attribute is
- * flagged and dropped, following the foreign-key precedent; a check constraint's misplaced
- * deferrability is flagged the same way. Enforcement and deferrability the model carries are
- * read instead: on a foreign key or check constraint the parser's one `skip_validation`
- * channel decodes to `NOT VALID` when `is_enforced` is true beside it and to `NOT ENFORCED`
- * otherwise, and a deferrable primary key, unique constraint, or foreign key keeps
- * `DEFERRABLE`/`INITIALLY DEFERRED`. A not-null constraint in any shape — inline, table-level,
- * or `ALTER TABLE … ADD`, named or unnamed — sets the column's `notNull`, with a stated name
- * on `notNullName`; the duplicate-declaration merge and the generated-name strip below keep
- * the model's one-fact-per-column shape. A not-null `NOT VALID` keeps its enforced not-null
- * fact and flags the validation state the model cannot carry. The
- * one statement-level exception is a partition (`partbound`): a
+ * model's words, and `CREATE UNLOGGED TABLE` as the table's persistence. A constraint
+ * carrying an attribute outside the model — `NULLS NOT DISTINCT`, `INCLUDE (…)`, or
+ * `NO INHERIT` on a unique or check constraint, `WITHOUT OVERLAPS` on a primary key or
+ * unique constraint, `PERIOD` on a foreign key (one flag per key, whichever side states it),
+ * or `NO INHERIT` on a not-null constraint — is still imported, and each unrepresentable
+ * attribute is flagged and dropped, following the foreign-key precedent; a check
+ * constraint's misplaced deferrability is flagged the same way. Enforcement and deferrability
+ * the model carries are read instead: on a foreign key or check constraint the parser's one
+ * `skip_validation` channel decodes to `NOT VALID` when `is_enforced` is true beside it and
+ * to `NOT ENFORCED` otherwise, and a deferrable primary key, unique constraint, or foreign
+ * key keeps `DEFERRABLE`/`INITIALLY DEFERRED`. A not-null constraint in any shape — inline,
+ * table-level, or `ALTER TABLE … ADD`, named or unnamed — sets the column's `notNull`, with a
+ * stated name on `notNullName`; the duplicate-declaration merge and the generated-name strip
+ * below keep the model's one-fact-per-column shape. A not-null `NOT VALID` keeps its enforced
+ * not-null fact and flags the validation state the model cannot carry. The one statement-level
+ * exception is a partition (`partbound`): a
  * plain-table representation would be a different object, so the whole statement is skipped
  * and named. `ALTER TABLE` on anything but a plain table is skipped the same way.
  *
@@ -507,7 +509,13 @@ function translateColumn(
   for (const constraint of constraints) {
     switch (constraint.contype) {
       case 'CONSTR_PRIMARY': {
-        const primaryKey = primaryKeyFromConstraint(constraint, [name]) as Mutable<PrimaryKey>;
+        const primaryKey = primaryKeyFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<PrimaryKey>;
         translated.primaryKey = primaryKey;
         fold = { kind: 'primary', value: primaryKey };
         break;
@@ -560,6 +568,11 @@ function translateColumn(
           );
         } else {
           translated.column = merged.column;
+        }
+        if (constraint.is_no_inherit === true) {
+          diagnostics.push(
+            flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
+          );
         }
         break;
       }
@@ -863,7 +876,7 @@ function translateTableConstraint(
       attachPrimaryKey(
         statement,
         draft,
-        primaryKeyFromConstraint(constraint, []),
+        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
         identity,
         diagnostics,
       );
@@ -961,6 +974,12 @@ function attachNotNullConstraint(
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
     diagnostics.push(
       flagAttribute(statement, identity, `NOT VALID on ${constraintLabel(constraint)}`),
+    );
+  }
+
+  if (constraint.is_no_inherit === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
     );
   }
 }
@@ -1630,7 +1649,7 @@ function translateAlterTableCommand(
       attachPrimaryKey(
         statement,
         draft,
-        primaryKeyFromConstraint(constraint, []),
+        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
         identity,
         diagnostics,
       );
@@ -2641,13 +2660,21 @@ function attachIndex(draft: TableDraft, index: Index): void {
 }
 
 function primaryKeyFromConstraint(
+  statement: ParsedStatement,
   constraint: Constraint,
   fallbackColumns: readonly string[],
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
 ): PrimaryKey {
   const keys = stringList(constraint.keys);
   const primaryKey: Mutable<PrimaryKey> = { columns: keys.length > 0 ? keys : fallbackColumns };
   if (constraint.conname !== undefined) primaryKey.name = constraint.conname;
   applyConstraintDeferrability(constraint, primaryKey);
+  if (constraint.without_overlaps === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `WITHOUT OVERLAPS on ${constraintLabel(constraint)}`),
+    );
+  }
   return primaryKey;
 }
 
@@ -2710,6 +2737,7 @@ function foreignKeyFromConstraint(
     flag(`MATCH ${constraint.fk_matchtype === 'f' ? 'FULL' : 'PARTIAL'}`);
   }
   if ((constraint.fk_del_set_cols ?? []).length > 0) flag('column list');
+  if (constraint.fk_with_period === true || constraint.pk_with_period === true) flag('PERIOD');
 
   const enforcement = constraintEnforcement(constraint);
   if (enforcement !== undefined) foreignKey.enforcement = enforcement;
@@ -2834,6 +2862,7 @@ function flagUniqueConstraintAttributes(
   };
   if (constraint.nulls_not_distinct === true) flag('NULLS NOT DISTINCT');
   if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.without_overlaps === true) flag('WITHOUT OVERLAPS');
   if (constraint.is_no_inherit === true) flag('NO INHERIT');
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
     flag('NOT VALID');

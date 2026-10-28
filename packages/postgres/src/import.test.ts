@@ -3316,3 +3316,294 @@ test('skips a materialized view index as a table that was not imported', async (
     },
   ]);
 });
+
+test('flags WITHOUT OVERLAPS on a primary key and imports the plain key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during tsrange);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The temporal attribute is dropped and the plain key imports; `t_pkey` is PostgreSQL's
+  // conventional primary-key name, so it canonicalizes back to unnamed as it does without the
+  // attribute.
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+  ]);
+});
+
+test('flags WITHOUT OVERLAPS on a unique constraint and imports the plain key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during tsrange);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT u_period UNIQUE (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.uniqueConstraints, [{ name: 'u_period', columns: ['id', 'during'] }]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped WITHOUT OVERLAPS on unique constraint u_period from public.t'],
+  );
+});
+
+test('flags PERIOD once per foreign key, whichever side carries it', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_ref FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_target FOREIGN KEY (a) REFERENCES public.p (id, PERIOD during);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_both FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id, PERIOD during);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  const foreignKey = (name: string) =>
+    table.foreignKeys.find((candidate) => candidate.name === name);
+  assert.deepEqual(foreignKey('f_period_ref')?.columns, ['a', 'b']);
+  assert.deepEqual(foreignKey('f_period_ref')?.referencedColumns, ['id']);
+  assert.deepEqual(foreignKey('f_period_target')?.columns, ['a']);
+  assert.deepEqual(foreignKey('f_period_target')?.referencedColumns, ['id', 'during']);
+  assert.deepEqual(foreignKey('f_period_both')?.columns, ['a', 'b']);
+  assert.deepEqual(foreignKey('f_period_both')?.referencedColumns, ['id', 'during']);
+
+  // A period on either side, or on both, is one dropped attribute, never two.
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped PERIOD on foreign key f_period_ref from public.t',
+      'dropped PERIOD on foreign key f_period_target from public.t',
+      'dropped PERIOD on foreign key f_period_both from public.t',
+    ],
+  );
+});
+
+test('flags NO INHERIT on a not-null constraint in every shape', async () => {
+  const dump = [
+    `CREATE TABLE public.nn (a integer NOT NULL NO INHERIT);`,
+    `CREATE TABLE public.named (a integer, CONSTRAINT nn_a NOT NULL a NO INHERIT);`,
+    `CREATE TABLE public.altered (a integer);`,
+    `ALTER TABLE ONLY public.altered ADD CONSTRAINT nn_a NOT NULL a NO INHERIT;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const columnsOf = (name: string) => {
+    const table = model.tables.find((candidate) => candidate.name === name);
+    assert.ok(table, `table ${name} is imported`);
+    return table.columns;
+  };
+
+  // The not-null fact survives every shape; the inheritance attribute is the dropped part.
+  assert.deepEqual(columnsOf('nn'), [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(columnsOf('named'), [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'nn_a' },
+  ]);
+  assert.deepEqual(columnsOf('altered'), [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'nn_a' },
+  ]);
+
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped NO INHERIT on not-null constraint from public.nn',
+      'dropped NO INHERIT on not-null constraint nn_a from public.named',
+      'dropped NO INHERIT on not-null constraint nn_a from public.altered',
+    ],
+  );
+});
+
+test('reads unnamed temporal and inheritance forms with the bare constraint kind', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (a integer, b integer, PRIMARY KEY (a, b WITHOUT OVERLAPS), UNIQUE (a, b WITHOUT OVERLAPS), FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id));`,
+    `CREATE TABLE public.nn (a integer NOT NULL NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Unnamed PK and unique constraints read the bare kind; the unnamed foreign key keeps the
+  // builder's `on <identity>` label.
+  assert.deepEqual(table.primaryKey, { columns: ['a', 'b'] });
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a', 'b'] }]);
+  assert.deepEqual(
+    table.foreignKeys.map((foreignKey) => ({
+      name: foreignKey.name,
+      columns: foreignKey.columns,
+    })),
+    [{ name: undefined, columns: ['a', 'b'] }],
+  );
+
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped WITHOUT OVERLAPS on primary key from public.t',
+      'dropped WITHOUT OVERLAPS on unique constraint from public.t',
+      'dropped PERIOD on foreign key on public.t from public.t',
+      'dropped NO INHERIT on not-null constraint from public.nn',
+    ],
+  );
+});
+
+test('orders the temporal and inheritance flags with the constraint they drop from', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, b integer, CONSTRAINT t_a_nn NOT NULL a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey_dup PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT u_period UNIQUE NULLS NOT DISTINCT (id, during WITHOUT OVERLAPS) INCLUDE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id, PERIOD during);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_other NOT NULL a NO INHERIT;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The duplicate primary key keeps the first declaration; its attribute flag precedes the
+  // `additional primary key` flag the attach path adds.
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey_dup from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NULLS NOT DISTINCT on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped PERIOD on foreign key f_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional not-null constraint on public.t.a from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on not-null constraint t_other from public.t',
+    },
+  ]);
+});
+
+test('flags NO INHERIT beside a not-null merge conflict', async () => {
+  // Two real names for one not-null fact: the merge keeps the first and reports the conflict,
+  // and the inheritance attribute is dropped either way, after the conflict flag.
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT t_a_nn NOT NULL, CONSTRAINT t_other NOT NULL a NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 't_a_nn' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped additional not-null constraint on public.t.a from public.t',
+      'dropped NO INHERIT on not-null constraint t_other from public.t',
+    ],
+  );
+});
+
+test('flags NO INHERIT beside an inline not-null merge conflict', async () => {
+  // Two real inline names for one not-null fact: the merge keeps the first and reports the
+  // conflict, and the inline inheritance attribute is dropped either way, after the conflict
+  // flag — the inline twin of the table-level case above.
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT t_a_nn NOT NULL CONSTRAINT t_other NOT NULL NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 't_a_nn' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped additional not-null constraint on public.t.a from public.t',
+      'dropped NO INHERIT on not-null constraint t_other from public.t',
+    ],
+  );
+});
+
+test('drops temporal and inheritance forms whole, leaving the same model', async () => {
+  const withForms = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS), CONSTRAINT u_period UNIQUE (id, during WITHOUT OVERLAPS), CONSTRAINT f_period FOREIGN KEY (a, PERIOD during) REFERENCES public.p (id, PERIOD during), CONSTRAINT nn_a NOT NULL a NO INHERIT);`,
+  ].join('\n');
+  const withoutForms = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, CONSTRAINT t_pkey PRIMARY KEY (id, during), CONSTRAINT u_period UNIQUE (id, during), CONSTRAINT f_period FOREIGN KEY (a, during) REFERENCES public.p (id, during), CONSTRAINT nn_a NOT NULL a);`,
+  ].join('\n');
+
+  const { model: withModel, diagnostics } = await importDump(withForms);
+  const { model: withoutModel } = await importDump(withoutForms);
+
+  assert.deepEqual(diff(withModel, withoutModel), []);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+      'dropped WITHOUT OVERLAPS on unique constraint u_period from public.t',
+      'dropped PERIOD on foreign key f_period from public.t',
+      'dropped NO INHERIT on not-null constraint nn_a from public.t',
+    ],
+  );
+});
