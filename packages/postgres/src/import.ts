@@ -14,7 +14,7 @@
  *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
  *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
  *   schema-qualified identity replaces the table wholesale, clearing its foreign keys, unique
- *   constraints, check constraints, and indexes.
+ *   constraints, check constraints, indexes, and comment.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
  *   order the statement lists them; `ALTER COLUMN … SET STORAGE` and `SET COMPRESSION` apply
@@ -68,8 +68,19 @@
  *   flag differs (an invalid dump). A recursive view is skipped and named: the parser rewrites
  *   it into a view-named recursive CTE and the body after `AS` omits that CTE, so the stored
  *   definition could not be re-rendered.
- * - Everything outside the imported subset (schemas, functions, comments, grants,
- *   settings, …) is skipped and named.
+ * - `COMMENT ON` stores the comment on every modeled family: a table, column, sequence, plain
+ *   or materialized view, index, primary key, unique/check/foreign-key constraint. The target
+ *   is resolved by its stored server name — the drafts still carry it, because canonicalization
+ *   runs after all statements — or, for a node the source declared unnamed, by the conventional
+ *   name PostgreSQL would have synthesized, so a comment stays on the node after the name strip.
+ *   `IS NULL` and `IS ''` clear the comment, a repeated comment replaces the earlier one, and a
+ *   repeated `CREATE` clears it with the entity. A comment the import cannot place is flagged,
+ *   never silent: an unknown or under-qualified object, a table/view kind mismatch, a view
+ *   output column, or text carrying NUL. A comment on a PG18 named not-null constraint is
+ *   flagged with its own wording (the model has no not-null entity); comments on unmodeled
+ *   families stay skipped and named.
+ * - Everything outside the imported subset (schemas, functions, grants, settings, …) is skipped
+ *   and named.
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
@@ -151,6 +162,7 @@ import type {
   AlterTableStmt,
   CollateClause,
   ColumnDef,
+  CommentStmt,
   Constraint,
   CreateSeqStmt,
   CreateStmt,
@@ -190,6 +202,8 @@ interface TableDraft {
   readonly indexes: Index[];
   /** `unlogged` while the source says so; `undefined` is `LOGGED`, the default. */
   persistence?: TablePersistence;
+  /** The table's comment; a repeated `CREATE TABLE` replaces it wholesale. */
+  comment?: string;
 }
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
@@ -339,6 +353,10 @@ function translateStatement(
     translateCreateMaterializedView(statement, node.CreateTableAsStmt, views, diagnostics);
     return;
   }
+  if ('CommentStmt' in node && MODELED_COMMENT_OBJECTS.has(node.CommentStmt.objtype ?? '')) {
+    translateCommentStatement(statement, node.CommentStmt, tables, sequences, views, diagnostics);
+    return;
+  }
 
   const { description, object } = describeStatement(node);
   diagnostics.push(skipStatement(statement, description, object));
@@ -371,13 +389,14 @@ function translateCreateTable(
 
   const columns: Column[] = [];
   // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys,
-  // unique constraints, check constraints, indexes, and persistence.
+  // unique constraints, check constraints, indexes, persistence, and the comment.
   draft.primaryKey = undefined;
   draft.foreignKeys.length = 0;
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
   draft.indexes.length = 0;
   draft.persistence = undefined;
+  delete draft.comment;
   // The draft sees the columns as they are collected, so a table-level not-null constraint —
   // which always follows the column definitions — can attach to its column.
   draft.columns = columns;
@@ -1005,6 +1024,352 @@ function translateCreateTableExtras(
   if ((create.options ?? []).length > 0) flag('storage parameters');
   if (create.relation?.relpersistence === 'u') draft.persistence = 'unlogged';
   if (create.relation?.relpersistence === 't') flag('temporary-table persistence');
+}
+
+/** The `COMMENT ON` object kinds whose target the model carries. */
+const MODELED_COMMENT_OBJECTS: ReadonlySet<string> = new Set([
+  'OBJECT_TABLE',
+  'OBJECT_COLUMN',
+  'OBJECT_SEQUENCE',
+  'OBJECT_VIEW',
+  'OBJECT_MATVIEW',
+  'OBJECT_INDEX',
+  'OBJECT_TABCONSTRAINT',
+]);
+
+/**
+ * Applies one parsed `COMMENT ON` to the draft it names. Resolution is by the stored server
+ * name — every draft still carries it, because finalization canonicalizes after all statements
+ * — or, for a node the source declared unnamed, the conventional name PostgreSQL would have
+ * synthesized, so a comment stays attached to the node after the name strip. `IS NULL` and
+ * `IS ''` arrive as an absent comment and clear the field; a repeated comment replaces the
+ * earlier one. A target the import cannot resolve, and text carrying NUL, is flagged and
+ * dropped. A comment on a not-null constraint takes the named deferral's flag wording.
+ */
+function translateCommentStatement(
+  statement: ParsedStatement,
+  comment: CommentStmt,
+  tables: Map<string, TableDraft>,
+  sequences: Map<string, SequenceDraft>,
+  views: Map<string, ViewDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const parts = commentObjectParts(comment.object);
+  const object = parts.length > 0 ? parts.join('.') : (commentObject(comment.object) ?? 'object');
+  // Widened to `string`: the parser's enum carries every object kind, while this switch owns
+  // only the modeled families and keeps the default as the total guard.
+  const objtype: string = comment.objtype ?? '';
+  const flag = (description = 'comment'): void => {
+    diagnostics.push(flagAttribute(statement, object, description));
+  };
+
+  switch (objtype) {
+    case 'OBJECT_TABLE': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.name));
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_COLUMN': {
+      const target =
+        parts.length === 3
+          ? { schema: parts[0]!, table: parts[1]!, column: parts[2]! }
+          : parts.length === 2
+            ? { schema: 'public', table: parts[0]!, column: parts[1]! }
+            : undefined;
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.table));
+      const column = draft?.columns.find((candidate) => candidate.name === target?.column);
+      if (draft === undefined || column === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          const position = draft.columns.indexOf(column);
+          draft.columns[position] = withComment(column, text);
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_SEQUENCE': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : sequences.get(tableKey(target.schema, target.name));
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_VIEW':
+    case 'OBJECT_MATVIEW': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : views.get(tableKey(target.schema, target.name));
+      const materialized = objtype === 'OBJECT_MATVIEW';
+      if (draft === undefined || draft.materialized !== materialized) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_INDEX': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const found = target === undefined ? undefined : findCommentedIndex(tables, target);
+      if (found === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          const position = found.draft.indexes.indexOf(found.index);
+          found.draft.indexes[position] = withComment(found.index, text);
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_TABCONSTRAINT': {
+      const target =
+        parts.length === 3
+          ? { schema: parts[0]!, table: parts[1]!, constraint: parts[2]! }
+          : parts.length === 2
+            ? { schema: 'public', table: parts[0]!, constraint: parts[1]! }
+            : undefined;
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.table));
+      if (draft === undefined || target === undefined) {
+        flag();
+        return;
+      }
+      applyConstraintComment(
+        statement,
+        object,
+        target.constraint,
+        comment.comment,
+        draft,
+        diagnostics,
+      );
+      return;
+    }
+    default:
+      // The dispatch only routes modeled objtypes here; keep the guard total.
+      flag();
+  }
+}
+
+/**
+ * Stores a comment text on one draft target, or flags it when the text carries NUL: no
+ * PostgreSQL text value can hold one, so the model's "a comment never contains NUL" invariant
+ * holds at this door too. Exported for the unit test — libpg-query rejects a NUL byte in a
+ * string literal at parse time, so the guard cannot be reached through DDL, but a future
+ * non-DDL producer must not store one either.
+ */
+export function storeComment(
+  statement: ParsedStatement,
+  object: string,
+  text: string | undefined,
+  store: (text: string | undefined) => void,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const refusal = nonStorableCommentFlag(statement, object, text);
+  if (refusal !== undefined) {
+    diagnostics.push(refusal);
+    return;
+  }
+  store(text);
+}
+
+/** The flag a comment whose text cannot be stored produces: text carrying U+0000. */
+function nonStorableCommentFlag(
+  statement: ParsedStatement,
+  object: string,
+  text: string | undefined,
+): PositionedDiagnostic | undefined {
+  if (text === undefined || !text.includes('\u0000')) return undefined;
+  return flagAttribute(statement, object, 'comment');
+}
+
+/** The schema-qualified target of a `[schema, name]` list; an unqualified name is `public`. */
+function schemaQualifiedCommentTarget(
+  parts: readonly string[],
+): { readonly schema: string; readonly name: string } | undefined {
+  if (parts.length === 2) return { schema: parts[0]!, name: parts[1]! };
+  if (parts.length === 1) return { schema: 'public', name: parts[0]! };
+  return undefined;
+}
+
+/** The identifier parts of a `CommentStmt.object` list, or an empty list for another shape. */
+function commentObjectParts(node: Node | undefined): string[] {
+  return node !== undefined && 'List' in node ? stringList(node.List.items) : [];
+}
+
+/** A copy of `node` carrying `text`, or without a comment when `text` is absent. */
+function withComment<Node extends { readonly comment?: string }>(
+  node: Node,
+  text: string | undefined,
+): Node {
+  const copy: Mutable<Node> = { ...node };
+  if (text === undefined) delete copy.comment;
+  else copy.comment = text;
+  return copy;
+}
+
+/** The draft index a `COMMENT ON INDEX` names, in its schema, by stored or synthesized name. */
+function findCommentedIndex(
+  tables: Map<string, TableDraft>,
+  target: { readonly schema: string; readonly name: string },
+): { readonly draft: TableDraft; readonly index: Index } | undefined {
+  for (const draft of tables.values()) {
+    if (draft.schema !== target.schema) continue;
+    const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+    const index = draft.indexes.find(
+      (candidate) =>
+        candidate.name === target.name ||
+        (candidate.name === undefined && synthesizedIndexName(identity, candidate) === target.name),
+    );
+    if (index !== undefined) return { draft, index };
+  }
+  return undefined;
+}
+
+/**
+ * Resolves a constraint comment by the fixed slot order: primary key, unique constraints,
+ * check constraints, foreign keys — each by stored name, or by the conventional synthesized
+ * name for a node the source left unnamed — then the columns' not-null facts, flagged with the
+ * PG18 deferral's wording, then the generic flag. PostgreSQL keeps constraint names unique per
+ * table, so the order is observable only for an invalid model.
+ */
+function applyConstraintComment(
+  statement: ParsedStatement,
+  object: string,
+  name: string,
+  text: string | undefined,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const matches = (stored: string | undefined, synthesized: string): boolean =>
+    stored === name || (stored === undefined && synthesized === name);
+
+  const primaryKey = draft.primaryKey;
+  if (primaryKey !== undefined && matches(primaryKey.name, synthesizedPrimaryKeyName(identity))) {
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.primaryKey = withComment(primaryKey, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const uniquePosition = draft.uniqueConstraints.findIndex((uniqueConstraint) =>
+    matches(uniqueConstraint.name, synthesizedUniqueConstraintName(identity, uniqueConstraint)),
+  );
+  if (uniquePosition !== -1) {
+    const uniqueConstraint = draft.uniqueConstraints[uniquePosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.uniqueConstraints[uniquePosition] = withComment(uniqueConstraint, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const checkPosition = draft.checkConstraints.findIndex((checkConstraint) =>
+    matches(checkConstraint.name, synthesizedCheckConstraintName(identity, checkConstraint)),
+  );
+  if (checkPosition !== -1) {
+    const checkConstraint = draft.checkConstraints[checkPosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.checkConstraints[checkPosition] = withComment(checkConstraint, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const foreignPosition = draft.foreignKeys.findIndex((foreignKey) =>
+    matches(foreignKey.name, synthesizedForeignKeyName(identity, foreignKey)),
+  );
+  if (foreignPosition !== -1) {
+    const foreignKey = draft.foreignKeys[foreignPosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.foreignKeys[foreignPosition] = withComment(foreignKey, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const notNull = draft.columns.find(
+    (column) =>
+      column.notNull &&
+      matches(column.notNullName, synthesizedNotNullName(draft.name, column.name)),
+  );
+  if (notNull !== undefined) {
+    diagnostics.push(flagAttribute(statement, object, 'comment on a not-null constraint'));
+    return;
+  }
+
+  diagnostics.push(flagAttribute(statement, object, 'comment'));
 }
 
 /** Maps PostgreSQL's normalized sequence type names onto the model's data types. */
@@ -3333,6 +3698,7 @@ function finalizeTable(draft: TableDraft): Table {
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
   if (draft.persistence !== undefined) table.persistence = draft.persistence;
+  if (draft.comment !== undefined) table.comment = draft.comment;
   return table;
 }
 
