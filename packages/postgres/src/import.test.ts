@@ -4,7 +4,12 @@ import { test } from 'node:test';
 import { diff } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
-import { extractCollationText, storeComment } from './import.ts';
+import {
+  describeStatement,
+  extractCollationText,
+  readCreateExtensionOptions,
+  storeComment,
+} from './import.ts';
 import { ddlImporter, importDump } from './index.ts';
 import type { ParsedStatement } from './parse.ts';
 
@@ -246,10 +251,11 @@ const EXPECTED_DIAGNOSTICS = [
 
 /**
  * The long-tail families in the order a dump emits them, captured from the #59 fact report:
- * every unmodeled statement is skipped with a family-named description, the plain view and
- * materialized view import, and the two `CREATE TABLE` attribute leftovers import partially
- * and are flagged. The two plain `CREATE TABLE`s (`app.t`, `app.rls`) are present for the
- * statements that reference them and produce nothing.
+ * every unmodeled statement is skipped with a family-named description, the dump-form extension
+ * imports with its install schema, the plain view and materialized view import, and the two
+ * `CREATE TABLE` attribute leftovers import partially and are flagged. The two plain
+ * `CREATE TABLE`s (`app.t`, `app.rls`) are present for the statements that reference them and
+ * produce nothing.
  */
 const LONG_TAIL_DUMP = [
   `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
@@ -305,12 +311,6 @@ const LONG_TAIL_DUMP = [
 
 /** The complete diagnostic contract for `LONG_TAIL_DUMP`, in dump order. */
 const LONG_TAIL_DIAGNOSTICS = [
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'pgcrypto',
-    message: 'skipped CREATE EXTENSION pgcrypto',
-  },
   {
     kind: 'skip',
     code: 'unsupported-statement',
@@ -547,6 +547,9 @@ test('names every long-tail family in dump order', async () => {
   const { model, diagnostics } = await importDump(LONG_TAIL_DUMP);
 
   assert.deepEqual(diagnostics.map(describeDiagnostic), LONG_TAIL_DIAGNOSTICS);
+
+  // The dump-form extension imports with its install schema; it is no longer a skip.
+  assert.deepEqual(model.extensions, [{ name: 'pgcrypto', schema: 'public' }]);
 
   // The materialized view's comment lands on the modeled view; the foreign table's stays skipped.
   const materializedView = model.views.find((view) => view.name === 'mv');
@@ -3611,6 +3614,227 @@ test('drops temporal and inheritance forms whole, leaving the same model', async
       'dropped PERIOD on foreign key f_period from public.t',
       'dropped NO INHERIT on not-null constraint nn_a from public.t',
     ],
+  );
+});
+
+test('imports CREATE EXTENSION with its install schema, ignoring IF NOT EXISTS', async () => {
+  const dump = [
+    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `CREATE EXTENSION citext WITH SCHEMA first SCHEMA second;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  // Extensions sort by name, not by source order: pgcrypto is written first and imports last.
+  assert.deepEqual(model.extensions, [
+    { name: 'citext', schema: 'second' },
+    { name: 'hstore', schema: 'hs1' },
+    { name: 'pgcrypto', schema: 'public' },
+  ]);
+});
+
+test('flags CREATE EXTENSION version and cascade options, keeping the extension', async () => {
+  const dump = `CREATE EXTENSION hstore WITH SCHEMA hs1 VERSION '1.4' CASCADE;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped VERSION from extension hstore',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped CASCADE from extension hstore',
+    },
+  ]);
+});
+
+test('replaces a repeated CREATE EXTENSION wholesale and clears its comment', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `COMMENT ON EXTENSION hstore IS 'gone';`,
+    `CREATE EXTENSION hstore WITH SCHEMA public;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'public' }]);
+});
+
+test('skips a CREATE EXTENSION without WITH SCHEMA and keeps an earlier draft', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `COMMENT ON EXTENSION hstore IS 'kept';`,
+    `CREATE EXTENSION hstore;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The schema-less definition is named and never replaces the imported draft or its comment.
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1', comment: 'kept' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped CREATE EXTENSION hstore (no WITH SCHEMA)',
+    },
+  ]);
+});
+
+test('imports and clears an extension comment', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `CREATE EXTENSION citext WITH SCHEMA public;`,
+    `CREATE EXTENSION pgcrypto WITH SCHEMA public;`,
+    `COMMENT ON EXTENSION hstore IS 'key/value store';`,
+    `COMMENT ON EXTENSION citext IS 'case';`,
+    `COMMENT ON EXTENSION citext IS NULL;`,
+    `COMMENT ON EXTENSION pgcrypto IS 'crypto';`,
+    `COMMENT ON EXTENSION pgcrypto IS '';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.extensions, [
+    { name: 'citext', schema: 'public' },
+    { name: 'hstore', schema: 'hs1', comment: 'key/value store' },
+    { name: 'pgcrypto', schema: 'public' },
+  ]);
+});
+
+test('flags a comment on an extension the import has not seen', async () => {
+  const dump = [
+    `COMMENT ON EXTENSION hstore IS 'x';`,
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The unresolved comment is named, never turned into a phantom extension.
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped comment from hstore',
+    },
+  ]);
+});
+
+test('skips extension updates, member statements, and drops by name', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `ALTER EXTENSION hstore UPDATE;`,
+    `ALTER EXTENSION hstore UPDATE TO '1.4';`,
+    `ALTER EXTENSION hstore SET SCHEMA hs2;`,
+    `ALTER EXTENSION hstore ADD TABLE public.t;`,
+    `ALTER EXTENSION hstore DROP FUNCTION public.f(integer);`,
+    `DROP EXTENSION hstore;`,
+    `DROP EXTENSION IF EXISTS citext;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore UPDATE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore UPDATE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore SET SCHEMA hs2',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore ADD TABLE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore DROP FUNCTION',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped DROP EXTENSION hstore',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'citext',
+      message: 'skipped DROP EXTENSION citext',
+    },
+  ]);
+});
+
+test('flags an unknown CREATE EXTENSION option the grammar cannot write', () => {
+  // The extension grammar admits only SCHEMA, VERSION, and CASCADE, so the catch-all flag is
+  // pinned on a fabricated option list rather than through DDL.
+  const position = { offset: 0, line: 1, column: 1 };
+  const statement: ParsedStatement = { sql: '', start: position, end: position, result: {} };
+  const diagnostics: Parameters<typeof readCreateExtensionOptions>[3] = [];
+
+  const schema = readCreateExtensionOptions(
+    statement,
+    'hstore',
+    [{ DefElem: { defname: 'something_else' } }],
+    diagnostics,
+  );
+
+  assert.equal(schema, undefined);
+  assert.deepEqual(
+    diagnostics.map((entry) => entry.diagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'hstore',
+        message: 'dropped something_else from extension hstore',
+        position,
+      },
+    ],
+  );
+});
+
+test('describes an extension rename, which the grammar cannot write', () => {
+  // PostgreSQL has no ALTER EXTENSION … RENAME; the branch is defensive, and its wording is
+  // pinned directly so a fabricated or future tree cannot fall back to the generic description.
+  assert.deepEqual(
+    describeStatement({
+      RenameStmt: {
+        renameType: 'OBJECT_EXTENSION',
+        object: { String: { sval: 'hstore' } },
+        newname: 'hstore2',
+      },
+    }),
+    { description: 'ALTER EXTENSION hstore RENAME', object: 'hstore' },
   );
 });
 

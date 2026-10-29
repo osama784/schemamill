@@ -68,11 +68,21 @@
  *   flag differs (an invalid dump). A recursive view is skipped and named: the parser rewrites
  *   it into a view-named recursive CTE and the body after `AS` omits that CTE, so the stored
  *   definition could not be re-rendered.
+ * - `CREATE EXTENSION` becomes an `Extension`: its name and the `WITH SCHEMA` install schema,
+ *   plus a later `COMMENT ON EXTENSION`. `IF NOT EXISTS` is pg_dump restore noise and is
+ *   ignored. A definition without `WITH SCHEMA` is skipped and named — the importer never
+ *   invents an install schema — and a skipped definition never replaces an already imported
+ *   extension; a repeated definition replaces it wholesale, clearing its comment. The install
+ *   schema is the only option the model carries: `VERSION`, install-time `CASCADE`, and any
+ *   other option are flagged and dropped. Extension members (`ALTER EXTENSION … ADD`/`DROP`),
+ *   `ALTER EXTENSION … UPDATE`/`SET SCHEMA`, `DROP EXTENSION`, and built-in extensions (never
+ *   dumped) are outside the imported subset and stay skipped and named.
  * - `COMMENT ON` stores the comment on every modeled family: a table, column, sequence, plain
- *   or materialized view, index, primary key, unique/check/foreign-key constraint. The target
- *   is resolved by its stored server name — the drafts still carry it, because canonicalization
- *   runs after all statements — or, for a node the source declared unnamed, by the conventional
- *   name PostgreSQL would have synthesized, so a comment stays on the node after the name strip.
+ *   or materialized view, index, primary key, unique/check/foreign-key constraint, or
+ *   extension. The target is resolved by its stored server name — the drafts still carry it,
+ *   because canonicalization runs after all statements — or, for a node the source declared
+ *   unnamed, by the conventional name PostgreSQL would have synthesized, so a comment stays on
+ *   the node after the name strip.
  *   `IS NULL` and `IS ''` clear the comment, a repeated comment replaces the earlier one, and a
  *   repeated `CREATE` clears it with the entity. A comment the import cannot place is flagged,
  *   never silent: an unknown or under-qualified object, a table/view kind mismatch, a view
@@ -110,7 +120,8 @@
  * `model.ts`: tables by schema then name, columns in source order, foreign keys by
  * referencing columns, then referenced table, then constraint name (unnamed first), unique
  * constraints by ordered columns then name (unnamed first), check constraints by expression
- * then name (unnamed first), indexes by name (unnamed first), and views by schema then name.
+ * then name (unnamed first), indexes by name (unnamed first), views by schema then name, and
+ * extensions by name.
  *
  * This module is internal to the package; `index.ts` re-exports `importDump` and
  * `ddlImporter` as the seam binding.
@@ -124,6 +135,7 @@ import type {
   ConstraintEnforcement,
   DdlImporter,
   Diagnostic,
+  Extension,
   ForeignKey,
   Identity,
   IdentityGeneration,
@@ -164,6 +176,7 @@ import type {
   ColumnDef,
   CommentStmt,
   Constraint,
+  CreateExtensionStmt,
   CreateSeqStmt,
   CreateStmt,
   CreateTableAsStmt,
@@ -215,6 +228,9 @@ type SequenceDraft = Mutable<Sequence>;
  */
 type ViewDraft = Mutable<View>;
 
+/** An extension being assembled; a repeated definition replaces it wholesale. */
+type ExtensionDraft = Mutable<Extension>;
+
 interface PositionedDiagnostic {
   readonly offset: number;
   readonly diagnostic: Diagnostic;
@@ -264,8 +280,9 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
   const tables = new Map<string, TableDraft>();
   const sequences = new Map<string, SequenceDraft>();
   const views = new Map<string, ViewDraft>();
+  const extensions = new Map<string, ExtensionDraft>();
   for (const statement of parsed.statements) {
-    translateStatement(statement, tables, sequences, views, diagnostics);
+    translateStatement(statement, tables, sequences, views, extensions, diagnostics);
   }
 
   diagnostics.sort((left, right) => left.offset - right.offset);
@@ -275,7 +292,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
       views: [...views.values()].sort(compareViews),
-      extensions: [],
+      extensions: [...extensions.values()].sort(compareExtensions),
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
@@ -310,6 +327,7 @@ function translateStatement(
   tables: Map<string, TableDraft>,
   sequences: Map<string, SequenceDraft>,
   views: Map<string, ViewDraft>,
+  extensions: Map<string, ExtensionDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
@@ -354,8 +372,20 @@ function translateStatement(
     translateCreateMaterializedView(statement, node.CreateTableAsStmt, views, diagnostics);
     return;
   }
+  if ('CreateExtensionStmt' in node) {
+    translateCreateExtension(statement, node.CreateExtensionStmt, extensions, diagnostics);
+    return;
+  }
   if ('CommentStmt' in node && MODELED_COMMENT_OBJECTS.has(node.CommentStmt.objtype ?? '')) {
-    translateCommentStatement(statement, node.CommentStmt, tables, sequences, views, diagnostics);
+    translateCommentStatement(
+      statement,
+      node.CommentStmt,
+      tables,
+      sequences,
+      views,
+      extensions,
+      diagnostics,
+    );
     return;
   }
 
@@ -1027,6 +1057,89 @@ function translateCreateTableExtras(
   if (create.relation?.relpersistence === 't') flag('temporary-table persistence');
 }
 
+/**
+ * Translates a `CREATE EXTENSION` into its draft. `IF NOT EXISTS` is ignored — pg_dump restore
+ * noise with no model meaning. The install schema is required: a definition without `WITH
+ * SCHEMA` is skipped and named, and a skipped definition never replaces an existing draft. A
+ * repeated definition replaces the extension wholesale, clearing its comment.
+ */
+function translateCreateExtension(
+  statement: ParsedStatement,
+  create: CreateExtensionStmt,
+  extensions: Map<string, ExtensionDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const name = create.extname ?? '';
+  const schema = readCreateExtensionOptions(statement, name, create.options ?? [], diagnostics);
+  if (schema === undefined) {
+    diagnostics.push(skipStatement(statement, `CREATE EXTENSION ${name} (no WITH SCHEMA)`, name));
+    return;
+  }
+  extensions.set(name, { name, schema });
+}
+
+/**
+ * Reads a `CREATE EXTENSION`'s options into the install schema, flagging every option the model
+ * cannot carry: the version, install-time `CASCADE`, and anything else. A repeated `schema`
+ * option takes its last value. Exported for the unit test: the grammar admits no option this
+ * switch does not know, so the unknown-option guard is pinned on a fabricated option list.
+ */
+export function readCreateExtensionOptions(
+  statement: ParsedStatement,
+  name: string,
+  options: readonly Node[],
+  diagnostics: PositionedDiagnostic[],
+): string | undefined {
+  let schema: string | undefined;
+  for (const option of options) {
+    if (!('DefElem' in option)) continue;
+    const def = option.DefElem;
+    const defname = def.defname ?? 'option';
+    if (defname === 'schema') {
+      const value = extensionOptionString(def);
+      if (value !== undefined) schema = value;
+      continue;
+    }
+    if (defname === 'new_version') {
+      diagnostics.push(extensionFlag(statement, name, 'VERSION'));
+      continue;
+    }
+    if (defname === 'cascade') {
+      diagnostics.push(extensionFlag(statement, name, 'CASCADE'));
+      continue;
+    }
+    diagnostics.push(extensionFlag(statement, name, defname));
+  }
+  return schema;
+}
+
+/** The string argument of a `CREATE EXTENSION` option, when it carries one. */
+function extensionOptionString(option: DefElem): string | undefined {
+  return option.arg !== undefined && 'String' in option.arg ? option.arg.String.sval : undefined;
+}
+
+/**
+ * A flag for one dropped extension option, reading `dropped <description> from extension
+ * <name>`. The shared `flagAttribute` is not reused: its `from <identity>` tail assumes a
+ * schema-qualified object, while an extension is named by its bare, database-unique name.
+ */
+function extensionFlag(
+  statement: ParsedStatement,
+  name: string,
+  description: string,
+): PositionedDiagnostic {
+  return {
+    offset: statement.start.offset,
+    diagnostic: {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: name,
+      message: `dropped ${description} from extension ${name}`,
+      position: statement.start,
+    },
+  };
+}
+
 /** The `COMMENT ON` object kinds whose target the model carries. */
 const MODELED_COMMENT_OBJECTS: ReadonlySet<string> = new Set([
   'OBJECT_TABLE',
@@ -1036,6 +1149,7 @@ const MODELED_COMMENT_OBJECTS: ReadonlySet<string> = new Set([
   'OBJECT_MATVIEW',
   'OBJECT_INDEX',
   'OBJECT_TABCONSTRAINT',
+  'OBJECT_EXTENSION',
 ]);
 
 /**
@@ -1053,6 +1167,7 @@ function translateCommentStatement(
   tables: Map<string, TableDraft>,
   sequences: Map<string, SequenceDraft>,
   views: Map<string, ViewDraft>,
+  extensions: Map<string, ExtensionDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const parts = commentObjectParts(comment.object);
@@ -1191,6 +1306,27 @@ function translateCommentStatement(
         target.constraint,
         comment.comment,
         draft,
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_EXTENSION': {
+      // An extension's object is a bare `String`, never a schema-qualified name list, and its
+      // name is database-unique: resolve it directly.
+      const name = commentObject(comment.object);
+      const draft = name === undefined ? undefined : extensions.get(name);
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
         diagnostics,
       );
       return;
@@ -3326,7 +3462,12 @@ interface StatementDescription {
   readonly object: string;
 }
 
-function describeStatement(node: Node): StatementDescription {
+/**
+ * The description and object of a statement outside the imported subset. Exported for the unit
+ * test: PostgreSQL has no `ALTER EXTENSION … RENAME` statement, so the defensive `RenameStmt`
+ * branch cannot be reached through `importDump`.
+ */
+export function describeStatement(node: Node): StatementDescription {
   if ('CreateSchemaStmt' in node) {
     const object = node.CreateSchemaStmt.schemaname ?? 'schema';
     return { description: `CREATE SCHEMA ${object}`, object };
@@ -3335,9 +3476,17 @@ function describeStatement(node: Node): StatementDescription {
     const object = listObjectName(node.DropStmt.objects?.[0]) ?? 'sequence';
     return { description: `DROP SEQUENCE ${object}`, object };
   }
+  if ('DropStmt' in node && node.DropStmt.removeType === 'OBJECT_EXTENSION') {
+    const object = commentObject(node.DropStmt.objects?.[0]) ?? 'extension';
+    return { description: `DROP EXTENSION ${object}`, object };
+  }
   if ('RenameStmt' in node && node.RenameStmt.renameType === 'OBJECT_SEQUENCE') {
     const object = rangeVarName(node.RenameStmt.relation) ?? 'sequence';
     return { description: `ALTER SEQUENCE ${object} RENAME`, object };
+  }
+  if ('RenameStmt' in node && node.RenameStmt.renameType === 'OBJECT_EXTENSION') {
+    const object = commentObject(node.RenameStmt.object) ?? 'extension';
+    return { description: `ALTER EXTENSION ${object} RENAME`, object };
   }
   if (
     'AlterObjectSchemaStmt' in node &&
@@ -3345,6 +3494,27 @@ function describeStatement(node: Node): StatementDescription {
   ) {
     const object = rangeVarName(node.AlterObjectSchemaStmt.relation) ?? 'sequence';
     return { description: `ALTER SEQUENCE ${object} SET SCHEMA`, object };
+  }
+  if (
+    'AlterObjectSchemaStmt' in node &&
+    node.AlterObjectSchemaStmt.objectType === 'OBJECT_EXTENSION'
+  ) {
+    const object = commentObject(node.AlterObjectSchemaStmt.object) ?? 'extension';
+    const schema = node.AlterObjectSchemaStmt.newschema ?? '';
+    return { description: `ALTER EXTENSION ${object} SET SCHEMA ${schema}`, object };
+  }
+  if ('AlterExtensionStmt' in node) {
+    const object = node.AlterExtensionStmt.extname ?? 'extension';
+    return { description: `ALTER EXTENSION ${object} UPDATE`, object };
+  }
+  if ('AlterExtensionContentsStmt' in node) {
+    const contents = node.AlterExtensionContentsStmt;
+    const object = contents.extname ?? 'extension';
+    const action = contents.action === -1 ? 'DROP' : 'ADD';
+    return {
+      description: `ALTER EXTENSION ${object} ${action} ${alterObjectKind(contents.objtype ?? 'OBJECT')}`,
+      object,
+    };
   }
   if ('CreateFunctionStmt' in node) {
     const object = stringList(node.CreateFunctionStmt.funcname).join('.') || 'function';
@@ -3850,6 +4020,10 @@ function compareSequences(left: Sequence, right: Sequence): number {
 
 function compareViews(left: View, right: View): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareExtensions(left: Extension, right: Extension): number {
+  return compareStrings(left.name, right.name);
 }
 
 function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {
