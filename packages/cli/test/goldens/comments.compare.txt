@@ -1,0 +1,30 @@
+~ table public.accounts
+    ~ index accounts_email_lookup: columns (email) → (email, id)
+
+~ table public.audit
+    ~ check constraint (amount >= 0): name (none) → (none), enforcement (none) → not-enforced
+    ~ check constraint (note <> ''): name (none) → (none), enforcement (none) → not-enforced
+
+~ table public.teams
+    ~ primary key (id) → (id): deferrable (none) → true
+
+~ view public.account_totals
+    definition SELECT count(*) AS n FROM public.accounts → SELECT count(*) AS n FROM public.accounts WHERE status = 'active'
+
+~ comment on column public.accounts.email: "login address" → "login address (unique)"
+
+~ comment on index public.accounts (status): "status filter" → "status filter v2"
+
+~ comment on table public.accounts: "accounts v1" → "accounts \"ledger\" \\ v2"
+
+- comment on view public.active_accounts: "active accounts view" → (none)
+
+~ comment on check constraint public.audit (note <> ''): "note v1" → "note v2"
+
+- comment on table public.audit: "temporary table note" → (none)
+
+~ comment on sequence public.invoice_seq: "invoice numbering" → "invoice numbers\n(legacy)"
+
++ comment on table public.members: (none) → "member rows"
+
+~ comment on unique constraint public.teams (code): "team code v1" → "team code v2"
