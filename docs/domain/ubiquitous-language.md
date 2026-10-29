@@ -6,7 +6,7 @@ The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the 
 
 ## Term clusters
 
-- **The model layer** — model, schema, table, column, comment, relationship, foreign key, sequence, sequence-backed default, ownership, identity column, identity sequence, view, materialized view, view definition, view check option, snapshot, baseline, target, diff, data.
+- **The model layer** — model, schema, table, column, comment, relationship, foreign key, sequence, sequence-backed default, ownership, identity column, identity sequence, view, materialized view, view definition, view check option, extension, snapshot, baseline, target, diff, data.
 - **Crossing the boundary** — import, introspection, DDL dump, apply.
 - **The change engine** — migration plan, migration SQL, hazard, definite hazard, state-dependent hazard, certain-cost hazard, expand/contract, round-trip fidelity.
 - **The product's shape** — safe-change loop, studio, canvas, workspace, and the two faces: studio for working visually, CLI for automation.
@@ -20,5 +20,6 @@ The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the 
 - **model vs schema, never conflated.** The schema is the real thing in a database; the model is our representation. One canonical model only means something if these stay apart.
 - **identity column vs sequence-backed default, kept distinct.** Both feed a column from a sequence, but PostgreSQL gives them different lifecycles: an identity column's sequence is internal (`pg_depend` deptype `i`), while a `serial`'s is a standalone sequence plus an opaque `nextval()` default. "Serial column" would blur the two; each keeps its own term.
 - **import vs introspection, kept distinct.** Text in, or live catalog read? Different risks, different fidelity questions; the two words keep them apart.
+- **extension over plugin / module / package.** PostgreSQL owns the word: an extension installs SQL objects and has a database-unique name, not a schema-qualified one. Its install schema is an attribute, which is why the model calls a schema move an alter rather than a drop and create; the other words would suggest a code artifact the model does not carry.
 - **PostgreSQL in definitions, "Postgres" in prose, never "PG".** The formal name is PostgreSQL; the short form is fine in flowing text.
 - **workspace over project / folder.** "Project" is claimed by other tools and by everyday speech for many things; "folder" names storage, not the role. A workspace is the container that organizes a user's work on disk — the unit the studio and the CLI work within. Definition in [CONTEXT.md](../../CONTEXT.md).
