@@ -1,0 +1,56 @@
+26 steps in one transaction:
+  1. drop-view              public.account_totals
+  2. drop-foreign-key       public.members: foreign key members_team_fkey (team_id) → public.teams (id)
+  3. drop-index             public.accounts: index accounts_email_lookup (email)
+  4. drop-check-constraint  public.audit: check constraint CHECK (amount >= 0)
+  5. drop-check-constraint  public.audit: check constraint CHECK (note <> '')
+  6. drop-primary-key       public.teams: primary key (id)
+  7. add-primary-key        public.teams: primary key (id)
+  8. add-check-constraint   public.audit: check constraint CHECK (amount >= 0)
+  9. add-check-constraint   public.audit: check constraint CHECK (note <> '')
+ 10. create-index           public.accounts: index accounts_email_lookup (email, id)
+ 11. add-foreign-key        public.members: foreign key members_team_fkey (team_id) → public.teams (id)
+ 12. create-view            public.account_totals
+ 13. comment                materialized view public.account_totals: "totals snapshot"
+ 14. comment                column public.accounts.email: "login address (unique)"
+ 15. comment                index public.accounts (email, id): "email lookup"
+ 16. comment                index public.accounts (status): "status filter v2"
+ 17. comment                table public.accounts: "accounts \"ledger\" \\ v2"
+ 18. comment                view public.active_accounts: (none)
+ 19. comment                check constraint public.audit (amount >= 0): "amount guard"
+ 20. comment                check constraint public.audit (note <> ''): "note v2"
+ 21. comment                table public.audit: (none)
+ 22. comment                sequence public.invoice_seq: "invoice numbers\n(legacy)"
+ 23. comment                foreign key public.members (team_id) → public.teams: "member team"
+ 24. comment                table public.members: "member rows"
+ 25. comment                primary key public.teams (id): "team identity"
+ 26. comment                unique constraint public.teams (code): "team code v2"
+
+BEGIN;
+DROP MATERIALIZED VIEW public.account_totals;
+ALTER TABLE public.members DROP CONSTRAINT members_team_fkey;
+DROP INDEX public.accounts_email_lookup;
+ALTER TABLE public.audit DROP CONSTRAINT audit_amount_check;
+ALTER TABLE public.audit DROP CONSTRAINT audit_note_check;
+ALTER TABLE public.teams DROP CONSTRAINT teams_pkey;
+ALTER TABLE public.teams ADD PRIMARY KEY (id) DEFERRABLE;
+ALTER TABLE public.audit ADD CHECK (amount >= 0) NOT ENFORCED;
+ALTER TABLE public.audit ADD CHECK (note <> '') NOT ENFORCED;
+CREATE INDEX accounts_email_lookup ON public.accounts USING btree (email, id);
+ALTER TABLE public.members ADD CONSTRAINT members_team_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id);
+CREATE MATERIALIZED VIEW public.account_totals AS SELECT count(*) AS n FROM public.accounts WHERE status = 'active' WITH NO DATA;
+COMMENT ON MATERIALIZED VIEW public.account_totals IS 'totals snapshot';
+COMMENT ON COLUMN public.accounts.email IS 'login address (unique)';
+COMMENT ON INDEX public.accounts_email_lookup IS 'email lookup';
+COMMENT ON INDEX public.accounts_status_idx IS 'status filter v2';
+COMMENT ON TABLE public.accounts IS E'accounts "ledger" \\ v2';
+COMMENT ON VIEW public.active_accounts IS NULL;
+COMMENT ON CONSTRAINT audit_amount_check ON public.audit IS 'amount guard';
+COMMENT ON CONSTRAINT audit_note_check ON public.audit IS 'note v2';
+COMMENT ON TABLE public.audit IS NULL;
+COMMENT ON SEQUENCE public.invoice_seq IS E'invoice numbers\n(legacy)';
+COMMENT ON CONSTRAINT members_team_fkey ON public.members IS 'member team';
+COMMENT ON TABLE public.members IS 'member rows';
+COMMENT ON CONSTRAINT teams_pkey ON public.teams IS 'team identity';
+COMMENT ON CONSTRAINT teams_code_key ON public.teams IS 'team code v2';
+COMMIT;

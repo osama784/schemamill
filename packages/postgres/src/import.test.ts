@@ -4,8 +4,9 @@ import { test } from 'node:test';
 import { diff } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
-import { extractCollationText } from './import.ts';
+import { extractCollationText, storeComment } from './import.ts';
 import { ddlImporter, importDump } from './index.ts';
+import type { ParsedStatement } from './parse.ts';
 
 /** Kind, code, and object of a diagnostic, with `object` omitted for errors. */
 const summarize = (diagnostic: Diagnostic) =>
@@ -210,6 +211,7 @@ const EXPECTED_MODEL: Model = {
       uniqueConstraints: [{ columns: ['email'] }],
       checkConstraints: [{ expression: '(age >= 0)' }],
       indexes: [{ name: 'idx_users_email', unique: false, columns: ['email'] }],
+      comment: 'people',
     },
   ],
   sequences: [
@@ -233,7 +235,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'statement_timeout' },
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
   { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
@@ -390,12 +391,6 @@ const LONG_TAIL_DIAGNOSTICS = [
   {
     kind: 'skip',
     code: 'unsupported-statement',
-    object: 'app.mv',
-    message: 'skipped COMMENT ON MATERIALIZED VIEW app.mv',
-  },
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
     object: 'app.ft',
     message: 'skipped COMMENT ON FOREIGN TABLE app.ft',
   },
@@ -532,7 +527,11 @@ test('reports skips, flags, and failures in dump order', async () => {
     undefined,
     'SET DEFAULT attaches instead of being skipped',
   );
-  assert.ok(byMessage('COMMENT ON TABLE public.users'), 'COMMENT is skipped and named');
+  assert.equal(
+    byMessage('COMMENT ON TABLE public.users'),
+    undefined,
+    'COMMENT attaches instead of being skipped',
+  );
   const failure = diagnostics.find((diagnostic) => diagnostic.code === 'parse-failure');
   assert.match(failure?.message ?? '', /syntax error at or near "UNSIGNED"/);
   // Failures point at the parser's error cursor when it has one.
@@ -544,9 +543,13 @@ test('reports skips, flags, and failures in dump order', async () => {
 });
 
 test('names every long-tail family in dump order', async () => {
-  const { diagnostics } = await importDump(LONG_TAIL_DUMP);
+  const { model, diagnostics } = await importDump(LONG_TAIL_DUMP);
 
   assert.deepEqual(diagnostics.map(describeDiagnostic), LONG_TAIL_DIAGNOSTICS);
+
+  // The materialized view's comment lands on the modeled view; the foreign table's stays skipped.
+  const materializedView = model.views.find((view) => view.name === 'mv');
+  assert.equal(materializedView?.comment, 'x');
 });
 
 test('imports LIKE and INHERITS tables partially, flagging the dropped clauses', async () => {
@@ -3606,4 +3609,323 @@ test('drops temporal and inheritance forms whole, leaving the same model', async
       'dropped NO INHERIT on not-null constraint nn_a from public.t',
     ],
   );
+});
+
+test('imports comments on every modeled family, including synthesized names', async () => {
+  // The constraints and the index are declared unnamed (or with their conventional names), so
+  // each comment resolves against the server form the importer would synthesize, and stays on
+  // the node after canonicalization strips the name.
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `CREATE TABLE public.t (`,
+    `    id bigint PRIMARY KEY,`,
+    `    a integer UNIQUE,`,
+    `    b integer,`,
+    `    CONSTRAINT t_b_check CHECK (b > 0)`,
+    `);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_fkey FOREIGN KEY (b) REFERENCES public.other(id);`,
+    `CREATE TABLE public.other (id bigint PRIMARY KEY);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE MATERIALIZED VIEW public.mv AS SELECT 1 WITH NO DATA;`,
+    `COMMENT ON TABLE public.t IS 'table';`,
+    `COMMENT ON COLUMN public.t.a IS 'column';`,
+    `COMMENT ON SEQUENCE public.s IS 'sequence';`,
+    `COMMENT ON VIEW public.v IS 'view';`,
+    `COMMENT ON MATERIALIZED VIEW public.mv IS 'matview';`,
+    `COMMENT ON INDEX t_b_idx IS 'index';`,
+    `COMMENT ON CONSTRAINT t_pkey ON public.t IS 'primary';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'unique';`,
+    `COMMENT ON CONSTRAINT t_b_check ON public.t IS 'check';`,
+    `COMMENT ON CONSTRAINT t_b_fkey ON public.t IS 'foreign';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+
+  assert.equal(table.comment, 'table');
+  assert.equal(table.columns.find((column) => column.name === 'a')?.comment, 'column');
+  assert.deepEqual(table.primaryKey, { columns: ['id'], comment: 'primary' });
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a'], comment: 'unique' }]);
+  assert.deepEqual(table.checkConstraints, [{ expression: 'b > 0', comment: 'check' }]);
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'other' },
+      referencedColumns: ['id'],
+      comment: 'foreign',
+    },
+  ]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['b'], comment: 'index' }]);
+
+  assert.equal(model.sequences[0]?.comment, 'sequence');
+  assert.deepEqual(
+    model.views.map((view) => `${view.name}:${String(view.comment)}`),
+    ['mv:matview', 'v:view'],
+  );
+});
+
+test('defaults unqualified comment targets to public and flags an under-qualified column', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `COMMENT ON TABLE t IS 'table';`,
+    `COMMENT ON SEQUENCE s IS 'sequence';`,
+    `COMMENT ON VIEW v IS 'view';`,
+    `COMMENT ON COLUMN t.a IS 'column';`,
+    `COMMENT ON COLUMN a IS 'lost';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  assert.equal(model.tables[0]?.comment, 'table');
+  assert.equal(model.tables[0]?.columns[0]?.comment, 'column');
+  assert.equal(model.sequences[0]?.comment, 'sequence');
+  assert.equal(model.views[0]?.comment, 'view');
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'a',
+      message: 'dropped comment from a',
+    },
+  ]);
+});
+
+test("clears a comment on IS NULL and on IS ''", async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `COMMENT ON TABLE public.t IS 'gone';`,
+    `COMMENT ON COLUMN public.t.a IS 'gone';`,
+    `COMMENT ON TABLE public.t IS NULL;`,
+    `COMMENT ON COLUMN public.t.a IS '';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables[0];
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.equal('comment' in table, false);
+  assert.equal('comment' in table.columns[0]!, false);
+});
+
+test('flags every comment target the import cannot resolve, keeping skips for unmodeled families', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE MATERIALIZED VIEW public.mv AS SELECT 1 WITH NO DATA;`,
+    `CREATE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON TABLE public.missing IS 'x';`,
+    `COMMENT ON COLUMN public.t.missing IS 'x';`,
+    `COMMENT ON COLUMN public.v.c IS 'x';`,
+    `COMMENT ON SEQUENCE public.missing IS 'x';`,
+    `COMMENT ON VIEW public.missing IS 'x';`,
+    `COMMENT ON VIEW public.mv IS 'x';`,
+    `COMMENT ON MATERIALIZED VIEW public.v IS 'x';`,
+    `COMMENT ON INDEX public.missing IS 'x';`,
+    `COMMENT ON CONSTRAINT missing ON public.t IS 'x';`,
+    `COMMENT ON SCHEMA public IS '';`,
+    `COMMENT ON FOREIGN TABLE public.ft IS 'x';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.missing',
+      message: 'dropped comment from public.t.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.v.c',
+      message: 'dropped comment from public.v.c',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.mv',
+      message: 'dropped comment from public.mv',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.v',
+      message: 'dropped comment from public.v',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.missing',
+      message: 'dropped comment from public.t.missing',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public',
+      message: 'skipped COMMENT ON SCHEMA public',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.ft',
+      message: 'skipped COMMENT ON FOREIGN TABLE public.ft',
+    },
+  ]);
+
+  // A flagged comment is never stored anywhere.
+  const table = model.tables[0];
+  assert.ok(table, 'the table is imported');
+  assert.equal('comment' in table, false);
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: false }]);
+});
+
+test('flags not-null comments with the deferral wording, after the constraint slots', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT a_nn NOT NULL,`,
+    `    b integer NOT NULL,`,
+    `    c integer NOT NULL,`,
+    `    CONSTRAINT t_b_not_null CHECK (b > 0)`,
+    `);`,
+    `COMMENT ON CONSTRAINT a_nn ON public.t IS 'x';`,
+    `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'x';`,
+    `COMMENT ON CONSTRAINT t_b_not_null ON public.t IS 'x';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The explicit check name wins over column b's generated not-null name: constraint slots are
+  // searched before the columns' not-null facts. The stored custom name and the generated name
+  // both take the deferral's wording.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_b_not_null', expression: 'b > 0', comment: 'x' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped comment on a not-null constraint from public.t.a_nn',
+      'dropped comment on a not-null constraint from public.t.t_c_not_null',
+    ],
+  );
+});
+
+test('keeps the last repeated comment on every modeled family', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer UNIQUE);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON TABLE public.t IS 'first';`,
+    `COMMENT ON TABLE public.t IS 'second';`,
+    `COMMENT ON COLUMN public.t.a IS 'first';`,
+    `COMMENT ON COLUMN public.t.a IS 'second';`,
+    `COMMENT ON SEQUENCE public.s IS 'first';`,
+    `COMMENT ON SEQUENCE public.s IS 'second';`,
+    `COMMENT ON VIEW public.v IS 'first';`,
+    `COMMENT ON VIEW public.v IS 'second';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'first';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'second';`,
+    `COMMENT ON INDEX t_a_idx IS 'first';`,
+    `COMMENT ON INDEX t_a_idx IS 'second';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.equal(table.comment, 'second');
+  assert.equal(table.columns[0]?.comment, 'second');
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a'], comment: 'second' }]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'], comment: 'second' }]);
+  assert.equal(model.sequences[0]?.comment, 'second');
+  assert.equal(model.views[0]?.comment, 'second');
+});
+
+test('clears table, sequence, and view comments when a create is repeated', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `COMMENT ON TABLE public.t IS 'gone';`,
+    `CREATE TABLE public.t (b integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `COMMENT ON SEQUENCE public.s IS 'gone';`,
+    `CREATE SEQUENCE public.s START WITH 5;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `COMMENT ON VIEW public.v IS 'gone';`,
+    `CREATE OR REPLACE VIEW public.v AS SELECT 2;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(
+    table.columns.map((column) => column.name),
+    ['b'],
+  );
+  assert.equal('comment' in table, false);
+  assert.equal(model.sequences[0]?.start, '5');
+  assert.equal('comment' in (model.sequences[0] ?? {}), false);
+  assert.equal(model.views[0]?.definition, 'SELECT 2');
+  assert.equal('comment' in (model.views[0] ?? {}), false);
+});
+
+test('refuses a comment carrying NUL before it can reach the model', () => {
+  // libpg-query rejects a NUL byte in a string literal at parse time, so the guard cannot be
+  // reached through DDL; the store seam is the door a future non-DDL producer would pass through.
+  const position = { offset: 0, line: 1, column: 1 };
+  const statement: ParsedStatement = { sql: '', start: position, end: position, result: {} };
+  const diagnostics: Parameters<typeof storeComment>[4] = [];
+  const stored: (string | undefined)[] = [];
+
+  storeComment(statement, 'public.t', 'a\u0000b', (text) => stored.push(text), diagnostics);
+  assert.equal(stored.length, 0);
+  assert.deepEqual(
+    diagnostics.map((entry) => entry.diagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.t',
+        message: 'dropped comment from public.t',
+        position,
+      },
+    ],
+  );
+
+  // An ordinary text stores, and an absent one reaches the store as a clear.
+  storeComment(statement, 'public.t', 'plain', (text) => stored.push(text), diagnostics);
+  storeComment(statement, 'public.t', undefined, (text) => stored.push(text), diagnostics);
+  assert.deepEqual(stored, ['plain', undefined]);
+  assert.equal(diagnostics.length, 1);
 });

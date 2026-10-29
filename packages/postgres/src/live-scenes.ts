@@ -4,6 +4,7 @@ import { diff, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
+  CommentTarget,
   Diagnostic,
   ForeignKey,
   Identity,
@@ -35,7 +36,8 @@ import { renderSql } from './render.ts';
  * `renderSql(plan(baseline, target))` to the baseline database, then dump and import both and
  * compare. The five golden scenes carry the catalog spot-checks ported from the first slice's
  * scratch evidence runs; the harness reads them in phases: `baselineChecks` after the baseline
- * build, then `probes` and `checks` after the migration, in that order.
+ * build, `targetChecks` after the target build, then `probes` and `checks` after the migration,
+ * in that order.
  *
  * The regression scenes are the shapes that caught real ordering bugs while the first slice
  * was built: table-removal cycles (`twocycle`, `smallvictim`), a primary key that changes
@@ -136,6 +138,19 @@ import { renderSql } from './render.ts';
  * PostgreSQL 18 run. The target build adds a unique index on the materialized view through raw
  * SQL, which the import must skip by name because a materialized view is not a table.
  *
+ * The comment scene carries `comment` through every modeled family: the table (with a changed
+ * special-character comment), columns (changed, removed, added), sequences (changed, removed),
+ * plain views (added, changed, removed), materialized views (removed, and an unchanged comment
+ * re-asserted through a definition rewrite), every constraint kind (a primary-key comment through
+ * a rename, a removed named unique, a changed unnamed conventional-name unique, a re-asserted
+ * check, and the dependent foreign key a primary-key change drops and re-adds), and indexes (a
+ * re-asserted named comment, a removed named comment, and a changed unnamed conventional-name
+ * comment). Its catalog checks pin the stored text on the target build and after the migration,
+ * its import checks compare every imported comment to the target model by structural identity,
+ * and its cross-import check adds a comment inventory to the structural `diff` — `diff` is
+ * deliberately blind to comments. It declares no `introspection` assertion: the catalog reader
+ * does not read comments yet, so a comment-carrying model is intentionally not what it returns.
+ *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
  * in place — a model that says otherwise would make the migrated database legitimately differ
@@ -156,6 +171,7 @@ const column = (name: string, fields: Partial<Omit<Column, 'name'>> = {}): Colum
 interface TableParts {
   schema?: string;
   columns?: readonly Column[];
+  comment?: string;
   persistence?: TablePersistence;
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
@@ -169,6 +185,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   schema: parts.schema ?? 'public',
   name,
   columns: parts.columns ?? [],
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
   ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
@@ -200,8 +217,10 @@ const withSequences = (tables: readonly Table[], sequences: readonly Sequence[])
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */
-const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence =>
-  effectiveSequence({ schema: 'public', name, ...fields });
+const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence => ({
+  ...effectiveSequence({ schema: 'public', name, ...fields }),
+  ...(fields.comment === undefined ? {} : { comment: fields.comment }),
+});
 
 /** A view named `name`: plain, with an empty definition unless overridden. */
 const view = (name: string, fields: Partial<Omit<View, 'name'>> = {}): View => ({
@@ -326,6 +345,8 @@ export interface LiveScene {
   readonly targetExtraSql?: string;
   /** Catalog facts to assert after the baseline build, before the migration. */
   readonly baselineChecks?: readonly SceneCheck[];
+  /** Catalog facts to assert after the target build, before the migration. */
+  readonly targetChecks?: readonly SceneCheck[];
   /** Plan facts to assert on `plan(baseline, target)`, before any SQL runs. */
   readonly planChecks?: readonly ScenePlanCheck[];
   /** Statements to run after the migration; a non-zero exit fails the scene. */
@@ -3374,9 +3395,12 @@ const constraintAttributesScene = (): LiveScene => {
  * `t_c_not_null`. Raw target SQL comments that constraint, which keeps the name in the target
  * dump — pg_dump suppresses a generated name only when the constraint carries no comment —
  * while the migrated database's dump suppresses it, so the empty diff is load-bearing on the
- * import's formula strip, which reads the generated name back as unnamed. The probes pin the
- * catalog behavior of `DROP NOT NULL` and `SET NOT NULL` on the baseline-built not-null fact
- * of `d`, and the catalog checks pin the generated names and the not-null definition.
+ * import's formula strip, which reads the generated name back as unnamed. The comment itself
+ * cannot be attached to a not-null fact the model does not carry: its `COMMENT ON CONSTRAINT`
+ * takes the named not-null deferral flag, which the target import pins while still stripping
+ * the generated name. The probes pin the catalog behavior of `DROP NOT NULL` and `SET NOT NULL`
+ * on the baseline-built not-null fact of `d`, and the catalog checks pin the generated names
+ * and the not-null definition.
  */
 const notNullConstraintNamesScene = (): LiveScene => {
   const baseline = table('t', {
@@ -3461,7 +3485,7 @@ const notNullConstraintNamesScene = (): LiveScene => {
     importChecks: [
       {
         description:
-          'both dumps import the columns as unnamed not-null facts; the target carries the comment skip',
+          'both dumps import the columns as unnamed not-null facts; the target carries the comment flag',
         failure: (imported, source) => {
           const t = imported.model.tables.find((candidate) => candidate.name === 't');
           if (t === undefined) return 't is not imported';
@@ -3473,7 +3497,8 @@ const notNullConstraintNamesScene = (): LiveScene => {
           if (facts !== 'c:true:undefined d:true:undefined') return `columns: ${facts}`;
           const comments = imported.diagnostics.filter(
             (diagnostic) =>
-              diagnostic.kind !== 'error' && diagnostic.message.includes('COMMENT ON'),
+              diagnostic.message.startsWith('dropped comment') ||
+              diagnostic.message.startsWith('skipped COMMENT ON'),
           );
           if (source === 'applied') {
             return comments.length === 0
@@ -3490,8 +3515,8 @@ const notNullConstraintNamesScene = (): LiveScene => {
             )
             .join('; ');
           const expected =
-            'skip:unsupported-statement:public.t.t_c_not_null:' +
-            'skipped COMMENT ON TABCONSTRAINT public.t.t_c_not_null';
+            'flag:unsupported-attribute:public.t.t_c_not_null:' +
+            'dropped comment on a not-null constraint from public.t.t_c_not_null';
           return shape === expected ? undefined : `comment diagnostics: ${shape}`;
         },
       },
@@ -5307,6 +5332,761 @@ const viewRoundTripScene = (): LiveScene => {
   };
 };
 
+/** The catalog text of a relation comment: a table, sequence, view, matview, or index. */
+const relationComment = (name: string, schema = 'public'): string =>
+  `select obj_description('${schema}.${name}'::regclass)`;
+
+/** The catalog text of a column's comment. */
+const columnComment = (tableName: string, columnName: string, schema = 'public'): string =>
+  `select col_description('${schema}.${tableName}'::regclass, ` +
+  `(select attnum from pg_attribute where attrelid = '${schema}.${tableName}'::regclass` +
+  ` and attname = '${columnName}' and not attisdropped))`;
+
+/** The catalog text of a table constraint's comment. */
+const constraintComment = (tableName: string, constraintName: string, schema = 'public'): string =>
+  `select obj_description(oid, 'pg_constraint') from pg_constraint` +
+  ` where conrelid = '${schema}.${tableName}'::regclass and conname = '${constraintName}'`;
+
+/** One catalog fact about a comment: the stored text, or the empty string when absent. */
+const commentCheck = (description: string, sql: string, text: string | undefined): SceneCheck => ({
+  description,
+  sql,
+  expected: text ?? '',
+});
+
+/**
+ * Every modeled entity's comment, keyed by a server-independent identity. Names are excluded
+ * from constraint and index identities because the import canonicalizes a conventional server
+ * name back to unnamed whether the source stated it or not, and a check constraint is keyed by
+ * its table because its expression is the server's deparse of the authored text (this scene has
+ * at most one check constraint per table). The label is the relation, member, or structure the
+ * comment belongs to, so a mismatch names the object and both texts. Values are JSON-quoted, and
+ * `absent` (never a JSON-quoted text) means the entity states no comment.
+ */
+function commentInventory(model: Model): ReadonlyMap<string, string> {
+  const inventory = new Map<string, string>();
+  const add = (kind: string, identity: readonly unknown[], comment: string | undefined): void => {
+    inventory.set(
+      `${kind} ${JSON.stringify(identity)}`,
+      comment === undefined ? 'absent' : JSON.stringify(comment),
+    );
+  };
+
+  for (const table of model.tables) {
+    const relation = [table.schema, table.name];
+    add('table', relation, table.comment);
+    for (const column of table.columns) {
+      add('column', [...relation, column.name], column.comment);
+    }
+    if (table.primaryKey !== undefined) {
+      add('primary-key', relation, table.primaryKey.comment);
+    }
+    for (const uniqueConstraint of table.uniqueConstraints) {
+      add(
+        'unique-constraint',
+        [...relation, { columns: uniqueConstraint.columns }],
+        uniqueConstraint.comment,
+      );
+    }
+    for (const checkConstraint of table.checkConstraints) {
+      add('check-constraint', relation, checkConstraint.comment);
+    }
+    for (const foreignKey of table.foreignKeys) {
+      add(
+        'foreign-key',
+        [
+          ...relation,
+          {
+            columns: foreignKey.columns,
+            referencedTable: [foreignKey.referencedTable.schema, foreignKey.referencedTable.name],
+            referencedColumns: foreignKey.referencedColumns,
+          },
+        ],
+        foreignKey.comment,
+      );
+    }
+    for (const index of table.indexes) {
+      add('index', [...relation, { unique: index.unique, columns: index.columns }], index.comment);
+    }
+  }
+
+  for (const sequence of model.sequences) {
+    add('sequence', [sequence.schema, sequence.name], sequence.comment);
+  }
+  for (const view of model.views) {
+    add('view', [view.schema, view.name, view.materialized], view.comment);
+  }
+  return inventory;
+}
+
+/** The differing entries of two comment inventories, in key order, as failure lines. */
+function commentInventoryDifferences(
+  left: ReadonlyMap<string, string>,
+  right: ReadonlyMap<string, string>,
+  leftLabel: string,
+  rightLabel: string,
+): string[] {
+  const keys = [...new Set([...left.keys(), ...right.keys()])].sort();
+  const differences: string[] = [];
+  for (const key of keys) {
+    const leftValue = left.get(key) ?? '<entity absent>';
+    const rightValue = right.get(key) ?? '<entity absent>';
+    if (leftValue !== rightValue) {
+      differences.push(`${key}: ${leftLabel} ${leftValue}, ${rightLabel} ${rightValue}`);
+    }
+  }
+  return differences;
+}
+
+/** One comment the plan must re-assert after a recreate. */
+interface ReassertedComment {
+  readonly label: string;
+  readonly text: string;
+  readonly matches: (target: CommentTarget) => boolean;
+}
+
+/**
+ * The comment round trip: every modeled family carries a comment through baseline, migration,
+ * target build, and both dumps, with additions, changes, and removals. The scene covers the
+ * table (a special-character comment with a quote, backslash, newline, and unicode, changed),
+ * column (changed, removed, and added), sequence (changed and removed), plain view (added,
+ * changed, and removed), and materialized view (removed, plus an unchanged comment re-asserted
+ * through a definition rewrite); every constraint kind (a primary-key comment re-asserted
+ * through a rename, a named unique comment removed, an unnamed conventional-name unique comment
+ * changed, a check comment re-asserted through an expression change, and a foreign-key comment
+ * re-asserted through the dependent foreign key a referenced primary-key change drops and
+ * re-adds); and indexes (an unchanged named comment re-asserted through a key change, a removed
+ * named comment, and an unnamed conventional-name comment changed).
+ *
+ * The target and migrated databases carry catalog assertions that the server stored exactly the
+ * intended text, including the special-character comment on both sides; the import checks
+ * compare every entity's imported comment, keyed by its model identity, against the target model,
+ * so a dump-import loss fails by object and text. The cross-import check then compares the two
+ * server-derived imports — structure through `diff`, comments through the inventory — because
+ * `diff` is deliberately blind to comments and cannot be the whole guard. There is no
+ * `introspection` assertion: the catalog reader does not read comments yet (D13), so a
+ * comment-carrying model is intentionally not what it returns.
+ */
+const commentRoundTripScene = (): LiveScene => {
+  const specialBaseline = "Owner's \\ draft\nline one — naïve ☃";
+  const specialTarget = "Owner's \\ revised draft\nline two — naïve ☃ ✓";
+  const specialBody = "body 'quoted' \\ slash\nsecond line → naïve ✓";
+  const pkComment = 'accounts primary key (unchanged through the rename)';
+  const emailIndexComment = 'email lookup (unchanged through a recreate)';
+  const checkComment = 'balance stays within range';
+  const foreignKeyComment = 'orders point at one account';
+  const summaryComment = 'account summary comment across a rewrite';
+
+  const baseline = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('tenant', { notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, baseline' }),
+          column('balance', { type: 'integer', notNull: true }),
+          column('nickname', { comment: 'nickname, removed in target' }),
+          column('code', { notNull: true }),
+          column('status', { notNull: true }),
+        ],
+        comment: specialBaseline,
+        primaryKey: { name: 'accounts_pkey', columns: ['id'], comment: pkComment },
+        uniqueConstraints: [
+          {
+            name: 'accounts_email_key',
+            columns: ['email'],
+            comment: 'email uniqueness, removed in target',
+          },
+          { columns: ['tenant', 'email'], comment: 'tenant email, baseline' },
+        ],
+        checkConstraints: [
+          {
+            name: 'accounts_balance_check',
+            expression: 'balance >= 0',
+            comment: checkComment,
+          },
+        ],
+        indexes: [
+          {
+            name: 'accounts_email_idx',
+            unique: false,
+            columns: ['email'],
+            comment: emailIndexComment,
+          },
+          { unique: false, columns: ['code'], comment: 'code lookup, baseline' },
+          {
+            name: 'accounts_balance_idx',
+            unique: false,
+            columns: ['balance'],
+            comment: 'balance lookup, removed in target',
+          },
+        ],
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer', notNull: true }),
+          column('code', { notNull: true }),
+        ],
+        primaryKey: { columns: ['id'] },
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), {
+            name: 'orders_account_id_fkey',
+            referencedColumns: ['id'],
+            comment: foreignKeyComment,
+          }),
+        ],
+      }),
+      table('legacy', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        comment: 'legacy table comment, removed in target',
+      }),
+      table('notes', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('body', { notNull: true }),
+        ],
+      }),
+    ],
+    sequences: [
+      sequence('legacy_seq', { comment: 'legacy sequence comment, removed in target' }),
+      sequence('audit_seq', { comment: 'audit sequence comment, baseline' }),
+    ],
+    views: [
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE balance >= 0',
+        comment: 'active accounts view comment, removed in target',
+      }),
+      view('account_labels', {
+        definition: 'SELECT id, email AS label FROM accounts',
+        comment: 'account labels view comment, baseline',
+      }),
+      view('recent_accounts', { definition: 'SELECT id FROM accounts WHERE balance > 0' }),
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: summaryComment,
+      }),
+      view('stale_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts WHERE balance < 0',
+        comment: 'stale summary comment, removed in target',
+      }),
+    ],
+  } satisfies Model;
+
+  const orders = baseline.tables.find((candidate) => candidate.name === 'orders')!;
+
+  const target = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('tenant', { notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, target' }),
+          column('balance', { type: 'integer', notNull: true }),
+          column('nickname'),
+          column('code', { notNull: true }),
+          column('status', { notNull: true }),
+        ],
+        comment: specialTarget,
+        primaryKey: { name: 'accounts_primary', columns: ['id'], comment: pkComment },
+        uniqueConstraints: [
+          { name: 'accounts_email_key', columns: ['email'] },
+          { columns: ['tenant', 'email'], comment: 'tenant email, target' },
+        ],
+        checkConstraints: [
+          {
+            name: 'accounts_balance_check',
+            expression: 'balance >= 0 AND balance <= 1000000',
+            comment: checkComment,
+          },
+        ],
+        indexes: [
+          {
+            name: 'accounts_email_idx',
+            unique: false,
+            columns: ['email', 'status'],
+            comment: emailIndexComment,
+          },
+          { unique: false, columns: ['code'], comment: 'code lookup, target' },
+          { name: 'accounts_balance_idx', unique: false, columns: ['balance'] },
+        ],
+      }),
+      orders,
+      table('legacy', { columns: [column('id', { type: 'integer', notNull: true })] }),
+      table('notes', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('body', { notNull: true, comment: specialBody }),
+        ],
+        comment: 'notes table comment (added in target)',
+        checkConstraints: [
+          {
+            name: 'notes_body_check',
+            expression: 'length(body) > 0',
+            comment: 'body must not be empty',
+          },
+        ],
+      }),
+    ],
+    sequences: [
+      sequence('legacy_seq'),
+      sequence('audit_seq', { comment: 'audit sequence comment, target' }),
+    ],
+    views: [
+      view('active_accounts', { definition: 'SELECT id, email FROM accounts WHERE balance >= 0' }),
+      view('account_labels', {
+        definition: 'SELECT id, email AS label FROM accounts',
+        comment: 'account labels view comment, target',
+      }),
+      view('recent_accounts', {
+        definition: 'SELECT id FROM accounts WHERE balance > 0',
+        comment: 'recent accounts view comment (added in target)',
+      }),
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total, sum(balance) AS total_balance FROM accounts',
+        comment: summaryComment,
+      }),
+      view('stale_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts WHERE balance < 0',
+      }),
+    ],
+  } satisfies Model;
+
+  const targetCommentChecks = (subject: string): readonly SceneCheck[] => [
+    commentCheck(
+      `the ${subject} stores the special-character accounts table comment exactly`,
+      relationComment('accounts'),
+      specialTarget,
+    ),
+    commentCheck(
+      `the ${subject} stores the changed accounts.email comment`,
+      columnComment('accounts', 'email'),
+      'contact email, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the accounts.nickname comment`,
+      columnComment('accounts', 'nickname'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the accounts primary-key comment under its new name`,
+      constraintComment('accounts', 'accounts_primary'),
+      pkComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the named unique-constraint comment`,
+      constraintComment('accounts', 'accounts_email_key'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the unnamed unique-constraint comment`,
+      constraintComment('accounts', 'accounts_tenant_email_key'),
+      'tenant email, target',
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the check-constraint comment`,
+      constraintComment('accounts', 'accounts_balance_check'),
+      checkComment,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the recreated index comment`,
+      relationComment('accounts_email_idx'),
+      emailIndexComment,
+    ),
+    commentCheck(
+      `the ${subject} changed the unnamed index comment`,
+      relationComment('accounts_code_idx'),
+      'code lookup, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the other index comment`,
+      relationComment('accounts_balance_idx'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the dependent foreign-key comment`,
+      constraintComment('orders', 'orders_account_id_fkey'),
+      foreignKeyComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the legacy table comment`,
+      relationComment('legacy'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} removed the legacy sequence comment`,
+      relationComment('legacy_seq'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the audit sequence comment`,
+      relationComment('audit_seq'),
+      'audit sequence comment, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the plain-view comment`,
+      relationComment('active_accounts'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the other plain-view comment`,
+      relationComment('account_labels'),
+      'account labels view comment, target',
+    ),
+    commentCheck(
+      `the ${subject} added the plain-view comment`,
+      relationComment('recent_accounts'),
+      'recent accounts view comment (added in target)',
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the materialized-view comment`,
+      relationComment('account_summary'),
+      summaryComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the other materialized-view comment`,
+      relationComment('stale_summary'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} added the notes table comment`,
+      relationComment('notes'),
+      'notes table comment (added in target)',
+    ),
+    commentCheck(
+      `the ${subject} stores the special-character column comment exactly`,
+      columnComment('notes', 'body'),
+      specialBody,
+    ),
+    commentCheck(
+      `the ${subject} added the notes check-constraint comment`,
+      constraintComment('notes', 'notes_body_check'),
+      'body must not be empty',
+    ),
+    {
+      description: `the ${subject} has the renamed primary key and the conventional constraint names`,
+      sql: constraintNames('accounts', 'p'),
+      expected: 'accounts_primary',
+    },
+    {
+      description: `the ${subject} keeps both unique constraints under their server names`,
+      sql: constraintNames('accounts', 'u'),
+      expected: 'accounts_email_key,accounts_tenant_email_key',
+    },
+    {
+      description: `the ${subject} has the named and conventionally named indexes`,
+      sql: indexesOf('accounts'),
+      expected:
+        'accounts_balance_idx,accounts_code_idx,accounts_email_idx,accounts_email_key,' +
+        'accounts_primary,accounts_tenant_email_key',
+    },
+  ];
+
+  const reasserted: readonly ReassertedComment[] = [
+    {
+      label: 'index accounts_email_idx',
+      text: emailIndexComment,
+      matches: (target) =>
+        target.kind === 'index' &&
+        target.table.name === 'accounts' &&
+        target.index.name === 'accounts_email_idx',
+    },
+    {
+      label: 'check constraint accounts_balance_check',
+      text: checkComment,
+      matches: (target) =>
+        target.kind === 'check-constraint' &&
+        target.table.name === 'accounts' &&
+        target.checkConstraint.name === 'accounts_balance_check',
+    },
+    {
+      label: 'materialized view account_summary',
+      text: summaryComment,
+      matches: (target) =>
+        target.kind === 'view' && target.view.name === 'account_summary' && target.materialized,
+    },
+    {
+      label: 'primary key accounts_primary',
+      text: pkComment,
+      matches: (target) =>
+        target.kind === 'primary-key' &&
+        target.table.name === 'accounts' &&
+        target.primaryKey.name === 'accounts_primary',
+    },
+    {
+      label: 'foreign key orders_account_id_fkey',
+      text: foreignKeyComment,
+      matches: (target) =>
+        target.kind === 'foreign-key' &&
+        target.table.name === 'orders' &&
+        target.foreignKey.name === 'orders_account_id_fkey',
+    },
+  ];
+
+  return {
+    name: 'comment-round-trip',
+    baseline,
+    target,
+    baselineChecks: [
+      commentCheck(
+        'the baseline stored the special-character accounts table comment exactly',
+        relationComment('accounts'),
+        specialBaseline,
+      ),
+      commentCheck(
+        'the baseline accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, baseline',
+      ),
+      commentCheck(
+        'the baseline accounts.nickname comment',
+        columnComment('accounts', 'nickname'),
+        'nickname, removed in target',
+      ),
+      commentCheck(
+        'the baseline accounts primary-key comment',
+        constraintComment('accounts', 'accounts_pkey'),
+        pkComment,
+      ),
+      commentCheck(
+        'the baseline named unique-constraint comment',
+        constraintComment('accounts', 'accounts_email_key'),
+        'email uniqueness, removed in target',
+      ),
+      commentCheck(
+        'the baseline unnamed conventional-name unique-constraint comment',
+        constraintComment('accounts', 'accounts_tenant_email_key'),
+        'tenant email, baseline',
+      ),
+      commentCheck(
+        'the baseline check-constraint comment',
+        constraintComment('accounts', 'accounts_balance_check'),
+        checkComment,
+      ),
+      commentCheck(
+        'the baseline named index comment',
+        relationComment('accounts_email_idx'),
+        emailIndexComment,
+      ),
+      commentCheck(
+        'the baseline unnamed conventional-name index comment',
+        relationComment('accounts_code_idx'),
+        'code lookup, baseline',
+      ),
+      commentCheck(
+        'the baseline removed-later index comment',
+        relationComment('accounts_balance_idx'),
+        'balance lookup, removed in target',
+      ),
+      commentCheck(
+        'the baseline foreign-key comment',
+        constraintComment('orders', 'orders_account_id_fkey'),
+        foreignKeyComment,
+      ),
+      commentCheck(
+        'the baseline legacy table comment',
+        relationComment('legacy'),
+        'legacy table comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline legacy sequence comment',
+        relationComment('legacy_seq'),
+        'legacy sequence comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline audit sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence comment, baseline',
+      ),
+      commentCheck(
+        'the baseline removed-later view comment',
+        relationComment('active_accounts'),
+        'active accounts view comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline changed-later view comment',
+        relationComment('account_labels'),
+        'account labels view comment, baseline',
+      ),
+      commentCheck(
+        'the baseline materialized-view comment',
+        relationComment('account_summary'),
+        summaryComment,
+      ),
+      commentCheck(
+        'the baseline removed-later materialized-view comment',
+        relationComment('stale_summary'),
+        'stale summary comment, removed in target',
+      ),
+      {
+        description: 'the baseline accounts unique constraints are the named and unnamed pair',
+        sql: constraintNames('accounts', 'u'),
+        expected: 'accounts_email_key,accounts_tenant_email_key',
+      },
+      {
+        description: 'the baseline indexes include the conventional unnamed index name',
+        sql: indexesOf('accounts'),
+        expected:
+          'accounts_balance_idx,accounts_code_idx,accounts_email_idx,accounts_email_key,' +
+          'accounts_pkey,accounts_tenant_email_key',
+      },
+    ],
+    targetChecks: targetCommentChecks('target build'),
+    planChecks: [
+      {
+        description:
+          'every comment step is terminal, and each recreated object re-asserts its comment',
+        failure: (steps) => {
+          const firstComment = steps.findIndex((step) => step.kind === 'comment');
+          if (firstComment === -1) return 'the plan carries no comment steps';
+          const trailing = steps.slice(firstComment);
+          const structural = trailing.filter((step) => step.kind !== 'comment');
+          if (structural.length > 0) {
+            return `non-comment steps follow the first comment step: ${structural
+              .map((step) => step.kind)
+              .join(', ')}`;
+          }
+          const comments = trailing.filter(
+            (step): step is Extract<Step, { kind: 'comment' }> => step.kind === 'comment',
+          );
+          const missing = reasserted.filter(
+            (expected) =>
+              !comments.some(
+                (step) => expected.matches(step.target) && step.text === expected.text,
+              ),
+          );
+          if (missing.length > 0) {
+            return `missing re-asserted comments: ${missing
+              .map((entry) => entry.label)
+              .join(', ')}`;
+          }
+          if (comments.length !== 22) {
+            return `comment steps: ${comments.length}, expected 22 (${comments
+              .map((step) => `${step.target.kind}:${step.text ?? '(none)'}`)
+              .join(', ')})`;
+          }
+          return undefined;
+        },
+      },
+    ],
+    checks: targetCommentChecks('migrated database'),
+    importChecks: [
+      {
+        description:
+          'both imports carry every target comment, keyed by structure and including the unnamed nodes',
+        failure: (imported) => {
+          const differences = commentInventoryDifferences(
+            commentInventory(imported.model),
+            commentInventory(target),
+            'imported',
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported comments differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the unnamed conventional-name unique constraint and index import unnamed',
+        failure: (imported, source) => {
+          const accounts = imported.model.tables.find(
+            (candidate) => candidate.schema === 'public' && candidate.name === 'accounts',
+          );
+          if (accounts === undefined) return `${source}: accounts is not imported`;
+          const unique = accounts.uniqueConstraints.find(
+            (candidate) =>
+              candidate.name === undefined && candidate.columns.join(',') === 'tenant,email',
+          );
+          if (unique === undefined) {
+            return `${source}: the unnamed (tenant, email) unique constraint is missing or named: ${JSON.stringify(
+              accounts.uniqueConstraints,
+            )}`;
+          }
+          if (unique.comment !== 'tenant email, target') {
+            return `${source}: the unnamed unique constraint comment is ${JSON.stringify(unique.comment)}`;
+          }
+          const index = accounts.indexes.find(
+            (candidate) =>
+              candidate.name === undefined &&
+              !candidate.unique &&
+              candidate.columns.join(',') === 'code',
+          );
+          if (index === undefined) {
+            return `${source}: the unnamed (code) index is missing or named: ${JSON.stringify(
+              accounts.indexes,
+            )}`;
+          }
+          if (index.comment !== 'code lookup, target') {
+            return `${source}: the unnamed index comment is ${JSON.stringify(index.comment)}`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the import names no dropped comment and skips no modeled COMMENT ON',
+        failure: (imported, source) => {
+          const dropped = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.startsWith('dropped comment'),
+          );
+          if (dropped.length > 0) {
+            return `${source}: dropped comments: ${dropped
+              .map((diagnostic) => diagnostic.message)
+              .join('; ')}`;
+          }
+          const skipped = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' &&
+              /^skipped COMMENT ON (TABLE|COLUMN|SEQUENCE|VIEW|MATERIALIZED VIEW|INDEX|CONSTRAINT)\b/.test(
+                diagnostic.message,
+              ),
+          );
+          return skipped.length === 0
+            ? undefined
+            : `${source}: skipped modeled comments: ${skipped
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description:
+          'the applied and target imports agree on every identity, structure, and comment',
+        failure: (applied, expected) => {
+          const structural = diff(applied.model, expected.model);
+          if (structural.length > 0) {
+            return `the server-derived imports differ structurally:\n${JSON.stringify(
+              structural,
+              null,
+              2,
+            )}`;
+          }
+          const differences = commentInventoryDifferences(
+            commentInventory(applied.model),
+            commentInventory(expected.model),
+            'applied',
+            'target',
+          );
+          if (differences.length > 0) {
+            return `the server-derived imports differ in their comments:\n${differences.join('\n')}`;
+          }
+          return isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ beyond structure and comments:\n${JSON.stringify(
+                { applied: applied.model, target: expected.model },
+                null,
+                2,
+              )}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -5353,4 +6133,5 @@ export const scenes: readonly LiveScene[] = [
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
+  commentRoundTripScene(),
 ];

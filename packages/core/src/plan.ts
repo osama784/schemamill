@@ -37,7 +37,7 @@ import type {
  * partitions its steps into transaction groups, telling a renderer what applies as one unit;
  * hazards are a separate analysis.
  *
- * A step is one of twenty-nine kinds. A table addition becomes a create-table step carrying
+ * A step is one of thirty kinds. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -92,7 +92,14 @@ import type {
  * drop-view and a create-view; a materialized view cannot be replaced, and the recreate states
  * `WITH NO DATA`. View steps carry no column or table payloads.
  *
- * The final sequence is the concatenation of ten global phases, in this exact order:
+ * A comment addition, change, or removal becomes a comment step carrying a `CommentTarget` and
+ * the target's text, absent text meaning `COMMENT … IS NULL`. The target's copied nodes never
+ * carry their own `comment`: the step's `text` is the single source of the rendered value. A
+ * node a structural change recreates (an index, a primary key, a constraint, or a view) gets a
+ * comment step right after its create when the target node states a comment, because the drop
+ * took the old one away; the plan then keeps one step per target, first occurrence wins.
+ *
+ * The final sequence is the concatenation of eleven global phases, in this exact order:
  *
  * 1. drop-identity — every removed identity whose column survives, in the diff's column and
  *    table order. It runs before everything else: it must precede the `DROP NOT NULL` /
@@ -131,7 +138,11 @@ import type {
  *    the added identities replace. This placement alone makes both conversions compositions of
  *    ordinary steps: serial→identity is a phase-5 `DROP DEFAULT`, a phase-9 sequence drop, and
  *    a phase-10 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
- *    create-sequence, and a phase-5 `SET DEFAULT`.
+ *    create-sequence, and a phase-5 `SET DEFAULT`;
+ * 11. comment — every comment addition, change, and removal, in target identity order, last
+ *    because every commented object exists by then (tables, columns, constraints, and indexes
+ *    from phase 5, views from phase 6, sequences from phases 2 and 8, identities from phase
+ *    10) and comments never affect structure.
  *
  * A `drop-identity` needs no drop-suppression: an identity reaches the plan as its own removal
  * only when its column survives — a removed column or table carries its identity away in that
@@ -246,6 +257,38 @@ export interface TransactionGroup {
   readonly transactional: boolean;
 }
 
+/**
+ * The entity a `comment` step (or a `comment-changed` change) names: one variant per
+ * `COMMENT ON` object form the model carries. Each carries the node or identity the renderer
+ * needs, never the comment text itself — the step's `text` is the single source of the rendered
+ * value, and a copied target's nodes carry no `comment` of their own. The constraint and index
+ * variants carry the whole node because an unnamed node's server name is synthesized at render
+ * time, and `view` carries `materialized` because the rendered keyword differs and a
+ * `ViewIdentity` alone does not say which kind it names.
+ */
+export type CommentTarget =
+  | { readonly kind: 'table'; readonly table: TableIdentity }
+  | { readonly kind: 'column'; readonly table: TableIdentity; readonly column: string }
+  | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
+  | { readonly kind: 'view'; readonly view: ViewIdentity; readonly materialized: boolean }
+  | { readonly kind: 'index'; readonly table: TableIdentity; readonly index: Index }
+  | { readonly kind: 'primary-key'; readonly table: TableIdentity; readonly primaryKey: PrimaryKey }
+  | {
+      readonly kind: 'unique-constraint';
+      readonly table: TableIdentity;
+      readonly uniqueConstraint: UniqueConstraint;
+    }
+  | {
+      readonly kind: 'check-constraint';
+      readonly table: TableIdentity;
+      readonly checkConstraint: CheckConstraint;
+    }
+  | {
+      readonly kind: 'foreign-key';
+      readonly table: TableIdentity;
+      readonly foreignKey: ForeignKey;
+    };
+
 /** One planned action. */
 export type Step =
   /** The target has a table the baseline does not; a copy without its foreign keys. */
@@ -342,7 +385,13 @@ export type Step =
    * A plain view both sides have with a differing definition or check option:
    * `CREATE OR REPLACE VIEW`. Never materialized: a materialized view is dropped and created.
    */
-  | { kind: 'replace-view'; view: View };
+  | { kind: 'replace-view'; view: View }
+  /**
+   * The target's comment on `target`, or the comment's removal when `text` is absent
+   * (`COMMENT … IS NULL`). `text` is the single source of the rendered value: the copied
+   * target's nodes carry no `comment` of their own.
+   */
+  | { kind: 'comment'; target: CommentTarget; text?: string };
 
 /**
  * The exhaustiveness guard for a union `switch`: every `switch` that must understand each member
@@ -392,6 +441,7 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-view': true,
   'drop-view': true,
   'replace-view': true,
+  comment: true,
 };
 
 /**
@@ -439,6 +489,18 @@ export function plan(baseline: Model, target: Model): Plan {
     target,
     application.primaryKeyDrops,
   );
+
+  // The seventh recreate site: a diff-equal foreign key is dropped and re-added when its
+  // table's primary key changes, so a comment on it must be asserted again after the add.
+  // Primary-key drops were walked in diff order, and each add carries the target payload.
+  for (const step of dependentKeyAdds) {
+    if (step.kind !== 'add-foreign-key') continue;
+    pushRecreateComment(
+      application,
+      { kind: 'foreign-key', table: step.table, foreignKey: step.foreignKey },
+      step.foreignKey.comment,
+    );
+  }
 
   const columnRemoved = (table: TableIdentity, column: string): boolean =>
     application.removedTableKeys.has(keyOf(table)) ||
@@ -516,6 +578,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...sequenceDrops,
     ...application.identityAdds,
     ...application.identityAlters,
+    ...commentPhase(application.comments),
   ];
 
   return { steps, groups: groupSteps(steps) };
@@ -564,6 +627,12 @@ export interface ChangeApplication {
   readonly viewCreates: Step[];
   /** Changed plain views, applied with `CREATE OR REPLACE VIEW` after the table phases. */
   readonly viewReplaces: Step[];
+  /**
+   * Every comment step: the diff's `comment-changed` changes and the recreate re-assertions
+   * alike. `plan` keeps this bucket out of every other one, so the terminal phase owns every
+   * comment statement.
+   */
+  readonly comments: Step[];
   /** A changed sequence's ownership, held until the plan knows which owners it removes. */
   readonly ownershipChanges: SequenceOwnershipChange[];
   /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
@@ -606,6 +675,7 @@ export function emptyChangeApplication(): ChangeApplication {
     viewDrops: [],
     viewCreates: [],
     viewReplaces: [],
+    comments: [],
     ownershipChanges: [],
     removedSequences: [],
     removedTableKeys: new Set<string>(),
@@ -822,6 +892,15 @@ export function applyChange(application: ChangeApplication, change: Change): voi
               table: copyIdentity(change.table),
               primaryKey: copyPrimaryKey(tableChange.after),
             });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'primary-key',
+                table: change.table,
+                primaryKey: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
             break;
           }
           case 'foreign-key-removed': {
@@ -851,6 +930,11 @@ export function applyChange(application: ChangeApplication, change: Change): voi
               table: copyIdentity(change.table),
               foreignKey: copyForeignKey(tableChange.after),
             });
+            pushRecreateComment(
+              application,
+              { kind: 'foreign-key', table: change.table, foreignKey: tableChange.after },
+              tableChange.after.comment,
+            );
             break;
           }
           case 'unique-constraint-removed': {
@@ -880,6 +964,15 @@ export function applyChange(application: ChangeApplication, change: Change): voi
               table: copyIdentity(change.table),
               uniqueConstraint: copyUniqueConstraint(tableChange.after),
             });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'unique-constraint',
+                table: change.table,
+                uniqueConstraint: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
             break;
           }
           case 'check-constraint-removed': {
@@ -909,6 +1002,15 @@ export function applyChange(application: ChangeApplication, change: Change): voi
               table: copyIdentity(change.table),
               checkConstraint: copyCheckConstraint(tableChange.after),
             });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'check-constraint',
+                table: change.table,
+                checkConstraint: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
             break;
           }
           case 'index-removed': {
@@ -929,6 +1031,11 @@ export function applyChange(application: ChangeApplication, change: Change): voi
             );
             application.indexCreates.push(
               indexCreateStep(copyIdentity(change.table), tableChange.after),
+            );
+            pushRecreateComment(
+              application,
+              { kind: 'index', table: change.table, index: tableChange.after },
+              tableChange.after.comment,
             );
             break;
           }
@@ -1029,7 +1136,20 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           materialized: change.before.materialized,
         });
         application.viewCreates.push({ kind: 'create-view', view: copyView(change.after) });
+        pushRecreateComment(
+          application,
+          {
+            kind: 'view',
+            view: change.after,
+            materialized: change.after.materialized,
+          },
+          change.after.comment,
+        );
       }
+      break;
+    }
+    case 'comment-changed': {
+      application.comments.push(commentStep(change.target, change.after));
       break;
     }
     default:
@@ -1223,6 +1343,169 @@ function indexDropStep(table: TableIdentity, index: Index): Step {
   };
 }
 
+/** A writable view of a model payload, for the one place a copy is stripped. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * The `comment` step for `target`: the target is copied without any carried node's `comment`,
+ * and `text` — absent for a removal — is the single source of the rendered value.
+ */
+function commentStep(target: CommentTarget, text: string | undefined): Step {
+  return {
+    kind: 'comment',
+    target: copyCommentTarget(target),
+    ...(text === undefined ? {} : { text }),
+  };
+}
+
+/**
+ * Re-asserts `comment` after a recreate, when the target node states one: the drop half took the
+ * old comment away. A target the diff also reports as `comment-changed` is deduped by the
+ * terminal phase, and both steps carry the target node's text, so one step survives.
+ */
+function pushRecreateComment(
+  application: ChangeApplication,
+  target: CommentTarget,
+  comment: string | undefined,
+): void {
+  if (comment === undefined) return;
+  application.comments.push(commentStep(target, comment));
+}
+
+/**
+ * A deep copy of `target` with every carried node stripped of its `comment`: a step's `text` is
+ * the single source of the rendered value, so a stale node field can never diverge from it.
+ */
+function copyCommentTarget(target: CommentTarget): CommentTarget {
+  switch (target.kind) {
+    case 'table':
+      return { kind: 'table', table: copyIdentity(target.table) };
+    case 'column':
+      return { kind: 'column', table: copyIdentity(target.table), column: target.column };
+    case 'sequence':
+      return { kind: 'sequence', sequence: copySequenceIdentity(target.sequence) };
+    case 'view':
+      return {
+        kind: 'view',
+        view: copyViewIdentity(target.view),
+        materialized: target.materialized,
+      };
+    case 'index': {
+      const index: Mutable<Index> = copyIndex(target.index);
+      delete index.comment;
+      return { kind: 'index', table: copyIdentity(target.table), index };
+    }
+    case 'primary-key': {
+      const primaryKey: Mutable<PrimaryKey> = copyPrimaryKey(target.primaryKey);
+      delete primaryKey.comment;
+      return { kind: 'primary-key', table: copyIdentity(target.table), primaryKey };
+    }
+    case 'unique-constraint': {
+      const uniqueConstraint: Mutable<UniqueConstraint> = copyUniqueConstraint(
+        target.uniqueConstraint,
+      );
+      delete uniqueConstraint.comment;
+      return { kind: 'unique-constraint', table: copyIdentity(target.table), uniqueConstraint };
+    }
+    case 'check-constraint': {
+      const checkConstraint: Mutable<CheckConstraint> = copyCheckConstraint(target.checkConstraint);
+      delete checkConstraint.comment;
+      return { kind: 'check-constraint', table: copyIdentity(target.table), checkConstraint };
+    }
+    case 'foreign-key': {
+      const foreignKey: Mutable<ForeignKey> = copyForeignKey(target.foreignKey);
+      delete foreignKey.comment;
+      return { kind: 'foreign-key', table: copyIdentity(target.table), foreignKey };
+    }
+  }
+}
+
+/**
+ * The identity key of a comment target: the schema-qualified relation identity, the target
+ * kind, then the member's name or identity — a column's name, a constraint's columns or
+ * expression, a foreign key's referencing columns and referenced table, or an index's name
+ * (an unnamed index by its structure). It deliberately ignores `comment` and every other text
+ * value, so the diff's change and a recreate re-assertion for the same target agree on one key.
+ * Targets that share the model's identity share a key, and the terminal phase keeps the first
+ * step: a recreated node's re-assertion and the diff's change carry the same target text, while
+ * two structurally identical unnamed nodes are one server object the model cannot distinguish,
+ * so one step is the only coherent assertion.
+ */
+function commentTargetKey(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
+    case 'column':
+      return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'sequence':
+      return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
+    case 'view':
+      return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'index':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'index',
+        target.index.name ?? [null, target.index.unique, target.index.columns],
+      ]);
+    case 'primary-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'primary-key',
+        target.primaryKey.columns,
+      ]);
+    case 'unique-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'unique-constraint',
+        target.uniqueConstraint.columns,
+      ]);
+    case 'check-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'check-constraint',
+        target.checkConstraint.expression,
+      ]);
+    case 'foreign-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'foreign-key',
+        [
+          target.foreignKey.columns,
+          target.foreignKey.referencedTable.schema,
+          target.foreignKey.referencedTable.name,
+        ],
+      ]);
+  }
+}
+
+/**
+ * The terminal comment phase: the bucket sorted by target identity, one step per target. A
+ * target appears twice only when the diff also emitted a change for a node a structural change
+ * recreates; both steps carry the target node's text, so keeping the first is sound.
+ */
+function commentPhase(steps: readonly Step[]): Step[] {
+  const comments = steps.filter(
+    (step): step is Extract<Step, { kind: 'comment' }> => step.kind === 'comment',
+  );
+  comments.sort((left, right) =>
+    compareStrings(commentTargetKey(left.target), commentTargetKey(right.target)),
+  );
+  const seen = new Set<string>();
+  const kept: Step[] = [];
+  for (const step of comments) {
+    const key = commentTargetKey(step.target);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(step);
+  }
+  return kept;
+}
+
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
   return copyStepPayload(field);
@@ -1270,6 +1553,7 @@ function copySequenceWithoutOwner(sequence: Sequence): Sequence {
     start: sequence.start,
     cache: sequence.cache,
     cycle: sequence.cycle,
+    ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
   };
 }
 
@@ -1296,6 +1580,7 @@ function copyTableForCreate(table: Table): Table {
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.comment === undefined ? {} : { comment: table.comment }),
     foreignKeys: [],
     uniqueConstraints: [],
     checkConstraints: [],

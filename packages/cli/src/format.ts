@@ -3,6 +3,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnFieldChange,
+  CommentTarget,
   ForeignKey,
   Hazard,
   HazardEntity,
@@ -47,7 +48,10 @@ import type {
  * added; sequences render the same way after the table changes, as
  * `sequence <schema>.<name>` with one option per line, and views follow the sequences as
  * `view <schema>.<name>`, a changed view listing its differing `materialized`, `definition`,
- * and `checkOption` fields. A plan renders as a numbered header
+ * and `checkOption` fields, and a comment change closes the diff as
+ * `comment on <target>: <text> → <text>` — signed `+` when the target gains a comment and `-`
+ * when it loses one, both sides `JSON.stringify`-quoted with `(none)` for an absent side. A plan
+ * renders as a numbered header
  * and one line per step: a plan that is a single transactional group covering every step
  * reads `N steps in one transaction:` (singular `1 step in one transaction:`); a plan whose
  * only group is non-transactional reads `N steps outside a transaction:`; a multi-group plan
@@ -222,6 +226,8 @@ function formatChange(change: Change): string {
       return formatView('-', change.view);
     case 'view-changed':
       return formatViewChange(change.view, change.changes);
+    case 'comment-changed':
+      return formatCommentChange(change.target, change.before, change.after);
   }
 }
 
@@ -416,6 +422,8 @@ function formatStep(step: Step): string {
     case 'replace-view':
     case 'drop-view':
       return formatIdentity(step.view);
+    case 'comment':
+      return `${formatCommentTarget(step.target)}: ${formatCommentText(step.text)}`;
   }
 }
 
@@ -554,6 +562,63 @@ function formatViewField(field: ViewFieldChange): string {
     case 'checkOption':
       return `checkOption ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }
+}
+
+/**
+ * A comment change: `+` when the target gains a comment, `-` when it loses one, `~` when the
+ * text changes. Each side is `JSON.stringify`-quoted so whitespace and escapes stay visible,
+ * and an absent side prints `(none)`.
+ */
+function formatCommentChange(
+  target: CommentTarget,
+  before: string | undefined,
+  after: string | undefined,
+): string {
+  const sign = before === undefined ? '+' : after === undefined ? '-' : '~';
+  return `${sign} comment on ${formatCommentTarget(target)}: ${formatCommentText(
+    before,
+  )} → ${formatCommentText(after)}`;
+}
+
+/**
+ * A comment target's spelling: the `COMMENT ON` object form, then the identity the model
+ * carries. A constraint's or index's stored name is not identity and is not printed; an
+ * unnamed node's server name is synthesized at render time.
+ */
+function formatCommentTarget(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return `table ${formatIdentity(target.table)}`;
+    case 'column':
+      return `column ${formatIdentity(target.table)}.${target.column}`;
+    case 'sequence':
+      return `sequence ${formatIdentity(target.sequence)}`;
+    case 'view':
+      return `${target.materialized ? 'materialized view' : 'view'} ${formatIdentity(target.view)}`;
+    case 'index':
+      return `index ${formatIdentity(target.table)} (${target.index.columns.join(', ')})`;
+    case 'primary-key':
+      return `primary key ${formatIdentity(target.table)} (${target.primaryKey.columns.join(
+        ', ',
+      )})`;
+    case 'unique-constraint':
+      return `unique constraint ${formatIdentity(target.table)} (${target.uniqueConstraint.columns.join(
+        ', ',
+      )})`;
+    case 'check-constraint':
+      return `check constraint ${formatIdentity(target.table)} (${
+        target.checkConstraint.expression
+      })`;
+    case 'foreign-key':
+      return `foreign key ${formatIdentity(target.table)} (${target.foreignKey.columns.join(
+        ', ',
+      )}) → ${formatIdentity(target.foreignKey.referencedTable)}`;
+  }
+}
+
+/** A comment's text as a plan line prints it: `JSON.stringify`-quoted, `(none)` when absent. */
+function formatCommentText(text: string | undefined): string {
+  return text === undefined ? '(none)' : JSON.stringify(text);
 }
 
 /**

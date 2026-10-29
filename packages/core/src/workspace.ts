@@ -418,6 +418,7 @@ function serializeTable(table: Table): object {
     checkConstraints: table.checkConstraints.map(serializeCheckConstraint),
     indexes: table.indexes.map(serializeIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.comment === undefined ? {} : { comment: table.comment }),
   };
 }
 
@@ -432,6 +433,7 @@ function serializeColumn(column: Column): object {
     ...(column.collation === undefined ? {} : { collation: column.collation }),
     ...(column.storage === undefined ? {} : { storage: column.storage }),
     ...(column.compression === undefined ? {} : { compression: column.compression }),
+    ...(column.comment === undefined ? {} : { comment: column.comment }),
   };
 }
 
@@ -457,6 +459,7 @@ function serializeKey(key: PrimaryKey | UniqueConstraint): object {
     columns: [...key.columns],
     ...(key.deferrable === undefined ? {} : { deferrable: key.deferrable }),
     ...(key.initiallyDeferred === undefined ? {} : { initiallyDeferred: key.initiallyDeferred }),
+    ...(key.comment === undefined ? {} : { comment: key.comment }),
   };
 }
 
@@ -467,6 +470,7 @@ function serializeCheckConstraint(checkConstraint: CheckConstraint): object {
     ...(checkConstraint.enforcement === undefined
       ? {}
       : { enforcement: checkConstraint.enforcement }),
+    ...(checkConstraint.comment === undefined ? {} : { comment: checkConstraint.comment }),
   };
 }
 
@@ -483,6 +487,7 @@ function serializeForeignKey(foreignKey: ForeignKey): object {
     ...(foreignKey.initiallyDeferred === undefined
       ? {}
       : { initiallyDeferred: foreignKey.initiallyDeferred }),
+    ...(foreignKey.comment === undefined ? {} : { comment: foreignKey.comment }),
   };
 }
 
@@ -492,6 +497,7 @@ function serializeIndex(index: Index): object {
     unique: index.unique,
     columns: [...index.columns],
     ...(index.concurrently === undefined ? {} : { concurrently: index.concurrently }),
+    ...(index.comment === undefined ? {} : { comment: index.comment }),
   };
 }
 
@@ -507,6 +513,7 @@ function serializeSequence(sequence: Sequence): object {
     cache: sequence.cache,
     cycle: sequence.cycle,
     ...(sequence.ownedBy === undefined ? {} : { ownedBy: serializeOwner(sequence.ownedBy) }),
+    ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
   };
 }
 
@@ -521,6 +528,7 @@ function serializeView(view: View): object {
     materialized: view.materialized,
     definition: view.definition,
     ...(view.checkOption === undefined ? {} : { checkOption: view.checkOption }),
+    ...(view.comment === undefined ? {} : { comment: view.comment }),
   };
 }
 
@@ -554,6 +562,7 @@ const TABLE_KEYS = [
   'checkConstraints',
   'indexes',
   'persistence',
+  'comment',
 ] as const;
 const COLUMN_KEYS = [
   'name',
@@ -565,6 +574,7 @@ const COLUMN_KEYS = [
   'collation',
   'storage',
   'compression',
+  'comment',
 ] as const;
 const IDENTITY_KEYS = [
   'generated',
@@ -576,8 +586,8 @@ const IDENTITY_KEYS = [
   'cache',
   'cycle',
 ] as const;
-const KEY_KEYS = ['name', 'columns', 'deferrable', 'initiallyDeferred'] as const;
-const CHECK_CONSTRAINT_KEYS = ['name', 'expression', 'enforcement'] as const;
+const KEY_KEYS = ['name', 'columns', 'deferrable', 'initiallyDeferred', 'comment'] as const;
+const CHECK_CONSTRAINT_KEYS = ['name', 'expression', 'enforcement', 'comment'] as const;
 const FOREIGN_KEY_KEYS = [
   'name',
   'columns',
@@ -588,8 +598,9 @@ const FOREIGN_KEY_KEYS = [
   'enforcement',
   'deferrable',
   'initiallyDeferred',
+  'comment',
 ] as const;
-const INDEX_KEYS = ['name', 'unique', 'columns', 'concurrently'] as const;
+const INDEX_KEYS = ['name', 'unique', 'columns', 'concurrently', 'comment'] as const;
 const SEQUENCE_KEYS = [
   'schema',
   'name',
@@ -601,9 +612,17 @@ const SEQUENCE_KEYS = [
   'cache',
   'cycle',
   'ownedBy',
+  'comment',
 ] as const;
 const OWNER_KEYS = ['table', 'column'] as const;
-const VIEW_KEYS = ['schema', 'name', 'materialized', 'definition', 'checkOption'] as const;
+const VIEW_KEYS = [
+  'schema',
+  'name',
+  'materialized',
+  'definition',
+  'checkOption',
+  'comment',
+] as const;
 const NAME_KEYS = ['schema', 'name'] as const;
 
 const REFERENTIAL_ACTIONS: readonly ReferentialAction[] = [
@@ -690,6 +709,16 @@ function parseNonEmptyString(value: unknown, path: string): Parsed<string> {
   const string = parseString(value, path);
   if (!string.ok) return string;
   if (string.value === '') return invalid(`${path} is not a non-empty string`);
+  return string;
+}
+
+/** An entity comment: non-empty, and never carrying a NUL PostgreSQL text cannot hold. */
+function parseComment(value: unknown, path: string): Parsed<string> {
+  const string = parseNonEmptyString(value, path);
+  if (!string.ok) return string;
+  if (string.value.includes('\u0000')) {
+    return invalid(`${path} must not contain a NUL character`);
+  }
   return string;
 }
 
@@ -781,6 +810,8 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       parseTablePersistence,
     );
     if (!persistence.ok) return persistence;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       schema: schema.value,
       name: name.value,
@@ -791,6 +822,7 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       checkConstraints: checkConstraints.value,
       indexes: indexes.value,
       ...(persistence.value === undefined ? {} : { persistence: persistence.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -830,6 +862,8 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       parseColumnCompression,
     );
     if (!compression.ok) return compression;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       name: name.value,
       type: type.value,
@@ -840,6 +874,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       ...(collation.value === undefined ? {} : { collation: collation.value }),
       ...(storage.value === undefined ? {} : { storage: storage.value }),
       ...(compression.value === undefined ? {} : { compression: compression.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -916,6 +951,8 @@ function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
       parseBoolean,
     );
     if (!initiallyDeferred.ok) return initiallyDeferred;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       columns: columns.value,
@@ -923,6 +960,7 @@ function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
       ...(initiallyDeferred.value === undefined
         ? {}
         : { initiallyDeferred: initiallyDeferred.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -939,10 +977,13 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
       parseConstraintEnforcement,
     );
     if (!enforcement.ok) return enforcement;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       expression: expression.value,
       ...(enforcement.value === undefined ? {} : { enforcement: enforcement.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -990,6 +1031,8 @@ function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
       parseBoolean,
     );
     if (!initiallyDeferred.ok) return initiallyDeferred;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       columns: columns.value,
@@ -1002,6 +1045,7 @@ function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
       ...(initiallyDeferred.value === undefined
         ? {}
         : { initiallyDeferred: initiallyDeferred.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -1028,11 +1072,14 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
       parseBoolean,
     );
     if (!concurrently.ok) return concurrently;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       ...(name.value === undefined ? {} : { name: name.value }),
       unique: unique.value,
       columns: columns.value,
       ...(concurrently.value === undefined ? {} : { concurrently: concurrently.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -1064,6 +1111,8 @@ function parseSequence(value: unknown, path: string): Parsed<Sequence> {
     if (!cycle.ok) return cycle;
     const ownedBy = parseOptional(object.ownedBy, fieldPath(path, 'ownedBy'), parseOwner);
     if (!ownedBy.ok) return ownedBy;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       schema: schema.value,
       name: name.value,
@@ -1075,6 +1124,7 @@ function parseSequence(value: unknown, path: string): Parsed<Sequence> {
       cache: cache.value,
       cycle: cycle.value,
       ...(ownedBy.value === undefined ? {} : { ownedBy: ownedBy.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }
@@ -1113,12 +1163,15 @@ function parseView(value: unknown, path: string): Parsed<View> {
     if (checkOption.value !== undefined && materialized.value) {
       return invalid(`${fieldPath(path, 'checkOption')} is not valid on a materialized view`);
     }
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
     return parsed({
       schema: schema.value,
       name: name.value,
       materialized: materialized.value,
       definition: definition.value,
       ...(checkOption.value === undefined ? {} : { checkOption: checkOption.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
 }

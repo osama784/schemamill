@@ -391,6 +391,7 @@ function findIdentityStep(
       case 'create-view':
       case 'drop-view':
       case 'replace-view':
+      case 'comment':
       default:
         return false;
     }

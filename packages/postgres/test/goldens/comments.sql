@@ -1,0 +1,14 @@
+BEGIN;
+COMMENT ON MATERIALIZED VIEW public.account_totals IS 'Per-account totals';
+COMMENT ON CONSTRAINT accounts_email_check ON public.accounts IS 'An account needs an address';
+COMMENT ON COLUMN public.accounts.email IS 'Sign-in address';
+COMMENT ON COLUMN public.accounts.legacy_note IS NULL;
+COMMENT ON COLUMN public.accounts.note IS E'it''s a \\ backslash\nsecond line\twith a tab -- and a semicolon; ok';
+COMMENT ON INDEX public.accounts_email_idx IS 'Lookup by address';
+COMMENT ON CONSTRAINT accounts_pkey ON public.accounts IS 'Account identity';
+COMMENT ON TABLE public.accounts IS 'Customer accounts — one row per signup.';
+COMMENT ON CONSTRAINT accounts_email_key ON public.accounts IS 'One account per address';
+COMMENT ON SEQUENCE public.accounts_id_seq IS 'Account id sequence';
+COMMENT ON VIEW public.active_accounts IS 'Active accounts';
+COMMENT ON CONSTRAINT orders_account_id_fkey ON public.orders IS 'Owning account';
+COMMIT;

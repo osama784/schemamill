@@ -5,6 +5,7 @@ import type {
   ColumnCompression,
   ColumnFieldChange,
   ColumnStorage,
+  CommentTarget,
   ConstraintEnforcement,
   ForeignKey,
   Identity,
@@ -146,7 +147,18 @@ import {
  * cannot be known offline, and pg_dump output always carries real constraint names, so
  * unnamed constraints are the unusual case.
  *
- * This module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
+ * A `comment` step renders one `COMMENT ON <kind> <identity> IS <literal>` statement for its
+ * target: `TABLE`, `COLUMN`, `SEQUENCE`, `VIEW`/`MATERIALIZED VIEW`, schema-qualified `INDEX`,
+ * or `CONSTRAINT <name> ON <table>` for each of the four constraint kinds, with an unnamed index
+ * or constraint named by the same conventional formulas a drop uses. The step's `text` is the
+ * only source of the value; an absent text renders `IS NULL`, and a target node's own `comment`
+ * is never read. A line-safe text renders as `'…'` with quotes doubled; a text carrying a
+ * backslash or a C0/DEL control renders as `E'…'` (`\\`, `''`, `\n`, `\r`, `\t`, and `\xHH` for
+ * the other controls), so a multi-line comment stays one statement on one line and unicode
+ * passes through unchanged. NUL refuses with `RenderRefusalError`.
+ *
+ * This module writes no SQL decoration comments of its own; the only comments it emits are the
+ * model's `COMMENT ON` statements. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
  */
 
 /**
@@ -419,6 +431,7 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'create-view':
     case 'drop-view':
     case 'replace-view':
+    case 'comment':
     default:
       return undefined;
   }
@@ -553,7 +566,104 @@ function renderStep(step: Step): string {
       return step.materialized
         ? `DROP MATERIALIZED VIEW ${renderTable(step.view)};`
         : `DROP VIEW ${renderTable(step.view)};`;
+    case 'comment':
+      return renderComment(step.target, step.text);
   }
+}
+
+/**
+ * One `COMMENT ON` statement for `target`: `text` is the single source of the value, and an
+ * absent text is the removal (`IS NULL`). A carried node's own `comment` is never read, so a
+ * stale node field cannot diverge from the step.
+ */
+function renderComment(target: CommentTarget, text: string | undefined): string {
+  const value = text === undefined ? 'NULL' : renderCommentLiteral(text);
+  return `COMMENT ON ${renderCommentTarget(target)} IS ${value};`;
+}
+
+/**
+ * The object clause of a `COMMENT ON` statement. An unnamed index or constraint is named by the
+ * same conventional formula its drop uses, because PostgreSQL keeps the server-generated name;
+ * an index is schema-qualified like a drop, while a constraint is scoped by `ON <table>`.
+ */
+function renderCommentTarget(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return `TABLE ${renderTable(target.table)}`;
+    case 'column':
+      return `COLUMN ${renderTable(target.table)}.${quoteIdentifier(target.column)}`;
+    case 'sequence':
+      return `SEQUENCE ${renderSequence(target.sequence)}`;
+    case 'view':
+      return `${target.materialized ? 'MATERIALIZED VIEW' : 'VIEW'} ${renderTable(target.view)}`;
+    case 'index': {
+      const name = target.index.name ?? synthesizedIndexName(target.table, target.index);
+      return `INDEX ${quoteIdentifier(target.table.schema)}.${quoteIdentifier(name)}`;
+    }
+    case 'primary-key': {
+      const name = target.primaryKey.name ?? synthesizedPrimaryKeyName(target.table);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'unique-constraint': {
+      const name =
+        target.uniqueConstraint.name ??
+        synthesizedUniqueConstraintName(target.table, target.uniqueConstraint);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'check-constraint': {
+      const name =
+        target.checkConstraint.name ??
+        synthesizedCheckConstraintName(target.table, target.checkConstraint);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'foreign-key': {
+      const name =
+        target.foreignKey.name ?? synthesizedForeignKeyName(target.table, target.foreignKey);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+  }
+}
+
+/**
+ * `text` as a PostgreSQL string literal. A line-safe text — no backslash and no C0/DEL control —
+ * renders as `'…'` with embedded quotes doubled. Any backslash or control character switches to
+ * `E'…'`: `\` becomes `\\`, `'` becomes `''`, newline/tab/carriage return become `\n`/`\t`/`\r`,
+ * and every other C0/DEL control becomes `\xHH`, so a multi-line comment stays one statement on
+ * one line. Unicode passes through unchanged. NUL is the one refused input: no PostgreSQL text
+ * can carry it, and rendering it would silently truncate the statement at the server.
+ */
+function renderCommentLiteral(text: string): string {
+  if (text.includes('\u0000')) {
+    throw new RenderRefusalError('refusing to render: a comment cannot contain a NUL character');
+  }
+  let escaped = false;
+  let body = '';
+  for (const character of text) {
+    if (character === '\\') {
+      escaped = true;
+      body += '\\\\';
+    } else if (character === "'") {
+      body += "''";
+    } else if (character === '\n') {
+      escaped = true;
+      body += '\\n';
+    } else if (character === '\r') {
+      escaped = true;
+      body += '\\r';
+    } else if (character === '\t') {
+      escaped = true;
+      body += '\\t';
+    } else {
+      const codePoint = character.codePointAt(0)!;
+      if (codePoint < 0x20 || codePoint === 0x7f) {
+        escaped = true;
+        body += `\\x${codePoint.toString(16).padStart(2, '0')}`;
+      } else {
+        body += character;
+      }
+    }
+  }
+  return escaped ? `E'${body}'` : `'${body}'`;
 }
 
 /**

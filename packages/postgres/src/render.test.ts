@@ -6,6 +6,7 @@ import { effectiveIdentity, plan, sequenceTypeBounds } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
+  CommentTarget,
   ForeignKey,
   Identity,
   IdentityInput,
@@ -27,7 +28,7 @@ import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin thirteen whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin fourteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -51,6 +52,7 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -64,6 +66,7 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A unique constraint on `columns`: unnamed unless overridden. */
@@ -2666,4 +2669,256 @@ test('golden: drops, creates, and replaces views and materialized views', () => 
   );
 
   assertGolden('views', baseline, target);
+});
+
+/** One `comment` step for `target`; an absent `text` is the removal. */
+const commentStep = (target: CommentTarget, text?: string): Step => ({
+  kind: 'comment',
+  target,
+  ...(text === undefined ? {} : { text }),
+});
+
+/**
+ * The single statement one comment step renders, asserting the statement stays on one line:
+ * `BEGIN;`, the statement, `COMMIT;`, and the trailing newline.
+ */
+const commentStatement = (
+  text: string | undefined,
+  target: CommentTarget = { kind: 'table', table: identity('t') },
+): string => {
+  const lines = renderSql(planOf(commentStep(target, text))).split('\n');
+  assert.equal(lines.length, 4, 'BEGIN, one statement, COMMIT, and the trailing newline');
+  return lines[1]!;
+};
+
+test('renders COMMENT ON for every target kind, synthesizing unnamed names', () => {
+  const primaryKey: PrimaryKey = { columns: ['id'] };
+  const unique = uniqueConstraint(['a', 'b']);
+  const check = checkConstraint('a > 0');
+  const key = foreignKey(['a'], identity('parent'), { referencedColumns: ['id'] });
+  const index = tableIndex(['b']);
+  const target = table('t', {
+    columns: [column('a'), column('b')],
+    primaryKey,
+    uniqueConstraints: [unique],
+    checkConstraints: [check],
+    foreignKeys: [key],
+    indexes: [index],
+  });
+
+  assert.equal(
+    renderSql(
+      planOf(
+        commentStep({ kind: 'table', table: target }, 'table'),
+        commentStep({ kind: 'column', table: target, column: 'a' }, 'column'),
+        commentStep({ kind: 'sequence', sequence: identity('s') }, 'sequence'),
+        commentStep({ kind: 'view', view: identity('v'), materialized: false }, 'view'),
+        commentStep({ kind: 'view', view: identity('mv'), materialized: true }, 'matview'),
+        commentStep({ kind: 'index', table: target, index }, 'index'),
+        commentStep({ kind: 'primary-key', table: target, primaryKey }, 'primary'),
+        commentStep(
+          { kind: 'unique-constraint', table: target, uniqueConstraint: unique },
+          'unique',
+        ),
+        commentStep({ kind: 'check-constraint', table: target, checkConstraint: check }, 'check'),
+        commentStep({ kind: 'foreign-key', table: target, foreignKey: key }, 'foreign'),
+      ),
+    ),
+    [
+      'BEGIN;',
+      "COMMENT ON TABLE public.t IS 'table';",
+      "COMMENT ON COLUMN public.t.a IS 'column';",
+      "COMMENT ON SEQUENCE public.s IS 'sequence';",
+      "COMMENT ON VIEW public.v IS 'view';",
+      "COMMENT ON MATERIALIZED VIEW public.mv IS 'matview';",
+      "COMMENT ON INDEX public.t_b_idx IS 'index';",
+      "COMMENT ON CONSTRAINT t_pkey ON public.t IS 'primary';",
+      "COMMENT ON CONSTRAINT t_a_b_key ON public.t IS 'unique';",
+      "COMMENT ON CONSTRAINT t_a_check ON public.t IS 'check';",
+      "COMMENT ON CONSTRAINT t_a_fkey ON public.t IS 'foreign';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('comment statements quote identifiers and keep explicit names as stored', () => {
+  const order = { schema: 'app', name: 'Order' };
+
+  assert.equal(
+    renderSql(
+      planOf(
+        commentStep({ kind: 'column', table: order, column: 'Mixed Case' }, 'column'),
+        commentStep(
+          {
+            kind: 'index',
+            table: order,
+            index: tableIndex(['Mixed Case'], { name: 'we"ird' }),
+          },
+          'index',
+        ),
+        commentStep(
+          {
+            kind: 'unique-constraint',
+            table: order,
+            uniqueConstraint: uniqueConstraint(['Mixed Case'], { name: 'we"ird key' }),
+          },
+          'unique',
+        ),
+        commentStep({ kind: 'sequence', sequence: { schema: 'app', name: 'S q' } }, 'sequence'),
+      ),
+    ),
+    [
+      'BEGIN;',
+      `COMMENT ON COLUMN app."Order"."Mixed Case" IS 'column';`,
+      `COMMENT ON INDEX app."we""ird" IS 'index';`,
+      `COMMENT ON CONSTRAINT "we""ird key" ON app."Order" IS 'unique';`,
+      `COMMENT ON SEQUENCE app."S q" IS 'sequence';`,
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a comment removal renders IS NULL', () => {
+  assert.equal(commentStatement(undefined), 'COMMENT ON TABLE public.t IS NULL;');
+  assert.equal(
+    commentStatement(undefined, { kind: 'column', table: identity('t'), column: 'a' }),
+    'COMMENT ON COLUMN public.t.a IS NULL;',
+  );
+});
+
+test('comment text renders plainly when line-safe and escapes otherwise', () => {
+  assert.equal(commentStatement("it's ready"), `COMMENT ON TABLE public.t IS 'it''s ready';`);
+  assert.equal(commentStatement('a -- b; c'), `COMMENT ON TABLE public.t IS 'a -- b; c';`);
+  assert.equal(
+    commentStatement('naïve — 日本語'),
+    `COMMENT ON TABLE public.t IS 'naïve — 日本語';`,
+  );
+  assert.equal(commentStatement(''), `COMMENT ON TABLE public.t IS '';`);
+
+  // A backslash or any C0/DEL control forces the E'' form, one statement on one line.
+  assert.equal(commentStatement('a\\b'), `COMMENT ON TABLE public.t IS E'a\\\\b';`);
+  assert.equal(
+    commentStatement('line one\nline two'),
+    `COMMENT ON TABLE public.t IS E'line one\\nline two';`,
+  );
+  assert.equal(commentStatement('a\rb'), `COMMENT ON TABLE public.t IS E'a\\rb';`);
+  assert.equal(commentStatement('a\tb'), `COMMENT ON TABLE public.t IS E'a\\tb';`);
+  assert.equal(commentStatement('a\u0001b'), `COMMENT ON TABLE public.t IS E'a\\x01b';`);
+  assert.equal(commentStatement('a\u007fb'), `COMMENT ON TABLE public.t IS E'a\\x7fb';`);
+  assert.equal(commentStatement("it's \\"), `COMMENT ON TABLE public.t IS E'it''s \\\\';`);
+});
+
+test('a comment containing NUL is refused with RenderRefusalError', () => {
+  assert.throws(
+    () => commentStatement('a\u0000b'),
+    (error: unknown) =>
+      error instanceof RenderRefusalError &&
+      error.message === 'refusing to render: a comment cannot contain a NUL character',
+  );
+});
+
+test("a comment step's text wins over a stale comment on its target node", () => {
+  const staleIndex = tableIndex(['a'], { comment: 'stale' });
+  assert.equal(
+    commentStatement('fresh', { kind: 'index', table: identity('t'), index: staleIndex }),
+    `COMMENT ON INDEX public.t_a_idx IS 'fresh';`,
+  );
+
+  const staleCheck = checkConstraint('a > 0', { comment: 'stale' });
+  assert.equal(
+    commentStatement(undefined, {
+      kind: 'check-constraint',
+      table: identity('t'),
+      checkConstraint: staleCheck,
+    }),
+    'COMMENT ON CONSTRAINT t_a_check ON public.t IS NULL;',
+  );
+});
+
+test('golden: comments on every modeled family, a removal, and escaping', () => {
+  // Only comments differ between the models, so the plan is the terminal comment phase alone:
+  // seven target kinds (both view kinds and each unnamed constraint kind), a table change, a
+  // column removal, and one text exercising the escape matrix.
+  const note = "it's a \\ backslash\nsecond line\twith a tab -- and a semicolon; ok";
+  const baseline: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email'),
+          column('legacy_note', { comment: 'Retired note' }),
+          column('note'),
+        ],
+        primaryKey: { columns: ['id'] },
+        uniqueConstraints: [uniqueConstraint(['email'])],
+        checkConstraints: [checkConstraint('email IS NOT NULL')],
+        indexes: [tableIndex(['email'])],
+        comment: 'Legacy customer accounts',
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), { referencedColumns: ['id'] }),
+        ],
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq')],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+      }),
+      view('active_accounts', { definition: 'SELECT id FROM public.accounts' }),
+    ],
+  };
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email', { comment: 'Sign-in address' }),
+          column('legacy_note'),
+          column('note', { comment: note }),
+        ],
+        primaryKey: { columns: ['id'], comment: 'Account identity' },
+        uniqueConstraints: [uniqueConstraint(['email'], { comment: 'One account per address' })],
+        checkConstraints: [
+          checkConstraint('email IS NOT NULL', { comment: 'An account needs an address' }),
+        ],
+        indexes: [tableIndex(['email'], { comment: 'Lookup by address' })],
+        comment: 'Customer accounts — one row per signup.',
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), {
+            referencedColumns: ['id'],
+            comment: 'Owning account',
+          }),
+        ],
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq', { comment: 'Account id sequence' })],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+        comment: 'Per-account totals',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id FROM public.accounts',
+        comment: 'Active accounts',
+      }),
+    ],
+  };
+
+  assertGolden('comments', baseline, target);
 });

@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Change, Column, Hazard, Identity, IdentityChange, Plan } from '@schemamill/core';
+import type {
+  Change,
+  Column,
+  CommentTarget,
+  Hazard,
+  Identity,
+  IdentityChange,
+  Plan,
+} from '@schemamill/core';
 
 import { formatChanges, formatHazards, formatPlan } from './format.ts';
 
@@ -9,7 +17,8 @@ import { formatChanges, formatHazards, formatPlan } from './format.ts';
  * Tests for the CLI renderings: the converted-bound wording on a sequence or identity type
  * conversion, where the diff reports the value in effect after the engine's conversion rather
  * than the as-written baseline value; the identity change lines; the identity plan steps and
- * the plan header's one-transaction wording; and the hazard clauses.
+ * the plan header's one-transaction wording; the comment change and comment step lines; and
+ * the hazard clauses.
  */
 
 test('a converted sequence bound prints with the converted mark', () => {
@@ -1053,6 +1062,148 @@ test('view plan steps print their identity', () => {
       ' 1. create-view   public.v',
       ' 2. replace-view  public.v',
       ' 3. drop-view     public.w',
+      '',
+    ].join('\n'),
+  );
+});
+
+const users = { schema: 'public', name: 'users' } as const;
+
+/** Every comment target shape, with the exact spelling the CLI prints for it. */
+const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
+  ['table public.users', { kind: 'table', table: users }],
+  ['column public.users.email', { kind: 'column', table: users, column: 'email' }],
+  [
+    'sequence public.invoice_seq',
+    { kind: 'sequence', sequence: { schema: 'public', name: 'invoice_seq' } },
+  ],
+  [
+    'view public.active_accounts',
+    { kind: 'view', view: { schema: 'public', name: 'active_accounts' }, materialized: false },
+  ],
+  [
+    'materialized view public.account_totals',
+    { kind: 'view', view: { schema: 'public', name: 'account_totals' }, materialized: true },
+  ],
+  [
+    'index public.users (email)',
+    { kind: 'index', table: users, index: { unique: false, columns: ['email'] } },
+  ],
+  [
+    'primary key public.users (id)',
+    { kind: 'primary-key', table: users, primaryKey: { columns: ['id'] } },
+  ],
+  [
+    'unique constraint public.users (email)',
+    {
+      kind: 'unique-constraint',
+      table: users,
+      uniqueConstraint: { columns: ['email'] },
+    },
+  ],
+  [
+    "check constraint public.users (email <> '')",
+    {
+      kind: 'check-constraint',
+      table: users,
+      checkConstraint: { expression: "email <> ''" },
+    },
+  ],
+  [
+    'foreign key public.users (team_id) → public.teams',
+    {
+      kind: 'foreign-key',
+      table: users,
+      foreignKey: {
+        columns: ['team_id'],
+        referencedTable: { schema: 'public', name: 'teams' },
+        referencedColumns: ['id'],
+      },
+    },
+  ],
+];
+
+/** One `comment-changed` change, omitting the absent sides so `(none)` can print. */
+function commentChanged(commentTarget: CommentTarget, before?: string, after?: string): Change {
+  return {
+    kind: 'comment-changed',
+    target: commentTarget,
+    ...(before === undefined ? {} : { before }),
+    ...(after === undefined ? {} : { after }),
+  };
+}
+
+test('comment changes print every target shape with the signed texts', () => {
+  for (const [spelling, target] of COMMENT_TARGETS) {
+    assert.equal(
+      formatChanges([commentChanged(target, undefined, 'new')]),
+      `+ comment on ${spelling}: (none) → "new"\n`,
+      `addition on ${spelling}`,
+    );
+    assert.equal(
+      formatChanges([commentChanged(target, 'old', 'new')]),
+      `~ comment on ${spelling}: "old" → "new"\n`,
+      `change on ${spelling}`,
+    );
+    assert.equal(
+      formatChanges([commentChanged(target, 'old', undefined)]),
+      `- comment on ${spelling}: "old" → (none)\n`,
+      `removal on ${spelling}`,
+    );
+  }
+});
+
+test('comment text is JSON-quoted so quotes, backslashes, newlines, and unicode stay visible', () => {
+  const text = 'quote " slash \\ line\nbreak — naïve 日本語';
+  assert.equal(
+    formatChanges([commentChanged({ kind: 'table', table: users }, 'old', text)]),
+    [
+      '~ comment on table public.users: "old" → "quote \\" slash \\\\ line\\nbreak — naïve 日本語"',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('comment plan steps print every target shape and the text or (none)', () => {
+  for (const [spelling, target] of COMMENT_TARGETS) {
+    const plan: Plan = {
+      steps: [
+        { kind: 'comment', target, text: 'new' },
+        { kind: 'comment', target },
+      ],
+      groups: [{ start: 0, end: 2, transactional: true }],
+    };
+
+    assert.equal(
+      formatPlan(plan),
+      [
+        '2 steps in one transaction:',
+        ` 1. comment  ${spelling}: "new"`,
+        ` 2. comment  ${spelling}: (none)`,
+        '',
+      ].join('\n'),
+      `comment steps on ${spelling}`,
+    );
+  }
+});
+
+test('a comment step prints its text JSON-quoted, not as raw whitespace', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'comment',
+        target: { kind: 'sequence', sequence: { schema: 'public', name: 'invoice_seq' } },
+        text: 'invoice numbers\n(legacy)',
+      },
+    ],
+    groups: [{ start: 0, end: 1, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '1 step in one transaction:',
+      ' 1. comment  sequence public.invoice_seq: "invoice numbers\\n(legacy)"',
       '',
     ].join('\n'),
   );

@@ -24,6 +24,7 @@ const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const SCENES = [
   'all-changes',
   'column-attributes',
+  'comments',
   'constraint-attributes',
   'constraints-indexes',
   'hazards',
