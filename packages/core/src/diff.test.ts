@@ -4266,6 +4266,66 @@ test('a comment-only change on a constraint or index never recreates it', () => 
   ]);
 });
 
+test('a structurally changed constraint reports its unchanged comment as an addition', () => {
+  // A constraint's identity is structural — a check constraint's expression, a unique
+  // constraint's columns — so a structural change reads as absent from the baseline in the
+  // comment pass: the comment change is an addition (`before` omitted) even though the model
+  // held the same comment before. The recreate site's terminal dedupe still yields one step.
+  const baseline = table('t', {
+    columns: [column('a'), column('b')],
+    uniqueConstraints: [uniqueConstraint(['a'], { name: 't_a_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint('a > 0', { name: 't_check', comment: 'ck' })],
+  });
+  const target = table('t', {
+    columns: [column('a'), column('b')],
+    uniqueConstraints: [uniqueConstraint(['a', 'b'], { name: 't_a_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint('a > 1', { name: 't_check', comment: 'ck' })],
+  });
+
+  assertDiff(model(baseline), model(target), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-removed',
+          uniqueConstraint: uniqueConstraint(['a'], { name: 't_a_key', comment: 'uq' }),
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['a', 'b'], { name: 't_a_key', comment: 'uq' }),
+        },
+        {
+          kind: 'check-constraint-removed',
+          checkConstraint: checkConstraint('a > 0', { name: 't_check', comment: 'ck' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('a > 1', { name: 't_check', comment: 'ck' }),
+        },
+      ],
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('a > 1', { name: 't_check' }),
+      },
+      after: 'ck',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a', 'b'], { name: 't_a_key' }),
+      },
+      after: 'uq',
+    },
+  ]);
+});
+
 test('equal comments on every member emit nothing', () => {
   const build = () =>
     table('t', {
@@ -4438,4 +4498,128 @@ test('comment changes come last, after table, sequence, and view changes, in tar
       after: 'new v',
     },
   ]);
+});
+
+test('comment changes sort by each target identity, not by model insertion order', () => {
+  // Every target key carries its member identity — an index name or structure, a unique
+  // constraint's columns, a foreign key's columns and referenced table, a view identity — so
+  // the comment group sorts by that key even when the model holds the entries in another
+  // order. Named index twins with one structure stay distinct because they key by name, and
+  // differently structured unnamed indexes stay distinct because they key by structure.
+  const indexes = (suffix: string) =>
+    table('t', {
+      columns: [column('a'), column('b'), column('c')],
+      indexes: [
+        index(['b'], { comment: `two${suffix}` }),
+        index(['a'], { comment: `one${suffix}` }),
+        index(['c'], { name: 't_c1', comment: `three${suffix}` }),
+        index(['c'], { name: 't_c2', comment: `four${suffix}` }),
+      ],
+    });
+
+  assertDiff(model(indexes('')), model(indexes('2')), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['c'], { name: 't_c1' }) },
+      before: 'three',
+      after: 'three2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['c'], { name: 't_c2' }) },
+      before: 'four',
+      after: 'four2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['a']) },
+      before: 'one',
+      after: 'one2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['b']) },
+      before: 'two',
+      after: 'two2',
+    },
+  ]);
+
+  const parent = table('p', { columns: [column('id')] });
+  const constraints = (suffix: string) =>
+    table('t', {
+      columns: [column('a'), column('b')],
+      uniqueConstraints: [
+        uniqueConstraint(['b'], { comment: `u${suffix}` }),
+        uniqueConstraint(['a'], { comment: `u${suffix}` }),
+      ],
+      foreignKeys: [
+        foreignKey(['b'], identity('p'), { referencedColumns: ['id'], comment: `f${suffix}` }),
+        foreignKey(['a'], identity('p'), { referencedColumns: ['id'], comment: `f${suffix}` }),
+      ],
+    });
+  const views = (suffix: string) => [
+    view('vb', { comment: `v${suffix}` }),
+    view('va', { comment: `v${suffix}` }),
+  ];
+
+  const expected = (suffix: string, before: string) => [
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'foreign-key' as const,
+        table: identity('t'),
+        foreignKey: foreignKey(['a'], identity('p'), { referencedColumns: ['id'] }),
+      },
+      before: `f${before}`,
+      after: `f${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'foreign-key' as const,
+        table: identity('t'),
+        foreignKey: foreignKey(['b'], identity('p'), { referencedColumns: ['id'] }),
+      },
+      before: `f${before}`,
+      after: `f${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'unique-constraint' as const,
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a']),
+      },
+      before: `u${before}`,
+      after: `u${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'unique-constraint' as const,
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['b']),
+      },
+      before: `u${before}`,
+      after: `u${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: { kind: 'view' as const, view: identity('va'), materialized: false },
+      before: `v${before}`,
+      after: `v${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: { kind: 'view' as const, view: identity('vb'), materialized: false },
+      before: `v${before}`,
+      after: `v${suffix}`,
+    },
+  ];
+
+  assertDiff(
+    viewModel(views('old'), constraints('old'), parent),
+    viewModel(views('new'), constraints('new'), parent),
+    expected('new', 'old'),
+  );
 });

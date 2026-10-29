@@ -6886,6 +6886,37 @@ test('an added commented table asserts its comments after every create', () => {
   simulate(model(), model(added));
 });
 
+test('a create-table step carries the table comment in its payload', () => {
+  // The terminal comment step re-asserts the text on the server, but the structural step's
+  // payload is still the entity snapshot: a create-table for an added table carries its
+  // comment, so a consumer reading the step sees the true payload rather than a stripped copy.
+  const added = table('fresh', { columns: [column('id')], comment: 'fresh table' });
+
+  const { steps } = plan(model(), model(added));
+  const createTable = steps.find((step) => step.kind === 'create-table');
+  assert.ok(createTable !== undefined && createTable.kind === 'create-table');
+  assert.equal(createTable.table.comment, 'fresh table');
+  assert.equal(steps.filter((step) => step.kind === 'comment').length, 1);
+});
+
+test('the sequence-added application keeps the comment through the owner strip', () => {
+  // `copySequenceWithoutOwner` states the copy contract at the application seam. The diff's
+  // sequence payload currently normalizes through `effectiveSequence`, which rebuilds the
+  // object without `comment`, so this branch is not reachable from a diff-produced change
+  // today; this pin guards the copy if the normalization starts preserving comments. The
+  // comment's SQL is unaffected either way — the terminal comment step comes from the raw
+  // model's comment pass.
+  const application = emptyChangeApplication();
+  applyChange(application, {
+    kind: 'sequence-added',
+    sequence: sequence('s', { comment: 'fresh sequence' }),
+  });
+
+  const [step] = application.sequenceCreates;
+  assert.ok(step !== undefined && step.kind === 'create-sequence');
+  assert.equal(step.sequence.comment, 'fresh sequence');
+});
+
 test('an index recreate re-asserts an unchanged comment after the create', () => {
   const baseline = model(
     table('t', {
@@ -6946,6 +6977,37 @@ test('a recreated index with a changed comment keeps exactly one comment step', 
     ],
   );
   simulate(baseline, target);
+});
+
+test('structurally identical unnamed comment targets collapse to the first step', () => {
+  // Two unnamed indexes with the same structure share one server object and one
+  // `commentTargetKey`, so the diff emits two changes and the terminal phase keeps one step.
+  // The kept step is the FIRST in target order (diff order), not the last: `commentPhase`
+  // sorts stably by target key and drops later duplicates. The brief's D3 claimed last-wins;
+  // the implementation is first-wins, and this test pins the actual behavior.
+  const baseline = model(table('t', { columns: [column('id')] }));
+  const target = model(
+    table('t', {
+      columns: [column('id')],
+      indexes: [index(['id'], { comment: 'first' }), index(['id'], { comment: 'second' })],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'comment'),
+    [
+      {
+        kind: 'comment',
+        target: { kind: 'index', table: identity('t'), index: index(['id']) },
+        text: 'first',
+      },
+    ],
+  );
+  // Both creates are emitted, against the one synthesized name the model cannot distinguish;
+  // the simulator is deliberately not run, because the second create of a live index is
+  // illegal there for the same reason the duplicate target cannot be applied twice.
+  assert.equal(steps.filter((step) => step.kind === 'create-index').length, 2);
 });
 
 test('a primary-key recreate re-asserts an unchanged comment', () => {
@@ -7167,6 +7229,179 @@ test('a commented foreign key is re-asserted when its referenced primary key cha
         }),
       },
       text: 'link',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two sequence comment changes keep one terminal step each, in identity order', () => {
+  const sequences = (comment: string) => [sequence('s2', { comment }), sequence('s1', { comment })];
+  const baseline = sequenceModel(sequences('old'));
+  const target = sequenceModel(sequences('new'));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'sequence', sequence: identity('s1') }, text: 'new' },
+    { kind: 'comment', target: { kind: 'sequence', sequence: identity('s2') }, text: 'new' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two commented views keep one terminal step each, in identity order', () => {
+  const baseline = viewModel([view('b', { comment: 'old' }), view('a', { comment: 'old' })]);
+  const target = viewModel([view('b', { comment: 'new' }), view('a', { comment: 'new' })]);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('a'), materialized: false },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('b'), materialized: false },
+      text: 'new',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two unnamed indexes with different structures keep one terminal step each', () => {
+  const indexes = (comment: string) => [index(['b'], { comment }), index(['a'], { comment })];
+  const baseline = model(
+    table('t', { columns: [column('a'), column('b')], indexes: indexes('old') }),
+  );
+  const target = model(
+    table('t', { columns: [column('a'), column('b')], indexes: indexes('new') }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['a']) },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['b']) },
+      text: 'new',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two commented constraints of each kind keep one terminal step each', () => {
+  const build = (comment: string) =>
+    model(
+      table('t', {
+        columns: [column('a'), column('b')],
+        uniqueConstraints: [
+          uniqueConstraint(['a'], { comment }),
+          uniqueConstraint(['b'], { comment }),
+        ],
+        checkConstraints: [
+          checkConstraint('a > 0', { comment }),
+          checkConstraint('b > 0', { comment }),
+        ],
+        foreignKeys: [
+          foreignKey(['a'], identity('p1'), { referencedColumns: ['id'], comment }),
+          foreignKey(['b'], identity('p2'), { referencedColumns: ['id'], comment }),
+        ],
+      }),
+      table('p1', { columns: [column('id')] }),
+      table('p2', { columns: [column('id')] }),
+    );
+
+  assertPlan(build('old'), build('new'), [
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('a > 0'),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('b > 0'),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['a'], identity('p1'), { referencedColumns: ['id'] }),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['b'], identity('p2'), { referencedColumns: ['id'] }),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a']),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['b']),
+      },
+      text: 'new',
+    },
+  ]);
+  simulate(build('old'), build('new'));
+});
+
+test('the terminal phase sorts diff changes and recreate re-assertions together', () => {
+  const baseline = model(
+    table('a', { columns: [column('id')], comment: 'old' }),
+    table('b', {
+      columns: [column('x'), column('y')],
+      indexes: [index(['x'], { name: 'b_idx', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('a', { columns: [column('id')], comment: 'new' }),
+    table('b', {
+      columns: [column('x'), column('y')],
+      indexes: [index(['y'], { name: 'b_idx', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-index',
+      table: identity('b'),
+      index: index(['x'], { name: 'b_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'create-index',
+      table: identity('b'),
+      index: index(['y'], { name: 'b_idx', comment: 'keep' }),
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('a') }, text: 'new' },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('b'), index: index(['y'], { name: 'b_idx' }) },
+      text: 'keep',
     },
   ]);
   simulate(baseline, target);
