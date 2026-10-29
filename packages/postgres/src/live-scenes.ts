@@ -207,13 +207,19 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A model of the given tables and sequences together. */
 const withSequences = (tables: readonly Table[], sequences: readonly Sequence[]): Model => ({
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */
@@ -5120,6 +5126,7 @@ const viewRoundTripScene = (): LiveScene => {
       view('obsolete_accounts', { definition: 'SELECT id FROM accounts WHERE NOT active' }),
       view('promote_me', { definition: 'SELECT id FROM accounts WHERE active' }),
     ],
+    extensions: [],
   };
   const target: Model = {
     tables: [accounts],
@@ -5144,6 +5151,7 @@ const viewRoundTripScene = (): LiveScene => {
         definition: 'SELECT id FROM accounts WHERE active AND balance >= 0',
       }),
     ],
+    extensions: [],
   };
 
   /** The five target views and the `materialized` flag each must import with. */
@@ -5573,6 +5581,7 @@ const commentRoundTripScene = (): LiveScene => {
         comment: 'stale summary comment, removed in target',
       }),
     ],
+    extensions: [],
   } satisfies Model;
 
   const orders = baseline.tables.find((candidate) => candidate.name === 'orders')!;
@@ -5654,6 +5663,7 @@ const commentRoundTripScene = (): LiveScene => {
         definition: 'SELECT count(*) AS total FROM accounts WHERE balance < 0',
       }),
     ],
+    extensions: [],
   } satisfies Model;
 
   const targetCommentChecks = (subject: string): readonly SceneCheck[] => [

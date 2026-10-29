@@ -141,11 +141,12 @@ test('the sequence retention guard allows state-only skips and rejects structura
   const imported = await importDump(dump);
   const scene: LiveScene = {
     name: 'state-only-skips',
-    baseline: { tables: [], sequences: [], views: [] },
+    baseline: { tables: [], sequences: [], views: [], extensions: [] },
     target: {
       tables: [],
       sequences: [effectiveSequence({ schema: 'public', name: 'state_seq' })],
       views: [],
+      extensions: [],
     },
   };
 
@@ -391,7 +392,7 @@ async function assertRollbackLeavesNoPartialEffect(
     const baselineFile = join(workDir, 'rollback.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -442,7 +443,7 @@ async function assertStrippedWrappersLeavePartialEffect(
     const baselineFile = join(workDir, 'stripped.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -511,7 +512,7 @@ async function assertConcurrentBuildRejectsWrapping(
     const baselineFile = join(workDir, 'concurrent.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -593,10 +594,12 @@ async function writeSceneFiles(
   const migration = join(workDir, `${slug}.migrate.sql`);
   await writeFile(
     baselineBuild,
-    renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
     'utf8',
   );
-  const targetSql = renderSql(plan({ tables: [], sequences: [], views: [] }, scene.target));
+  const targetSql = renderSql(
+    plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.target),
+  );
   const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
   await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');

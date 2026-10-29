@@ -139,7 +139,12 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -190,6 +195,7 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
@@ -210,6 +216,7 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   tables,
   sequences: [],
   views,
+  extensions: [],
 });
 
 /**
@@ -1947,11 +1954,13 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       tables: shuffle(baselineTables),
       sequences: baselineSequences,
       views: [],
+      extensions: [],
     },
     target: {
       tables: shuffle([...target.values()].map(toTable)),
       sequences: targetSequences,
       views: [],
+      extensions: [],
     },
   };
 };
@@ -3997,6 +4006,7 @@ test('a removed identity precedes DROP NOT NULL and SET DEFAULT on its column', 
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
     views: [],
+    extensions: [],
   };
 
   assertPlan(baseline, target, [
@@ -4248,6 +4258,7 @@ test('serial to identity drops the default, drops the sequence, then adds the id
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
     views: [],
+    extensions: [],
   };
   const target = model(
     table('t', {
@@ -4300,6 +4311,7 @@ test('identity to serial drops the identity, creates the sequence, then sets the
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
     views: [],
+    extensions: [],
   };
 
   assertPlan(baseline, target, [
@@ -5700,6 +5712,7 @@ const permutedModel = (source: Model, random: Random): Model => ({
   })),
   sequences: shuffleWith(random, source.sequences),
   views: shuffleWith(random, source.views),
+  extensions: [...source.extensions],
 });
 
 test('seeded pairs keep diff and plan deterministic and order-independent', () => {
@@ -7456,6 +7469,7 @@ test('the simulator applies comment steps to all nine target kinds', () => {
     tables: [table('p', { columns: [column('id', { type: 'integer' })] }), live],
     sequences: [sequence('s')],
     views: [view('v')],
+    extensions: [],
   });
   const targets: readonly CommentTarget[] = [
     { kind: 'table', table: identity('t') },

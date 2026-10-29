@@ -10,6 +10,7 @@ import type {
   ColumnCompression,
   ColumnStorage,
   ConstraintEnforcement,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -109,8 +110,11 @@ type WorkspaceRootResult =
   | { readonly ok: true; readonly root: string }
   | { readonly ok: false; readonly diagnostic: WorkspaceDiagnostic };
 
-/** The model `initWorkspace` writes when the caller supplies none: no tables, sequences, or views. */
-const EMPTY_MODEL: Model = { tables: [], sequences: [], views: [] };
+/**
+ * The model `initWorkspace` writes when the caller supplies none: no tables, sequences, views,
+ * or extensions.
+ */
+const EMPTY_MODEL: Model = { tables: [], sequences: [], views: [], extensions: [] };
 
 /**
  * Resolves the workspace nearest `startPath` and reads its model.
@@ -261,9 +265,10 @@ export async function initWorkspace(
 
 /**
  * `model` as the canonical model file text: entities rebuilt in their declaration order with
- * `undefined` optionals omitted, `tables`, `sequences`, and `views` re-sorted into canonical
- * order (schema then name, JavaScript string comparison), nested arrays kept as stored,
- * two-space JSON, and a trailing newline. `views` always follows `sequences`. Deterministic:
+ * `undefined` optionals omitted, `tables`, `sequences`, `views`, and `extensions` re-sorted into
+ * canonical order (schema then name for the first three, name alone for extensions, JavaScript
+ * string comparison), nested arrays kept as stored, two-space JSON, and a trailing newline.
+ * `views` always follows `sequences`, and `extensions` always follows `views`. Deterministic:
  * one model always serializes to the same bytes.
  *
  * Exported for tests; `writeWorkspaceModel` is the public writer that persists these bytes.
@@ -273,6 +278,7 @@ export function serializeModel(model: Model): string {
     tables: [...model.tables].sort(compareNames).map(serializeTable),
     sequences: [...model.sequences].sort(compareNames).map(serializeSequence),
     views: [...model.views].sort(compareNames).map(serializeView),
+    extensions: [...model.extensions].sort(compareExtensions).map(serializeExtension),
   };
   return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -393,6 +399,11 @@ interface QualifiedName {
 /** Tables, sequences, and views in canonical order: schema, then name, plain string comparison. */
 function compareNames(left: QualifiedName, right: QualifiedName): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** Extensions in canonical order: name alone, plain string comparison. */
+function compareExtensions(left: Extension, right: Extension): number {
+  return compareStrings(left.name, right.name);
 }
 
 function compareStrings(left: string, right: string): number {
@@ -532,6 +543,14 @@ function serializeView(view: View): object {
   };
 }
 
+function serializeExtension(extension: Extension): object {
+  return {
+    schema: extension.schema,
+    name: extension.name,
+    ...(extension.comment === undefined ? {} : { comment: extension.comment }),
+  };
+}
+
 /**
  * The reader's shape check result: the rebuilt value, or the first failing path-named
  * message.
@@ -551,7 +570,7 @@ function invalid(message: string): ParseFailure {
   return { ok: false, message };
 }
 
-const MODEL_KEYS = ['tables', 'sequences', 'views'] as const;
+const MODEL_KEYS = ['tables', 'sequences', 'views', 'extensions'] as const;
 const TABLE_KEYS = [
   'schema',
   'name',
@@ -623,6 +642,7 @@ const VIEW_KEYS = [
   'checkOption',
   'comment',
 ] as const;
+const EXTENSION_KEYS = ['schema', 'name', 'comment'] as const;
 const NAME_KEYS = ['schema', 'name'] as const;
 
 const REFERENTIAL_ACTIONS: readonly ReferentialAction[] = [
@@ -663,7 +683,19 @@ function parseModel(value: unknown): Parsed<Model> {
         ? parsed<View[]>([])
         : parseArrayOf(object.views, 'views', parseView);
     if (!views.ok) return views;
-    return parsed({ tables: tables.value, sequences: sequences.value, views: views.value });
+    // Older model files have no extensions section either: absent means none, while an explicit
+    // `null` or non-array still fails closed.
+    const extensions =
+      object.extensions === undefined
+        ? parsed<Extension[]>([])
+        : parseArrayOf(object.extensions, 'extensions', parseExtension);
+    if (!extensions.ok) return extensions;
+    return parsed({
+      tables: tables.value,
+      sequences: sequences.value,
+      views: views.value,
+      extensions: extensions.value,
+    });
   });
 }
 
@@ -1178,6 +1210,27 @@ function parseView(value: unknown, path: string): Parsed<View> {
 
 function parseViewCheckOption(value: unknown, path: string): Parsed<ViewCheckOption> {
   return parseEnum(value, path, VIEW_CHECK_OPTIONS, 'view check option');
+}
+
+/**
+ * An extension: a database-unique name, the schema it is installed in, and an optional comment.
+ * The name stands alone — it is never schema-qualified — while the schema is a required
+ * attribute, so both are non-empty and the comment follows the entity-comment contract.
+ */
+function parseExtension(value: unknown, path: string): Parsed<Extension> {
+  return parseObject(value, path, EXTENSION_KEYS, (object) => {
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
+    if (!schema.ok) return schema;
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
+    if (!name.ok) return name;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
+    return parsed({
+      schema: schema.value,
+      name: name.value,
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
+    });
+  });
 }
 
 /**

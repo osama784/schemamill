@@ -100,7 +100,12 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -138,6 +143,7 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
@@ -158,6 +164,7 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   tables,
   sequences: [],
   views,
+  extensions: [],
 });
 
 /** A plan of the given steps as one transactional group, for renderer edge cases. */
@@ -2118,6 +2125,7 @@ test('renders both identity conversions in policy order', () => {
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
     views: [],
+    extensions: [],
   };
   const identityTarget = model(
     table('t', {
@@ -2151,6 +2159,7 @@ test('renders both identity conversions in policy order', () => {
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
     views: [],
+    extensions: [],
   };
 
   assert.equal(
@@ -2875,6 +2884,7 @@ test('golden: comments on every modeled family, a removal, and escaping', () => 
       }),
       view('active_accounts', { definition: 'SELECT id FROM public.accounts' }),
     ],
+    extensions: [],
   };
   const target: Model = {
     tables: [
@@ -2918,6 +2928,7 @@ test('golden: comments on every modeled family, a removal, and escaping', () => 
         comment: 'Active accounts',
       }),
     ],
+    extensions: [],
   };
 
   assertGolden('comments', baseline, target);

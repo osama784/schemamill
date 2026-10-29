@@ -97,7 +97,12 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A sequence named `name`: bigint ascending defaults unless overridden. */
 const sequence = (
@@ -140,6 +145,7 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
@@ -160,6 +166,7 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   tables,
   sequences: [],
   views,
+  extensions: [],
 });
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -4016,8 +4023,18 @@ test('removed and added views follow the sequence changes, in identity order', (
   const gone = view('a');
   const appView = view('z', {}, 'app');
   const fresh = view('b');
-  const baseline: Model = { tables: [], sequences: [sequence('s')], views: [gone] };
-  const target: Model = { tables: [], sequences: [], views: [appView, fresh] };
+  const baseline: Model = {
+    tables: [],
+    sequences: [sequence('s')],
+    views: [gone],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [appView, fresh],
+    extensions: [],
+  };
 
   assertDiff(baseline, target, [
     { kind: 'sequence-removed', sequence: baseline.sequences[0]! },
@@ -4451,6 +4468,7 @@ test('comment changes come last, after table, sequence, and view changes, in tar
     ],
     sequences: [sequence('s', { comment: 'old s' })],
     views: [view('v', { comment: 'old v' })],
+    extensions: [],
   };
   const target: Model = {
     tables: [
@@ -4459,6 +4477,7 @@ test('comment changes come last, after table, sequence, and view changes, in tar
     ],
     sequences: [sequence('s', { cache: '2', comment: 'new s' })],
     views: [view('v', { definition: 'SELECT 2', comment: 'new v' })],
+    extensions: [],
   };
 
   assertDiff(baseline, target, [

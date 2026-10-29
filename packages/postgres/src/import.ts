@@ -275,6 +275,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
       views: [...views.values()].sort(compareViews),
+      extensions: [],
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };

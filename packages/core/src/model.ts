@@ -19,6 +19,8 @@ import type { Identity } from './identity.ts';
  * - A view is identified by its schema and its name together, like a table. A view and a
  *   materialized view share one namespace, so the `materialized` discriminator is part of the
  *   entity's shape, not of its identity.
+ * - An extension is identified by its name alone: extension names are database-unique and are
+ *   never schema-qualified. Its install schema is an attribute, not part of identity.
  *
  * Ordering — deterministic, so two models of the same schema compare structurally:
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
@@ -35,6 +37,8 @@ import type { Identity } from './identity.ts';
  * - `indexes` are sorted by name (`name ?? ''`, so unnamed first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
  * - `views` are sorted by schema, then name (JavaScript string comparison).
+ * - `extensions` are sorted by name (JavaScript string comparison); the schema is not part of
+ *   the order.
  *
  * `Index.concurrently` is apply metadata, not structure: it is excluded from structural
  * identity and equality, and only steers how a create or drop is applied — the target index's
@@ -75,7 +79,7 @@ export interface TableIdentity {
   readonly name: string;
 }
 
-/** The canonical model: the whole schema, as tables, sequences, and views. */
+/** The canonical model: the whole schema, as tables, sequences, views, and extensions. */
 export interface Model {
   /** Every imported table, in the model's deterministic order. */
   readonly tables: readonly Table[];
@@ -83,6 +87,8 @@ export interface Model {
   readonly sequences: readonly Sequence[];
   /** Every imported view and materialized view, in the model's deterministic order. */
   readonly views: readonly View[];
+  /** Every imported extension, in the model's deterministic order. */
+  readonly extensions: readonly Extension[];
 }
 
 /** A table and its imported structure. */
@@ -401,6 +407,33 @@ export interface View extends ViewIdentity {
   /**
    * The view's PostgreSQL comment, stored verbatim; absent means none. An empty string is not a
    * comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
+   */
+  readonly comment?: string;
+}
+
+/**
+ * Identifies an extension in the model: its name. Extension names are database-unique and are
+ * never schema-qualified, so the name alone is identity.
+ */
+export interface ExtensionIdentity {
+  /** The extension's name, as written without quoting and never schema-qualified. */
+  readonly name: string;
+}
+
+/**
+ * A PostgreSQL extension and the schema it is installed in.
+ *
+ * `schema` is the install schema the source states (`WITH SCHEMA`) and is required: every
+ * extension has one, and the importer never invents it. The schema is a mutable attribute,
+ * not part of identity — moving an extension is an `ALTER EXTENSION … SET SCHEMA`.
+ */
+export interface Extension extends ExtensionIdentity {
+  /** The schema the extension is installed in, e.g. `public`. */
+  readonly schema: string;
+  /**
+   * The extension's PostgreSQL comment, stored verbatim; absent means none. An empty string is
+   * not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no
+   * NUL.
    */
   readonly comment?: string;
 }
