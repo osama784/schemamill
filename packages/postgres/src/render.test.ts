@@ -7,6 +7,7 @@ import type {
   CheckConstraint,
   Column,
   CommentTarget,
+  Extension,
   ForeignKey,
   Identity,
   IdentityInput,
@@ -28,7 +29,7 @@ import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin fourteen whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin fifteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -165,6 +166,21 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   sequences: [],
   views,
   extensions: [],
+});
+
+/** An extension named `name`, installed in `public` unless a schema or fields are given. */
+const extension = (
+  name: string,
+  fields: Partial<Omit<Extension, 'name'>> = {},
+  schema = 'public',
+): Extension => ({ name, schema, ...fields });
+
+/** A model of the given extensions, with no tables, sequences, or views unless supplied. */
+const extensionModel = (extensions: readonly Extension[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** A plan of the given steps as one transactional group, for renderer edge cases. */
@@ -2582,6 +2598,52 @@ test('a materialized replace-view is refused with a pinned message', () => {
   );
 });
 
+test('extension steps render create, alter from field.after, and drop, never IF NOT EXISTS', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-extension', extension: extension('pgcrypto', {}, 'app') },
+        {
+          kind: 'alter-extension',
+          extension: { name: 'hstore' },
+          fields: [{ field: 'schema', before: 'legacy', after: 'app' }],
+        },
+        { kind: 'drop-extension', extension: { name: 'citext' } },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE EXTENSION pgcrypto WITH SCHEMA app;',
+      'ALTER EXTENSION hstore SET SCHEMA app;',
+      'DROP EXTENSION citext;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('extension names stay bare and quote by need, never schema-qualified', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-extension', extension: extension('postgis-topology', {}, 'gis') },
+        { kind: 'create-extension', extension: extension('Order', {}, 'Sales') },
+        { kind: 'create-extension', extension: extension('app.citext') },
+        { kind: 'drop-extension', extension: { name: 'Mixed Case' } },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE EXTENSION "postgis-topology" WITH SCHEMA gis;',
+      'CREATE EXTENSION "Order" WITH SCHEMA "Sales";',
+      'CREATE EXTENSION "app.citext" WITH SCHEMA public;',
+      'DROP EXTENSION "Mixed Case";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('golden: drops, creates, and replaces views and materialized views', () => {
   // The view drops land before the table work, the creates and replaces after it, and both
   // view buckets keep identity order: a kind change contributes its baseline-kind drop and its
@@ -2723,6 +2785,7 @@ test('renders COMMENT ON for every target kind, synthesizing unnamed names', () 
         commentStep({ kind: 'sequence', sequence: identity('s') }, 'sequence'),
         commentStep({ kind: 'view', view: identity('v'), materialized: false }, 'view'),
         commentStep({ kind: 'view', view: identity('mv'), materialized: true }, 'matview'),
+        commentStep({ kind: 'extension', extension: { name: 'hstore' } }, 'extension'),
         commentStep({ kind: 'index', table: target, index }, 'index'),
         commentStep({ kind: 'primary-key', table: target, primaryKey }, 'primary'),
         commentStep(
@@ -2740,6 +2803,7 @@ test('renders COMMENT ON for every target kind, synthesizing unnamed names', () 
       "COMMENT ON SEQUENCE public.s IS 'sequence';",
       "COMMENT ON VIEW public.v IS 'view';",
       "COMMENT ON MATERIALIZED VIEW public.mv IS 'matview';",
+      "COMMENT ON EXTENSION hstore IS 'extension';",
       "COMMENT ON INDEX public.t_b_idx IS 'index';",
       "COMMENT ON CONSTRAINT t_pkey ON public.t IS 'primary';",
       "COMMENT ON CONSTRAINT t_a_b_key ON public.t IS 'unique';",
@@ -2786,6 +2850,24 @@ test('comment statements quote identifiers and keep explicit names as stored', (
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('COMMENT ON EXTENSION keeps the target bare, with text or IS NULL', () => {
+  assert.equal(
+    commentStatement('Key-value pairs', { kind: 'extension', extension: { name: 'hstore' } }),
+    `COMMENT ON EXTENSION hstore IS 'Key-value pairs';`,
+  );
+  assert.equal(
+    commentStatement("it's ordered", { kind: 'extension', extension: { name: 'Order' } }),
+    `COMMENT ON EXTENSION "Order" IS 'it''s ordered';`,
+  );
+  assert.equal(
+    commentStatement(undefined, {
+      kind: 'extension',
+      extension: { name: 'postgis-topology' },
+    }),
+    'COMMENT ON EXTENSION "postgis-topology" IS NULL;',
   );
 });
 
@@ -2932,4 +3014,27 @@ test('golden: comments on every modeled family, a removal, and escaping', () => 
   };
 
   assertGolden('comments', baseline, target);
+});
+
+test('golden: creates, moves, drops, and comments extensions', () => {
+  // Only extensions differ, so the plan is three global phases: phase 1 creates in name order
+  // (a quoted capital name, a plain name, a dashed name), the terminal comment phase in target
+  // identity order — including an addition onto an added extension and a removal — then phase
+  // 13 moves `hstore` and drops `citext`. A removed extension emits no comment step.
+  const baseline = extensionModel([
+    extension('citext', { comment: 'Case-insensitive text' }),
+    extension('hstore', { comment: 'Old comment' }, 'legacy'),
+    extension('pg_trgm', { comment: 'Trigram indexes' }),
+    extension('uuid-ossp', { comment: 'UUID generation' }),
+  ]);
+  const target = extensionModel([
+    extension('Order', { comment: 'Case-sensitive order rows' }, 'sales'),
+    extension('hstore', { comment: 'Key-value pairs' }, 'app'),
+    extension('pgcrypto', { comment: 'Cryptographic functions' }),
+    extension('pg_trgm'),
+    extension('postgis-topology', { comment: 'Topology support' }, 'gis'),
+    extension('uuid-ossp', { comment: 'UUID generation' }),
+  ]);
+
+  assertGolden('extensions', baseline, target);
 });

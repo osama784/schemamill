@@ -1,0 +1,12 @@
+BEGIN;
+CREATE EXTENSION "Order" WITH SCHEMA sales;
+CREATE EXTENSION pgcrypto WITH SCHEMA public;
+CREATE EXTENSION "postgis-topology" WITH SCHEMA gis;
+COMMENT ON EXTENSION "Order" IS 'Case-sensitive order rows';
+COMMENT ON EXTENSION hstore IS 'Key-value pairs';
+COMMENT ON EXTENSION pg_trgm IS NULL;
+COMMENT ON EXTENSION pgcrypto IS 'Cryptographic functions';
+COMMENT ON EXTENSION "postgis-topology" IS 'Topology support';
+ALTER EXTENSION hstore SET SCHEMA app;
+DROP EXTENSION citext;
+COMMIT;

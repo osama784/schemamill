@@ -7,6 +7,9 @@ import type {
   ColumnStorage,
   CommentTarget,
   ConstraintEnforcement,
+  Extension,
+  ExtensionFieldChange,
+  ExtensionIdentity,
   ForeignKey,
   Identity,
   IdentityFieldChange,
@@ -79,6 +82,14 @@ import {
  * `materialized` flag. The definition is emitted exactly as stored, on one line; the renderer
  * never re-deparses it. A materialized `replace-view` is a hand-built-plan error and refuses
  * with `RenderRefusalError` rather than render SQL PostgreSQL would reject.
+ *
+ * `create-extension` renders `CREATE EXTENSION <name> WITH SCHEMA <schema>;` — never
+ * `IF NOT EXISTS`, since drift must surface at apply. `alter-extension` renders
+ * `ALTER EXTENSION <name> SET SCHEMA <schema>;` reading the destination from the step's
+ * value-carrying `schema` field, with no baseline lookup; a hand-built step without that field
+ * throws. `drop-extension` renders `DROP EXTENSION <name>;`. All three names are bare — an
+ * extension name is database-unique and never schema-qualified — and quoted only when the
+ * identifier rule requires it. The `COMMENT ON EXTENSION` target follows the same rule.
  *
  * `add-unique-constraint` renders `ALTER TABLE … ADD [CONSTRAINT name] UNIQUE (cols)`,
  * `add-check-constraint` renders `… ADD [CONSTRAINT name] CHECK (expr)` with the expression
@@ -478,18 +489,6 @@ export function quoteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`;
 }
 
-/**
- * The loud placeholder for an extension statement, until workstream 4 renders the real SQL:
- * `CREATE EXTENSION … WITH SCHEMA`, `ALTER EXTENSION … SET SCHEMA`, `DROP EXTENSION`, and
- * `COMMENT ON EXTENSION`. It throws rather than guess, so an extension plan can never render
- * misleading SQL in the intermediate state.
- */
-function pendingExtensionRender(what: string): never {
-  throw new Error(
-    `render: ${what} is not implemented yet; workstream 4 (feat(postgres): render extension statements) replaces this placeholder`,
-  );
-}
-
 /** One plan step as one or more statements, without a trailing newline. */
 function renderStep(step: Step): string {
   switch (step.kind) {
@@ -574,9 +573,11 @@ function renderStep(step: Step): string {
     case 'alter-sequence':
       return renderAlterSequence(step.sequence, step.fields);
     case 'create-extension':
+      return renderCreateExtension(step.extension);
     case 'alter-extension':
+      return renderAlterExtension(step.extension, step.fields);
     case 'drop-extension':
-      return pendingExtensionRender(step.kind);
+      return renderDropExtension(step.extension);
     case 'create-view':
       return renderView(step.view, false);
     case 'replace-view':
@@ -616,7 +617,7 @@ function renderCommentTarget(target: CommentTarget): string {
     case 'view':
       return `${target.materialized ? 'MATERIALIZED VIEW' : 'VIEW'} ${renderTable(target.view)}`;
     case 'extension':
-      return pendingExtensionRender('COMMENT ON EXTENSION');
+      return `EXTENSION ${quoteIdentifier(target.extension.name)}`;
     case 'index': {
       const name = target.index.name ?? synthesizedIndexName(target.table, target.index);
       return `INDEX ${quoteIdentifier(target.table.schema)}.${quoteIdentifier(name)}`;
@@ -1090,6 +1091,43 @@ function renderView(view: View, replace: boolean): string {
 /** A schema-qualified sequence reference, quoted exactly like a table reference. */
 function renderSequence(identity: SequenceIdentity): string {
   return renderTable(identity);
+}
+
+/**
+ * `CREATE EXTENSION <name> WITH SCHEMA <schema>`, both identifiers quoted by need. The name is
+ * never schema-qualified and the statement never states `IF NOT EXISTS`: a create applies to a
+ * database without the extension, and drift must surface rather than be silently tolerated.
+ */
+function renderCreateExtension(extension: Extension): string {
+  return (
+    `CREATE EXTENSION ${quoteIdentifier(extension.name)}` +
+    ` WITH SCHEMA ${quoteIdentifier(extension.schema)};`
+  );
+}
+
+/**
+ * `ALTER EXTENSION <name> SET SCHEMA <schema>`, the destination read from the step's
+ * value-carrying `schema` field, so no baseline lookup is needed. A hand-built step without the
+ * field is malformed and throws rather than render a guessed destination.
+ */
+function renderAlterExtension(
+  extension: ExtensionIdentity,
+  fields: readonly ExtensionFieldChange[],
+): string {
+  const schema = fields.find((field) => field.field === 'schema');
+  if (schema === undefined) {
+    throw new Error(
+      `render: alter-extension for ${JSON.stringify(extension.name)} carries no schema field`,
+    );
+  }
+  return `ALTER EXTENSION ${quoteIdentifier(extension.name)} SET SCHEMA ${quoteIdentifier(
+    schema.after,
+  )};`;
+}
+
+/** `DROP EXTENSION <name>`, the name bare and never schema-qualified. */
+function renderDropExtension(extension: ExtensionIdentity): string {
+  return `DROP EXTENSION ${quoteIdentifier(extension.name)};`;
 }
 
 /** `CREATE SEQUENCE` in canonical full-explicit form, every effective option stated. */
