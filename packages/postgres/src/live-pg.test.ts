@@ -43,8 +43,9 @@ import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts
  * target database the build SQL for the target model plus any raw `targetExtraSql` the scene
  * declares for objects the model cannot represent; the baseline database then gets
  * `renderSql(plan(baseline, target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
- * run against the baseline database after its build, and its probes and remaining checks after
- * the migration. Both databases are dumped with `pg_dump --schema-only --no-owner
+ * run against the baseline database after its build, its target checks against the target
+ * database after its build, and its probes and remaining checks after the migration. Both
+ * databases are dumped with `pg_dump --schema-only --no-owner
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
  * the modeled sequences and identity columns must come back exactly (see
  * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
@@ -235,6 +236,7 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     await applyFile(appliedUrl, files.baselineBuild);
     await assertChecks(appliedUrl, scene.baselineChecks ?? []);
     await applyFile(targetUrl, files.targetBuild);
+    await assertChecks(targetUrl, scene.targetChecks ?? []);
     await applyFile(appliedUrl, files.migration);
     for (const probe of scene.probes ?? []) {
       await psql(appliedUrl, ['-c', probe]);
