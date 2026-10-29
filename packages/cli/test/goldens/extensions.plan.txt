@@ -1,0 +1,16 @@
+6 steps in one transaction:
+ 1. create-extension  btree_gist
+ 2. comment           extension btree_gist: "GiST index support"
+ 3. comment           extension pgcrypto: "crypto v2"
+ 4. comment           extension uuid-ossp: (none)
+ 5. alter-extension   hstore: schema hs1 → hs2
+ 6. drop-extension    citext
+
+BEGIN;
+CREATE EXTENSION btree_gist WITH SCHEMA public;
+COMMENT ON EXTENSION btree_gist IS 'GiST index support';
+COMMENT ON EXTENSION pgcrypto IS 'crypto v2';
+COMMENT ON EXTENSION "uuid-ossp" IS NULL;
+ALTER EXTENSION hstore SET SCHEMA hs2;
+DROP EXTENSION citext;
+COMMIT;

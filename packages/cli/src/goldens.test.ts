@@ -27,6 +27,7 @@ const SCENES = [
   'comments',
   'constraint-attributes',
   'constraints-indexes',
+  'extensions',
   'hazards',
   'identity',
   'schema-edges',

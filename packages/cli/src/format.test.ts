@@ -1067,6 +1067,62 @@ test('view plan steps print their identity', () => {
   );
 });
 
+test('extension changes print additions, removals, and schema moves', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'extension-added',
+      extension: { name: 'btree_gist', schema: 'public', comment: 'GiST index support' },
+    },
+    {
+      kind: 'extension-removed',
+      extension: { name: 'citext', schema: 'public', comment: 'case-insensitive text' },
+    },
+    {
+      kind: 'extension-changed',
+      extension: { name: 'hstore' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '+ extension btree_gist',
+      '',
+      '- extension citext',
+      '',
+      '~ extension hstore: schema hs1 → hs2',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('extension plan steps print the bare name and the moved schema', () => {
+  const plan: Plan = {
+    steps: [
+      { kind: 'create-extension', extension: { name: 'btree_gist', schema: 'public' } },
+      {
+        kind: 'alter-extension',
+        extension: { name: 'hstore' },
+        fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+      { kind: 'drop-extension', extension: { name: 'citext' } },
+    ],
+    groups: [{ start: 0, end: 3, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '3 steps in one transaction:',
+      ' 1. create-extension  btree_gist',
+      ' 2. alter-extension   hstore: schema hs1 → hs2',
+      ' 3. drop-extension    citext',
+      '',
+    ].join('\n'),
+  );
+});
+
 const users = { schema: 'public', name: 'users' } as const;
 
 /** Every comment target shape, with the exact spelling the CLI prints for it. */
@@ -1085,6 +1141,7 @@ const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
     'materialized view public.account_totals',
     { kind: 'view', view: { schema: 'public', name: 'account_totals' }, materialized: true },
   ],
+  ['extension uuid-ossp', { kind: 'extension', extension: { name: 'uuid-ossp' } }],
   [
     'index public.users (email)',
     { kind: 'index', table: users, index: { unique: false, columns: ['email'] } },
