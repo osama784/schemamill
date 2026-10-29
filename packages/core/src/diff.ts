@@ -6,6 +6,8 @@ import type {
   ColumnAttributes,
   ColumnCompression,
   ColumnStorage,
+  Extension,
+  ExtensionIdentity,
   ForeignKey,
   Index,
   Model,
@@ -29,9 +31,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * The diff: what changed between a baseline model and a target model.
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
- * column, primary key, foreign key, unique constraint, check constraint, index, sequence, or
- * view, plus one `comment-changed` per target entity whose comment text differs (or that the
- * baseline lacks while it states one).
+ * column, primary key, foreign key, unique constraint, check constraint, index, sequence, view,
+ * or extension, plus one `comment-changed` per target entity whose comment text differs (or
+ * that the baseline lacks while it states one).
  * It never guesses a rename: a table or column under a new name is a removal and an addition,
  * a primary key with a different column list is a primary-key change, a foreign key pointing
  * at a different table is a removal and an addition, and so are a unique constraint with a
@@ -60,6 +62,10 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * the `materialized` field, never a removal and an addition. The definition is compared
  * exactly as stored, like any other opaque text, and the check option compares as an optional
  * enum whose absent side is reported by omission.
+ *
+ * An extension is identified by its name alone — database-unique, never schema-qualified —
+ * and its install schema is a mutable attribute, not identity: a schema difference is an
+ * `extension-changed` carrying one value-carrying field, never a removal and an addition.
  *
  * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
  * whose only stated difference is its flag is not a change, and an added or removed index
@@ -140,11 +146,17 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    and `checkOption`, in that fixed order. A changed view carries both stored sides —
  *    `before` and `after` — because the plan recreates a materialized view from its target
  *    payload; an absent check option is reported by omission.
- * 6. Comment changes are walked over the target model, after every view change, and reported
- *    as a group in target identity order: the schema-qualified relation, then the target kind,
- *    then the member's name or identity. An entity the target removes contributes nothing —
- *    dropping it drops its comment — and an entity whose identity fields changed reads as
- *    absent from the baseline, so its comment is an addition. The payload is a copy without
+ * 6. Extension identities are merge-walked the same way, after every view change, and reported
+ *    as a group in name order: a baseline-only identity is `extension-removed`, a target-only
+ *    identity `extension-added`, and a shared identity is compared on `schema`, its one mutable
+ *    field, reported value-carrying as `before` and `after`. The added and changed entries keep
+ *    target name order and the removed entries baseline name order, so a model's array order
+ *    never leaks into the result.
+ * 7. Comment changes are walked over the target model, after every extension change, and
+ *    reported as a group in target identity order: the schema-qualified relation, then the
+ *    target kind, then the member's name or identity. An entity the target removes contributes
+ *    nothing — dropping it drops its comment — and an entity whose identity fields changed reads
+ *    as absent from the baseline, so its comment is an addition. The payload is a copy without
  *    the carried node's own `comment`: `before` and `after` are the only text.
  *
  * Duplicate identities — several foreign keys with the same referencing columns and referenced
@@ -195,6 +207,19 @@ export type Change =
       changes: readonly ViewFieldChange[];
       before: View;
       after: View;
+    }
+  /** The target has an extension the baseline does not. */
+  | { kind: 'extension-added'; extension: Extension }
+  /** The baseline has an extension the target does not. */
+  | { kind: 'extension-removed'; extension: Extension }
+  /**
+   * Both sides have the extension identity, and at least one of its fields differs. The fields
+   * are value-carrying — today `schema` alone — so the plan needs no baseline lookup.
+   */
+  | {
+      kind: 'extension-changed';
+      extension: ExtensionIdentity;
+      changes: readonly ExtensionFieldChange[];
     }
   /**
    * A comment differs, or the entity is new: `before`/`after` are the stored texts, a side
@@ -340,6 +365,13 @@ export type ViewFieldChange =
   | { field: 'checkOption'; before?: ViewCheckOption; after?: ViewCheckOption };
 
 /**
+ * One differing field of a changed extension; only fields that differ are reported. The union
+ * holds one member today — the install schema — so the plan's `assertNever` default is real
+ * from day one, and every value the destination needs travels in `after`.
+ */
+export type ExtensionFieldChange = { field: 'schema'; before: string; after: string };
+
+/**
  * The changes from `baseline` to `target`, in the module's deterministic order. Returned
  * payloads are independent copies: mutating them never affects the caller's models, and
  * neither input is mutated.
@@ -394,6 +426,7 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     ...changes,
     ...diffSequences(baseline, target),
     ...diffViews(baseline, target),
+    ...diffExtensions(baseline, target),
     ...diffComments(baseline, target),
   ];
 }
@@ -519,6 +552,67 @@ function diffViewFields(baseline: View, target: View): ViewFieldChange[] {
   return fields;
 }
 
+/**
+ * The extension group of the diff, in name order. Extensions identify by name alone, so a
+ * schema move is an `extension-changed` with its value-carrying field — never a removal and an
+ * addition.
+ */
+function diffExtensions(baseline: Model, target: Model): readonly Change[] {
+  const baselineExtensions = [...baseline.extensions].sort(compareExtensions);
+  const targetExtensions = [...target.extensions].sort(compareExtensions);
+
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineExtensions.length && targetIndex < targetExtensions.length) {
+    const baselineExtension = baselineExtensions[baselineIndex]!;
+    const targetExtension = targetExtensions[targetIndex]!;
+    const comparison = compareStrings(baselineExtension.name, targetExtension.name);
+    if (comparison < 0) {
+      changes.push({ kind: 'extension-removed', extension: copyExtension(baselineExtension) });
+      baselineIndex += 1;
+    } else if (comparison > 0) {
+      changes.push({ kind: 'extension-added', extension: copyExtension(targetExtension) });
+      targetIndex += 1;
+    } else {
+      const fields = diffExtensionFields(baselineExtension, targetExtension);
+      if (fields.length > 0) {
+        changes.push({
+          kind: 'extension-changed',
+          extension: { name: baselineExtension.name },
+          changes: fields,
+        });
+      }
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+
+  for (; baselineIndex < baselineExtensions.length; baselineIndex += 1) {
+    changes.push({
+      kind: 'extension-removed',
+      extension: copyExtension(baselineExtensions[baselineIndex]!),
+    });
+  }
+  for (; targetIndex < targetExtensions.length; targetIndex += 1) {
+    changes.push({
+      kind: 'extension-added',
+      extension: copyExtension(targetExtensions[targetIndex]!),
+    });
+  }
+
+  return changes;
+}
+
+function diffExtensionFields(baseline: Extension, target: Extension): ExtensionFieldChange[] {
+  const fields: ExtensionFieldChange[] = [];
+  if (baseline.schema !== target.schema) {
+    fields.push({ field: 'schema', before: baseline.schema, after: target.schema });
+  }
+  return fields;
+}
+
 /** A `comment-changed` entry, as the comment pass emits it. */
 type CommentChange = Extract<Change, { kind: 'comment-changed' }>;
 
@@ -528,13 +622,13 @@ type CommentChange = Extract<Change, { kind: 'comment-changed' }>;
  * lacks while stating a comment, is an entry; a removed entity is not, because dropping it drops
  * its comment.
  *
- * Counterparts match by the model's identity — table, sequence, or view identity, a column's
- * name, a primary key's or unique constraint's columns, a check constraint's expression, a
- * foreign key's referencing columns and referenced table, and an index's name (an unnamed index
- * by its structure) — so a name or attribute change still compares both sides' comments, while
- * an identity change reads as absent from the baseline and reports an addition. Every differing
- * entry is emitted; the plan's terminal phase keeps one step per target, the first in target
- * order, mirroring its target key.
+ * Counterparts match by the model's identity — table, sequence, view, or extension identity, a
+ * column's name, a primary key's or unique constraint's columns, a check constraint's
+ * expression, a foreign key's referencing columns and referenced table, and an index's name (an
+ * unnamed index by its structure) — so a name or attribute change still compares both sides'
+ * comments, while an identity change reads as absent from the baseline and reports an addition.
+ * Every differing entry is emitted; the plan's terminal phase keeps one step per target, the
+ * first in target order, mirroring its target key.
  */
 function diffComments(baseline: Model, target: Model): readonly CommentChange[] {
   const changes: CommentChange[] = [];
@@ -543,6 +637,9 @@ function diffComments(baseline: Model, target: Model): readonly CommentChange[] 
     baseline.sequences.map((sequence) => [tableKey(sequence), sequence]),
   );
   const baselineViews = new Map(baseline.views.map((view) => [tableKey(view), view]));
+  const baselineExtensions = new Map(
+    baseline.extensions.map((extension) => [extension.name, extension]),
+  );
 
   const emit = (
     commentTarget: CommentTarget,
@@ -645,6 +742,14 @@ function diffComments(baseline: Model, target: Model): readonly CommentChange[] 
     );
   }
 
+  for (const extension of target.extensions) {
+    emit(
+      { kind: 'extension', extension },
+      baselineExtensions.get(extension.name)?.comment,
+      extension.comment,
+    );
+  }
+
   changes.sort((left, right) =>
     compareStrings(commentTargetKey(left.target), commentTargetKey(right.target)),
   );
@@ -685,6 +790,8 @@ function copyTarget(target: CommentTarget): CommentTarget {
         view: copyTargetIdentity(target.view),
         materialized: target.materialized,
       };
+    case 'extension':
+      return { kind: 'extension', extension: { name: target.extension.name } };
     case 'index': {
       const index: Mutable<Index> = copyIndex(target.index);
       delete index.comment;
@@ -729,9 +836,10 @@ function copyTargetIdentity(identity: TableIdentity): TableIdentity {
 }
 
 /**
- * The identity key of a comment target: the relation identity, the target kind, then the
- * member's name or identity. It mirrors `plan.ts`'s private key so the diff's order and the
- * plan's terminal phase agree, and it never reads a comment.
+ * The identity key of a comment target: the relation identity — a schema-qualified relation or
+ * the name-only extension, whose empty schema slot sorts it before every qualified relation —
+ * the target kind, then the member's name or identity. It mirrors `plan.ts`'s private key so
+ * the diff's order and the plan's terminal phase agree, and it never reads a comment.
  */
 function commentTargetKey(target: CommentTarget): string {
   switch (target.kind) {
@@ -743,6 +851,8 @@ function commentTargetKey(target: CommentTarget): string {
       return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
     case 'view':
       return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'extension':
+      return JSON.stringify(['', target.extension.name, 'extension', '']);
     case 'index':
       return JSON.stringify([
         target.table.schema,
@@ -932,6 +1042,11 @@ function copySequence(sequence: Sequence): Sequence {
 /** A copy of `view`, independent of the caller's model. */
 function copyView(view: View): View {
   return { ...view };
+}
+
+/** A copy of `extension`, independent of the caller's model. */
+function copyExtension(extension: Extension): Extension {
+  return { ...extension };
 }
 
 /**
@@ -1660,6 +1775,10 @@ function compareSequences(left: SequenceIdentity, right: SequenceIdentity): numb
 
 function compareViews(left: ViewIdentity, right: ViewIdentity): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareExtensions(left: ExtensionIdentity, right: ExtensionIdentity): number {
+  return compareStrings(left.name, right.name);
 }
 
 function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {

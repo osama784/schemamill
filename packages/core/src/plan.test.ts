@@ -15,6 +15,7 @@ import type { Identity, IdentityInput } from './identity.ts';
 import type {
   Change,
   ColumnFieldChange,
+  ExtensionFieldChange,
   IdentityChange,
   IdentityFieldChange,
   SequenceFieldChange,
@@ -25,6 +26,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -42,7 +44,7 @@ import type { ChangeApplication, CommentTarget, Step, TransactionGroup } from '.
 import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eleven global phases with the eighteen table phases at their
+ * Tests for the migration plan: the thirteen global phases with the eighteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -219,6 +221,21 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   extensions: [],
 });
 
+/** An extension named `name`: installed in `public` unless overridden. */
+const extension = (name: string, fields: Partial<Omit<Extension, 'name'>> = {}): Extension => ({
+  name,
+  schema: 'public',
+  ...fields,
+});
+
+/** A model of the given extensions, with no tables, sequences, or views. */
+const extensionModel = (extensions: readonly Extension[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions,
+});
+
 /**
  * Asserts that planning `baseline` to `target` yields exactly `expected`, in one transactional
  * group: every kind the tests that use this helper plan is transactional, and a plan of
@@ -284,10 +301,15 @@ interface SimulatedState {
   readonly tables: Map<string, SimulatedTable>;
   readonly sequences: Map<string, Mutable<Sequence>>;
   readonly views: Map<string, Mutable<View>>;
+  readonly extensions: Map<string, Mutable<Extension>>;
 }
 
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
 const keyOf = (identity: TableIdentity): string => JSON.stringify([identity.schema, identity.name]);
+
+/** The map key of an extension identity: its name alone, JSON-encoded. */
+const extensionKey = (identity: { readonly name: string }): string =>
+  JSON.stringify([identity.name]);
 
 /** Whether both identities name the same table. */
 const sameIdentity = (left: TableIdentity, right: TableIdentity): boolean =>
@@ -393,7 +415,9 @@ const stateOf = (model: Model): SimulatedState => {
   for (const source of model.sequences) sequences.set(keyOf(source), copySequenceState(source));
   const views = new Map<string, Mutable<View>>();
   for (const source of model.views) views.set(keyOf(source), { ...source });
-  return { tables, sequences, views };
+  const extensions = new Map<string, Mutable<Extension>>();
+  for (const source of model.extensions) extensions.set(extensionKey(source), { ...source });
+  return { tables, sequences, views, extensions };
 };
 
 /**
@@ -517,6 +541,12 @@ const commentTargetNode = (
       assert.ok(view !== undefined, `comment on missing view ${key}`);
       assert.equal(view.materialized, target.materialized, `comment on ${key} must carry its kind`);
       return view;
+    }
+    case 'extension': {
+      const key = extensionKey(target.extension);
+      const found = state.extensions.get(key);
+      assert.ok(found !== undefined, `comment on missing extension ${key}`);
+      return found;
     }
     case 'index': {
       const key = keyOf(target.table);
@@ -1010,6 +1040,33 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       state.views.delete(key);
       return;
     }
+    case 'create-extension': {
+      const key = extensionKey(step.extension);
+      assert.equal(state.extensions.has(key), false, `create-extension of live extension ${key}`);
+      state.extensions.set(key, { ...step.extension });
+      return;
+    }
+    case 'alter-extension': {
+      const key = extensionKey(step.extension);
+      const live = state.extensions.get(key);
+      assert.ok(live !== undefined, `alter-extension of missing extension ${key}`);
+      for (const field of step.fields) {
+        if (field.field !== 'schema') assertNever(field as never, 'extension field');
+        assert.equal(
+          live.schema,
+          field.before,
+          `alter-extension on ${key} must start from its live schema`,
+        );
+        live.schema = field.after;
+      }
+      return;
+    }
+    case 'drop-extension': {
+      const key = extensionKey(step.extension);
+      assert.ok(state.extensions.has(key), `drop-extension of missing extension ${key}`);
+      state.extensions.delete(key);
+      return;
+    }
     case 'comment': {
       const node = commentTargetNode(state, step.target);
       if (step.text === undefined) delete node.comment;
@@ -1108,6 +1165,18 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
   );
   for (const expected of target.views) {
     assert.deepStrictEqual(state.views.get(keyOf(expected)), expected, `view ${keyOf(expected)}`);
+  }
+  assert.deepStrictEqual(
+    [...state.extensions.keys()].sort(),
+    target.extensions.map(extensionKey).sort(),
+    'the plan must leave exactly the target extensions',
+  );
+  for (const expected of target.extensions) {
+    assert.deepStrictEqual(
+      state.extensions.get(extensionKey(expected)),
+      expected,
+      `extension ${extensionKey(expected)}`,
+    );
   }
 };
 
@@ -2080,10 +2149,13 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'create-view',
     'drop-view',
     'replace-view',
+    'create-extension',
+    'alter-extension',
+    'drop-extension',
     'comment',
   ];
 
-  assert.equal(kinds.length, 30);
+  assert.equal(kinds.length, 33);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -4405,16 +4477,16 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
   );
 
   assertPlan(baseline, target, [
-    // Phase 1: identity drops, in diff order.
+    // Phase 2: identity drops, in diff order.
     { kind: 'drop-identity', table: identity('a_keep'), name: 'id' },
     { kind: 'drop-identity', table: identity('c_ident'), name: 'id' },
     { kind: 'drop-identity', table: identity('f_serial'), name: 'id' },
-    // Phase 2: the conversion's replacement sequence, name-freed by the phase-1 drops.
+    // Phase 3: the conversion's replacement sequence, name-freed by the phase-2 drops.
     {
       kind: 'create-sequence',
       sequence: sequence('f_serial_id_seq', { dataType: 'integer' }),
     },
-    // Phase 5: the table phases.
+    // Phase 6: the table phases.
     {
       kind: 'create-table',
       table: {
@@ -4444,16 +4516,16 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
       name: 'id',
       fields: [{ field: 'default', after: fSerialDefault }],
     },
-    // Phase 7: the replacement sequence's ownership.
+    // Phase 8: the replacement sequence's ownership.
     {
       kind: 'alter-sequence',
       sequence: identity('f_serial_id_seq'),
       fields: [{ field: 'ownedBy', after: owner('f_serial', 'id') }],
     },
-    // Phase 9: sequence drops, after the table phases released them.
+    // Phase 10: sequence drops, after the table phases released them.
     { kind: 'drop-sequence', sequence: identity('b_serial_id_seq') },
     { kind: 'drop-sequence', sequence: identity('gone_seq') },
-    // Phase 10: identity additions, then alters.
+    // Phase 11: identity additions, then alters.
     {
       kind: 'add-identity',
       table: identity('a_keep'),
@@ -4729,7 +4801,7 @@ test('a new owned sequence is created before its table and attached after it', (
   const owned = sequence('fresh_id_seq', { ownedBy: owner('fresh', 'id') });
   const standalone = sequence('standalone');
 
-  // Phase 1 creates both sequences (identity order), phase 3 the table, phase 7 the ownership.
+  // Phase 3 creates both sequences (identity order), phase 6 the table, phase 8 the ownership.
   assertPlan(model(), sequenceModel([standalone, owned], fresh), [
     { kind: 'create-sequence', sequence: unowned(owned) },
     { kind: 'create-sequence', sequence: standalone },
@@ -5779,6 +5851,9 @@ const applicationArrays = [
   'identityAlters',
   'sequenceCreates',
   'optionAlters',
+  'extensionCreates',
+  'extensionAlters',
+  'extensionDrops',
   'viewDrops',
   'viewCreates',
   'viewReplaces',
@@ -5826,6 +5901,9 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     identityAlters: 0,
     sequenceCreates: 0,
     optionAlters: 0,
+    extensionCreates: 0,
+    extensionAlters: 0,
+    extensionDrops: 0,
     viewDrops: 0,
     viewCreates: 0,
     viewReplaces: 0,
@@ -5978,6 +6056,15 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
           if (change.after.comment !== undefined) count('comments');
         }
         break;
+      case 'extension-added':
+        count('extensionCreates');
+        break;
+      case 'extension-removed':
+        count('extensionDrops');
+        break;
+      case 'extension-changed':
+        if (change.changes.length > 0) count('extensionAlters');
+        break;
       case 'comment-changed':
         count('comments');
         break;
@@ -6015,6 +6102,9 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.identityAlters.push(...source.identityAlters);
   target.sequenceCreates.push(...source.sequenceCreates);
   target.optionAlters.push(...source.optionAlters);
+  target.extensionCreates.push(...source.extensionCreates);
+  target.extensionAlters.push(...source.extensionAlters);
+  target.extensionDrops.push(...source.extensionDrops);
   target.viewDrops.push(...source.viewDrops);
   target.viewCreates.push(...source.viewCreates);
   target.viewReplaces.push(...source.viewReplaces);
@@ -6073,7 +6163,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 30, 'every step kind must be classified');
+  assert.equal(kinds.length, 33, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -6734,13 +6824,13 @@ test('views are dropped before the table phases and created after them', () => {
   const newView = view('new');
 
   assertPlan(baseline, target, [
-    // Global phase 4: view drops, in view identity order.
+    // Global phase 5: view drops, in view identity order.
     { kind: 'drop-view', view: identity('mat'), materialized: true },
     { kind: 'drop-view', view: identity('old'), materialized: false },
-    // Global phase 5: the table phases.
+    // Global phase 6: the table phases.
     { kind: 'drop-table', table: identity('gone') },
     { kind: 'create-table', table: fresh },
-    // Global phase 6: view creates.
+    // Global phase 7: view creates.
     { kind: 'create-view', view: newView },
   ]);
   simulate(baseline, target);
@@ -6756,7 +6846,7 @@ test('a changed plain view is replaced after the table phases', () => {
 
   assertPlan(baseline, target, [
     { kind: 'add-column', table: identity('t'), column: column('extra') },
-    // Global phase 6: a plain-view change is a CREATE OR REPLACE, never a drop and create.
+    // Global phase 7: a plain-view change is a CREATE OR REPLACE, never a drop and create.
     { kind: 'replace-view', view: view('v', { definition: 'SELECT 2' }) },
   ]);
   simulate(baseline, target);
@@ -7547,4 +7637,166 @@ test('a comment step strips the target node so its text is the only source', () 
   assert.equal(Object.hasOwn(step.target.index, 'comment'), false);
   assert.equal(step.text, 'fresh');
   assert.deepStrictEqual(step.target.index, index(['id'], { name: 't_idx' }));
+});
+
+test('extension creates open the plan, in name order', () => {
+  const baseline = extensionModel([], table('gone'));
+  const target = extensionModel([extension('b'), extension('a')], table('fresh'));
+
+  assertPlan(baseline, target, [
+    // Global phase 1: extension creates, in name order, before every other step.
+    { kind: 'create-extension', extension: extension('a') },
+    { kind: 'create-extension', extension: extension('b') },
+    // Global phase 6: the table phases.
+    { kind: 'drop-table', table: identity('gone') },
+    { kind: 'create-table', table: table('fresh') },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension comments are phase 12 and the extension alter is phase 13', () => {
+  const baseline = extensionModel([extension('hstore', { schema: 'hs1', comment: 'old' })]);
+  const target = extensionModel([
+    extension('pgcrypto', { comment: 'crypto' }),
+    extension('hstore', { schema: 'hs2', comment: 'new' }),
+  ]);
+
+  assertPlan(baseline, target, [
+    // Global phase 1: the added extension, carrying its comment.
+    { kind: 'create-extension', extension: extension('pgcrypto', { comment: 'crypto' }) },
+    // Global phase 12: extension comments, in target identity order.
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      text: 'crypto',
+    },
+    // Global phase 13: the schema move, carrying its destination in the field.
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension alters come before extension drops, both last and in name order', () => {
+  const baseline = extensionModel([
+    extension('z_gone'),
+    extension('a_gone'),
+    extension('hstore', { schema: 'hs1' }),
+  ]);
+  const target = extensionModel([extension('hstore', { schema: 'hs2' })]);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'drop-extension', extension: { name: 'a_gone' } },
+    { kind: 'drop-extension', extension: { name: 'z_gone' } },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension steps are classified transactional', () => {
+  assert.equal(TRANSACTIONAL['create-extension'], true);
+  assert.equal(TRANSACTIONAL['alter-extension'], true);
+  assert.equal(TRANSACTIONAL['drop-extension'], true);
+});
+
+test('extension changes apply to their buckets with copied payloads', () => {
+  const application = emptyChangeApplication();
+  const created = deepFreeze(extension('pgcrypto', { comment: 'crypto' }));
+  const schemaField: ExtensionFieldChange = {
+    field: 'schema',
+    before: 'hs1',
+    after: 'hs2',
+  };
+
+  applyChange(application, { kind: 'extension-added', extension: created });
+  applyChange(application, {
+    kind: 'extension-removed',
+    extension: extension('gone'),
+  });
+  applyChange(application, {
+    kind: 'extension-changed',
+    extension: { name: 'hstore' },
+    changes: [schemaField],
+  });
+
+  assert.deepStrictEqual(application.extensionCreates, [
+    { kind: 'create-extension', extension: created },
+  ]);
+  assert.deepStrictEqual(application.extensionDrops, [
+    { kind: 'drop-extension', extension: { name: 'gone' } },
+  ]);
+  assert.deepStrictEqual(application.extensionAlters, [
+    { kind: 'alter-extension', extension: { name: 'hstore' }, fields: [schemaField] },
+  ]);
+
+  const create = application.extensionCreates[0]!;
+  assert.ok(create.kind === 'create-extension');
+  assert.notStrictEqual(create.extension, created);
+  const alter = application.extensionAlters[0]!;
+  assert.ok(alter.kind === 'alter-extension');
+  assert.notStrictEqual(alter.fields[0], schemaField);
+});
+
+test('a comment change on an extension becomes an extension comment step', () => {
+  const application = emptyChangeApplication();
+
+  applyChange(application, {
+    kind: 'comment-changed',
+    target: { kind: 'extension', extension: { name: 'hstore' } },
+    after: 'note',
+  });
+
+  assert.deepStrictEqual(application.comments, [
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'note',
+    },
+  ]);
+});
+
+test('an unknown extension field is rejected by the exhaustiveness guard', () => {
+  const application = emptyChangeApplication();
+
+  assert.throws(
+    () =>
+      applyChange(application, {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'frobnicate' }] as unknown as readonly ExtensionFieldChange[],
+      }),
+    /Unhandled extension field: frobnicate/,
+  );
+});
+
+test('a schema change flows from the diff to the plan destination field', () => {
+  const baseline = extensionModel([extension('hstore', { schema: 'hs1' })]);
+  const target = extensionModel([extension('hstore', { schema: 'hs2' })]);
+
+  assert.deepStrictEqual(diff(baseline, target), [
+    {
+      kind: 'extension-changed',
+      extension: { name: 'hstore' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
 });

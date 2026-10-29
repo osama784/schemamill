@@ -8,6 +8,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -167,6 +168,21 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   sequences: [],
   views,
   extensions: [],
+});
+
+/** An extension named `name`: installed in `public` unless overridden. */
+const extension = (name: string, fields: Partial<Omit<Extension, 'name'>> = {}): Extension => ({
+  name,
+  schema: 'public',
+  ...fields,
+});
+
+/** A model of the given extensions, with no tables, sequences, or views. */
+const extensionModel = (extensions: readonly Extension[]): Model => ({
+  tables: [],
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -4640,5 +4656,139 @@ test('comment changes sort by each target identity, not by model insertion order
     viewModel(views('old'), constraints('old'), parent),
     viewModel(views('new'), constraints('new'), parent),
     expected('new', 'old'),
+  );
+});
+
+test('extensions report additions, removals, and value-carrying schema changes by name', () => {
+  const removed = extension('a_gone', { schema: 'old' });
+  const movedBefore = extension('moved', { schema: 'hs1' });
+  const movedAfter = extension('moved', { schema: 'hs2' });
+  const added = extension('z_new');
+
+  // The target's added and changed identities and the baseline's removed identity merge-walk
+  // by name, so each category keeps its own name order while the walk interleaves them.
+  assertDiff(extensionModel([movedBefore, removed]), extensionModel([movedAfter, added]), [
+    { kind: 'extension-removed', extension: removed },
+    {
+      kind: 'extension-changed',
+      extension: { name: 'moved' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'extension-added', extension: added },
+  ]);
+});
+
+test('a schema-only extension change carries no comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { schema: 'hs1' })]),
+    extensionModel([extension('hstore', { schema: 'hs2' })]),
+    [
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+    ],
+  );
+});
+
+test('an extension comment change, addition, and removal are separate comment changes', () => {
+  assertDiff(
+    extensionModel([
+      extension('a', { comment: 'one' }),
+      extension('b', { comment: 'two' }),
+      extension('c'),
+    ]),
+    extensionModel([
+      extension('a', { comment: 'uno' }),
+      extension('b'),
+      extension('c', { comment: 'three' }),
+    ]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'a' } },
+        before: 'one',
+        after: 'uno',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'b' } },
+        before: 'two',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'c' } },
+        after: 'three',
+      },
+    ],
+  );
+});
+
+test('a comment-only extension change emits only its comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { comment: 'old' })]),
+    extensionModel([extension('hstore', { comment: 'new' })]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
+  );
+});
+
+test('an added extension reports its comment as an addition', () => {
+  const added = extension('pgcrypto', { comment: 'crypto' });
+
+  assertDiff(extensionModel([]), extensionModel([added]), [
+    { kind: 'extension-added', extension: added },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      after: 'crypto',
+    },
+  ]);
+});
+
+test('a removed extension emits no comment change', () => {
+  const removed = extension('citext', { comment: 'old' });
+
+  assertDiff(extensionModel([removed]), extensionModel([]), [
+    { kind: 'extension-removed', extension: removed },
+  ]);
+});
+
+test('extension changes follow view changes and precede comment changes', () => {
+  assertDiff(
+    {
+      tables: [],
+      sequences: [],
+      views: [view('gone')],
+      extensions: [extension('hstore', { schema: 'hs1', comment: 'old' })],
+    },
+    {
+      tables: [],
+      sequences: [],
+      views: [view('new')],
+      extensions: [extension('hstore', { schema: 'hs2', comment: 'new' })],
+    },
+    [
+      { kind: 'view-removed', view: view('gone') },
+      { kind: 'view-added', view: view('new') },
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
   );
 });

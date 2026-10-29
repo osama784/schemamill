@@ -428,6 +428,9 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'create-sequence':
     case 'drop-sequence':
     case 'alter-sequence':
+    case 'create-extension':
+    case 'alter-extension':
+    case 'drop-extension':
     case 'create-view':
     case 'drop-view':
     case 'replace-view':
@@ -473,6 +476,18 @@ export const sqlRenderer: SqlRenderer<Plan> = { render: renderSql };
 export function quoteIdentifier(identifier: string): string {
   if (BARE_IDENTIFIER.test(identifier) && !RESERVED_KEYWORDS.has(identifier)) return identifier;
   return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+/**
+ * The loud placeholder for an extension statement, until workstream 4 renders the real SQL:
+ * `CREATE EXTENSION … WITH SCHEMA`, `ALTER EXTENSION … SET SCHEMA`, `DROP EXTENSION`, and
+ * `COMMENT ON EXTENSION`. It throws rather than guess, so an extension plan can never render
+ * misleading SQL in the intermediate state.
+ */
+function pendingExtensionRender(what: string): never {
+  throw new Error(
+    `render: ${what} is not implemented yet; workstream 4 (feat(postgres): render extension statements) replaces this placeholder`,
+  );
 }
 
 /** One plan step as one or more statements, without a trailing newline. */
@@ -558,6 +573,10 @@ function renderStep(step: Step): string {
       return `DROP SEQUENCE ${renderSequence(step.sequence)};`;
     case 'alter-sequence':
       return renderAlterSequence(step.sequence, step.fields);
+    case 'create-extension':
+    case 'alter-extension':
+    case 'drop-extension':
+      return pendingExtensionRender(step.kind);
     case 'create-view':
       return renderView(step.view, false);
     case 'replace-view':
@@ -596,6 +615,8 @@ function renderCommentTarget(target: CommentTarget): string {
       return `SEQUENCE ${renderSequence(target.sequence)}`;
     case 'view':
       return `${target.materialized ? 'MATERIALIZED VIEW' : 'VIEW'} ${renderTable(target.view)}`;
+    case 'extension':
+      return pendingExtensionRender('COMMENT ON EXTENSION');
     case 'index': {
       const name = target.index.name ?? synthesizedIndexName(target.table, target.index);
       return `INDEX ${quoteIdentifier(target.table.schema)}.${quoteIdentifier(name)}`;

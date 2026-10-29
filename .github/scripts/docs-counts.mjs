@@ -139,12 +139,12 @@ export function extractLineClaims(line) {
 }
 
 /**
- * Parses the numbered table-phase list inside plan phase 5. The list starts after the
- * "table phases inside phase 5" heading and ends at the next star-only comment line.
+ * Parses the numbered table-phase list inside plan phase 6. The list starts after the
+ * "table phases inside phase 6" heading and ends at the next star-only comment line.
  */
 export function parseTablePhases(source) {
   const lines = source.split('\n');
-  const heading = lines.findIndex((line) => line.includes('table phases inside phase 5'));
+  const heading = lines.findIndex((line) => line.includes('table phases inside phase 6'));
   if (heading === -1) throw new Error('table phase heading not found in plan.ts');
 
   const numbers = [];

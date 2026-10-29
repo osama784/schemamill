@@ -2,6 +2,7 @@ import { diff } from './diff.ts';
 import type {
   Change,
   ColumnFieldChange,
+  ExtensionFieldChange,
   IdentityFieldChange,
   SequenceFieldChange,
 } from './diff.ts';
@@ -10,6 +11,8 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  Extension,
+  ExtensionIdentity,
   ForeignKey,
   Index,
   Model,
@@ -37,7 +40,7 @@ import type {
  * partitions its steps into transaction groups, telling a renderer what applies as one unit;
  * hazards are a separate analysis.
  *
- * A step is one of thirty kinds. A table addition becomes a create-table step carrying
+ * A step is one of thirty-three kinds. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -92,6 +95,13 @@ import type {
  * drop-view and a create-view; a materialized view cannot be replaced, and the recreate states
  * `WITH NO DATA`. View steps carry no column or table payloads.
  *
+ * An extension addition becomes a create-extension step carrying the extension as stored,
+ * comment included; its comment still travels through the terminal comment phase as the single
+ * rendered source. A removal becomes a drop-extension step carrying the baseline identity. A
+ * changed extension maps field by field — today its install schema alone — into an
+ * alter-extension step carrying the identity and only the differing value-carrying fields, so
+ * the destination is `field.after` and the plan needs no baseline lookup.
+ *
  * A comment addition, change, or removal becomes a comment step carrying a `CommentTarget` and
  * the target's text, absent text meaning `COMMENT … IS NULL`. The target's copied nodes never
  * carry their own `comment`: the step's `text` is the single source of the rendered value. A
@@ -99,56 +109,64 @@ import type {
  * comment step right after its create when the target node states a comment, because the drop
  * took the old one away; the plan then keeps one step per target, first occurrence wins.
  *
- * The final sequence is the concatenation of eleven global phases, in this exact order:
+ * The final sequence is the concatenation of thirteen global phases, in this exact order:
  *
- * 1. drop-identity — every removed identity whose column survives, in the diff's column and
- *    table order. It runs before everything else: it must precede the `DROP NOT NULL` /
+ * 1. create-extension — every added extension, in name order, before everything else: any
+ *    object may use an extension's type or function, so the extension must exist first;
+ * 2. drop-identity — every removed identity whose column survives, in the diff's column and
+ *    table order. It runs before every table step: it must precede the `DROP NOT NULL` /
  *    `SET DEFAULT` the table phases put on the same column, and it frees the default sequence
- *    name for the replacement sequence the identity→serial conversion creates in phase 2 (or
- *    for the replacement identity's sequence added in phase 10);
- * 2. create-sequence — one per added sequence, in sequence identity order;
- * 3. ownership detaches — an ownership alter-sequence step for every kept sequence whose
+ *    name for the replacement sequence the identity→serial conversion creates in phase 3 (or
+ *    for the replacement identity's sequence added in phase 11);
+ * 3. create-sequence — one per added sequence, in sequence identity order;
+ * 4. ownership detaches — an ownership alter-sequence step for every kept sequence whose
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 4. drop-view — every removed view and the drop half of every rewritten one, in view identity
+ * 5. drop-view — every removed view and the drop half of every rewritten one, in view identity
  *    order. View drops precede the table phases so a removed view cannot block a table or
  *    column drop; a dependency between views is not modeled, so a dependent view may still
- *    fail the drop at apply;
- * 5. table operations — the eighteen table phases listed below, in their exact order;
- * 6. create-view, then replace-view — every added view and the create half of every rewritten
+ *    fail the drop at apply. Extension removal carries the same class: `DROP EXTENSION`
+ *    defaults to RESTRICT, so a kept object that depends on a removed extension fails at apply
+ *    (phase 13);
+ * 6. table operations — the eighteen table phases listed below, in their exact order;
+ * 7. create-view, then replace-view — every added view and the create half of every rewritten
  *    one, then the changed plain views, each bucket in view identity order. Views come after
  *    every table phase so a view can reference a newly created table or column; a kept view
  *    whose definition references a dropped object still fails at apply;
- * 7. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
+ * 8. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
- *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
+ *    removed in phase 4: a new owner after a phase-4 detach, a new owner over a surviving
  *    baseline one, or a detach when the target drops ownership but keeps the owner;
- * 8. sequence option alters — one alter-sequence step per changed sequence, carrying its
+ * 9. sequence option alters — one alter-sequence step per changed sequence, carrying its
  *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
  *    statement without passing through an invalid intermediate state;
- * 9. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
+ * 10. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
  *    identity order. Drops come after the table phases, so a column `DROP DEFAULT` has already
  *    released the sequence by the time its drop runs; a surviving default that still
  *    references a dropped sequence is a broken target and fails at apply;
- * 10. add-identity, then alter-identity — the identity additions and option alters, in the
+ * 11. add-identity, then alter-identity — the identity additions and option alters, in the
  *    diff's column and table order, adds before alters. They run last because `ADD GENERATED`
  *    manufactures a fresh sequence: by then the table phases have produced the column, its
- *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 9 have freed the sequence names
+ *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 2 and 10 have freed the sequence names
  *    the added identities replace. This placement alone makes both conversions compositions of
- *    ordinary steps: serial→identity is a phase-5 `DROP DEFAULT`, a phase-9 sequence drop, and
- *    a phase-10 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
- *    create-sequence, and a phase-5 `SET DEFAULT`;
- * 11. comment — every comment addition, change, and removal, in target identity order, last
- *    because every commented object exists by then (tables, columns, constraints, and indexes
- *    from phase 5, views from phase 6, sequences from phases 2 and 8, identities from phase
- *    10) and comments never affect structure.
+ *    ordinary steps: serial→identity is a phase-6 `DROP DEFAULT`, a phase-10 sequence drop, and
+ *    a phase-11 add-identity; identity→serial is a phase-2 drop-identity, a phase-3
+ *    create-sequence, and a phase-6 `SET DEFAULT`;
+ * 12. comment — every comment addition, change, and removal, in target identity order, before
+ *    the extension teardown. Every commented object exists by then (tables, columns,
+ *    constraints, and indexes from phase 6, views from phase 7, sequences from phases 3 and 9,
+ *    identities from phase 11, extensions from phase 1) and comments never affect structure. A
+ *    removed extension emits no comment step: the drop takes its comment with it;
+ * 13. alter-extension, then drop-extension — the schema moves in name order, then the removals
+ *    in name order, last (after every dependent object and comment; a dropped extension takes
+ *    its comment with it).
  *
  * A `drop-identity` needs no drop-suppression: an identity reaches the plan as its own removal
  * only when its column survives — a removed column or table carries its identity away in that
  * drop — so every collected drop-identity names an owner that still exists.
  *
- * The table phases inside phase 5 are numbered as before (and keep their documented semantics):
+ * The table phases inside phase 6 are numbered as before (and keep their documented semantics):
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -271,6 +289,7 @@ export type CommentTarget =
   | { readonly kind: 'column'; readonly table: TableIdentity; readonly column: string }
   | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
   | { readonly kind: 'view'; readonly view: ViewIdentity; readonly materialized: boolean }
+  | { readonly kind: 'extension'; readonly extension: ExtensionIdentity }
   | { readonly kind: 'index'; readonly table: TableIdentity; readonly index: Index }
   | { readonly kind: 'primary-key'; readonly table: TableIdentity; readonly primaryKey: PrimaryKey }
   | {
@@ -374,6 +393,20 @@ export type Step =
       sequence: SequenceIdentity;
       fields: readonly SequenceFieldChange[];
     }
+  /** The target has an extension the baseline does not; the full entity, comment included. */
+  | { kind: 'create-extension'; extension: Extension }
+  /**
+   * An extension both sides have with differing fields, in the diff's fixed field order. The
+   * fields are value-carrying, so the destination is `field.after` and no baseline lookup is
+   * needed.
+   */
+  | {
+      kind: 'alter-extension';
+      extension: ExtensionIdentity;
+      fields: readonly ExtensionFieldChange[];
+    }
+  /** The baseline has an extension the target does not. */
+  | { kind: 'drop-extension'; extension: ExtensionIdentity }
   /** The target has a view the baseline does not; `materialized` decides the rendered keyword. */
   | { kind: 'create-view'; view: View }
   /**
@@ -441,6 +474,9 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-view': true,
   'drop-view': true,
   'replace-view': true,
+  'create-extension': true,
+  'alter-extension': true,
+  'drop-extension': true,
   comment: true,
 };
 
@@ -546,6 +582,7 @@ export function plan(baseline: Model, target: Model): Plan {
   }
 
   const steps: Step[] = [
+    ...application.extensionCreates,
     ...application.identityDrops,
     ...application.sequenceCreates,
     ...ownershipDetaches,
@@ -579,6 +616,8 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.identityAdds,
     ...application.identityAlters,
     ...commentPhase(application.comments),
+    ...application.extensionAlters,
+    ...application.extensionDrops,
   ];
 
   return { steps, groups: groupSteps(steps) };
@@ -621,6 +660,12 @@ export interface ChangeApplication {
   readonly identityAlters: Step[];
   readonly sequenceCreates: Step[];
   readonly optionAlters: Step[];
+  /** Added extensions, first in the plan. */
+  readonly extensionCreates: Step[];
+  /** Changed extensions, after every comment and before the removals. */
+  readonly extensionAlters: Step[];
+  /** Removed extensions, last in the plan. */
+  readonly extensionDrops: Step[];
   /** Removed views and the drop half of rewritten ones, before the table phases. */
   readonly viewDrops: Step[];
   /** Added views and the create half of rewritten ones, after the table phases. */
@@ -672,6 +717,9 @@ export function emptyChangeApplication(): ChangeApplication {
     identityAlters: [],
     sequenceCreates: [],
     optionAlters: [],
+    extensionCreates: [],
+    extensionAlters: [],
+    extensionDrops: [],
     viewDrops: [],
     viewCreates: [],
     viewReplaces: [],
@@ -1148,6 +1196,41 @@ export function applyChange(application: ChangeApplication, change: Change): voi
       }
       break;
     }
+    case 'extension-added': {
+      application.extensionCreates.push({
+        kind: 'create-extension',
+        extension: copyStepPayload(change.extension),
+      });
+      break;
+    }
+    case 'extension-removed': {
+      application.extensionDrops.push({
+        kind: 'drop-extension',
+        extension: copyExtensionIdentity(change.extension),
+      });
+      break;
+    }
+    case 'extension-changed': {
+      const fields: ExtensionFieldChange[] = [];
+      for (const field of change.changes) {
+        if (field.field === 'schema') {
+          fields.push(copyStepPayload(field));
+        } else {
+          // A one-member union's object type does not reduce to `never` in the else branch;
+          // the cast keeps the runtime detector real without narrowing the guard's contract
+          // for the multi-member unions elsewhere.
+          assertNever(field as never, 'extension field');
+        }
+      }
+      if (fields.length > 0) {
+        application.extensionAlters.push({
+          kind: 'alter-extension',
+          extension: copyExtensionIdentity(change.extension),
+          fields,
+        });
+      }
+      break;
+    }
     case 'comment-changed': {
       application.comments.push(commentStep(change.target, change.after));
       break;
@@ -1165,6 +1248,11 @@ function copyView(view: View): View {
 /** A copy of a view identity, independent of the diff's change. */
 function copyViewIdentity(identity: ViewIdentity): ViewIdentity {
   return { schema: identity.schema, name: identity.name };
+}
+
+/** A copy of an extension identity, independent of the diff's change. */
+function copyExtensionIdentity(identity: ExtensionIdentity): ExtensionIdentity {
+  return { name: identity.name };
 }
 
 /** A changed sequence's ownership, held until the plan knows which owners it removes. */
@@ -1390,6 +1478,8 @@ function copyCommentTarget(target: CommentTarget): CommentTarget {
         view: copyViewIdentity(target.view),
         materialized: target.materialized,
       };
+    case 'extension':
+      return { kind: 'extension', extension: copyExtensionIdentity(target.extension) };
     case 'index': {
       const index: Mutable<Index> = copyIndex(target.index);
       delete index.comment;
@@ -1421,9 +1511,10 @@ function copyCommentTarget(target: CommentTarget): CommentTarget {
 }
 
 /**
- * The identity key of a comment target: the schema-qualified relation identity, the target
- * kind, then the member's name or identity — a column's name, a constraint's columns or
- * expression, a foreign key's referencing columns and referenced table, or an index's name
+ * The identity key of a comment target: the relation identity — a schema-qualified relation or
+ * the name-only extension, whose empty schema slot sorts it before every qualified relation —
+ * the target kind, then the member's name or identity — a column's name, a constraint's columns
+ * or expression, a foreign key's referencing columns and referenced table, or an index's name
  * (an unnamed index by its structure). It deliberately ignores `comment` and every other text
  * value, so the diff's change and a recreate re-assertion for the same target agree on one key.
  * Targets that share the model's identity share a key, and the terminal phase keeps the first
@@ -1441,6 +1532,8 @@ function commentTargetKey(target: CommentTarget): string {
       return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
     case 'view':
       return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'extension':
+      return JSON.stringify(['', target.extension.name, 'extension', '']);
     case 'index':
       return JSON.stringify([
         target.table.schema,
