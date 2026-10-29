@@ -4,6 +4,9 @@ import type {
   Column,
   ColumnFieldChange,
   CommentTarget,
+  Extension,
+  ExtensionFieldChange,
+  ExtensionIdentity,
   ForeignKey,
   Hazard,
   HazardEntity,
@@ -46,9 +49,11 @@ import type {
  * in that order — as raw model values (`true`/`false`, with `(none)` for an absent side),
  * comma-joined after `: ` on the same line and omitted when none differ, so no sub-lines are
  * added; sequences render the same way after the table changes, as
- * `sequence <schema>.<name>` with one option per line, and views follow the sequences as
+ * `sequence <schema>.<name>` with one option per line, views follow the sequences as
  * `view <schema>.<name>`, a changed view listing its differing `materialized`, `definition`,
- * and `checkOption` fields, and a comment change closes the diff as
+ * and `checkOption` fields, extensions follow the views as `extension <name>` (a name is never
+ * schema-qualified, and a changed extension lists its `schema` change after `: `), and a
+ * comment change closes the diff as
  * `comment on <target>: <text> → <text>` — signed `+` when the target gains a comment and `-`
  * when it loses one, both sides `JSON.stringify`-quoted with `(none)` for an absent side. A plan
  * renders as a numbered header
@@ -226,6 +231,12 @@ function formatChange(change: Change): string {
       return formatView('-', change.view);
     case 'view-changed':
       return formatViewChange(change.view, change.changes);
+    case 'extension-added':
+      return formatExtension('+', change.extension);
+    case 'extension-removed':
+      return formatExtension('-', change.extension);
+    case 'extension-changed':
+      return formatExtensionChange(change.extension, change.changes);
     case 'comment-changed':
       return formatCommentChange(change.target, change.before, change.after);
   }
@@ -418,6 +429,11 @@ function formatStep(step: Step): string {
       return formatIdentity(step.sequence);
     case 'alter-sequence':
       return `${formatIdentity(step.sequence)}: ${step.fields.map(formatSequenceField).join(', ')}`;
+    case 'create-extension':
+    case 'drop-extension':
+      return step.extension.name;
+    case 'alter-extension':
+      return `${step.extension.name}: ${step.fields.map(formatExtensionField).join(', ')}`;
     case 'create-view':
     case 'replace-view':
     case 'drop-view':
@@ -564,6 +580,27 @@ function formatViewField(field: ViewFieldChange): string {
   }
 }
 
+/** An extension's line: `extension <name>`; a name is never schema-qualified. */
+function formatExtension(sign: string, extension: Extension): string {
+  return `${sign} extension ${extension.name}`;
+}
+
+/** A changed extension: the identity, then each differing field after `: `. */
+function formatExtensionChange(
+  extension: ExtensionIdentity,
+  changes: readonly ExtensionFieldChange[],
+): string {
+  return `~ extension ${extension.name}: ${changes.map(formatExtensionField).join(', ')}`;
+}
+
+/** One changed extension field; `schema` is the union's only member today. */
+function formatExtensionField(field: ExtensionFieldChange): string {
+  switch (field.field) {
+    case 'schema':
+      return `schema ${field.before} → ${field.after}`;
+  }
+}
+
 /**
  * A comment change: `+` when the target gains a comment, `-` when it loses one, `~` when the
  * text changes. Each side is `JSON.stringify`-quoted so whitespace and escapes stay visible,
@@ -595,6 +632,8 @@ function formatCommentTarget(target: CommentTarget): string {
       return `sequence ${formatIdentity(target.sequence)}`;
     case 'view':
       return `${target.materialized ? 'materialized view' : 'view'} ${formatIdentity(target.view)}`;
+    case 'extension':
+      return `extension ${target.extension.name}`;
     case 'index':
       return `index ${formatIdentity(target.table)} (${target.index.columns.join(', ')})`;
     case 'primary-key':

@@ -2,17 +2,17 @@
 
 **Status:** built · **Last updated:** 2026-10-29
 
-Every comment on a modeled entity now survives dump import → model → diff → plan → render → apply → dump import: tables, columns, sequences, plain and materialized views, primary keys, unique/check/foreign-key constraints, and standalone indexes. The slice shipped in [#87](https://github.com/osama784/schemamill/issues/87) as Slice C of the [import long-tail plan](./import-long-tail.md), after views, so comments were modeled once, on the families that existed when they landed. Its durable decisions are recorded in [ADR 0021](../adr/0021-comments-travel-the-model.md).
+Every comment on a modeled entity now survives dump import → model → diff → plan → render → apply → dump import: tables, columns, sequences, plain and materialized views, primary keys, unique/check/foreign-key constraints, standalone indexes, and — since [#91](https://github.com/osama784/schemamill/issues/91) — extensions. The slice shipped in [#87](https://github.com/osama784/schemamill/issues/87) as Slice C of the [import long-tail plan](./import-long-tail.md), after views, so comments were modeled once, on the families that existed when they landed; the extension target followed in the [extensions slice](./extensions.md). Its durable decisions are recorded in [ADR 0021](../adr/0021-comments-travel-the-model.md).
 
 ## Goal
 
-A dump's comments — the seven `COMMENT ON` object forms the model can name — import onto their entities, compare as their own change, plan in a terminal phase, render with PostgreSQL-correct literal quoting, and re-import unchanged; a recreated constraint, index, or materialized view re-asserts its comment instead of losing it to the drop.
+A dump's comments — the seven `COMMENT ON` object forms this slice modeled, plus the extension form added in [#91](https://github.com/osama784/schemamill/issues/91) — import onto their entities, compare as their own change, plan in a terminal phase, render with PostgreSQL-correct literal quoting, and re-import unchanged; a recreated constraint, index, or materialized view re-asserts its comment instead of losing it to the drop.
 
 ## Scope
 
-**In:** `comment?: string` on the nine entity interfaces; import of `COMMENT ON TABLE`, `COLUMN`, `SEQUENCE`, `VIEW`, `MATERIALIZED VIEW`, `INDEX`, and `CONSTRAINT`; `comment-changed`; the `CommentTarget` union and one transactional `comment` step; the terminal global phase 11; canonical rendering with plain and `E'…'` literals and NUL refusal; CLI display and the `comments` golden scene; the workspace `comment` key; and the `comment-round-trip` live scene with server-derived cross-import checks.
+**In:** `comment?: string` on the nine entity interfaces this slice carried (the extension entity gained one in [#91](https://github.com/osama784/schemamill/issues/91)); import of `COMMENT ON TABLE`, `COLUMN`, `SEQUENCE`, `VIEW`, `MATERIALIZED VIEW`, `INDEX`, and `CONSTRAINT` (plus `EXTENSION` since [#91](https://github.com/osama784/schemamill/issues/91)); `comment-changed`; the `CommentTarget` union and one transactional `comment` step; the terminal global phase 12; canonical rendering with plain and `E'…'` literals and NUL refusal; CLI display and the `comments` golden scene; the workspace `comment` key; and the `comment-round-trip` live scene with server-derived cross-import checks.
 
-**Out, named — never silent:** comments on extensions ([#91](https://github.com/osama784/schemamill/issues/91)); comments on unmodeled families (schemas, functions, procedures, triggers, rules, policies, types, foreign tables, tablespaces, roles, databases) — skipped and named as before; comments on PostgreSQL 18 named not-null constraints (deferred below); catalog introspection of comments (deferred below); grants, ownership, and security labels ([#92](https://github.com/osama784/schemamill/issues/92)); view output columns, including their comments ([#143](https://github.com/osama784/schemamill/issues/143)); and `COMMENT ON` deparse ([#57](https://github.com/osama784/schemamill/issues/57)).
+**Out, named — never silent:** comments on extensions, listed here when this slice landed, have since shipped in the [extensions slice](./extensions.md) ([#91](https://github.com/osama784/schemamill/issues/91)); comments on unmodeled families (schemas, functions, procedures, triggers, rules, policies, types, foreign tables, tablespaces, roles, databases) — skipped and named as before; comments on PostgreSQL 18 named not-null constraints (deferred below); catalog introspection of comments (deferred below); grants, ownership, and security labels ([#92](https://github.com/osama784/schemamill/issues/92)); view output columns, including their comments ([#143](https://github.com/osama784/schemamill/issues/143)); and `COMMENT ON` deparse ([#57](https://github.com/osama784/schemamill/issues/57)).
 
 **Deliberately shallow for now:** a comment is text the model stores and compares verbatim; it is never parsed, normalized, or used as identity, and the engine does not attempt to merge conflicting comments on the same server object.
 
@@ -21,8 +21,8 @@ A dump's comments — the seven `COMMENT ON` object forms the model can name —
 - **Model field, absent or non-empty.** Each entity carries `comment?: string`, stored verbatim — exact characters, unicode and newlines allowed. Absent means no comment. The empty string is not a model value: PostgreSQL reduces `COMMENT … IS ''` to the same removal case as `IS NULL`, and `pg_dump` never emits `IS NULL`, so the equivalence is semantic, not a fidelity loss. The workspace parser rejects `""` and text carrying NUL; the renderer refuses NUL again.
 - **Descriptive, not structural.** `comment` is excluded from every structural equality function and from every field-change union, and never enters `ColumnAttributes`. A comment-only change must not decompose a constraint or index into a destructive drop and add.
 - **One target union, one step.** `CommentTarget` has one variant per `COMMENT ON` object form; `view` carries `materialized`, and the index and constraint variants carry the node so the renderer can synthesize an unnamed node's conventional server name. One `comment` step carries `text`, absent meaning `IS NULL`, and every copied target strips the node's own `comment` so `text` is the only rendered value.
-- **One change, appended last.** `diff` returns the table, sequence, and view groups, then `diffComments` in target identity order. A comment the baseline lacks is an addition; a removed entity emits nothing; an entity whose structural identity changed reads as absent and reports an addition. The plan posts one `comment` step per change.
-- **Terminal phase 11.** Every comment step — the diff's changes and the recreate re-assertions alike — lands in `application.comments`, and the plan appends the bucket after every structural and identity phase. Every target exists by then: tables, columns, constraints, and indexes from the table phases, views from phase 6, sequences from phases 2 and 8, identities from phase 10. Comments never affect structure and are order-insensitive among themselves.
+- **One change, appended last.** `diff` returns the table, sequence, view, and extension groups, then `diffComments` in target identity order. A comment the baseline lacks is an addition; a removed entity emits nothing; an entity whose structural identity changed reads as absent and reports an addition. The plan posts one `comment` step per change.
+- **Terminal phase 12.** Every comment step — the diff's changes and the recreate re-assertions alike — lands in `application.comments`, and the plan appends the bucket after every structural and identity phase and before the extension teardown (phase 13). Every target exists by then: tables, columns, constraints, and indexes from the table phases, views from phase 7, sequences from phases 3 and 9, identities from phase 11, extensions from phase 1. Comments never affect structure and are order-insensitive among themselves.
 - **Recreate re-assertion.** A drop takes the comment with the object, so seven recreate sites push a comment step when the target node states one: index, primary key, foreign key, unique constraint, check constraint, materialized or kind-change view, and the synthesized dependent foreign key whose referenced primary key changes. Both a recreate step and a diff change may name one target; the terminal phase keeps one step per target, and both carry the target's text. A removal is never suppressed.
 - **Known ambiguity, recorded.** Two structurally identical unnamed nodes with different comments share one `CommentTarget` key, so the terminal phase keeps one step. The model already cannot distinguish the two server objects on apply, and the workspace does not forbid the shape; the behavior is documented rather than hidden.
 - **Literal quoting.** A line-safe comment renders as `'…'` with embedded quotes doubled; a backslash or any C0/DEL control switches to `E'…'`, escaping `\`, `'`, newline, carriage return, tab, and other controls as `\xHH`. The one-statement-per-line contract survives a multi-line comment, unicode passes through unchanged, and NUL throws `RenderRefusalError`.
@@ -33,7 +33,7 @@ A dump's comments — the seven `COMMENT ON` object forms the model can name —
 
 ## Import envelope
 
-`translateStatement` routes the seven modeled `CommentStmt` object kinds to `translateCommentStatement` before the generic skip fallback. The object lists and arity defaults:
+`translateStatement` routes the eight modeled `CommentStmt` object kinds to `translateCommentStatement` before the generic skip fallback. The object lists and arity defaults:
 
 | `objtype` | Object list | Target | Arity default |
 | --- | --- | --- | --- |
@@ -44,6 +44,7 @@ A dump's comments — the seven `COMMENT ON` object forms the model can name —
 | `OBJECT_MATVIEW` | `[schema, name]` | materialized view | 1 → `public` |
 | `OBJECT_INDEX` | `[schema, index]` | the one table's index of that stored or synthesized name | 1 → `public` |
 | `OBJECT_TABCONSTRAINT` | `[schema, table, constraint]` | primary key, unique, check, or foreign key | 2 → `public` |
+| `OBJECT_EXTENSION` | `<name>` (a `String` node, never a name list) | extension | bare name; never schema-qualified, resolved only against an imported extension ([#91](https://github.com/osama784/schemamill/issues/91)) |
 
 Constraint resolution searches the table draft's primary key, unique constraints, check constraints, and foreign keys by stored or synthesized name, then the columns' named not-null facts (the deferral flag), then the generic flag — the fixed order recorded in ADR 0021. A view or materialized-view output-column comment resolves in no table draft, so it takes the generic `dropped comment` flag; view output columns are [still unmodeled](./views.md) ([#143](https://github.com/osama784/schemamill/issues/143)).
 
@@ -65,7 +66,7 @@ Constraint resolution searches the table draft's primary key, unique constraints
 
 ## Evidence
 
-The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 374 tests across 48 scenes, 3 skipped — the three PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
+The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 388 tests across 49 scenes, 3 skipped — the three PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
 
 ## Acceptance
 
@@ -83,7 +84,7 @@ The package suites pin the contract level by level; the CLI `comments` scene pin
 
 Named, never silent:
 
-- **Comments on extensions** — [#91](https://github.com/osama784/schemamill/issues/91); `COMMENT ON EXTENSION` stays a named skip until the extensions slice.
+- **Comments on extensions** — closed in [#91](https://github.com/osama784/schemamill/issues/91): `COMMENT ON EXTENSION` now imports, plans in the terminal comment phase, and renders ([extensions plan](./extensions.md)).
 - **Comments on unmodeled families** — schemas, functions, procedures, triggers, rules, policies, types, foreign tables, tablespaces, roles, and databases stay skipped and named.
 - **Comments on PostgreSQL 18 named not-null constraints** — the model has no not-null entity; the flag keeps the not-null fact while the comment is dropped, and a follow-up is recorded for bookkeeping.
 - **Catalog introspection of comments** — `catalog.ts` reads no `obj_description`/`col_description` today, so a live-database import loses comments with no diagnostic; a follow-up is recorded for bookkeeping and the live scene omits `introspection`.

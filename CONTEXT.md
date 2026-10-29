@@ -75,7 +75,7 @@ A column's explicit compression method: `pglz` or `lz4`. Absent means the type's
 _Avoid_: codec, encoding
 
 **Comment**:
-Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, or index — carried verbatim as the entity's `comment`. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
+Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, index, or extension — carried verbatim as the entity's `comment`. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
 _Avoid_: description, annotation, docstring, metadata
 
 **Table persistence**:
@@ -138,6 +138,10 @@ _Avoid_: view query, view SQL
 A plain view's `WITH [LOCAL|CASCADED] CHECK OPTION`: `local` or `cascaded` in the model, absent meaning none. A materialized view never carries one.
 _Avoid_: check constraint, validation rule
 
+**Extension**:
+A PostgreSQL extension installed in the database, identified by its name alone: extension names are database-unique and never schema-qualified. Its install schema and comment are attributes, not identity, so moving the extension is an `ALTER EXTENSION … SET SCHEMA`, not a drop and create. The install schema is required because a dump always states it; a definition without one is skipped and named, never defaulted.
+_Avoid_: plugin, module, package
+
 ### Crossing the boundary
 
 **Import**:
@@ -159,7 +163,7 @@ _Avoid_: run, execute, deploy
 ### The change engine
 
 **Change**:
-One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, index, sequence, view, or comment added, removed, or changed between a baseline and a target.
+One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, index, sequence, view, extension, or comment added, removed, or changed between a baseline and a target.
 _Avoid_: edit, modification, alteration
 
 **Migration plan**:

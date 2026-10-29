@@ -388,6 +388,9 @@ function findIdentityStep(
       case 'create-sequence':
       case 'drop-sequence':
       case 'alter-sequence':
+      case 'create-extension':
+      case 'alter-extension':
+      case 'drop-extension':
       case 'create-view':
       case 'drop-view':
       case 'replace-view':

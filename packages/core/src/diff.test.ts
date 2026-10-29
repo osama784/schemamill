@@ -8,6 +8,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -97,7 +98,12 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A sequence named `name`: bigint ascending defaults unless overridden. */
 const sequence = (
@@ -140,6 +146,7 @@ const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Mode
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
@@ -160,6 +167,22 @@ const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
   tables,
   sequences: [],
   views,
+  extensions: [],
+});
+
+/** An extension named `name`: installed in `public` unless overridden. */
+const extension = (name: string, fields: Partial<Omit<Extension, 'name'>> = {}): Extension => ({
+  name,
+  schema: 'public',
+  ...fields,
+});
+
+/** A model of the given extensions, with no tables, sequences, or views. */
+const extensionModel = (extensions: readonly Extension[]): Model => ({
+  tables: [],
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -4016,8 +4039,18 @@ test('removed and added views follow the sequence changes, in identity order', (
   const gone = view('a');
   const appView = view('z', {}, 'app');
   const fresh = view('b');
-  const baseline: Model = { tables: [], sequences: [sequence('s')], views: [gone] };
-  const target: Model = { tables: [], sequences: [], views: [appView, fresh] };
+  const baseline: Model = {
+    tables: [],
+    sequences: [sequence('s')],
+    views: [gone],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [appView, fresh],
+    extensions: [],
+  };
 
   assertDiff(baseline, target, [
     { kind: 'sequence-removed', sequence: baseline.sequences[0]! },
@@ -4451,6 +4484,7 @@ test('comment changes come last, after table, sequence, and view changes, in tar
     ],
     sequences: [sequence('s', { comment: 'old s' })],
     views: [view('v', { comment: 'old v' })],
+    extensions: [],
   };
   const target: Model = {
     tables: [
@@ -4459,6 +4493,7 @@ test('comment changes come last, after table, sequence, and view changes, in tar
     ],
     sequences: [sequence('s', { cache: '2', comment: 'new s' })],
     views: [view('v', { definition: 'SELECT 2', comment: 'new v' })],
+    extensions: [],
   };
 
   assertDiff(baseline, target, [
@@ -4621,5 +4656,181 @@ test('comment changes sort by each target identity, not by model insertion order
     viewModel(views('old'), constraints('old'), parent),
     viewModel(views('new'), constraints('new'), parent),
     expected('new', 'old'),
+  );
+});
+
+test('extensions report additions, removals, and value-carrying schema changes by name', () => {
+  const removed = extension('a_gone', { schema: 'old' });
+  const movedBefore = extension('moved', { schema: 'hs1' });
+  const movedAfter = extension('moved', { schema: 'hs2' });
+  const added = extension('z_new');
+
+  // The target's added and changed identities and the baseline's removed identity merge-walk
+  // by name, so each category keeps its own name order while the walk interleaves them.
+  assertDiff(extensionModel([movedBefore, removed]), extensionModel([movedAfter, added]), [
+    { kind: 'extension-removed', extension: removed },
+    {
+      kind: 'extension-changed',
+      extension: { name: 'moved' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'extension-added', extension: added },
+  ]);
+});
+
+test('an added extension that sorts before a baseline extension reports in the merge walk', () => {
+  // The added identity sorts first, so the merge walk takes its added branch before the shared
+  // identity; the trailing loop alone would not exercise it.
+  assertDiff(
+    extensionModel([extension('moved')]),
+    extensionModel([extension('added'), extension('moved')]),
+    [{ kind: 'extension-added', extension: extension('added') }],
+  );
+});
+
+test('an extension comment sorts before a schema-qualified comment by its empty schema slot', () => {
+  // The key's empty schema slot sorts the extension before every qualified relation, even one
+  // whose schema starts with an uppercase letter.
+  const baseline = {
+    tables: [table('t', { schema: 'A', comment: 'old' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'old' })],
+  };
+  const target = {
+    tables: [table('t', { schema: 'A', comment: 'new' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'new' })],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('t', 'A') },
+      before: 'old',
+      after: 'new',
+    },
+  ]);
+});
+
+test('a schema-only extension change carries no comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { schema: 'hs1' })]),
+    extensionModel([extension('hstore', { schema: 'hs2' })]),
+    [
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+    ],
+  );
+});
+
+test('an extension comment change, addition, and removal are separate comment changes', () => {
+  assertDiff(
+    extensionModel([
+      extension('a', { comment: 'one' }),
+      extension('b', { comment: 'two' }),
+      extension('c'),
+    ]),
+    extensionModel([
+      extension('a', { comment: 'uno' }),
+      extension('b'),
+      extension('c', { comment: 'three' }),
+    ]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'a' } },
+        before: 'one',
+        after: 'uno',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'b' } },
+        before: 'two',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'c' } },
+        after: 'three',
+      },
+    ],
+  );
+});
+
+test('a comment-only extension change emits only its comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { comment: 'old' })]),
+    extensionModel([extension('hstore', { comment: 'new' })]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
+  );
+});
+
+test('an added extension reports its comment as an addition', () => {
+  const added = extension('pgcrypto', { comment: 'crypto' });
+
+  assertDiff(extensionModel([]), extensionModel([added]), [
+    { kind: 'extension-added', extension: added },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      after: 'crypto',
+    },
+  ]);
+});
+
+test('a removed extension emits no comment change', () => {
+  const removed = extension('citext', { comment: 'old' });
+
+  assertDiff(extensionModel([removed]), extensionModel([]), [
+    { kind: 'extension-removed', extension: removed },
+  ]);
+});
+
+test('extension changes follow view changes and precede comment changes', () => {
+  assertDiff(
+    {
+      tables: [],
+      sequences: [],
+      views: [view('gone')],
+      extensions: [extension('hstore', { schema: 'hs1', comment: 'old' })],
+    },
+    {
+      tables: [],
+      sequences: [],
+      views: [view('new')],
+      extensions: [extension('hstore', { schema: 'hs2', comment: 'new' })],
+    },
+    [
+      { kind: 'view-removed', view: view('gone') },
+      { kind: 'view-added', view: view('new') },
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
   );
 });

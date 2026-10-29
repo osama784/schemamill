@@ -35,7 +35,8 @@ import { serializeModel } from './workspace.ts';
  */
 
 /** The empty model's exact file bytes: two-space JSON and a trailing newline. */
-const EMPTY_MODEL_BYTES = '{\n  "tables": [],\n  "sequences": [],\n  "views": []\n}\n';
+const EMPTY_MODEL_BYTES =
+  '{\n  "tables": [],\n  "sequences": [],\n  "views": [],\n  "extensions": []\n}\n';
 
 /** A fresh temp directory removed when the test ends. */
 async function fixtureDir(context: TestContext): Promise<string> {
@@ -172,6 +173,15 @@ function viewPayload(overrides: Record<string, unknown> = {}): Record<string, un
     name: 'v',
     materialized: false,
     definition: 'SELECT 1',
+    ...overrides,
+  };
+}
+
+/** The minimal valid extension payload; `overrides` replace its fields. */
+function extensionPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema: 'public',
+    name: 'hstore',
     ...overrides,
   };
 }
@@ -928,6 +938,7 @@ const POPULATED_MODEL: Model = {
     },
   ],
   views: [],
+  extensions: [],
 };
 
 test('resolveWorkspace reads back a populated model written literally', async (t) => {
@@ -1038,6 +1049,7 @@ const ATTRIBUTE_MODEL: Model = {
   ],
   sequences: [],
   views: [],
+  extensions: [],
 };
 
 test('resolveWorkspace reads back every constraint attribute written literally', async (t) => {
@@ -1158,6 +1170,7 @@ const ROUND_TRIP_MODEL: Model = {
   ],
   sequences: [],
   views: [],
+  extensions: [],
 };
 
 test('serializeModel round-trips a populated model through resolveWorkspace without loss', async (t) => {
@@ -1196,7 +1209,12 @@ test('resolveWorkspace walks up from a nested directory to the nearest root', as
   const resolved = await resolveOk(nested);
 
   assert.equal(resolved.root, dir);
-  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
+  assert.deepStrictEqual(resolved.model, {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [],
+  });
 });
 
 test('resolveWorkspace resolves the root given explicitly', async (t) => {
@@ -1216,7 +1234,12 @@ test('resolution treats a file component as absent and keeps walking to the work
   const resolved = await resolveOk(join(dir, 'blocker', 'sub'));
 
   assert.equal(resolved.root, dir);
-  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
+  assert.deepStrictEqual(resolved.model, {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [],
+  });
 });
 
 test('resolveWorkspace returns the nearest of hand-crafted nested workspaces', async (t) => {
@@ -1469,7 +1492,12 @@ test('resolveWorkspace reads a model without a views field as no views', async (
 
   const resolved = await resolveOk(dir);
 
-  assert.deepStrictEqual(resolved.model, { tables: [], sequences: [], views: [] });
+  assert.deepStrictEqual(resolved.model, {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [],
+  });
 });
 
 test('serializeModel emits views after sequences, sorted, with the check option last', () => {
@@ -1487,6 +1515,7 @@ test('serializeModel emits views after sequences, sorted, with the check option 
       },
       { schema: 'app', name: 'a', materialized: false, definition: 'SELECT 1' },
     ],
+    extensions: [],
   };
   const expected = [
     '{',
@@ -1512,7 +1541,8 @@ test('serializeModel emits views after sequences, sorted, with the check option 
     '      "materialized": true,',
     '      "definition": "SELECT 2"',
     '    }',
-    '  ]',
+    '  ],',
+    '  "extensions": []',
     '}',
     '',
   ].join('\n');
@@ -1535,12 +1565,150 @@ test('serializeModel round-trips views through resolveWorkspace without loss', a
       },
       { schema: 'public', name: 'totals', materialized: true, definition: 'SELECT 2' },
     ],
+    extensions: [],
   };
   await writeWorkspace(dir, serializeModel(model));
 
   const resolved = await resolveOk(dir);
 
   assert.deepStrictEqual(resolved.model, model);
+});
+
+test('serializeModel round-trips extensions with and without a comment without loss', async (t) => {
+  const dir = await fixtureDir(t);
+  const model: Model = {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [
+      { schema: 'public', name: 'hstore', comment: 'key/value store' },
+      { schema: 'app', name: 'pgcrypto' },
+    ],
+  };
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, model);
+});
+
+test('resolveWorkspace reads a model without an extensions field as no extensions', async (t) => {
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, '{"tables":[],"sequences":[],"views":[]}');
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [],
+  });
+});
+
+test('resolveWorkspace fails closed when extensions is null or not an array', async (t) => {
+  for (const extensions of [null, {}]) {
+    const diagnostic = await resolvePayload(t, {
+      tables: [],
+      sequences: [],
+      views: [],
+      extensions,
+    });
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, 'invalid model: extensions is not an array');
+  }
+});
+
+test('resolveWorkspace fails closed on an unknown extension key', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [extensionPayload({ bogus: true })],
+  });
+
+  assert.equal(diagnostic.code, 'workspace-model-invalid');
+  assert.equal(diagnostic.message, 'invalid model: unknown field extensions[0].bogus');
+});
+
+test('resolveWorkspace requires a non-empty extension name and schema', async (t) => {
+  const cases: ReadonlyArray<readonly [Record<string, unknown>, string]> = [
+    [extensionPayload({ name: '' }), 'invalid model: extensions[0].name is not a non-empty string'],
+    [extensionPayload({ name: 1 }), 'invalid model: extensions[0].name is not a string'],
+    [
+      extensionPayload({ schema: '' }),
+      'invalid model: extensions[0].schema is not a non-empty string',
+    ],
+    [extensionPayload({ schema: 1 }), 'invalid model: extensions[0].schema is not a string'],
+  ];
+
+  for (const [extension, message] of cases) {
+    const diagnostic = await resolvePayload(t, {
+      tables: [],
+      sequences: [],
+      views: [],
+      extensions: [extension],
+    });
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, message);
+  }
+});
+
+test('resolveWorkspace fails closed on an invalid extension comment', async (t) => {
+  const cases: ReadonlyArray<readonly [unknown, string]> = [
+    ['', 'invalid model: extensions[0].comment is not a non-empty string'],
+    [123, 'invalid model: extensions[0].comment is not a string'],
+    ['before\u0000after', 'invalid model: extensions[0].comment must not contain a NUL character'],
+  ];
+
+  for (const [comment, message] of cases) {
+    const diagnostic = await resolvePayload(t, {
+      tables: [],
+      sequences: [],
+      views: [],
+      extensions: [extensionPayload({ comment })],
+    });
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, message);
+  }
+});
+
+test('serializeModel emits extensions after views, name-sorted, schema before name, comment last', () => {
+  const model: Model = {
+    tables: [],
+    sequences: [],
+    views: [],
+    extensions: [
+      { schema: 'app', name: 'z', comment: 'last' },
+      { schema: 'public', name: 'a' },
+    ],
+  };
+  const text = serializeModel(model);
+
+  assert.ok(
+    text.includes(
+      [
+        '  "views": [],',
+        '  "extensions": [',
+        '    {',
+        '      "schema": "public",',
+        '      "name": "a"',
+        '    },',
+        '    {',
+        '      "schema": "app",',
+        '      "name": "z",',
+        '      "comment": "last"',
+        '    }',
+        '  ]',
+      ].join('\n'),
+    ),
+    text,
+  );
+  const payload = JSON.parse(text) as { extensions: object[] };
+  assert.deepStrictEqual(Object.keys(payload.extensions[1]!), ['schema', 'name', 'comment']);
 });
 
 test('serializeModel pins declaration order and omits undefined optionals', () => {
@@ -1558,6 +1726,7 @@ test('serializeModel pins declaration order and omits undefined optionals', () =
     ],
     sequences: [],
     views: [],
+    extensions: [],
   };
   const expected = [
     '{',
@@ -1579,7 +1748,8 @@ test('serializeModel pins declaration order and omits undefined optionals', () =
     '    }',
     '  ],',
     '  "sequences": [],',
-    '  "views": []',
+    '  "views": [],',
+    '  "extensions": []',
     '}',
     '',
   ].join('\n');
@@ -1595,11 +1765,13 @@ test('serializeModel is deterministic and re-sorts tables and sequences canonica
       effectiveSequence({ schema: 'public', name: 'a' }),
     ],
     views: [],
+    extensions: [],
   };
   const reordered: Model = {
     tables: [...model.tables].reverse(),
     sequences: [...model.sequences].reverse(),
     views: [],
+    extensions: [],
   };
 
   assert.equal(serializeModel(model), serializeModel(reordered));
@@ -1681,6 +1853,7 @@ const COMMENTED_MODEL: Model = {
       comment: 'active rows',
     },
   ],
+  extensions: [],
 };
 
 test('serializeModel round-trips a comment on every entity kind through resolveWorkspace', async (t) => {
@@ -1739,6 +1912,7 @@ test('serializeModel round-trips comment text with escapes and unicode byte-exac
     ],
     sequences: [],
     views: [],
+    extensions: [],
   };
   const dir = await fixtureDir(t);
   await writeWorkspace(dir, serializeModel(model));
@@ -1882,6 +2056,7 @@ const OLDER_MODEL: Model = {
     },
   ],
   views: [{ schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' }],
+  extensions: [],
 };
 
 test('resolveWorkspace reads a pre-comment model as entities without a comment property', async (t) => {

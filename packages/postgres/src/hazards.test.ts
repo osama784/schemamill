@@ -50,13 +50,19 @@ const table = (name: string, columns: readonly Column[] = [], schema = 'public')
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [], views: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A model of the given sequences, with no tables unless they are supplied. */
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
   views: [],
+  extensions: [],
 });
 
 /** A sequence named `name` with the effective values for the stated options. */
@@ -1477,6 +1483,7 @@ test('model array order never affects the hazards', () => {
           sequence('bad', { cache: '0' }),
         ]),
         views: [],
+        extensions: [],
       },
       target: {
         tables: order([targetTable]),
@@ -1485,6 +1492,7 @@ test('model array order never affects the hazards', () => {
           sequence('bad', { cache: '0' }),
         ]),
         views: [],
+        extensions: [],
       },
     };
   };

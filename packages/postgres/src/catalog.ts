@@ -1042,7 +1042,12 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   diagnostics.push(...sequenceMapping.diagnostics);
 
   return {
-    model: { tables: modelTables, sequences: sequenceMapping.sequences, views: [] },
+    model: {
+      tables: modelTables,
+      sequences: sequenceMapping.sequences,
+      views: [],
+      extensions: [],
+    },
     diagnostics,
   };
 }

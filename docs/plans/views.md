@@ -30,7 +30,7 @@ Every inline attribute outside the model is flagged by name and the view still i
 
 ## Plan phases
 
-View steps join a plan now ordered in eleven global phases: view drops are phase 4, before the table phases, so a removed view cannot block a table or column drop; table operations are phase 5; view creates and then replaces are phase 6, after every table phase, so a view can reference a newly created table or column; and comment assertions are phase 11. The three view step kinds are transactional and append to the step union.
+View steps join a plan now ordered in thirteen global phases: extension creates are phase 1; view drops are phase 5, before the table phases, so a removed view cannot block a table or column drop; table operations are phase 6; view creates and then replaces are phase 7, after every table phase, so a view can reference a newly created table or column; comment assertions are phase 12; and the extension alter/drop teardown is phase 13. The three view step kinds are transactional and append to the step union.
 
 ## Change strategy
 
@@ -44,7 +44,7 @@ Every failure here is PostgreSQL's own error at apply, and view steps are transa
 
 ## Evidence
 
-Unit tests pin the model and workspace read/write, import forms and every flag, diff field order and copy isolation, the three plan steps and their phases, and render's grammar and matview-replace refusal. The postgres golden `views.sql` and the CLI `views` fixture pair pin add/remove/change of both kinds byte-for-byte; existing goldens are untouched because no existing fixture has views. The gated `view-round-trip` scene redefines a view, rewrites a materialized view, removes one, adds two (one with `WITH LOCAL CHECK OPTION`), and changes one from plain to materialized; its `crossImportChecks` seam asserts the applied and target imports are deep-equal, and its catalog checks read `relkind` and `relispopulated` and only boolean anchors from the server's deparse. No test pins `pg_get_viewdef` text, so a PostgreSQL 18 spelling difference cannot fail a PostgreSQL 16-authored expectation. On PostgreSQL 16.15 the live suite is 374 tests across 48 scenes, 3 skipped — the three PostgreSQL 18 scenes, skipped by name — and all 48 run on the CI's PostgreSQL 18.
+Unit tests pin the model and workspace read/write, import forms and every flag, diff field order and copy isolation, the three plan steps and their phases, and render's grammar and matview-replace refusal. The postgres golden `views.sql` and the CLI `views` fixture pair pin add/remove/change of both kinds byte-for-byte; existing goldens are untouched because no existing fixture has views. The gated `view-round-trip` scene redefines a view, rewrites a materialized view, removes one, adds two (one with `WITH LOCAL CHECK OPTION`), and changes one from plain to materialized; its `crossImportChecks` seam asserts the applied and target imports are deep-equal, and its catalog checks read `relkind` and `relispopulated` and only boolean anchors from the server's deparse. No test pins `pg_get_viewdef` text, so a PostgreSQL 18 spelling difference cannot fail a PostgreSQL 16-authored expectation. On PostgreSQL 16.15 the live suite is 388 tests across 49 scenes, 3 skipped — the three PostgreSQL 18 scenes, skipped by name — and all 49 run on the CI's PostgreSQL 18.
 
 ## Acceptance
 

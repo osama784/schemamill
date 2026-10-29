@@ -11,6 +11,7 @@ import { diff, effectiveSequence, plan } from '@schemamill/core';
 import type {
   CatalogReader,
   Diagnostic,
+  Extension,
   Identity,
   Model,
   ReadResult,
@@ -47,11 +48,11 @@ import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts
  * database after its build, and its probes and remaining checks after the migration. Both
  * databases are dumped with `pg_dump --schema-only --no-owner
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
- * the modeled sequences and identity columns must come back exactly (see
- * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
- * against both imported models (see `assertImportChecks`), its cross-import checks compare the
- * two imports to each other (see `assertCrossImportChecks`), and `diff` between the imported
- * models must be exactly empty. A scene that declares an `introspection` assertion is then read
+ * the modeled sequences, identity columns, and extensions must come back exactly (see
+ * `assertSequencesRetained`, `assertIdentitiesRetained`, and `assertExtensionsRetained`), the
+ * scene's import checks run against both imported models (see `assertImportChecks`), its
+ * cross-import checks compare the two imports to each other (see `assertCrossImportChecks`),
+ * and `diff` between the imported models must be exactly empty. A scene that declares an `introspection` assertion is then read
  * back through the production `catalogReader` (see `assertIntrospection`). Databases are
  * dropped best-effort, so a failed scene still cleans up after itself.
  */
@@ -141,11 +142,12 @@ test('the sequence retention guard allows state-only skips and rejects structura
   const imported = await importDump(dump);
   const scene: LiveScene = {
     name: 'state-only-skips',
-    baseline: { tables: [], sequences: [], views: [] },
+    baseline: { tables: [], sequences: [], views: [], extensions: [] },
     target: {
       tables: [],
       sequences: [effectiveSequence({ schema: 'public', name: 'state_seq' })],
       views: [],
+      extensions: [],
     },
   };
 
@@ -257,6 +259,12 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     assertSequencesRetained(`${targetDb}: imported from the target model's build`, scene, expected);
     assertIdentitiesRetained(`${appliedDb}: imported after the migration`, scene, applied);
     assertIdentitiesRetained(
+      `${targetDb}: imported from the target model's build`,
+      scene,
+      expected,
+    );
+    assertExtensionsRetained(`${appliedDb}: imported after the migration`, scene, applied);
+    assertExtensionsRetained(
       `${targetDb}: imported from the target model's build`,
       scene,
       expected,
@@ -391,7 +399,7 @@ async function assertRollbackLeavesNoPartialEffect(
     const baselineFile = join(workDir, 'rollback.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -442,7 +450,7 @@ async function assertStrippedWrappersLeavePartialEffect(
     const baselineFile = join(workDir, 'stripped.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -511,7 +519,7 @@ async function assertConcurrentBuildRejectsWrapping(
     const baselineFile = join(workDir, 'concurrent.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
       'utf8',
     );
     await applyFile(url, baselineFile);
@@ -593,10 +601,12 @@ async function writeSceneFiles(
   const migration = join(workDir, `${slug}.migrate.sql`);
   await writeFile(
     baselineBuild,
-    renderSql(plan({ tables: [], sequences: [], views: [] }, scene.baseline)),
+    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
     'utf8',
   );
-  const targetSql = renderSql(plan({ tables: [], sequences: [], views: [] }, scene.target));
+  const targetSql = renderSql(
+    plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.target),
+  );
   const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
   await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
@@ -887,6 +897,55 @@ function assertIdentitiesRetained(
     [],
     `${scene.name}: ${what}: the import named identity problems`,
   );
+}
+
+/**
+ * Asserts that every extension the target model declares survived an import with the same
+ * install schema and comment. The map is keyed by name, so an import that drops, renames, or
+ * moves an extension cannot pass by matching descriptors as a set of values. Extra imported
+ * extensions are allowed: a scene's `setupSql` may install an ambient one the model does not
+ * declare, as `introspection-flags-constraints-18` does with `btree_gist`. Scenes whose target
+ * has no extensions still reject any import diagnostic that names one.
+ */
+function assertExtensionsRetained(
+  what: string,
+  scene: LiveScene,
+  imported: ReadResult<Model, Diagnostic>,
+): void {
+  const declared = extensionByName(scene.target);
+  const found = extensionByName(imported.model);
+  const failures: string[] = [];
+  for (const [name, expected] of declared) {
+    const actual = found.get(name);
+    if (actual === undefined) {
+      failures.push(`${name}: dropped (${describeExtension(expected)})`);
+    } else if (!sameExtensionDescriptor(expected, actual)) {
+      failures.push(`${name}: ${describeExtension(expected)} became ${describeExtension(actual)}`);
+    }
+  }
+  assert.deepEqual(failures, [], `${scene.name}: ${what}: extension retention failed`);
+  assert.deepEqual(
+    imported.diagnostics
+      .filter((diagnostic) => diagnostic.message.toLowerCase().includes('extension'))
+      .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`),
+    [],
+    `${scene.name}: ${what}: the import named extension problems`,
+  );
+}
+
+/** Every extension by name. */
+function extensionByName(model: Model): ReadonlyMap<string, Extension> {
+  return new Map(model.extensions.map((extension) => [extension.name, extension]));
+}
+
+/** Whether two extensions state the same install schema and comment. */
+function sameExtensionDescriptor(left: Extension, right: Extension): boolean {
+  return left.schema === right.schema && left.comment === right.comment;
+}
+
+/** One extension descriptor as one line, for a failure message. */
+function describeExtension(extension: Extension): string {
+  return `schema=${extension.schema} comment=${JSON.stringify(extension.comment)}`;
 }
 
 /** Every identity column's `schema.table.column` key and descriptor, as a map. */
