@@ -532,8 +532,9 @@ type CommentChange = Extract<Change, { kind: 'comment-changed' }>;
  * name, a primary key's or unique constraint's columns, a check constraint's expression, a
  * foreign key's referencing columns and referenced table, and an index's name (an unnamed index
  * by its structure) — so a name or attribute change still compares both sides' comments, while
- * an identity change reads as absent from the baseline and reports an addition. Entries sharing
- * an identity collapse to one, last-wins, mirroring the plan's target key.
+ * an identity change reads as absent from the baseline and reports an addition. Every differing
+ * entry is emitted; the plan's terminal phase keeps one step per target, the first in target
+ * order, mirroring its target key.
  */
 function diffComments(baseline: Model, target: Model): readonly CommentChange[] {
   const changes: CommentChange[] = [];
