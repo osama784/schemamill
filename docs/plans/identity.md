@@ -14,7 +14,7 @@ Identity columns as first-class column properties in the model: the DDL forms a 
 
 ## Plan ordering
 
-Identity steps open and close the plan's ten global phases, in this exact order:
+Identity steps sit in the plan's eleven global phases, in this exact order:
 
 1. **drop-identity** — every removed identity whose column survives, in diff order. First, always: it must precede the `DROP NOT NULL`/`SET DEFAULT` the table phases put on the same column, and it frees the default sequence name for the replacement sequence the identity→serial conversion creates in phase 2 — or for the replacement identity's own sequence in phase 10.
 2. **create-sequence** — one per added sequence, in identity order.
@@ -26,6 +26,7 @@ Identity steps open and close the plan's ten global phases, in this exact order:
 8. **Option alters** — one `alter-sequence` per changed sequence.
 9. **drop-sequence** — every removed sequence whose owner the plan does not remove; a column's `DROP DEFAULT` has already released it.
 10. **add-identity, then alter-identity** — additions before option alters, in diff order. Last because `ADD GENERATED` manufactures a fresh sequence and refuses a column that still carries a `DEFAULT`: by then the table phases have produced the column, its `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 9 have freed the sequence names the added identities reuse.
+11. **Comments** — every comment addition, change, and removal, after every identity step ([comments](./comments.md)).
 
 A `drop-identity` needs no suppression: an identity reaches the plan as its own removal only when its column survives, and a removed column or table carries its identity away in its own drop.
 
@@ -68,7 +69,7 @@ Three levels pin the slice:
   - Each scene also checks that the identity columns come back column by column: the harness's retention guard matches every target identity against the re-imported model by `schema.table.column`, rejects an invented or moved identity, and fails the scene on any import diagnostic that names identity.
 - **Dogfood** — the sequences slice's 24-table corpus across `public`, `app`, and `"Sales"` (bigserial primary keys, a standalone `public.invoice_seq START WITH 1000`), plus a target that converts `public.audit_log.id` from `bigserial` to `GENERATED ALWAYS AS IDENTITY` reusing `public.audit_log_id_seq` and adds `public.identity_events` with a nameless identity: plan → apply the plan SQL verbatim → re-dump → import → `No changes.`, with no `audit_log_id_seq1` collision, the engine-chosen `public.identity_events_id_seq` for the nameless identity, and `attidentity` `a`/`d` after the migration. Commands and output on [#20](https://github.com/osama784/schemamill/issues/20#issuecomment-5913091302).
 
-On PostgreSQL 16.15 the live suite is 358 tests across 47 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 47 run.
+On PostgreSQL 16.15 the live suite is 374 tests across 48 scenes, 3 skipped — the three PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 48 run.
 
 ## Done means
 

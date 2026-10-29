@@ -74,6 +74,10 @@ _Avoid_: toast mode, storage class
 A column's explicit compression method: `pglz` or `lz4`. Absent means the type's default. `attcompression` exists only from PostgreSQL 14: on the 13 floor the catalog reports no explicit method.
 _Avoid_: codec, encoding
 
+**Comment**:
+Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, or index — carried verbatim as the entity's `comment`. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
+_Avoid_: description, annotation, docstring, metadata
+
 **Table persistence**:
 A table's persistence when it is not PostgreSQL's default: `unlogged`. Absent means `LOGGED`. Temporary persistence is not modeled and stays flagged.
 _Avoid_: logging, durability
@@ -155,7 +159,7 @@ _Avoid_: run, execute, deploy
 ### The change engine
 
 **Change**:
-One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, or index added, removed, or changed between a baseline and a target.
+One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, index, sequence, view, or comment added, removed, or changed between a baseline and a target.
 _Avoid_: edit, modification, alteration
 
 **Migration plan**:

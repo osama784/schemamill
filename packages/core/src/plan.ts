@@ -1426,8 +1426,10 @@ function copyCommentTarget(target: CommentTarget): CommentTarget {
  * expression, a foreign key's referencing columns and referenced table, or an index's name
  * (an unnamed index by its structure). It deliberately ignores `comment` and every other text
  * value, so the diff's change and a recreate re-assertion for the same target agree on one key.
- * Targets that share the model's identity share a key: the terminal phase keeps the first step
- * and the server applies the last write, the documented last-wins behavior.
+ * Targets that share the model's identity share a key, and the terminal phase keeps the first
+ * step: a recreated node's re-assertion and the diff's change carry the same target text, while
+ * two structurally identical unnamed nodes are one server object the model cannot distinguish,
+ * so one step is the only coherent assertion.
  */
 function commentTargetKey(target: CommentTarget): string {
   switch (target.kind) {
