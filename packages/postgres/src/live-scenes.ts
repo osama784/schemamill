@@ -6,6 +6,7 @@ import type {
   Column,
   CommentTarget,
   Diagnostic,
+  Extension,
   ForeignKey,
   Identity,
   IdentityInput,
@@ -151,6 +152,16 @@ import { renderSql } from './render.ts';
  * deliberately blind to comments. It declares no `introspection` assertion: the catalog reader
  * does not read comments yet, so a comment-carrying model is intentionally not what it returns.
  *
+ * The extension scene carries the whole extension lifecycle: `extension-round-trip` moves a
+ * commented `hstore` from `hs1` to `hs2` with a changed comment, installs a commented `pgcrypto`
+ * in `public`, and removes a commented `citext`. Its `setupSql` creates both install schemas on
+ * both databases, because the plan has no schema-creation phase. Its plan check pins the global
+ * phase order — the create, then the two terminal comments, then the move and the drop — and its
+ * catalog checks pin `extnamespace` through `pg_namespace` and the comment through
+ * `obj_description(oid, 'pg_extension')`. It declares no `introspection` assertion either: the
+ * catalog reader returns `extensions: []` until the follow-up, so a model carrying extensions is
+ * intentionally not what it returns.
+ *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
  * in place — a model that says otherwise would make the migrated database legitimately differ
@@ -220,6 +231,21 @@ const withSequences = (tables: readonly Table[], sequences: readonly Sequence[])
   sequences,
   views: [],
   extensions: [],
+});
+
+/** An extension named `name`, uncommented and installed in `public` unless the schema is given. */
+const extension = (name: string, schema = 'public', comment?: string): Extension => ({
+  name,
+  schema,
+  ...(comment === undefined ? {} : { comment }),
+});
+
+/** A model of the given extensions and nothing else. */
+const extensionModel = (...extensions: Extension[]): Model => ({
+  tables: [],
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */
@@ -5362,14 +5388,28 @@ const commentCheck = (description: string, sql: string, text: string | undefined
   expected: text ?? '',
 });
 
+/** The install schema of the extension named `name`, via `extnamespace` joined to `pg_namespace`. */
+const extensionSchema = (name: string): string =>
+  `select namespace.nspname from pg_extension extension_row` +
+  ' join pg_namespace namespace on namespace.oid = extension_row.extnamespace' +
+  ` where extension_row.extname = '${name}'`;
+
+/** The catalog text of the extension named `name`. */
+const extensionComment = (name: string): string =>
+  `select obj_description(oid, 'pg_extension') from pg_extension where extname = '${name}'`;
+
+/** How many extensions named `name` are installed: `0` or `1`, pinned as one text fact. */
+const extensionCount = (name: string): string =>
+  `select count(*) from pg_extension where extname = '${name}'`;
+
 /**
  * Every modeled entity's comment, keyed by a server-independent identity. Names are excluded
  * from constraint and index identities because the import canonicalizes a conventional server
  * name back to unnamed whether the source stated it or not, and a check constraint is keyed by
  * its table because its expression is the server's deparse of the authored text (this scene has
- * at most one check constraint per table). The label is the relation, member, or structure the
- * comment belongs to, so a mismatch names the object and both texts. Values are JSON-quoted, and
- * `absent` (never a JSON-quoted text) means the entity states no comment.
+ * at most one check constraint per table). The label is the relation, member, structure, or
+ * extension the comment belongs to, so a mismatch names the object and both texts. Values are
+ * JSON-quoted, and `absent` (never a JSON-quoted text) means the entity states no comment.
  */
 function commentInventory(model: Model): ReadonlyMap<string, string> {
   const inventory = new Map<string, string>();
@@ -5424,7 +5464,24 @@ function commentInventory(model: Model): ReadonlyMap<string, string> {
   for (const view of model.views) {
     add('view', [view.schema, view.name, view.materialized], view.comment);
   }
+  for (const extension of model.extensions) {
+    add('extension', [extension.name], extension.comment);
+  }
   return inventory;
+}
+
+/**
+ * Every extension's install schema and comment, keyed by name: the server-derived inventory
+ * the extension scene compares, so a lost move and a lost comment are both named. Values are
+ * JSON so `null` means no comment and never an empty text.
+ */
+function extensionInventory(model: Model): ReadonlyMap<string, string> {
+  return new Map(
+    model.extensions.map((extension) => [
+      extension.name,
+      JSON.stringify({ schema: extension.schema, comment: extension.comment ?? null }),
+    ]),
+  );
 }
 
 /** The differing entries of two comment inventories, in key order, as failure lines. */
@@ -6097,6 +6154,211 @@ const commentRoundTripScene = (): LiveScene => {
   };
 };
 
+/**
+ * The extension scene: a commented `hstore` moves schemas with a changed comment, a commented
+ * `pgcrypto` arrives in `public`, and a commented `citext` leaves. `setupSql` creates both
+ * install schemas on both databases, because the plan has no schema-creation phase and the
+ * baseline's `WITH SCHEMA hs1` would otherwise fail. Every extension statement the dump carries
+ * is the server's `IF NOT EXISTS` form, so the round trip also proves the import ignores the
+ * clause.
+ *
+ * The catalog checks pin `extnamespace` through `pg_namespace` and the comment through
+ * `obj_description(oid, 'pg_extension')`, so a write that updates the model but not the server
+ * cannot pass. The scene declares no introspection assertion: the catalog reader returns
+ * `extensions: []` until the follow-up, so `matches-import` cannot hold for a model carrying
+ * extensions.
+ */
+const extensionRoundTripScene = (): LiveScene => {
+  const hstoreBaselineComment = 'Key-value pairs (baseline)';
+  const hstoreTargetComment = 'Key-value pairs';
+  const citextComment = 'Case-insensitive text';
+  const pgcryptoComment = 'Cryptographic functions';
+
+  const baseline = extensionModel(
+    extension('citext', 'public', citextComment),
+    extension('hstore', 'hs1', hstoreBaselineComment),
+  );
+  const target = extensionModel(
+    extension('hstore', 'hs2', hstoreTargetComment),
+    extension('pgcrypto', 'public', pgcryptoComment),
+  );
+
+  const targetStateChecks = (subject: string): readonly SceneCheck[] => [
+    {
+      description: `the ${subject} installed hstore in hs2`,
+      sql: extensionSchema('hstore'),
+      expected: 'hs2',
+    },
+    commentCheck(
+      `the ${subject} stored the changed hstore comment`,
+      extensionComment('hstore'),
+      hstoreTargetComment,
+    ),
+    {
+      description: `the ${subject} installed pgcrypto in public`,
+      sql: extensionSchema('pgcrypto'),
+      expected: 'public',
+    },
+    commentCheck(
+      `the ${subject} stored the new pgcrypto comment`,
+      extensionComment('pgcrypto'),
+      pgcryptoComment,
+    ),
+    {
+      description: `the ${subject} holds no citext`,
+      sql: extensionCount('citext'),
+      expected: '0',
+    },
+  ];
+
+  const expectedSteps: readonly Step[] = [
+    // Global phase 1: the added extension, carrying its comment.
+    {
+      kind: 'create-extension',
+      extension: { name: 'pgcrypto', schema: 'public', comment: pgcryptoComment },
+    },
+    // Global phase 12: extension comments in target identity order.
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: hstoreTargetComment,
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      text: pgcryptoComment,
+    },
+    // Global phase 13: the schema move, then the removal.
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'drop-extension', extension: { name: 'citext' } },
+  ];
+
+  return {
+    name: 'extension-round-trip',
+    baseline,
+    target,
+    setupSql: ['CREATE SCHEMA hs1;', 'CREATE SCHEMA hs2;'].join('\n'),
+    baselineChecks: [
+      {
+        description: 'the baseline installed hstore in hs1',
+        sql: extensionSchema('hstore'),
+        expected: 'hs1',
+      },
+      commentCheck(
+        'the baseline stored the hstore comment',
+        extensionComment('hstore'),
+        hstoreBaselineComment,
+      ),
+      {
+        description: 'the baseline installed citext in public',
+        sql: extensionSchema('citext'),
+        expected: 'public',
+      },
+      commentCheck(
+        'the baseline stored the citext comment',
+        extensionComment('citext'),
+        citextComment,
+      ),
+      {
+        description: 'the baseline holds no pgcrypto',
+        sql: extensionCount('pgcrypto'),
+        expected: '0',
+      },
+    ],
+    targetChecks: targetStateChecks('target build'),
+    planChecks: [
+      {
+        description:
+          'the plan creates, comments, moves, and drops the extensions in global phase order',
+        failure: (steps, plan) => {
+          const citextComments = steps.filter(
+            (step) =>
+              step.kind === 'comment' &&
+              step.target.kind === 'extension' &&
+              step.target.extension.name === 'citext',
+          );
+          if (citextComments.length > 0) {
+            return 'the plan emits a comment step for the removed citext';
+          }
+          if (!isDeepStrictEqual(steps, expectedSteps)) {
+            return `steps: ${JSON.stringify(steps)}, expected ${JSON.stringify(expectedSteps)}`;
+          }
+          return isDeepStrictEqual(plan.groups, [{ start: 0, end: 5, transactional: true }])
+            ? undefined
+            : `transaction groups: ${JSON.stringify(plan.groups)}`;
+        },
+      },
+    ],
+    checks: targetStateChecks('migrated database'),
+    importChecks: [
+      {
+        description:
+          'both imports carry the target extension inventory: each install schema and comment',
+        failure: (imported, source) => {
+          const differences = commentInventoryDifferences(
+            extensionInventory(imported.model),
+            extensionInventory(target),
+            source,
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported extensions differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the import reports no diagnostic naming an extension',
+        failure: (imported, source) => {
+          const named = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.toLowerCase().includes('extension'),
+          );
+          return named.length === 0
+            ? undefined
+            : `${source}: extension diagnostics: ${named
+                .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description:
+          'the applied and target imports agree on every extension, install schema, and comment',
+        failure: (applied, expected) => {
+          const structural = diff(applied.model, expected.model);
+          if (structural.length > 0) {
+            return `the server-derived imports differ structurally:\n${JSON.stringify(
+              structural,
+              null,
+              2,
+            )}`;
+          }
+          const differences = commentInventoryDifferences(
+            extensionInventory(applied.model),
+            extensionInventory(expected.model),
+            'applied',
+            'target',
+          );
+          if (differences.length > 0) {
+            return `the server-derived imports differ in their extensions:\n${differences.join('\n')}`;
+          }
+          return isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ beyond their extensions:\n${JSON.stringify(
+                { applied: applied.model, target: expected.model },
+                null,
+                2,
+              )}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -6144,4 +6406,5 @@ export const scenes: readonly LiveScene[] = [
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
   commentRoundTripScene(),
+  extensionRoundTripScene(),
 ];
