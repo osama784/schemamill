@@ -7654,6 +7654,42 @@ test('extension creates open the plan, in name order', () => {
   simulate(baseline, target);
 });
 
+test('extension comments sort before schema-qualified comments by the empty schema slot', () => {
+  const baseline = {
+    tables: [table('t', { schema: 'A', comment: 'old' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'old' })],
+  };
+  const target = {
+    tables: [table('t', { schema: 'A', comment: 'new' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'new' })],
+  };
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'new',
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('t', 'A') }, text: 'new' },
+  ]);
+});
+
+test('an extension change with no differing fields adds no alter step', () => {
+  const application = emptyChangeApplication();
+
+  applyChange(application, {
+    kind: 'extension-changed',
+    extension: { name: 'hstore' },
+    changes: [],
+  });
+
+  assert.deepStrictEqual(application.extensionAlters, []);
+});
+
 test('extension comments are phase 12 and the extension alter is phase 13', () => {
   const baseline = extensionModel([extension('hstore', { schema: 'hs1', comment: 'old' })]);
   const target = extensionModel([

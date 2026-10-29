@@ -4678,6 +4678,48 @@ test('extensions report additions, removals, and value-carrying schema changes b
   ]);
 });
 
+test('an added extension that sorts before a baseline extension reports in the merge walk', () => {
+  // The added identity sorts first, so the merge walk takes its added branch before the shared
+  // identity; the trailing loop alone would not exercise it.
+  assertDiff(
+    extensionModel([extension('moved')]),
+    extensionModel([extension('added'), extension('moved')]),
+    [{ kind: 'extension-added', extension: extension('added') }],
+  );
+});
+
+test('an extension comment sorts before a schema-qualified comment by its empty schema slot', () => {
+  // The key's empty schema slot sorts the extension before every qualified relation, even one
+  // whose schema starts with an uppercase letter.
+  const baseline = {
+    tables: [table('t', { schema: 'A', comment: 'old' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'old' })],
+  };
+  const target = {
+    tables: [table('t', { schema: 'A', comment: 'new' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'new' })],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('t', 'A') },
+      before: 'old',
+      after: 'new',
+    },
+  ]);
+});
+
 test('a schema-only extension change carries no comment change', () => {
   assertDiff(
     extensionModel([extension('hstore', { schema: 'hs1' })]),
