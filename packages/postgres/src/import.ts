@@ -49,7 +49,9 @@
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
  *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale, and unlogged or
- *   temporary sequence persistence is flagged.
+ *   temporary sequence persistence is flagged. A sequence whose `OWNED BY` is not in the
+ *   imported model — an unread relation, a partitioned parent, or an absent column — is
+ *   omitted whole and named, judged on the final drafts so a forward reference is kept.
  * - `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max,
  *   start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — apply to the already imported
  *   sequence, in the order the engine processes them, and are skipped and named when the
@@ -152,6 +154,7 @@ import type {
   SequenceOptions,
   SequenceOwner,
   SkipDiagnosticCode,
+  SourcePosition,
   Table,
   TableIdentity,
   TablePersistence,
@@ -281,9 +284,33 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
   const sequences = new Map<string, SequenceDraft>();
   const views = new Map<string, ViewDraft>();
   const extensions = new Map<string, ExtensionDraft>();
+  // Sequence-keyed side state for the owner post-pass: where the latest `OWNED BY` was set, the
+  // create-time findings that wait for the pass, and every table created with a partition spec.
+  const ownerPositions = new Map<string, SourcePosition>();
+  const sequenceFindings = new Map<string, PositionedDiagnostic[]>();
+  const partitionedTables = new Set<string>();
   for (const statement of parsed.statements) {
-    translateStatement(statement, tables, sequences, views, extensions, diagnostics);
+    translateStatement(
+      statement,
+      tables,
+      sequences,
+      views,
+      extensions,
+      diagnostics,
+      ownerPositions,
+      sequenceFindings,
+      partitionedTables,
+    );
   }
+
+  reconcileSequenceOwners(
+    sequences,
+    tables,
+    partitionedTables,
+    ownerPositions,
+    sequenceFindings,
+    diagnostics,
+  );
 
   diagnostics.sort((left, right) => left.offset - right.offset);
 
@@ -296,6 +323,68 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
+}
+
+/**
+ * Drops every sequence whose `OWNED BY` owner is not in the imported model, naming the skip.
+ *
+ * The pass judges the final drafts, not each statement: a forward reference to a table or
+ * column created later is kept, and a later `OWNED BY NONE` clears an earlier owner. An owner
+ * relation is unread when absent — a partition child, view, foreign table, or skipped
+ * `CREATE TABLE AS` never enters `tables` — or when it is a partitioned parent, which imports
+ * as a table draft but is `relkind 'p'` to the catalog. A present table with a missing column is
+ * an unread column. Either way the whole sequence is omitted, matching the catalog reader, so
+ * no dangling owner can reach the model or `plan()`.
+ */
+function reconcileSequenceOwners(
+  sequences: Map<string, SequenceDraft>,
+  tables: Map<string, TableDraft>,
+  partitionedTables: ReadonlySet<string>,
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  for (const [key, sequence] of sequences) {
+    const owner = sequence.ownedBy;
+    if (owner === undefined) continue;
+
+    const ownerKey = tableKey(owner.table.schema, owner.table.name);
+    const table = tables.get(ownerKey);
+    const unreadRelation = table === undefined || partitionedTables.has(ownerKey);
+    const unreadColumn =
+      table !== undefined && !table.columns.some((column) => column.name === owner.column);
+    if (!unreadRelation && !unreadColumn) continue;
+
+    const position = ownerPositions.get(key);
+    if (position === undefined) {
+      throw new Error(
+        `sequence ${tableIdentityName(sequence)} has an owner but no recorded owner position`,
+      );
+    }
+
+    sequences.delete(key);
+    sequenceFindings.delete(key);
+    const identity = tableIdentityName(sequence);
+    const place = `${owner.table.schema}.${owner.table.name}`;
+    diagnostics.push({
+      offset: position.offset,
+      diagnostic: {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: identity,
+        message: unreadRelation
+          ? `skipped sequence ${identity} belongs to unread relation ${place}; it is not represented`
+          : `skipped sequence ${identity} belongs to unread column ${place}.${owner.column}; it is not represented`,
+        position,
+      },
+    });
+  }
+
+  // Create-time persistence findings wait for the pass so a dropped sequence yields exactly one
+  // diagnostic, like the catalog reader.
+  for (const [key, findings] of sequenceFindings) {
+    if (sequences.has(key)) diagnostics.push(...findings);
+  }
 }
 
 /** The seam binding: a structurally checked `DdlImporter`. */
@@ -329,6 +418,9 @@ function translateStatement(
   views: Map<string, ViewDraft>,
   extensions: Map<string, ExtensionDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
+  partitionedTables: Set<string>,
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
   if (node === undefined) {
@@ -345,7 +437,7 @@ function translateStatement(
   }
 
   if ('CreateStmt' in node) {
-    translateCreateTable(statement, node.CreateStmt, tables, diagnostics);
+    translateCreateTable(statement, node.CreateStmt, tables, diagnostics, partitionedTables);
     return;
   }
   if ('AlterTableStmt' in node) {
@@ -353,11 +445,18 @@ function translateStatement(
     return;
   }
   if ('CreateSeqStmt' in node) {
-    translateCreateSequence(statement, node.CreateSeqStmt, sequences, diagnostics);
+    translateCreateSequence(
+      statement,
+      node.CreateSeqStmt,
+      sequences,
+      diagnostics,
+      ownerPositions,
+      sequenceFindings,
+    );
     return;
   }
   if ('AlterSeqStmt' in node) {
-    translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics);
+    translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics, ownerPositions);
     return;
   }
   if ('IndexStmt' in node) {
@@ -398,6 +497,7 @@ function translateCreateTable(
   create: CreateStmt,
   tables: Map<string, TableDraft>,
   diagnostics: PositionedDiagnostic[],
+  partitionedTables: Set<string>,
 ): void {
   const schema = create.relation?.schemaname ?? 'public';
   const name = create.relation?.relname ?? '';
@@ -414,6 +514,13 @@ function translateCreateTable(
     );
     return;
   }
+
+  // The owner post-pass treats a partitioned parent as unread, like the catalog reader; a
+  // repeated CREATE TABLE replaces the draft, so a table that stops being partitioned must
+  // lose its stale membership.
+  const key = tableKey(schema, name);
+  if (create.partspec !== undefined) partitionedTables.add(key);
+  else partitionedTables.delete(key);
 
   const draft = getOrCreateTable(tables, schema, name);
   const elements = create.tableElts ?? [];
@@ -1536,24 +1643,41 @@ function translateCreateSequence(
   create: CreateSeqStmt,
   sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
 ): void {
   const schema = create.sequence?.schemaname ?? 'public';
   const name = create.sequence?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
-  const options = readCreateSequenceOptions(statement, create.options ?? [], identity, diagnostics);
+  const key = tableKey(schema, name);
+  const options = readCreateSequenceOptions(
+    statement,
+    create.options ?? [],
+    identity,
+    diagnostics,
+    key,
+    ownerPositions,
+  );
   if (options === undefined) return;
 
   // Sequence persistence is not modeled; the re-render is a plain sequence, so flag the loss,
-  // exactly as the table path flags temporary tables (unlogged table persistence is read).
+  // exactly as the table path flags temporary tables (unlogged table persistence is read). The
+  // findings wait for owner reconciliation: a sequence dropped for an unread owner yields only
+  // its skip, like the catalog reader.
+  const findings: PositionedDiagnostic[] = [];
   if (create.sequence?.relpersistence === 'u') {
-    diagnostics.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
+    findings.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
   }
   if (create.sequence?.relpersistence === 't') {
-    diagnostics.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+    findings.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
   }
 
-  // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE.
-  sequences.set(tableKey(schema, name), effectiveSequence({ schema, name, ...options }));
+  // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE:
+  // only an inline owner on this definition keeps an owner position.
+  if (options.ownedBy === undefined) ownerPositions.delete(key);
+  sequenceFindings.set(key, findings);
+
+  sequences.set(key, effectiveSequence({ schema, name, ...options }));
 }
 
 /**
@@ -1566,6 +1690,8 @@ function readCreateSequenceOptions(
   elements: readonly Node[],
   identity: string,
   diagnostics: PositionedDiagnostic[],
+  key: string,
+  ownerPositions: Map<string, SourcePosition>,
 ): SequenceOptions | undefined {
   const defs = sequenceOptionDefs(elements);
   for (const defname of defs.keys()) {
@@ -1616,7 +1742,10 @@ function readCreateSequenceOptions(
   if (ownedBy !== undefined) {
     const owner = parseSequenceOwner(ownedBy);
     if (owner.kind === 'invalid') return unsupported('invalid OWNED BY');
-    if (owner.kind === 'owner') options.ownedBy = owner.owner;
+    if (owner.kind === 'owner') {
+      options.ownedBy = owner.owner;
+      ownerPositions.set(key, statement.start);
+    }
   }
 
   return options;
@@ -1627,12 +1756,14 @@ function translateAlterSequence(
   alter: AlterSeqStmt,
   sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
 ): void {
   const schema = alter.sequence?.schemaname ?? 'public';
   const name = alter.sequence?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
+  const key = tableKey(schema, name);
 
-  const draft = sequences.get(tableKey(schema, name));
+  const draft = sequences.get(key);
   if (draft === undefined) {
     diagnostics.push(
       skipStatement(statement, `ALTER SEQUENCE ${identity} (sequence not imported)`, identity),
@@ -1725,8 +1856,13 @@ function translateAlterSequence(
   if (ownedBy !== undefined) {
     const owner = parseSequenceOwner(ownedBy);
     if (owner.kind === 'invalid') skip('invalid OWNED BY');
-    else if (owner.kind === 'none') delete draft.ownedBy;
-    else draft.ownedBy = owner.owner;
+    else if (owner.kind === 'none') {
+      delete draft.ownedBy;
+      ownerPositions.delete(key);
+    } else {
+      draft.ownedBy = owner.owner;
+      ownerPositions.set(key, statement.start);
+    }
   }
 
   for (const defname of defs.keys()) {

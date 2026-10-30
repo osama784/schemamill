@@ -66,7 +66,7 @@ Constraint resolution searches the table draft's primary key, unique constraints
 
 ## Evidence
 
-The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 391 tests across 50 scenes, 3 skipped — the three PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
+The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 398 tests across 50 scenes, 3 skipped — the three PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
 
 ## Acceptance
 
