@@ -1,8 +1,8 @@
 # Export — project the model as DDL or canonical JSON
 
-**Status:** planned · **Last updated:** 2026-10-30
+**Status:** built · **Last updated:** 2026-10-30
 
-Export is the model's read-only projection out of the workspace. [#134](https://github.com/osama784/schemamill/issues/134) adds `schemamill export --format ddl|json`; the durable decisions are recorded in [ADR 0023](../adr/0023-export-projects-the-model.md).
+Export is the model's read-only projection out of the workspace: `schemamill export --format ddl|json` prints migration-style DDL or the canonical model bytes without changing the workspace or a database. It shipped in [#134](https://github.com/osama784/schemamill/issues/134); the durable decisions are recorded in [ADR 0023](../adr/0023-export-projects-the-model.md).
 
 ## Goal
 
@@ -39,4 +39,4 @@ The command, the step, the renderer, the goldens, the live scene, CONTEXT, ADR 0
 
 ## Deferred
 
-`--out`; a DDL header; markdown projection; JSON envelope/version; `drop-schema` and schema ownership/ACL/comments; empty schemas as objects; system schemas; version-aware semantics (#57); studio consumption (#83); applying SQL/hazards/snapshots; export from a bare dump; extension `VERSION`; cleanup of redundant `setupSql` schema creates outside `extension-round-trip`.
+`--out`; a DDL header; markdown projection; JSON envelope/version; `drop-schema` and schema ownership/ACL/comments; empty schemas as objects; system schemas; schemas named only inside opaque text (collation names, view definitions, check/default expressions) or reachable through a foreign key to an unmodeled table; version-aware semantics (#57); studio consumption (#83); applying SQL/hazards/snapshots; export from a bare dump; extension `VERSION`; cleanup of redundant `setupSql` schema creates outside `extension-round-trip`.

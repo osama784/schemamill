@@ -152,6 +152,10 @@ _Avoid_: ingest, load, sync, reverse-engineer
 Bringing a schema into the model by reading a live database's catalog, read-only. The verb is introspect.
 _Avoid_: import, scan, sync
 
+**Export**:
+Projecting the canonical model into a reviewable artifact — migration-style DDL or canonical JSON — without changing the workspace. Read-only: schemamill never applies the SQL it prints.
+_Avoid_: dump, save, serialize
+
 **DDL dump**:
 The textual source import reads: a file or paste of DDL statements.
 _Avoid_: SQL file, pg_dump output
