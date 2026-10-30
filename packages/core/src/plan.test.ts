@@ -604,6 +604,9 @@ const commentTargetNode = (
 /** Applies one step to `state`, failing the test when the step is illegal there. */
 const applyStep = (state: SimulatedState, step: Step): void => {
   switch (step.kind) {
+    case 'create-schema':
+      // Schemas are namespaces, not model state: the simulator tracks objects, not namespaces.
+      return;
     case 'create-table': {
       const key = keyOf(step.table);
       assert.equal(state.tables.has(key), false, `create-table of live table ${key}`);
@@ -2120,6 +2123,7 @@ test('an empty step list has no transaction groups', () => {
 
 test('every current step kind is classified, and only the concurrent kinds stand alone', () => {
   const kinds: readonly Step['kind'][] = [
+    'create-schema',
     'create-table',
     'drop-table',
     'add-column',
@@ -2155,7 +2159,7 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'comment',
   ];
 
-  assert.equal(kinds.length, 33);
+  assert.equal(kinds.length, 34);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -6163,7 +6167,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 33, 'every step kind must be classified');
+  assert.equal(kinds.length, 34, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -7698,7 +7702,8 @@ test('extension comments are phase 12 and the extension alter is phase 13', () =
   ]);
 
   assertPlan(baseline, target, [
-    // Global phase 1: the added extension, carrying its comment.
+    // Global phase 1: the target-only schema, then the added extension carrying its comment.
+    { kind: 'create-schema', schema: 'hs2' },
     { kind: 'create-extension', extension: extension('pgcrypto', { comment: 'crypto' }) },
     // Global phase 12: extension comments, in target identity order.
     {
@@ -7730,6 +7735,8 @@ test('extension alters come before extension drops, both last and in name order'
   const target = extensionModel([extension('hstore', { schema: 'hs2' })]);
 
   assertPlan(baseline, target, [
+    // Global phase 1: the target-only destination schema.
+    { kind: 'create-schema', schema: 'hs2' },
     {
       kind: 'alter-extension',
       extension: { name: 'hstore' },
@@ -7829,10 +7836,100 @@ test('a schema change flows from the diff to the plan destination field', () => 
     },
   ]);
   assertPlan(baseline, target, [
+    // Global phase 1: the target-only destination schema.
+    { kind: 'create-schema', schema: 'hs2' },
     {
       kind: 'alter-extension',
       extension: { name: 'hstore' },
       fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
     },
   ]);
+});
+
+test('schema creates open the plan before every object, in name order', () => {
+  const target: Model = {
+    tables: [table('orders', { schema: 'sales', columns: [column('id')] })],
+    sequences: [sequence('invoice_seq', {}, 'app')],
+    views: [view('totals', {}, 'analytics')],
+    extensions: [extension('hstore', { schema: 'gis' })],
+  };
+
+  assertPlan(model(), target, [
+    // Global phase 1: the target's schemas first, in name order, before extensions and objects.
+    { kind: 'create-schema', schema: 'analytics' },
+    { kind: 'create-schema', schema: 'app' },
+    { kind: 'create-schema', schema: 'gis' },
+    { kind: 'create-schema', schema: 'sales' },
+    { kind: 'create-extension', extension: extension('hstore', { schema: 'gis' }) },
+    { kind: 'create-sequence', sequence: sequence('invoice_seq', {}, 'app') },
+    {
+      kind: 'create-table',
+      table: table('orders', { schema: 'sales', columns: [column('id')] }),
+    },
+    { kind: 'create-view', view: view('totals', {}, 'analytics') },
+  ]);
+  simulate(model(), target);
+});
+
+test('public is never a schema step', () => {
+  const target = model(table('t', { columns: [column('id')] }));
+
+  assert.deepStrictEqual(
+    plan(model(), target).steps.map((step) => step.kind),
+    ['create-table'],
+  );
+});
+
+test('a schema a baseline object uses is not created again', () => {
+  const baseline = model(table('old', { schema: 'app', columns: [column('id')] }));
+  const target = model(table('new', { schema: 'app', columns: [column('id')] }));
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('old', 'app') },
+    { kind: 'create-table', table: table('new', { schema: 'app', columns: [column('id')] }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('one schema step covers every family that names the schema', () => {
+  const target: Model = {
+    tables: [
+      table('a', { schema: 'app', columns: [column('id')] }),
+      table('b', { schema: 'app', columns: [column('id')] }),
+    ],
+    sequences: [sequence('s', {}, 'app')],
+    views: [view('v', {}, 'app')],
+    extensions: [extension('hstore', { schema: 'app' })],
+  };
+
+  assert.deepStrictEqual(
+    plan(model(), target).steps.filter((step) => step.kind === 'create-schema'),
+    [{ kind: 'create-schema', schema: 'app' }],
+  );
+});
+
+test('a baseline-only schema emits no step', () => {
+  const baseline = model(table('old', { schema: 'legacy', columns: [column('id')] }));
+  const target = model(table('fresh', { columns: [column('id')] }));
+
+  assert.deepStrictEqual(
+    plan(baseline, target).steps.filter((step) => step.kind === 'create-schema'),
+    [],
+  );
+});
+
+test('an identity sequence name counts as a schema use', () => {
+  const descriptor = identityColumn({ sequenceName: { schema: 'app', name: 't_id_seq' } });
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: descriptor })],
+    }),
+  );
+
+  assertPlan(model(), target, [
+    { kind: 'create-schema', schema: 'app' },
+    { kind: 'create-table', table: target.tables[0]! },
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+  ]);
+  simulate(model(), target);
 });

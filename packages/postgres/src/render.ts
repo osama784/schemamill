@@ -58,6 +58,10 @@ import {
  * key, when present, is the trailing line. A table with neither columns nor a primary key
  * renders on one line as `CREATE TABLE <q> ();`.
  *
+ * `create-schema` renders `CREATE SCHEMA IF NOT EXISTS <schema>;`. Schemas are not modeled, so
+ * a namespace the target database already carries is not a difference; the guard keeps that
+ * ordinary case from aborting the migration.
+ *
  * `create-sequence` renders the canonical full-explicit form — `AS`, `INCREMENT BY`,
  * `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`/`NO CYCLE` — with the plan's
  * effective values, so re-importing the rendered SQL reproduces the same sequence.
@@ -417,6 +421,7 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'drop-index':
     case 'drop-index-concurrently':
       return { table: step.table, index: step.index, polarity: 'drops' };
+    case 'create-schema':
     case 'create-table':
     case 'drop-table':
     case 'add-column':
@@ -492,6 +497,8 @@ export function quoteIdentifier(identifier: string): string {
 /** One plan step as one or more statements, without a trailing newline. */
 function renderStep(step: Step): string {
   switch (step.kind) {
+    case 'create-schema':
+      return `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(step.schema)};`;
     case 'create-table':
       return renderCreateTable(step.table);
     case 'drop-table':

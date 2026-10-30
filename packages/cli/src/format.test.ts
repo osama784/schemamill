@@ -1265,3 +1265,23 @@ test('a comment step prints its text JSON-quoted, not as raw whitespace', () => 
     ].join('\n'),
   );
 });
+
+test('schema plan steps print the bare schema name', () => {
+  const plan: Plan = {
+    steps: [
+      { kind: 'create-schema', schema: 'app' },
+      { kind: 'create-extension', extension: { name: 'btree_gist', schema: 'public' } },
+    ],
+    groups: [{ start: 0, end: 2, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '2 steps in one transaction:',
+      ' 1. create-schema     app',
+      ' 2. create-extension  btree_gist',
+      '',
+    ].join('\n'),
+  );
+});

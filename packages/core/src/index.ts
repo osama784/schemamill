@@ -15,6 +15,7 @@ export {
 export {
   initWorkspace,
   resolveWorkspace,
+  serializeModel,
   writeWorkspaceModel,
   WORKSPACE_DIR_NAME,
   WORKSPACE_MODEL_FILE_NAME,

@@ -7,7 +7,7 @@ The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the 
 ## Term clusters
 
 - **The model layer** — model, schema, table, column, comment, relationship, foreign key, sequence, sequence-backed default, ownership, identity column, identity sequence, view, materialized view, view definition, view check option, extension, snapshot, baseline, target, diff, data.
-- **Crossing the boundary** — import, introspection, DDL dump, apply.
+- **Crossing the boundary** — import, introspection, export, DDL dump, apply.
 - **The change engine** — migration plan, migration SQL, hazard, definite hazard, state-dependent hazard, certain-cost hazard, expand/contract, round-trip fidelity.
 - **The product's shape** — safe-change loop, studio, canvas, workspace, and the two faces: studio for working visually, CLI for automation.
 
