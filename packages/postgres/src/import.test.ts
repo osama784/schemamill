@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { diff } from '@schemamill/core';
+import { diff, plan } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
 import {
@@ -2611,6 +2611,285 @@ test('skips sequence state, missing sequences, and unmapped options by name', as
   assert.match(messages, /CREATE SEQUENCE public\.bad \(unsupported data type\)/);
   assert.match(messages, /CREATE SEQUENCE public\.fractional \(non-integer cache\)/);
   assert.match(messages, /SELECT setval\('public\.s', 1, false\)/);
+});
+
+/**
+ * One dump with an owner for every unread shape the import must recognize: an absent table, a
+ * partitioned parent, a partition child, a view, a missing column, and a skipped
+ * `CREATE TABLE AS`; plus one dropped unlogged and one dropped temporary sequence, so each
+ * deferred persistence flag is discriminated, and one kept sequence.
+ */
+const MIXED_OWNER_DUMP = [
+  `CREATE TABLE public.kept (id bigint);`,
+  `CREATE SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`,
+  `ALTER SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`,
+  `CREATE TABLE public.parted (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+  `CREATE TABLE public.parted_2026 PARTITION OF public.parted FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+  `CREATE SEQUENCE public.child_seq;`,
+  `ALTER SEQUENCE public.child_seq OWNED BY public.parted_2026.id;`,
+  `CREATE VIEW public.v AS SELECT 1;`,
+  `CREATE SEQUENCE public.view_seq;`,
+  `ALTER SEQUENCE public.view_seq OWNED BY public.v.id;`,
+  `CREATE SEQUENCE public.parent_seq;`,
+  `ALTER SEQUENCE public.parent_seq OWNED BY public.parted.id;`,
+  `CREATE SEQUENCE public.column_seq;`,
+  `ALTER SEQUENCE public.column_seq OWNED BY public.kept.missing;`,
+  `CREATE TABLE public.ctas AS SELECT 1 AS id;`,
+  `CREATE SEQUENCE public.ctas_seq;`,
+  `ALTER SEQUENCE public.ctas_seq OWNED BY public.ctas.id;`,
+  `CREATE UNLOGGED SEQUENCE public.dropped_unlogged;`,
+  `ALTER SEQUENCE public.dropped_unlogged OWNED BY public.absent.id;`,
+  `CREATE TEMPORARY SEQUENCE public.dropped_temporary;`,
+  `ALTER SEQUENCE public.dropped_temporary OWNED BY public.absent.id;`,
+  `CREATE SEQUENCE public.kept_seq;`,
+  `ALTER SEQUENCE public.kept_seq OWNED BY public.kept.id;`,
+].join('\n');
+
+test('skips sequences whose owners are not in the imported model, in source order', async () => {
+  const at = (statement: string, line: number) => ({
+    offset: MIXED_OWNER_DUMP.indexOf(statement),
+    line,
+    column: 1,
+  });
+
+  const { model, diagnostics } = await importDump(MIXED_OWNER_DUMP);
+
+  assert.deepEqual(model.sequences, [
+    sequence('kept_seq', {
+      ownedBy: { table: { schema: 'public', name: 'kept' }, column: 'id' },
+    }),
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ({
+      ...describeDiagnostic(diagnostic),
+      position: diagnostic.position,
+    })),
+    [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.absent_owner_seq',
+        message:
+          'skipped sequence public.absent_owner_seq belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`, 3),
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.parted',
+        message: 'dropped partitioning clauses from public.parted',
+        position: at(
+          `CREATE TABLE public.parted (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+          4,
+        ),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.parted_2026',
+        message: 'skipped partition public.parted_2026 (a partition is not a plain table)',
+        position: at(
+          `CREATE TABLE public.parted_2026 PARTITION OF public.parted FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+          5,
+        ),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.child_seq',
+        message:
+          'skipped sequence public.child_seq belongs to unread relation public.parted_2026; it is not represented',
+        position: at(`ALTER SEQUENCE public.child_seq OWNED BY public.parted_2026.id;`, 7),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.view_seq',
+        message:
+          'skipped sequence public.view_seq belongs to unread relation public.v; it is not represented',
+        position: at(`ALTER SEQUENCE public.view_seq OWNED BY public.v.id;`, 10),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.parent_seq',
+        message:
+          'skipped sequence public.parent_seq belongs to unread relation public.parted; it is not represented',
+        position: at(`ALTER SEQUENCE public.parent_seq OWNED BY public.parted.id;`, 12),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.column_seq',
+        message:
+          'skipped sequence public.column_seq belongs to unread column public.kept.missing; it is not represented',
+        position: at(`ALTER SEQUENCE public.column_seq OWNED BY public.kept.missing;`, 14),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.ctas',
+        message: 'skipped CREATE TABLE AS public.ctas',
+        position: at(`CREATE TABLE public.ctas AS SELECT 1 AS id;`, 15),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.ctas_seq',
+        message:
+          'skipped sequence public.ctas_seq belongs to unread relation public.ctas; it is not represented',
+        position: at(`ALTER SEQUENCE public.ctas_seq OWNED BY public.ctas.id;`, 17),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.dropped_unlogged',
+        message:
+          'skipped sequence public.dropped_unlogged belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.dropped_unlogged OWNED BY public.absent.id;`, 19),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.dropped_temporary',
+        message:
+          'skipped sequence public.dropped_temporary belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.dropped_temporary OWNED BY public.absent.id;`, 21),
+      },
+    ],
+  );
+});
+
+test('keeps a sequence whose owner table appears later in the dump', async () => {
+  const dump = [
+    // The owner is set before its table exists; the post-pass judges final state, so it survives.
+    `CREATE SEQUENCE public.early;`,
+    `ALTER SEQUENCE public.early OWNED BY public.t.id;`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE TABLE public.t (id bigint);`,
+    `ALTER SEQUENCE public.s OWNED BY public.t.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('early', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a sequence whose owner column is added after the OWNED BY statement', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id bigint);`,
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.t.added;`,
+    `ALTER TABLE public.t ADD COLUMN added bigint;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'added' } }),
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('OWNED BY NONE clears an earlier unread owner and keeps the sequence', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.absent.id;`,
+    `ALTER SEQUENCE public.s OWNED BY NONE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.equal(model.sequences[0]?.ownedBy, undefined);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('validates inline OWNED BY and keeps a resolvable inline owner', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.unread OWNED BY public.absent.id;`,
+    `CREATE TABLE public.t (id bigint);`,
+    `CREATE SEQUENCE public.kept OWNED BY public.t.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('kept', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ({
+      ...describeDiagnostic(diagnostic),
+      position: diagnostic.position,
+    })),
+    [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.unread',
+        message:
+          'skipped sequence public.unread belongs to unread relation public.absent; it is not represented',
+        position: { offset: 0, line: 1, column: 1 },
+      },
+    ],
+  );
+});
+
+test('a re-created partition parent is a plain table and its sequence survives', async () => {
+  const dump = [
+    `CREATE TABLE public.p (a bigint) PARTITION BY RANGE (a);`,
+    `CREATE TABLE public.p (a bigint);`,
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.p.a;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 'p' }, column: 'a' } }),
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.p' },
+  ]);
+});
+
+test('never plans an ownership attach to a relation the model does not carry', async () => {
+  const { model } = await importDump(MIXED_OWNER_DUMP);
+
+  const tables = new Map(
+    model.tables.map((table) => [`${table.schema}\u0000${table.name}`, table]),
+  );
+  for (const entry of model.sequences) {
+    const owner = entry.ownedBy;
+    if (owner === undefined) continue;
+    const table = tables.get(`${owner.table.schema}\u0000${owner.table.name}`);
+    assert.ok(
+      table,
+      `${entry.name} owns ${owner.table.schema}.${owner.table.name}, which is modeled`,
+    );
+    assert.ok(
+      table.columns.some((column) => column.name === owner.column),
+      `${entry.name} owns ${owner.table.schema}.${owner.table.name}.${owner.column}, which is modeled`,
+    );
+  }
+
+  const emptyModel: Model = { tables: [], sequences: [], views: [], extensions: [] };
+  const attached = plan(emptyModel, model).steps.filter((step) => step.kind === 'alter-sequence');
+  assert.ok(attached.length > 0, 'the kept sequence contributes an ownership attach');
+  for (const step of attached) {
+    for (const field of step.fields) {
+      if (field.field !== 'ownedBy') continue;
+      const owner = field.after ?? field.before;
+      assert.ok(
+        owner === undefined || tables.has(`${owner.table.schema}\u0000${owner.table.name}`),
+        `no alter-sequence step names an absent owner relation`,
+      );
+    }
+  }
 });
 
 test('names a setval call and keeps non-setval or non-literal select generic', async () => {
