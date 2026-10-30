@@ -154,13 +154,22 @@ import { renderSql } from './render.ts';
  *
  * The extension scene carries the whole extension lifecycle: `extension-round-trip` moves a
  * commented `hstore` from `hs1` to `hs2` with a changed comment, installs a commented `pgcrypto`
- * in `public`, and removes a commented `citext`. Its `setupSql` creates both install schemas on
- * both databases, because the plan has no schema-creation phase. Its plan check pins the global
- * phase order — the create, then the two terminal comments, then the move and the drop — and its
- * catalog checks pin `extnamespace` through `pg_namespace` and the comment through
- * `obj_description(oid, 'pg_extension')`. It declares no `introspection` assertion either: the
- * catalog reader returns `extensions: []` until the follow-up, so a model carrying extensions is
- * intentionally not what it returns.
+ * in `public`, and removes a commented `citext`. The plan creates each build's non-public
+ * install schema itself — the baseline build creates `hs1`, the target build and migration
+ * create the target-only `hs2` — so the scene needs no `setupSql`. Its plan check pins the
+ * global phase order — the schema create, the extension create, then the two terminal comments,
+ * then the move and the drop — and its catalog checks pin `extnamespace` through `pg_namespace`
+ * and the comment through `obj_description(oid, 'pg_extension')`. It declares no `introspection`
+ * assertion either: the catalog reader returns `extensions: []` until the follow-up, so a model
+ * carrying extensions is intentionally not what it returns.
+ *
+ * The export scene is the apply-to-a-fresh-database probe: `export-round-trip` has an empty
+ * baseline and no `setupSql` or `targetExtraSql`, so its baseline build is empty and both the
+ * target build and the migration are exactly `renderSql(plan(empty, target))` — the DDL
+ * `schemamill export --format ddl` prints. Both non-public schemas, including a quoted
+ * mixed-case name, hold at least two tables, and one schema also hosts a sequence, a view, and
+ * the scene's comments, so the database that starts with only `public` can only reach the
+ * target through the export's own `CREATE SCHEMA` steps.
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -6156,11 +6165,11 @@ const commentRoundTripScene = (): LiveScene => {
 
 /**
  * The extension scene: a commented `hstore` moves schemas with a changed comment, a commented
- * `pgcrypto` arrives in `public`, and a commented `citext` leaves. `setupSql` creates both
- * install schemas on both databases, because the plan has no schema-creation phase and the
- * baseline's `WITH SCHEMA hs1` would otherwise fail. Every extension statement the dump carries
- * is the server's `IF NOT EXISTS` form, so the round trip also proves the import ignores the
- * clause.
+ * `pgcrypto` arrives in `public`, and a commented `citext` leaves. The plan creates the install
+ * schemas itself: the baseline build creates `hs1`, and the target build and the migration
+ * create the target-only `hs2`, so the scene needs no `setupSql`. Every extension statement the
+ * dump carries is the server's `IF NOT EXISTS` form, so the round trip also proves the import
+ * ignores the clause.
  *
  * The catalog checks pin `extnamespace` through `pg_namespace` and the comment through
  * `obj_description(oid, 'pg_extension')`, so a write that updates the model but not the server
@@ -6212,7 +6221,8 @@ const extensionRoundTripScene = (): LiveScene => {
   ];
 
   const expectedSteps: readonly Step[] = [
-    // Global phase 1: the added extension, carrying its comment.
+    // Global phase 1: the target-only install schema, then the added extension with its comment.
+    { kind: 'create-schema', schema: 'hs2' },
     {
       kind: 'create-extension',
       extension: { name: 'pgcrypto', schema: 'public', comment: pgcryptoComment },
@@ -6241,7 +6251,6 @@ const extensionRoundTripScene = (): LiveScene => {
     name: 'extension-round-trip',
     baseline,
     target,
-    setupSql: ['CREATE SCHEMA hs1;', 'CREATE SCHEMA hs2;'].join('\n'),
     baselineChecks: [
       {
         description: 'the baseline installed hstore in hs1',
@@ -6287,7 +6296,7 @@ const extensionRoundTripScene = (): LiveScene => {
           if (!isDeepStrictEqual(steps, expectedSteps)) {
             return `steps: ${JSON.stringify(steps)}, expected ${JSON.stringify(expectedSteps)}`;
           }
-          return isDeepStrictEqual(plan.groups, [{ start: 0, end: 5, transactional: true }])
+          return isDeepStrictEqual(plan.groups, [{ start: 0, end: 6, transactional: true }])
             ? undefined
             : `transaction groups: ${JSON.stringify(plan.groups)}`;
         },
@@ -6359,6 +6368,180 @@ const extensionRoundTripScene = (): LiveScene => {
   };
 };
 
+/**
+ * The export round trip: the migrated database is built by applying exactly the SQL `export`
+ * prints. `baseline` is the empty model, and there is no `setupSql` or `targetExtraSql`, so the
+ * applied database starts with only `public`: its baseline build is empty, its target build is
+ * `renderSql(plan(empty, target))` — the exported DDL — and the migration is the same plan.
+ * Both non-public schemas, `app` and the quoted mixed-case `"Weird Schema"`, hold two tables;
+ * `app` also hosts an exported sequence and view, and the tables carry a table comment and a
+ * column comment, so the export must carry `CREATE SCHEMA`, `CREATE TABLE`, `CREATE SEQUENCE`,
+ * `CREATE VIEW`, and `COMMENT ON` statements that all apply to a database with no ambient
+ * namespace.
+ *
+ * The plan check pins both schema creates first in name order and none after an object step;
+ * catalog checks pin the applied database; import checks pin that both server dumps' imports
+ * carry every schema-qualified object and both comments.
+ */
+const exportRoundTripScene = (): LiveScene => {
+  const accountsComment = 'Accounts owned by the app schema';
+  const idComment = 'Surrogate account key';
+
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        schema: 'app',
+        comment: accountsComment,
+        columns: [
+          column('id', { type: 'integer', notNull: true, comment: idComment }),
+          column('email', { notNull: true }),
+        ],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('audit', {
+        schema: 'app',
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('things', {
+        schema: 'Weird Schema',
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('other', {
+        schema: 'Weird Schema',
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { columns: ['id'] },
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq', { schema: 'app' })],
+    views: [
+      view('active_accounts', {
+        schema: 'app',
+        definition: 'SELECT id, email FROM app.accounts WHERE id > 0',
+      }),
+    ],
+    extensions: [],
+  };
+
+  /** The tables in `schema` in name order, or the empty string when there are none. */
+  const tablesIn = (schema: string): string =>
+    `select string_agg(tablename, ',' order by tablename) from pg_tables` +
+    ` where schemaname = '${schema}'`;
+
+  return {
+    name: 'export-round-trip',
+    baseline: model(),
+    target,
+    planChecks: [
+      {
+        description:
+          'the plan creates both non-public schemas first, in name order, and never later',
+        failure: (steps) => {
+          const [first, second] = steps;
+          if (first?.kind !== 'create-schema' || second?.kind !== 'create-schema') {
+            return `the first two steps are ${JSON.stringify(
+              steps.slice(0, 2).map((step) => step.kind),
+            )}, expected create-schema`;
+          }
+          const names = [first.schema, second.schema];
+          if (!isDeepStrictEqual(names, ['Weird Schema', 'app'])) {
+            return `schema steps: ${JSON.stringify(names)}, expected ["Weird Schema","app"]`;
+          }
+          const later = steps
+            .slice(2)
+            .filter((step) => step.kind === 'create-schema')
+            .map((step) => (step.kind === 'create-schema' ? step.schema : ''));
+          return later.length === 0
+            ? undefined
+            : `schema steps after objects: ${JSON.stringify(later)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database has both non-public schemas',
+        sql: "select count(*) from pg_namespace where nspname in ('app', 'Weird Schema')",
+        expected: '2',
+      },
+      {
+        description: 'app holds the exported tables',
+        sql: tablesIn('app'),
+        expected: 'accounts,audit',
+      },
+      {
+        description: 'the quoted schema holds the exported tables',
+        sql: tablesIn('Weird Schema'),
+        expected: 'other,things',
+      },
+      {
+        description: 'app holds the exported view',
+        sql: relKindOf('active_accounts', 'app'),
+        expected: 'v',
+      },
+      {
+        description: 'app holds the exported sequence',
+        sql: relationExists('accounts_id_seq', 'app'),
+        expected: 't',
+      },
+      commentCheck(
+        'the exported table comment survives the migration',
+        relationComment('accounts', 'app'),
+        accountsComment,
+      ),
+    ],
+    importChecks: [
+      {
+        description:
+          'both imports carry every schema-qualified object, comment, and column comment',
+        failure: (imported, source) => {
+          const tables = imported.model.tables
+            .map((table) => `${table.schema}.${table.name}`)
+            .sort();
+          const expectedTables = [
+            'Weird Schema.other',
+            'Weird Schema.things',
+            'app.accounts',
+            'app.audit',
+          ];
+          if (!isDeepStrictEqual(tables, expectedTables)) {
+            return `${source}: imported tables ${JSON.stringify(tables)}, expected ${JSON.stringify(expectedTables)}`;
+          }
+          const accounts = imported.model.tables.find(
+            (table) => table.schema === 'app' && table.name === 'accounts',
+          );
+          if (accounts === undefined) return `${source}: app.accounts is not imported`;
+          if (accounts.comment !== accountsComment) {
+            return `${source}: accounts.comment is ${JSON.stringify(accounts.comment)}, expected ${JSON.stringify(accountsComment)}`;
+          }
+          const id = accounts.columns.find((column) => column.name === 'id');
+          if (id?.comment !== idComment) {
+            return `${source}: accounts.id.comment is ${JSON.stringify(id?.comment)}, expected ${JSON.stringify(idComment)}`;
+          }
+          if (
+            !imported.model.sequences.some(
+              (sequence) => sequence.schema === 'app' && sequence.name === 'accounts_id_seq',
+            )
+          ) {
+            return `${source}: app.accounts_id_seq is not imported`;
+          }
+          const active = imported.model.views.find(
+            (view) => view.schema === 'app' && view.name === 'active_accounts',
+          );
+          if (active === undefined) return `${source}: app.active_accounts is not imported`;
+          if (active.definition.trim() === '') {
+            return `${source}: app.active_accounts imported an empty definition`;
+          }
+          return undefined;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -6407,4 +6590,5 @@ export const scenes: readonly LiveScene[] = [
   viewRoundTripScene(),
   commentRoundTripScene(),
   extensionRoundTripScene(),
+  exportRoundTripScene(),
 ];
