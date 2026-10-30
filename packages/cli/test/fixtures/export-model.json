@@ -1,0 +1,128 @@
+{
+  "tables": [
+    {
+      "schema": "app",
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": true
+        },
+        {
+          "name": "email",
+          "type": "text",
+          "notNull": true
+        },
+        {
+          "name": "display_name",
+          "type": "text",
+          "notNull": false
+        }
+      ],
+      "primaryKey": {
+        "name": "users_pkey",
+        "columns": ["id"]
+      },
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": [
+        {
+          "name": "users_email_idx",
+          "unique": true,
+          "columns": ["email"]
+        }
+      ],
+      "comment": "one row per account"
+    },
+    {
+      "schema": "app",
+      "name": "orders",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "notNull": true
+        },
+        {
+          "name": "user_id",
+          "type": "integer",
+          "notNull": true
+        },
+        {
+          "name": "placed_on",
+          "type": "date",
+          "notNull": false,
+          "default": "CURRENT_DATE"
+        }
+      ],
+      "primaryKey": {
+        "columns": ["id"]
+      },
+      "foreignKeys": [
+        {
+          "name": "orders_user_id_fkey",
+          "columns": ["user_id"],
+          "referencedTable": {
+            "schema": "app",
+            "name": "users"
+          },
+          "referencedColumns": ["id"],
+          "onDelete": "CASCADE"
+        }
+      ],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": []
+    },
+    {
+      "schema": "Weird Schema",
+      "name": "items",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": true
+        },
+        {
+          "name": "label",
+          "type": "text",
+          "notNull": true
+        }
+      ],
+      "primaryKey": {
+        "name": "items_pkey",
+        "columns": ["id"]
+      },
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": []
+    }
+  ],
+  "sequences": [
+    {
+      "schema": "app",
+      "name": "order_number_seq",
+      "dataType": "bigint",
+      "increment": "1",
+      "minValue": "1",
+      "maxValue": "9223372036854775807",
+      "start": "1000",
+      "cache": "1",
+      "cycle": false
+    }
+  ],
+  "views": [
+    {
+      "schema": "Weird Schema",
+      "name": "item_labels",
+      "materialized": false,
+      "definition": "SELECT id, label FROM \"Weird Schema\".items",
+      "checkOption": "local",
+      "comment": "labels only"
+    }
+  ],
+  "extensions": []
+}

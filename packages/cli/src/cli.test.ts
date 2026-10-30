@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, readFileSync } from 'node:fs';
 import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,8 @@ import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { resolveWorkspace, version } from '@schemamill/core';
+import { initWorkspace, resolveWorkspace, version } from '@schemamill/core';
+import type { Model } from '@schemamill/core';
 import { importDump } from '@schemamill/postgres';
 
 /**
@@ -18,9 +19,10 @@ import { importDump } from '@schemamill/postgres';
  * compare and plan scenes pass fixture dumps written into a fresh temp directory — except the
  * render refusal, which reads the checked-in pair under `test/fixtures` — or run inside a temp
  * workspace whose `model.json` resolves the side a lone path leaves open, with the spawned
- * cwd deciding which workspace root wins; the init scenes pass a fresh temp directory as the
- * workspace target, sometimes with a dump imported from a file or stdin, and the usage tests
- * pass their arguments bare. Each asserts the exact
+ * cwd deciding which workspace root wins; the export scenes create a temp workspace holding
+ * the committed fixture model and run from it; the init scenes pass a fresh temp directory as
+ * the workspace target, sometimes with a dump imported from a file or stdin, and the usage
+ * tests pass their arguments bare. Each asserts the exact
  * stdout, stderr, and exit code: stdout carries only the artifact — or the help and version
  * text — while stderr carries only diagnostics, failures, and usage errors.
  */
@@ -61,6 +63,33 @@ const STALE_MODEL = [
   '}',
   '',
 ].join('\n');
+
+/** The committed export fixture, parsed from its bytes: both projections read this model. */
+const EXPORT_MODEL = JSON.parse(testText('fixtures/export-model.json')) as Model;
+
+/**
+ * A model whose two identical unnamed indexes on one table resolve to the same conventional
+ * name (`t_a_idx`): the DDL projection can render neither create, so it refuses with no stdout.
+ */
+const REFUSAL_MODEL: Model = {
+  tables: [
+    {
+      schema: 'public',
+      name: 't',
+      columns: [{ name: 'a', type: 'integer', notNull: false }],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [
+        { unique: false, columns: ['a'] },
+        { unique: false, columns: ['a'] },
+      ],
+    },
+  ],
+  sequences: [],
+  views: [],
+  extensions: [],
+};
 
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
@@ -325,6 +354,7 @@ const USAGE = [
   '',
   'Commands:',
   '  compare [options] [baseline] [target]  Print the diff and any hazards between a baseline and a target.',
+  '  export [options]                       Print the workspace model as DDL or canonical JSON.',
   '  init [options] [path]                  Create a workspace in a directory.',
   '  plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.',
   '  help [command]                         display help for command',
@@ -348,6 +378,18 @@ const COMPARE_HELP = [
   '  -h, --help            display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
+  '',
+].join('\n');
+
+/** What `export --help` prints to stdout. */
+const EXPORT_HELP = [
+  'Usage: schemamill export [options]',
+  '',
+  'Print the workspace model as DDL or canonical JSON.',
+  '',
+  'Options:',
+  '  --format <format>  output format: ddl or json (default: "ddl")',
+  '  -h, --help         display help for command',
   '',
 ].join('\n');
 
@@ -420,6 +462,19 @@ async function writeWorkspaceModel(root: string, contents: string): Promise<void
 /** A checked-in fixture dump under `test/fixtures`, as a filesystem path. */
 function fixturePath(fileName: string): string {
   return fileURLToPath(new URL(`../test/fixtures/${fileName}`, import.meta.url));
+}
+
+/** A checked-in file under `test/` (a fixture or a golden), verbatim. */
+function testText(relativePath: string): string {
+  return readFileSync(fileURLToPath(new URL(`../test/${relativePath}`, import.meta.url)), 'utf8');
+}
+
+/** A fresh temp workspace holding the committed export fixture model, for `export` runs. */
+async function exportWorkspace(context: TestContext): Promise<string> {
+  const root = await fixtureDir(context);
+  const created = await initWorkspace(root, EXPORT_MODEL);
+  assert.equal(created.ok, true);
+  return root;
 }
 
 interface RunOptions {
@@ -1343,6 +1398,137 @@ test('init --help documents --from and --verbose, exit 0', async () => {
   const result = await runCli('init', '--help');
 
   assert.equal(result.stdout, INIT_HELP);
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('export prints exactly the export.ddl.sql golden, exit 0', async (t) => {
+  const root = await exportWorkspace(t);
+
+  const result = await runCli('export', { cwd: root });
+
+  assert.equal(result.stdout, testText('goldens/export.ddl.sql'));
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('export --format json prints the canonical bytes and parses back to the model', async (t) => {
+  const root = await exportWorkspace(t);
+
+  const result = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(result.stdout, testText('goldens/export.json.txt'));
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  const resolution = await resolveWorkspace(root);
+  assert.ok(resolution.ok);
+  assert.deepEqual(JSON.parse(result.stdout), resolution.model);
+});
+
+test('export --format=json is the same artifact as --format json', async (t) => {
+  const root = await exportWorkspace(t);
+
+  const equalsForm = await runCli('export', '--format=json', { cwd: root });
+  const spacedForm = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(equalsForm.stdout, testText('goldens/export.json.txt'));
+  assert.equal(equalsForm.stdout, spacedForm.stdout);
+  assert.equal(equalsForm.stderr, '');
+  assert.equal(equalsForm.code, 0);
+});
+
+test('export of an empty workspace prints an empty DDL script and the empty model', async (t) => {
+  const root = await fixtureDir(t);
+  const created = await initWorkspace(root);
+  assert.equal(created.ok, true);
+
+  const ddl = await runCli('export', { cwd: root });
+
+  assert.equal(ddl.stdout, '');
+  assert.equal(ddl.stderr, '');
+  assert.equal(ddl.code, 0);
+
+  const json = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(json.stdout, EMPTY_MODEL);
+  assert.equal(json.stderr, '');
+  assert.equal(json.code, 0);
+});
+
+test('export outside any workspace is one stderr line, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+
+  const result = await runCli('export', { cwd: dir });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, `schemamill: no workspace found from ${dir}\n`);
+  assert.equal(result.code, 1);
+});
+
+test('export with a corrupt model reports the parse failure, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  const modelPath = join(root, '.schemamill', 'model.json');
+  const corrupt = '{"tables": ';
+  await writeWorkspaceModel(root, corrupt);
+
+  const result = await runCli('export', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    `schemamill: cannot parse ${modelPath}: ${jsonParseFailure(corrupt)}\n`,
+  );
+  assert.equal(result.code, 1);
+});
+
+test('an invalid --format is a usage error before any filesystem access, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+
+  const result = await runCli('export', '--format', 'text', { cwd: dir });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'error: --format must be "ddl" or "json"\n');
+  assert.equal(result.code, 1);
+});
+
+test("export --format without a value is Commander's usage error, exit 1", async () => {
+  const result = await runCli('export', '--format');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: option '--format <format>' argument missing\n");
+  assert.equal(result.code, 1);
+});
+
+test('export with an extra argument is a usage error naming it, exit 1', async () => {
+  const result = await runCli('export', 'extra');
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    "error: too many arguments for 'export'. Expected 0 arguments but got 1: extra.\n",
+  );
+  assert.equal(result.code, 1);
+});
+
+test('export refuses a plan whose index creates share a name, with empty stdout, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  const created = await initWorkspace(root, REFUSAL_MODEL);
+  assert.equal(created.ok, true);
+
+  const result = await runCli('export', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an unnamed index on (a)\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('export --help documents --format, exit 0', async () => {
+  const result = await runCli('export', '--help');
+
+  assert.equal(result.stdout, EXPORT_HELP);
   assert.equal(result.stderr, '');
   assert.equal(result.code, 0);
 });

@@ -46,10 +46,11 @@ import type {
  * workspace inside an existing one, claims the marker with an atomic `mkdir`, and then
  * writes the canonical model it is given — the empty model unless the caller supplies one.
  *
- * `serializeModel` is internal to this module — `initWorkspace` and `writeWorkspaceModel` use
- * it, and tests pin its exact bytes. `writeWorkspaceModel` is the public writer: it replaces
- * an existing workspace's model atomically, through a same-directory temp file and a rename,
- * and never creates a marker, a directory, or a workspace.
+ * `serializeModel` is the public read-only projection of a model — the writer
+ * (`writeWorkspaceModel`) and `initWorkspace` use it, `schemamill export` prints its bytes, and
+ * tests pin them. `writeWorkspaceModel` is the only persistence path: it replaces an existing
+ * workspace's model atomically, through a same-directory temp file and a rename, and never
+ * creates a marker, a directory, or a workspace.
  */
 
 /** The hidden marker directory a workspace root contains. */
@@ -271,7 +272,8 @@ export async function initWorkspace(
  * `views` always follows `sequences`, and `extensions` always follows `views`. Deterministic:
  * one model always serializes to the same bytes.
  *
- * Exported for tests; `writeWorkspaceModel` is the public writer that persists these bytes.
+ * The public read-only projection: `schemamill export --format json` prints exactly these bytes.
+ * `writeWorkspaceModel` remains the only persistence path — this function writes nothing.
  */
 export function serializeModel(model: Model): string {
   const value = {
