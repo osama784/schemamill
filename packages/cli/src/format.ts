@@ -385,6 +385,8 @@ function formatTableChange(change: TableChange): string {
 /** One step's details: every payload field the step carries, in the step kind's order. */
 function formatStep(step: Step): string {
   switch (step.kind) {
+    case 'create-schema':
+      return step.schema;
     case 'create-table':
     case 'drop-table':
       return formatIdentity(step.table);

@@ -365,6 +365,7 @@ function findIdentityStep(
           sameIdentity(candidate.table, entry.table) &&
           candidate.name === entry.name
         );
+      case 'create-schema':
       case 'create-table':
       case 'drop-table':
       case 'add-column':

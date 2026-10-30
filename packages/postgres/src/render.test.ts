@@ -2582,7 +2582,7 @@ test('view identifiers quote and the definition renders verbatim on one line', (
 
   assert.equal(
     renderSql(plan(model(), viewModel([quoted]))),
-    'BEGIN;\nCREATE VIEW app."Order View" AS SELECT \'a b\' AS label, 1 + 2 AS total;\nCOMMIT;\n',
+    'BEGIN;\nCREATE SCHEMA IF NOT EXISTS app;\nCREATE VIEW app."Order View" AS SELECT \'a b\' AS label, 1 + 2 AS total;\nCOMMIT;\n',
   );
 });
 
@@ -3037,4 +3037,49 @@ test('golden: creates, moves, drops, and comments extensions', () => {
   ]);
 
   assertGolden('extensions', baseline, target);
+});
+
+test('create-schema renders IF NOT EXISTS and quotes when the schema needs it', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-schema', schema: 'app' },
+        { kind: 'create-schema', schema: 'Order' },
+        { kind: 'create-schema', schema: 'user' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE SCHEMA IF NOT EXISTS app;',
+      'CREATE SCHEMA IF NOT EXISTS "Order";',
+      'CREATE SCHEMA IF NOT EXISTS "user";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('schema creates render before extension creates and the objects they hold', () => {
+  const target: Model = {
+    tables: [table('t', { schema: 'app', columns: [column('id')] })],
+    sequences: [],
+    views: [view('v', {}, 'sales')],
+    extensions: [extension('hstore', { schema: 'app' })],
+  };
+
+  assert.equal(
+    renderSql(plan(model(), target)),
+    [
+      'BEGIN;',
+      'CREATE SCHEMA IF NOT EXISTS app;',
+      'CREATE SCHEMA IF NOT EXISTS sales;',
+      'CREATE EXTENSION hstore WITH SCHEMA app;',
+      'CREATE TABLE app.t (',
+      '    id text',
+      ');',
+      'CREATE VIEW sales.v AS SELECT 1;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
 });

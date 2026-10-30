@@ -40,7 +40,8 @@ import type {
  * partitions its steps into transaction groups, telling a renderer what applies as one unit;
  * hazards are a separate analysis.
  *
- * A step is one of thirty-three kinds. A table addition becomes a create-table step carrying
+ * A step is one of thirty-four kinds. A schema the target's objects use but the baseline's do
+ * not becomes a create-schema step. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -111,8 +112,12 @@ import type {
  *
  * The final sequence is the concatenation of thirteen global phases, in this exact order:
  *
- * 1. create-extension — every added extension, in name order, before everything else: any
- *    object may use an extension's type or function, so the extension must exist first;
+ * 1. create-schema, then create-extension — every schema the target uses that no baseline
+ *    object uses, in name order, then every added extension, in name order, before everything
+ *    else: an object lives in a schema and may use an extension's type or function, so both
+ *    must exist first. The schema step renders `CREATE SCHEMA IF NOT EXISTS`: schemas are not
+ *    modeled, so an existing but unmodeled namespace is not a difference and must not fail the
+ *    migration;
  * 2. drop-identity — every removed identity whose column survives, in the diff's column and
  *    table order. It runs before every table step: it must precede the `DROP NOT NULL` /
  *    `SET DEFAULT` the table phases put on the same column, and it frees the default sequence
@@ -310,6 +315,11 @@ export type CommentTarget =
 
 /** One planned action. */
 export type Step =
+  /**
+   * The target uses a non-`public` schema that no baseline object uses; schemas are not modeled,
+   * so this is the only step that creates a namespace. Idempotent at apply.
+   */
+  | { kind: 'create-schema'; schema: string }
   /** The target has a table the baseline does not; a copy without its foreign keys. */
   | { kind: 'create-table'; table: Table }
   /** The baseline has a table the target does not. */
@@ -445,6 +455,7 @@ export function assertNever(value: never, context: string): never {
  * stand its step alone, outside any wrapper.
  */
 export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
+  'create-schema': true,
   'create-table': true,
   'drop-table': true,
   'add-column': true,
@@ -506,6 +517,39 @@ export function groupSteps(
     groups.push({ start: open.start, end: steps.length, transactional: open.transactional });
   }
   return groups;
+}
+
+/**
+ * Every schema a model's objects name: table, sequence, view, and extension schemas, plus the
+ * schemas of stated identity sequence names. `public` is excluded, and the result is deduped and
+ * in name order. A schema is not a modeled entity, so this inventory is the only offline view of
+ * which namespaces the objects need.
+ */
+function schemaInventory(model: Model): readonly string[] {
+  const schemas = new Set<string>();
+  for (const table of model.tables) {
+    schemas.add(table.schema);
+    for (const column of table.columns) {
+      const sequenceName = column.identity?.sequenceName;
+      if (sequenceName !== undefined) schemas.add(sequenceName.schema);
+    }
+  }
+  for (const sequence of model.sequences) schemas.add(sequence.schema);
+  for (const view of model.views) schemas.add(view.schema);
+  for (const extension of model.extensions) schemas.add(extension.schema);
+  schemas.delete('public');
+  return [...schemas].sort(compareStrings);
+}
+
+/**
+ * One `create-schema` step for every schema the target uses that no baseline object uses, in
+ * name order. A baseline-only schema emits nothing: schema drops are out of scope.
+ */
+function schemaSteps(baseline: Model, target: Model): readonly Step[] {
+  const baselineSchemas = new Set(schemaInventory(baseline));
+  return schemaInventory(target)
+    .filter((schema) => !baselineSchemas.has(schema))
+    .map((schema) => ({ kind: 'create-schema', schema }));
 }
 
 /**
@@ -581,7 +625,10 @@ export function plan(baseline: Model, target: Model): Plan {
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
+  const schemaCreates = schemaSteps(baseline, target);
+
   const steps: Step[] = [
+    ...schemaCreates,
     ...application.extensionCreates,
     ...application.identityDrops,
     ...application.sequenceCreates,
