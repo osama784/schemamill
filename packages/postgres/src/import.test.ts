@@ -1887,6 +1887,209 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   assert.match(messages, /unique constraint t_missing_key on public\.t \(USING INDEX t_missing\)/);
 });
 
+test('consumes a plain unique index into a USING INDEX primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key absorbs the index, taking the stated name; no standalone Index survives.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test("consumes the primary key's named index, not another unique index", async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Resolution is name-exact: the referenced index backs the key, while the unreferenced one
+  // survives as a standalone index and canonicalizes to unnamed.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['b'] });
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('takes the index name and deferrability for an unnamed USING INDEX primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY USING INDEX t_a_idx DEFERRABLE INITIALLY DEFERRED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // An unnamed constraint is named after the index it consumes, not the conventional
+  // `<table>_pkey`; the stated deferrability survives.
+  assert.deepEqual(table.primaryKey, {
+    name: 't_a_idx',
+    columns: ['a'],
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes an index name that is the conventional primary-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_pkey ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY USING INDEX t_pkey;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The consumed index's name is the conventional primary-key name, so the finalize pass
+  // strips it back to unnamed.
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips a USING INDEX primary key whole when the index cannot back it', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_a_idx ON public.t (a);`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t ((b + 1));`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_missing_pk PRIMARY KEY USING INDEX t_missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
+  // skipped whole, and every USING INDEX primary key that cannot consume a plain unique index is
+  // skipped and named.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_a_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_b_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_missing_pk' },
+  ]);
+
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /CREATE INDEX t_b_idx \(expression element\)/);
+  assert.match(messages, /skipped primary key t_a_pk on public\.t \(USING INDEX t_a_idx\)/);
+  assert.match(messages, /skipped primary key t_b_pk on public\.t \(USING INDEX t_b_idx\)/);
+  assert.match(messages, /skipped primary key t_missing_pk on public\.t \(USING INDEX t_missing\)/);
+});
+
+test('flags a USING INDEX primary key stated in CREATE TABLE', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx);`,
+    `CREATE TABLE public.u (a integer, PRIMARY KEY USING INDEX u_idx);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const t = model.tables.find((candidate) => candidate.name === 't');
+  const u = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(t, 'the first table is imported');
+  assert.ok(u, 'the second table is imported');
+
+  // PostgreSQL rejects the form at execution: the table imports without the key, and the drop is
+  // a flag on the table, not a skip of the statement.
+  assert.equal(t.primaryKey, undefined);
+  assert.equal(u.primaryKey, undefined);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /dropped primary key t_pk \(USING INDEX t_a_idx; cannot use an existing index in CREATE TABLE\) from public\.t/,
+  );
+  assert.match(
+    diagnostics[1]?.message ?? '',
+    /dropped primary key \(USING INDEX u_idx; cannot use an existing index in CREATE TABLE\) from public\.u/,
+  );
+});
+
+test('keeps a USING INDEX primary key unresolved when the index statement comes later', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Resolution is in order, against the draft's indexes only: the key is skipped, and the later
+  // index still imports standalone, canonicalized to unnamed.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_pk' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /skipped primary key t_pk on public\.t \(USING INDEX t_a_idx\)/,
+  );
+});
+
+test('keeps the first USING INDEX consumer and skips later references', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk2 PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_key UNIQUE USING INDEX u_a_idx;`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_pk PRIMARY KEY USING INDEX u_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const t = model.tables.find((candidate) => candidate.name === 't');
+  const u = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(t, 'the first table is imported');
+  assert.ok(u, 'the second table is imported');
+
+  // The first consumer splices the index out, so the second reference cannot resolve; a unique
+  // constraint that consumed the index first keeps the primary key from doing so.
+  assert.deepEqual(t.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(t.indexes, []);
+  assert.equal(u.primaryKey, undefined);
+  assert.deepEqual(u.uniqueConstraints, [{ name: 'u_key', columns: ['a'] }]);
+  assert.deepEqual(u.indexes, []);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_pk2' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'u_pk' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /skipped primary key t_pk2 on public\.t \(USING INDEX t_a_idx\)/,
+  );
+  assert.match(
+    diagnostics[1]?.message ?? '',
+    /skipped primary key u_pk on public\.u \(USING INDEX u_a_idx\)/,
+  );
+});
+
 test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and unknowns', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer DEFAULT 1, b integer, c integer);`,
