@@ -21,19 +21,22 @@
  *   the stated method to the column, `DEFAULT` clearing it, and `SET LOGGED`/`SET UNLOGGED`
  *   set the table's persistence; `ADD CONSTRAINT` attaches a foreign key, primary key,
  *   unique constraint, check constraint, or not-null constraint to an already imported table.
- *   A unique constraint stated `USING INDEX` consumes the named standalone index when it is a
- *   plain column-list unique index, and the whole constraint is skipped and named otherwise.
- *   Any other action is skipped and named, as is an identity action on a column that is not a
- *   modeled identity.
+ *   An `ALTER TABLE … ADD CONSTRAINT` unique constraint or primary key stated
+ *   `USING INDEX` consumes the named standalone index when it is a plain column-list unique
+ *   index, and the whole constraint is skipped and named otherwise; the table-level
+ *   `CREATE TABLE … PRIMARY KEY USING INDEX` form is server-rejected, so it is flagged and
+ *   never consumed. Any other action is skipped and named, as is an identity action on a
+ *   column that is not a modeled identity.
  * - `CREATE [UNIQUE] INDEX` becomes an `Index` with its name (optional), `unique`, ordered
  *   columns, and `concurrently`. A statement outside the minimal envelope — an expression
  *   element, partial `WHERE`, `INCLUDE (…)`, a non-btree access method, a non-default
  *   ordering, operator class, collation, or NULLS ordering, a tablespace, storage parameters,
  *   or `NULLS NOT DISTINCT` — is skipped and named whole; an index is never partially
  *   imported. A constraint-backed index is never a standalone `Index`: inline and
- *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
- *   consumes the index it names. Once every statement is translated, a standalone index whose
- *   name equals the server form of PostgreSQL's conventional `<table>_<cols>_idx` for its
+ *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, `ADD CONSTRAINT` primary
+ *   keys produce `PrimaryKey`s, and `USING INDEX` consumes the index it names for either kind.
+ *   Once every statement is translated, a standalone index whose name
+ *   equals the server form of PostgreSQL's conventional `<table>_<cols>_idx` for its
  *   structure, and a primary key, unique constraint, foreign key, or check constraint whose
  *   name equals the server form of the conventional formula for its structure, are
  *   canonicalized back to unnamed, so a dump of a declaration the model makes unnamed
