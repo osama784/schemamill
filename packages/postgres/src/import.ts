@@ -1030,6 +1030,16 @@ function translateTableConstraint(
 ): void {
   switch (constraint.contype) {
     case 'CONSTR_PRIMARY':
+      if (constraint.indexname !== undefined) {
+        diagnostics.push(
+          flagAttribute(
+            statement,
+            identity,
+            `${constraintLabel(constraint)} (USING INDEX ${constraint.indexname}; cannot use an existing index in CREATE TABLE)`,
+          ),
+        );
+        return;
+      }
       attachPrimaryKey(
         statement,
         draft,
@@ -2284,13 +2294,7 @@ function translateAlterTableCommand(
       return;
     }
     if (constraint.contype === 'CONSTR_PRIMARY') {
-      attachPrimaryKey(
-        statement,
-        draft,
-        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
-        identity,
-        diagnostics,
-      );
+      attachAlteredPrimaryKey(statement, constraint, identity, draft, diagnostics);
       return;
     }
     if (constraint.contype === 'CONSTR_UNIQUE') {
@@ -3569,6 +3573,51 @@ function attachAlteredUniqueConstraint(
   applyConstraintDeferrability(constraint, uniqueConstraint);
   flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   attachUniqueConstraint(draft, uniqueConstraint);
+}
+
+/**
+ * Attaches an `ADD CONSTRAINT … PRIMARY KEY`: a plain key list attaches directly, while a
+ * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
+ * column-list unique index; otherwise the whole constraint is skipped and named.
+ */
+function attachAlteredPrimaryKey(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const indexname = constraint.indexname;
+  if (indexname === undefined) {
+    attachPrimaryKey(
+      statement,
+      draft,
+      primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
+      identity,
+      diagnostics,
+    );
+    return;
+  }
+
+  const position = draft.indexes.findIndex((index) => index.name === indexname && index.unique);
+  const index = position === -1 ? undefined : draft.indexes[position]!;
+  if (index === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `${constraintLabel(constraint)} on ${identity} (USING INDEX ${indexname})`,
+        constraint.conname ?? indexname,
+      ),
+    );
+    return;
+  }
+
+  draft.indexes.splice(position, 1);
+  const primaryKey: Mutable<PrimaryKey> = { columns: [...index.columns] };
+  const name = constraint.conname ?? index.name;
+  if (name !== undefined) primaryKey.name = name;
+  applyConstraintDeferrability(constraint, primaryKey);
+  attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
 }
 
 /**
