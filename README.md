@@ -12,7 +12,7 @@ schemamill is a local-first studio for PostgreSQL schema change. One canonical m
 
 Applying it is your call: **schemamill generates, never applies, and never writes to a database.**
 
-**Status:** Early — the engine and the CLI are released through v0.6.0: DDL import (tables, columns, primary and foreign keys, sequences, identity columns, constraints, indexes), semantic diff, and deterministic migration SQL with hazards and transaction boundaries, verified against live PostgreSQL locally and in CI. Not released yet: live-database introspection, snapshots, and the studio UI. Nothing is published to npm.
+**Status:** Early — the engine and the CLI are released through v0.6.0: DDL import (tables, columns, primary and foreign keys, sequences, identity columns, constraints, indexes), semantic diff, and deterministic migration SQL with hazards and transaction boundaries, verified against live PostgreSQL locally and in CI. Not released yet: live-database introspection, snapshots, and the studio UI. The engine exposes a live-tested `catalogReader`, but no CLI command consumes it yet. Nothing is published to npm.
 
 ## Scope and refusals
 

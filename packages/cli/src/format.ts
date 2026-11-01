@@ -382,7 +382,11 @@ function formatTableChange(change: TableChange): string {
   }
 }
 
-/** One step's details: every payload field the step carries, in the step kind's order. */
+/**
+ * One step's details: the identity and member spellings, plus an `alter-*` step's changed
+ * values and a comment step's quoted text; constraint attributes and create-time bodies are
+ * carried by the rendered SQL.
+ */
 function formatStep(step: Step): string {
   switch (step.kind) {
     case 'create-schema':

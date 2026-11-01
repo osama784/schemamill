@@ -2,7 +2,7 @@
 
 **Status:** built 2026-10-24 · living document
 
-Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the four count classes from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. It is **report-only** for now; `--check` is implemented and unit-tested but not wired into CI.
+Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the count figures from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. It is **report-only** for now; `--check` is implemented and unit-tested but not wired into CI.
 
 ## Count classes and sources
 
