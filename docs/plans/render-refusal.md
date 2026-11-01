@@ -6,7 +6,7 @@
 
 ## Goal
 
-Every plan either renders SQL PostgreSQL accepts or is refused by name before any statement is produced — no same-name pair reaches apply from a plan schemamill can see, and a refusal is visible wherever a plan or diff is reported, not only as a stderr line from one command.
+Every plan either renders SQL PostgreSQL accepts for its declared target version or is refused by name before any statement is produced — no same-name pair reaches apply from a plan schemamill can see, and a refusal is visible wherever a plan or diff is reported, not only as a stderr line from one command.
 
 ## Scope
 
@@ -50,4 +50,4 @@ Named for the slices that own them, never silent:
 - **Hand-written explicit names longer than 63 bytes** — an explicit name renders as written while PostgreSQL stores its clip, so a hand-written name longer than 63 bytes reads as a change against a dump of what was applied; pinned as a residual, not fixed in slice A ([ADR 0013](../adr/0013-generated-names-and-omitted-declarations-round-trip.md)).
 - **Non-UTF-8 database encodings** — the prediction mirrors `pg_mbcliplen` under a UTF-8 database; any other encoding is a named residual.
 - **Catalog-dependent suffix recovery** — knowing which suffix the server actually assigned needs a live catalog read; introspection parity is the [introspection follow-ups](./introspection-attributes.md).
-- **Version gating** — differences across PostgreSQL majors stay with the version-aware slice, so the guard's formulas keep the PG 13 floor.
+- **Version gating** — version gating for renderer-synthesized forms shipped in the [target version plan](./target-version.md); the guard's formulas are conventional-name arithmetic with no version branch and stay at the PG 13 floor, and differences across PostgreSQL majors otherwise stay with the version-aware slice.

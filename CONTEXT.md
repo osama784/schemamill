@@ -178,6 +178,10 @@ _Avoid_: changeset, script
 The SQL rendering of a migration plan — deterministic and reviewable, for the user to apply.
 _Avoid_: script, patch, changeset
 
+**Target version**:
+The PostgreSQL major a migration plan's SQL is generated for, declared offline — `plan --target-version <major>`, default 13, the documented floor. The renderer synthesizes nothing above it: a synthesized statement whose form postdates the target is refused by name, while a declaration the model carries still renders as declared. Distinct from the diff's **Target** side, which is a model, not a server major.
+_Avoid_: server version, PG version, dialect, version
+
 **Transaction group**:
 A run of consecutive migration-plan steps that applies as one unit. Transaction-safe steps coalesce into one group; a step PostgreSQL cannot run inside a transaction stands alone. Boundaries are derived from step semantics, never configured by the user. A plan with more than one group displays the group count with one section per group, and its SQL separates the groups with a blank line.
 _Avoid_: batch, transaction block, commit point
