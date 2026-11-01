@@ -12,7 +12,16 @@ Declarations the model carries render as declared at every target: an explicit s
 
 **Consequences:** A plan that resets storage or compression no longer renders by default: it refuses until the target declares 16 or 14 respectively. That is the deliberate behavior change — loud, named in the message and in `plan --help`, and recorded in the changelog — and it makes the documented PostgreSQL 13 floor true rather than aspirational. A target above 18 is accepted and trivially satisfied.
 
-Declaration validation against the target is a named residual, not a silent guarantee. The per-form consequences when a target sits below a declaration's floor are: a PostgreSQL 18 named `NOT NULL` (inline or `ADD CONSTRAINT … NOT NULL`) is accepted by 13–17 with its name discarded — no `pg_constraint` row exists, so a later `COMMENT ON CONSTRAINT` fails — and that is the one **silent** case; `NOT ENFORCED` on a check or foreign key is a loud syntax error at apply on 13–17; an explicit `COMPRESSION` method is a loud syntax error at apply on 13; an explicit `STORAGE` letter is valid on all of 13–18 and harmless. Fixing that gap needs its own slice and ADR, and the [target-version plan](../plans/target-version.md) carries the table as its body.
+Declaration validation against the target is a named residual, not a silent guarantee. The per-form consequences when a target sits below a declaration's floor are:
+
+| Declaration | On a target below its floor | Loudness |
+|---|---|---|
+| PostgreSQL 18 named `NOT NULL` (inline or `ADD CONSTRAINT … NOT NULL`) | 13–17 accept the inline form and discard the name — no `pg_constraint` row, so a later `COMMENT ON CONSTRAINT` fails | **silent** |
+| `NOT ENFORCED` on a check or foreign key | 13–17 reject the statement | loud syntax error at apply |
+| explicit `COMPRESSION` method | 13 rejects the statement | loud syntax error at apply |
+| explicit `STORAGE` letter | valid on all of 13–18 | harmless |
+
+The silent row is the named cost of the ADR 0012 fence: a target below 18 with a named `NOT NULL` declaration renders as declared and its name is lost on apply. Fixing that gap needs its own slice and ADR, and the [target-version plan](../plans/target-version.md) carries the table as its body.
 
 The oldest-major live leg is a recorded deviation: the development host has only PostgreSQL 16.15 and CI only 18, with no 13/14/15 package available and no container runtime. The 13 target's behavior is a pre-SQL refusal with no PostgreSQL 13-specific SQL to apply, so the unit boundary tests and the 13-floor sweep across the 14 non-reset goldens carry that evidence; a PostgreSQL 13 CI job is proposed at bookkeeping. `export` and `compare` take no target flag in v1 — export's creates can never emit a reset, and compare renders nothing — so those flags wait for their first version-sensitive form or for the declaration-validation follow-up.
 
