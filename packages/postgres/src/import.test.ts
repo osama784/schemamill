@@ -2281,6 +2281,250 @@ test('keeps the first USING INDEX consumer and skips later references', async ()
   );
 });
 
+test('flags a UNIQUE USING INDEX constraint stated in CREATE TABLE', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_u UNIQUE USING INDEX t_a_idx);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL rejects the form at execution: the unique constraint is dropped with a flag on
+  // the table, while the index it names still imports standalone (canonicalized, since
+  // `t_a_idx` is the synthesized name for its structure).
+  assert.deepEqual(table.uniqueConstraints, []);
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped unique constraint t_u (USING INDEX t_a_idx; cannot use an existing index in CREATE TABLE) from public.t',
+    },
+  ]);
+});
+
+test('flags INCLUDE on a primary key and keeps the key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer, CONSTRAINT t_pk PRIMARY KEY (a) INCLUDE (b));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key imports with its representable identity; the covering columns it cannot carry are
+  // named and dropped.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on primary key t_pk from public.t',
+    },
+  ]);
+});
+
+test('copies an index comment into a consumed unique constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The comment travels with the index onto the constraint it becomes; nothing is dropped.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'backing index' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('copies an index comment into a consumed primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key takes the consumed index's comment the same way a unique constraint does.
+  assert.deepEqual(table.primaryKey, {
+    name: 't_a_pk',
+    columns: ['a'],
+    comment: 'backing index',
+  });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags a comment on an index consumed by a constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `COMMENT ON INDEX public.t_a_idx IS 'late';`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_a_key UNIQUE USING INDEX u_a_idx;`,
+    `COMMENT ON INDEX public.u_a_idx IS 'late';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // The index is gone by the time its comment arrives, so the comment cannot be placed; the
+  // after-consumption order keeps the pre-existing flag wording for both kinds.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(other.uniqueConstraints, [{ columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.u_a_idx',
+      message: 'dropped comment from public.u_a_idx',
+    },
+  ]);
+});
+
+test('flags CONCURRENTLY on consumed primary-key and unique indexes', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_key UNIQUE USING INDEX u_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // A constraint carries no apply metadata, so each consumed concurrent index is named once
+  // while the constraint itself still imports.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(other.uniqueConstraints, [{ name: 'u_key', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(other.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped CONCURRENTLY on primary key t_pk (index t_a_idx; a constraint cannot carry it) from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.u',
+      message:
+        'dropped CONCURRENTLY on unique constraint u_key (index u_a_idx; a constraint cannot carry it) from public.u',
+    },
+  ]);
+});
+
+test('copies the comment and flags CONCURRENTLY for a consumed commented concurrent primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'kept';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Two facts on one consumed index: the comment survives on the key, the apply metadata
+  // cannot and is named once.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'], comment: 'kept' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped CONCURRENTLY on primary key t_pk (index t_a_idx; a constraint cannot carry it) from public.t',
+    },
+  ]);
+});
+
+test('keeps the existing skips for an INCLUDE index referenced by USING INDEX', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a) INCLUDE (b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The covering index is outside the envelope, so it is skipped whole; the key then has no
+  // index to consume and is skipped and named too. Neither statement is partially imported.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_a_idx',
+      message: 'skipped CREATE INDEX t_a_idx (INCLUDE)',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_pk',
+      message: 'skipped primary key t_pk on public.t (USING INDEX t_a_idx)',
+    },
+  ]);
+});
+
+test('flags an inline NOT ENFORCED attribute on a primary key', async () => {
+  const dump = [`CREATE TABLE public.t (a integer PRIMARY KEY NOT ENFORCED);`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The server rejects the placement, but the raw parser accepts it: the key imports and the
+  // misplaced attribute keeps its raw parser label.
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.a from public.t',
+    },
+  ]);
+});
+
 test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and unknowns', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer DEFAULT 1, b integer, c integer);`,

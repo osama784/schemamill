@@ -1067,6 +1067,16 @@ function translateTableConstraint(
       );
       return;
     case 'CONSTR_UNIQUE':
+      if (constraint.indexname !== undefined) {
+        diagnostics.push(
+          flagAttribute(
+            statement,
+            identity,
+            `${constraintLabel(constraint)} (USING INDEX ${constraint.indexname}; cannot use an existing index in CREATE TABLE)`,
+          ),
+        );
+        return;
+      }
       attachUniqueConstraint(
         draft,
         uniqueConstraintFromConstraint(statement, constraint, [], identity, diagnostics),
@@ -3323,6 +3333,7 @@ function primaryKeyFromConstraint(
       flagAttribute(statement, identity, `WITHOUT OVERLAPS on ${constraintLabel(constraint)}`),
     );
   }
+  flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
   return primaryKey;
 }
 
@@ -3518,6 +3529,31 @@ function flagUniqueConstraintAttributes(
 }
 
 /**
+ * Flags every attribute of a primary key that the model cannot carry, mirroring
+ * `flagUniqueConstraintAttributes`: the key still imports with its representable identity, and
+ * each dropped attribute is named. Deferrability is read into the model, so it is absent here;
+ * `NO INHERIT` and `NOT VALID` cannot appear on a primary key (the server rejects them), so
+ * those flags are defensive only.
+ */
+function flagPrimaryKeyAttributes(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const flag = (description: string): void => {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${description} on ${constraintLabel(constraint)}`),
+    );
+  };
+  if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.is_no_inherit === true) flag('NO INHERIT');
+  if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    flag('NOT VALID');
+  }
+}
+
+/**
  * Flags every attribute of a check constraint that the model cannot carry: `NO INHERIT`, and
  * deferrability, which the server rejects on a check constraint — only a misplaced inline
  * attribute node could carry it here, so the flag is defensive. Enforcement is read into the
@@ -3539,9 +3575,33 @@ function flagCheckConstraintAttributes(
 }
 
 /**
+ * Flags the one fact a consumed index cannot hand to the constraint it becomes: a constraint
+ * carries no `CONCURRENTLY` apply metadata. The index's comment, by contrast, travels onto the
+ * constraint in both splice functions.
+ */
+function flagConsumedIndexConcurrently(
+  statement: ParsedStatement,
+  index: Index,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  if (index.concurrently !== true || index.name === undefined) return;
+  diagnostics.push(
+    flagAttribute(
+      statement,
+      identity,
+      `CONCURRENTLY on ${constraintLabel(constraint)} (index ${index.name}; a constraint cannot carry it)`,
+    ),
+  );
+}
+
+/**
  * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
  * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
- * column-list unique index; otherwise the whole constraint is skipped and named.
+ * column-list unique index; otherwise the whole constraint is skipped and named. The consumed
+ * index's comment travels onto the constraint, and its `CONCURRENTLY` apply metadata is
+ * flagged because the constraint cannot carry it.
  */
 function attachAlteredUniqueConstraint(
   statement: ParsedStatement,
@@ -3572,19 +3632,25 @@ function attachAlteredUniqueConstraint(
     return;
   }
 
+  const comment = index.comment;
   draft.indexes.splice(position, 1);
   const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
+  if (comment !== undefined) uniqueConstraint.comment = comment;
   const name = constraint.conname ?? index.name;
   if (name !== undefined) uniqueConstraint.name = name;
   applyConstraintDeferrability(constraint, uniqueConstraint);
   flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
+  flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
   attachUniqueConstraint(draft, uniqueConstraint);
 }
 
 /**
- * Attaches an `ADD CONSTRAINT … PRIMARY KEY`: a plain key list attaches directly, while a
- * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
- * column-list unique index; otherwise the whole constraint is skipped and named.
+ * Attaches an `ADD CONSTRAINT … PRIMARY KEY`: a plain key list attaches directly through
+ * `primaryKeyFromConstraint` — which owns the primary-key attribute flags — while a constraint
+ * stated `USING INDEX` consumes the named standalone index when it is a plain column-list
+ * unique index; otherwise the whole constraint is skipped and named. The consumed index's
+ * comment travels onto the key, and its `CONCURRENTLY` apply metadata is flagged because the
+ * constraint cannot carry it.
  */
 function attachAlteredPrimaryKey(
   statement: ParsedStatement,
@@ -3618,11 +3684,15 @@ function attachAlteredPrimaryKey(
     return;
   }
 
+  const comment = index.comment;
   draft.indexes.splice(position, 1);
   const primaryKey: Mutable<PrimaryKey> = { columns: [...index.columns] };
+  if (comment !== undefined) primaryKey.comment = comment;
   const name = constraint.conname ?? index.name;
   if (name !== undefined) primaryKey.name = name;
   applyConstraintDeferrability(constraint, primaryKey);
+  flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
+  flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
   attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
 }
 
