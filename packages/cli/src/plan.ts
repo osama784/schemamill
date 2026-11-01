@@ -51,7 +51,7 @@ export function registerPlan(program: Command): void {
     .option('--baseline-workspace', 'resolve the baseline from the workspace')
     .option('--target-workspace', 'resolve the target from the workspace')
     .option('--verbose', 'list every import diagnostic')
-    .option('--target-version <major>', 'PostgreSQL major to generate for, 13 to 18', '13')
+    .option('--target-version <major>', 'PostgreSQL major (13-18)', '13')
     .addHelpText('after', '\nA single path is the target; the workspace fills the baseline.')
     .action(
       async (
