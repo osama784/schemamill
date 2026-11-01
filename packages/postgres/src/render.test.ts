@@ -26,6 +26,7 @@ import type {
 } from '@schemamill/core';
 
 import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
+import type { RenderOptions } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
@@ -196,9 +197,25 @@ const dropStep = (name: string): Step => ({ kind: 'drop-table', table: identity(
 const golden = (name: string): string =>
   readFileSync(new URL(`../test/goldens/${name}.sql`, import.meta.url), 'utf8');
 
-/** Asserts that planning `baseline` to `target` renders exactly the golden `<name>.sql`. */
-const assertGolden = (name: string, baseline: Model, target: Model): void => {
-  assert.equal(renderSql(plan(baseline, target)), golden(name));
+/**
+ * Asserts that planning `baseline` to `target` renders exactly the golden `<name>.sql` for the
+ * declared `options`. With no explicit options, the same plan must also render the same bytes at
+ * the PostgreSQL 13 floor: a default-drift tripwire over every golden that carries no reset form.
+ */
+const assertGolden = (
+  name: string,
+  baseline: Model,
+  target: Model,
+  options?: RenderOptions,
+): void => {
+  assert.equal(renderSql(plan(baseline, target), options), golden(name));
+  if (options === undefined) {
+    assert.equal(
+      renderSql(plan(baseline, target), { targetVersion: 13 }),
+      golden(name),
+      `golden ${name} must render byte-identically at the PostgreSQL 13 floor`,
+    );
+  }
 };
 
 /**
@@ -1054,11 +1071,13 @@ test('restates target storage and compression after the merged TYPE statement', 
   );
 });
 
-test('renders standalone storage and compression changes, resets included', () => {
-  // With no type or collation change, a storage or compression field states one `SET`
-  // statement; an absent target restores the default (`SET STORAGE DEFAULT`, `SET COMPRESSION
-  // default`), and every statement carries the dump's post-data `ONLY` form.
-  const baseline = model(
+/**
+ * The standalone storage/compression scene: explicit changes plus both resets, on one table.
+ * Shared by the pre-existing standalone test (rendered for PostgreSQL 16) and the target-version
+ * tests that cross the two reset floors.
+ */
+const standaloneAttributeScene = (): { readonly baseline: Model; readonly target: Model } => ({
+  baseline: model(
     table('t', {
       columns: [
         column('stored'),
@@ -1068,8 +1087,8 @@ test('renders standalone storage and compression changes, resets included', () =
         column('uncompressed', { compression: 'pglz' }),
       ],
     }),
-  );
-  const target = model(
+  ),
+  target: model(
     table('t', {
       columns: [
         column('stored', { storage: 'external' }),
@@ -1079,22 +1098,29 @@ test('renders standalone storage and compression changes, resets included', () =
         column('uncompressed'),
       ],
     }),
-  );
-  const sql = renderSql(plan(baseline, target));
+  ),
+});
 
-  assert.equal(
-    sql,
-    [
-      'BEGIN;',
-      'ALTER TABLE ONLY public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
-      'ALTER TABLE ONLY public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
-      'ALTER TABLE ONLY public.t ALTER COLUMN moved SET STORAGE PLAIN;',
-      'ALTER TABLE ONLY public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
-      'ALTER TABLE ONLY public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
-      'COMMIT;',
-      '',
-    ].join('\n'),
-  );
+/** The exact SQL the standalone scene renders for a target that accepts both reset forms. */
+const STANDALONE_ATTRIBUTE_SQL = [
+  'BEGIN;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN moved SET STORAGE PLAIN;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
+  'COMMIT;',
+  '',
+].join('\n');
+
+test('renders standalone storage and compression changes, resets included', () => {
+  // With no type or collation change, a storage or compression field states one `SET`
+  // statement; an absent target restores the default (`SET STORAGE DEFAULT`, `SET COMPRESSION
+  // default`), and every statement carries the dump's post-data `ONLY` form.
+  const { baseline, target } = standaloneAttributeScene();
+  const sql = renderSql(plan(baseline, target), { targetVersion: 16 });
+
+  assert.equal(sql, STANDALONE_ATTRIBUTE_SQL);
   const setStatements = sql.split('\n').filter((line) => line.includes(' SET '));
   assert.equal(setStatements.length, 5);
   assert.ok(
@@ -1373,6 +1399,185 @@ const assertRefusal = (render: () => unknown, message: string): void => {
   }
   assert.equal(caught.message, message);
 };
+
+/** A plan that resets one column's storage: `main` in the baseline, absent in the target. */
+const storageResetPlan = (tableName = 't', columnName = 'c', schema = 'public'): Plan =>
+  plan(
+    model(table(tableName, { schema, columns: [column(columnName, { storage: 'main' })] })),
+    model(table(tableName, { schema, columns: [column(columnName)] })),
+  );
+
+/** A plan that resets one column's compression: `pglz` in the baseline, absent in the target. */
+const compressionResetPlan = (tableName = 't', columnName = 'c', schema = 'public'): Plan =>
+  plan(
+    model(table(tableName, { schema, columns: [column(columnName, { compression: 'pglz' })] })),
+    model(table(tableName, { schema, columns: [column(columnName)] })),
+  );
+
+test('the default target refuses both synthesized resets below their floors', () => {
+  // Unset means the PostgreSQL 13 floor, so a plan that removes storage or compression cannot
+  // render: `SET STORAGE DEFAULT` needs 16 and `SET COMPRESSION default` needs 14.
+  assertRefusal(
+    () => renderSql(storageResetPlan()),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  assertRefusal(
+    () => renderSql(compressionResetPlan()),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+});
+
+test('target 15 refuses the storage reset and renders the compression reset', () => {
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 15 }),
+    'refusing to render for PostgreSQL 15: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  const at15 = renderSql(compressionResetPlan(), { targetVersion: 15 });
+  assert.equal(at15, renderSql(compressionResetPlan(), { targetVersion: 16 }));
+  assert.equal(
+    at15,
+    'BEGIN;\nALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION default;\nCOMMIT;\n',
+  );
+});
+
+test('target 16 renders both synthesized resets', () => {
+  const { baseline, target } = standaloneAttributeScene();
+  assert.equal(renderSql(plan(baseline, target), { targetVersion: 16 }), STANDALONE_ATTRIBUTE_SQL);
+});
+
+test('the reset floors are PostgreSQL 14 for compression and 16 for storage', () => {
+  const compressionAt14 = renderSql(compressionResetPlan(), { targetVersion: 14 });
+  assert.equal(compressionAt14, renderSql(compressionResetPlan(), { targetVersion: 16 }));
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 14 }),
+    'refusing to render for PostgreSQL 14: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  assertRefusal(
+    () => renderSql(compressionResetPlan(), { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+});
+
+test('declarations render as declared at every target', () => {
+  // The model's declarations are stated exactly as carried — an explicit storage letter and
+  // compression method, a named not-null inline and as an added constraint, and NOT ENFORCED —
+  // even at a target below the declaration's own floor. Only synthesized resets consult it.
+  const declared = planOf(
+    {
+      kind: 'add-column',
+      table: identity('t'),
+      column: column('c', {
+        storage: 'external',
+        compression: 'lz4',
+        notNull: true,
+        notNullName: 'nn_c',
+      }),
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'd', name: 'nn_d' },
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('c IS NOT NULL', {
+        name: 'ck',
+        enforcement: 'not-enforced',
+      }),
+    },
+  );
+  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(declared, { targetVersion }));
+
+  for (const output of outputs) {
+    assert.equal(output, outputs[0], 'declarations render identically at every target');
+  }
+  assert.match(outputs[0]!, /SET STORAGE EXTERNAL;/);
+  assert.match(outputs[0]!, /SET COMPRESSION lz4;/);
+  assert.match(outputs[0]!, /CONSTRAINT nn_c NOT NULL/);
+  assert.match(outputs[0]!, /ADD CONSTRAINT nn_d NOT NULL d;/);
+  assert.match(outputs[0]!, /NOT ENFORCED/);
+});
+
+test('a plan with no reset renders byte-identically at every target', () => {
+  const planned = plan(
+    model(),
+    model(
+      table('t', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('c', { storage: 'external', compression: 'pglz' }),
+        ],
+      }),
+    ),
+  );
+  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(planned, { targetVersion }));
+
+  for (const output of outputs) {
+    assert.equal(output, outputs[0], 'a reset-free plan renders identically at every target');
+  }
+});
+
+test('the first reset in plan order names itself', () => {
+  // The gate sits in the emitter, so the first offending statement aborts the render; the later
+  // storage reset never gets a chance to report.
+  const planned = planOf(
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'compression', before: 'pglz' }],
+    },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'storage', before: 'main' }],
+    },
+  );
+
+  assertRefusal(
+    () => renderSql(planned, { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+});
+
+test('a refusal message quotes odd identifiers exactly as the SQL does', () => {
+  assertRefusal(
+    () => renderSql(storageResetPlan('Odd Table', 'Odd Col', 'Odd Schema')),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on "Odd Schema"."Odd Table" column "Odd Col" needs PostgreSQL 16 or newer',
+  );
+});
+
+test('a target-absent storage with a type change emits no reset and never refuses', () => {
+  // The merged TYPE statement resets storage itself, so the carrier branch emits only explicit
+  // values; the gate mirrors that emission and stays silent at the 13 floor.
+  const baseline = model(table('t', { columns: [column('c', { storage: 'main' })] }));
+  const target = model(table('t', { columns: [column('c', { type: 'character varying(12)' })] }));
+  const at13 = renderSql(plan(baseline, target));
+
+  assert.equal(
+    at13,
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN c TYPE character varying(12);\nCOMMIT;\n',
+  );
+  assert.ok(!at13.includes('SET STORAGE'), 'the TYPE reset covers the absent target');
+  assert.equal(at13, renderSql(plan(baseline, target), { targetVersion: 16 }));
+});
+
+test('a target below the floor or not an integer is a plain Error', () => {
+  assert.throws(() => renderSql(storageResetPlan(), { targetVersion: 12 }), {
+    name: 'Error',
+    message: 'targetVersion must be a PostgreSQL major of 13 or newer, got 12',
+  });
+  assert.throws(() => renderSql(storageResetPlan(), { targetVersion: 13.5 }), {
+    name: 'Error',
+    message: 'targetVersion must be a PostgreSQL major of 13 or newer, got 13.5',
+  });
+  assertRefusal(
+    () => renderSql(storageResetPlan(), {}),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+});
 
 test('refuses two index creates on one table that resolve to one name', () => {
   // The reproduced shape: an unnamed index (a) beside an explicit t_a_idx on one table.
@@ -2489,6 +2694,7 @@ test('golden: renders column attributes and table persistence', () => {
     'column-attributes',
     model(attrs, flipped, backed),
     model(attrsTarget, flippedTarget, table('backed', { columns }), created),
+    { targetVersion: 16 },
   );
 });
 

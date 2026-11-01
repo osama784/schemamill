@@ -40,14 +40,14 @@ import {
  * Migration SQL rendering: a migration plan → the migration SQL that moves one schema toward
  * another.
  *
- * `renderSql` is a pure function of the plan — the plan carries every payload the SQL needs,
- * and the same plan always renders the same text. One statement per line, terminated with a
- * semicolon, and a single trailing newline at the end of the output; an empty plan renders as
- * the empty string. The plan's groups must partition its steps — non-empty half-open ranges
- * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
- * guarantees this contract, and a malformed partition throws before any SQL is rendered,
- * naming the violated invariant and the offending indices. A plan that renders two index
- * statements of one polarity on one table under one server-form name is refused with
+ * `renderSql` is pure in the plan and the declared target — the plan carries every payload the
+ * SQL needs, and the same plan and target always render the same text. One statement per line,
+ * terminated with a semicolon, and a single trailing newline at the end of the output; an empty
+ * plan renders as the empty string. The plan's groups must partition its steps — non-empty
+ * half-open ranges that tile `[0, steps.length)` in order, with no groups when there are no
+ * steps; `plan()` guarantees this contract, and a malformed partition throws before any SQL is
+ * rendered, naming the violated invariant and the offending indices. A plan that renders two
+ * index statements of one polarity on one table under one server-form name is refused with
  * `RenderRefusalError` before anything renders: the second create could not claim the name,
  * and the second drop would already be gone. A drop and a create of one name are different
  * statements — `index-changed` decomposes that way — and render. `renderSql` walks the plan's
@@ -109,8 +109,12 @@ import {
  * stated `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT
  * DEFERRABLE` and valid-and-enforced being the defaults. A not-null fact with a name renders
  * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
- * `CREATE TABLE` and `ADD COLUMN`; nothing negotiates the server version — the renderer states
- * the attributes the model carries.
+ * `CREATE TABLE` and `ADD COLUMN`. The declarations the model carries — that inline name, `NOT
+ * ENFORCED`, an explicit storage letter, an explicit compression method — render as declared at
+ * every target, even one below the form's own floor. Only the renderer's own synthesized reset
+ * statements consult the declared target: `SET STORAGE DEFAULT` refuses below PostgreSQL 16 and
+ * `SET COMPRESSION default` below PostgreSQL 14, rather than emit SQL the declared server would
+ * reject.
  *
  * Column attributes render in PostgreSQL's grammar order. `renderColumn` states an explicit
  * collation inline, after the type and before the constraints: `name type COLLATE <collation>
@@ -133,9 +137,10 @@ import {
  * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. Every
  * `SET STORAGE`/`SET COMPRESSION` statement — create tail, add tail, post-`TYPE` restatement,
  * or standalone — carries the dump's post-data `ONLY` form; only the merged `TYPE` statement
- * stays bare. A plan that reaches the renderer malformed — a `type` or `collation` field whose
- * step carries no `attributes` carrier, or any attribute field reaching the per-field renderer
- * — throws rather than render a guess.
+ * stays bare. The order is target-independent; the two synthesized reset forms alone consult
+ * the declared target, refusing below their floor. A plan that reaches the renderer malformed —
+ * a `type` or `collation` field whose step carries no `attributes` carrier, or any attribute
+ * field reaching the per-field renderer — throws rather than render a guess.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -291,10 +296,26 @@ export const RESERVED_KEYWORDS: ReadonlySet<string> = new Set([
 /** The shape of an identifier PostgreSQL accepts without double quotes. */
 const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 
+/** The oldest PostgreSQL major the renderer targets. */
+export const MIN_TARGET_VERSION = 13;
+
+/** The newest PostgreSQL major whose forms the renderer knows. */
+export const MAX_TARGET_VERSION = 18;
+
+/** Options for {@link renderSql}. */
+export interface RenderOptions {
+  /**
+   * The PostgreSQL major the SQL is generated for. Defaults to `MIN_TARGET_VERSION`;
+   * a major newer than `MAX_TARGET_VERSION` is accepted and behaves like the newest one.
+   */
+  readonly targetVersion?: number;
+}
+
 /**
  * Thrown by `renderSql` when a plan cannot render soundly: two index statements of one polarity
- * on one table resolve to the same name. Callers that report the refusal instead of crashing —
- * the CLI — catch exactly this class.
+ * on one table resolve to the same name, a comment carries NUL, a materialized view is asked to
+ * be replaced, or a renderer-synthesized reset statement needs a newer target than the declared
+ * one. Callers that report the refusal instead of crashing — the CLI — catch exactly this class.
  */
 export class RenderRefusalError extends Error {
   constructor(message: string) {
@@ -304,11 +325,22 @@ export class RenderRefusalError extends Error {
 }
 
 /**
- * The migration SQL for `plan`, deterministic. `plan.groups` must tile `[0, plan.steps.length)`;
- * a malformed partition throws before anything renders, and so does a plan whose index
- * statements of one table and polarity would share a name.
+ * The migration SQL for `plan`, deterministic in the plan and the declared target.
+ * `plan.groups` must tile `[0, plan.steps.length)`; a malformed partition throws before
+ * anything renders, and so does a plan whose index statements of one table and polarity would
+ * share a name. `options.targetVersion` is the PostgreSQL major the SQL is generated for,
+ * defaulting to `MIN_TARGET_VERSION`; a renderer-synthesized reset form below its floor refuses
+ * with `RenderRefusalError`, while a declaration the model carries renders as declared at every
+ * target. A target that is not an integer major at or above `MIN_TARGET_VERSION` is a caller
+ * bug and throws a plain `Error`.
  */
-export function renderSql(plan: Plan): string {
+export function renderSql(plan: Plan, options?: RenderOptions): string {
+  const targetVersion = options?.targetVersion ?? MIN_TARGET_VERSION;
+  if (!Number.isInteger(targetVersion) || targetVersion < MIN_TARGET_VERSION) {
+    throw new Error(
+      `targetVersion must be a PostgreSQL major of ${MIN_TARGET_VERSION} or newer, got ${String(targetVersion)}`,
+    );
+  }
   assertGroupsTileSteps(plan);
   assertIndexNamesUnique(plan);
   if (plan.steps.length === 0) return '';
@@ -317,7 +349,7 @@ export function renderSql(plan: Plan): string {
     const lines: string[] = [];
     if (group.transactional) lines.push('BEGIN;');
     for (let index = group.start; index < group.end; index += 1) {
-      lines.push(renderStep(plan.steps[index]!));
+      lines.push(renderStep(plan.steps[index]!, targetVersion));
     }
     if (group.transactional) lines.push('COMMIT;');
     groups.push(lines.join('\n'));
@@ -495,22 +527,22 @@ export function quoteIdentifier(identifier: string): string {
 }
 
 /** One plan step as one or more statements, without a trailing newline. */
-function renderStep(step: Step): string {
+function renderStep(step: Step, targetVersion: number): string {
   switch (step.kind) {
     case 'create-schema':
       return `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(step.schema)};`;
     case 'create-table':
-      return renderCreateTable(step.table);
+      return renderCreateTable(step.table, targetVersion);
     case 'drop-table':
       return `DROP TABLE ${renderTable(step.table)};`;
     case 'add-column':
-      return renderAddColumn(step.table, step.column);
+      return renderAddColumn(step.table, step.column, targetVersion);
     case 'drop-column':
       return `ALTER TABLE ${renderTable(step.table)} DROP COLUMN ${quoteIdentifier(
         step.column.name,
       )};`;
     case 'alter-column':
-      return renderAlterColumn(step.table, step.name, step.fields, step.attributes);
+      return renderAlterColumn(step.table, step.name, step.fields, step.attributes, targetVersion);
     case 'drop-not-null':
       return step.name === undefined
         ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
@@ -701,7 +733,7 @@ function renderCommentLiteral(text: string): string {
  * such column's post-data `ALTER TABLE ONLY` statements follow it, storage before compression,
  * in column order. An `unlogged` table states `UNLOGGED`.
  */
-function renderCreateTable(table: Table): string {
+function renderCreateTable(table: Table, targetVersion: number): string {
   const persistence = table.persistence === 'unlogged' ? 'UNLOGGED ' : '';
   const lines = table.columns.map((column) => `    ${renderColumn(column)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${renderPrimaryKey(table.primaryKey)}`);
@@ -712,7 +744,7 @@ function renderCreateTable(table: Table): string {
     .join('\n');
   const statements = [`CREATE ${persistence}TABLE ${renderTable(table)} (\n${body}\n);`];
   for (const column of table.columns) {
-    statements.push(...renderColumnAttributeStatements(table, column));
+    statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
   }
   return statements.join('\n');
 }
@@ -721,9 +753,9 @@ function renderCreateTable(table: Table): string {
  * One added column: the `ADD COLUMN` statement and, for explicit attributes, the post-data
  * `ALTER TABLE ONLY` statements that state them, storage before compression.
  */
-function renderAddColumn(table: TableIdentity, column: Column): string {
+function renderAddColumn(table: TableIdentity, column: Column, targetVersion: number): string {
   const statements = [`ALTER TABLE ${renderTable(table)} ADD COLUMN ${renderColumn(column)};`];
-  statements.push(...renderColumnAttributeStatements(table, column));
+  statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
   return statements.join('\n');
 }
 
@@ -750,45 +782,78 @@ function renderColumn(column: Column): string {
  * The post-data statements a created or added column's explicit storage and compression need:
  * `ALTER TABLE ONLY … ALTER COLUMN … SET STORAGE …` and `… SET COMPRESSION …`, in that order,
  * each only when the column states it. Inline `STORAGE`/`COMPRESSION` qualifiers are never
- * rendered; `ONLY` matches the dump's post-data form, and inheritance is out of scope.
+ * rendered; `ONLY` matches the dump's post-data form, and inheritance is out of scope. An
+ * absent value emits nothing here — the reset forms exist only for an `alter-column` step.
  */
-function renderColumnAttributeStatements(table: TableIdentity, column: Column): string[] {
+function renderColumnAttributeStatements(
+  table: TableIdentity,
+  column: Column,
+  targetVersion: number,
+): string[] {
   const statements: string[] = [];
   if (column.storage !== undefined) {
-    statements.push(renderSetStorage(table, column.name, column.storage));
+    statements.push(renderSetStorage(table, column.name, column.storage, targetVersion));
   }
   if (column.compression !== undefined) {
-    statements.push(renderSetCompression(table, column.name, column.compression));
+    statements.push(renderSetCompression(table, column.name, column.compression, targetVersion));
   }
   return statements;
 }
+
+/** The first PostgreSQL major that accepts the synthesized `SET STORAGE DEFAULT` reset. */
+const STORAGE_DEFAULT_MIN_MAJOR = 16;
 
 /**
  * One `SET STORAGE` statement for a column: the explicit method in PostgreSQL's upper-case
  * word, or `DEFAULT` when the target states none (the storage removal). Every form — the
  * `CREATE TABLE`/`ADD COLUMN` tail, the post-`TYPE` restatement, and the standalone change —
- * carries the dump's post-data `ONLY` form; inheritance is out of scope.
+ * carries the dump's post-data `ONLY` form; inheritance is out of scope. `DEFAULT` is a form
+ * the renderer synthesizes, not one the model declares, so it consults the declared target:
+ * below PostgreSQL 16 the statement does not exist and the renderer refuses rather than emit
+ * SQL the declared server would reject. An explicit letter renders at every target.
  */
 function renderSetStorage(
   table: TableIdentity,
   name: string,
   storage: ColumnStorage | undefined,
+  targetVersion: number,
 ): string {
+  if (storage === undefined && targetVersion < STORAGE_DEFAULT_MIN_MAJOR) {
+    throw new RenderRefusalError(
+      `refusing to render for PostgreSQL ${targetVersion}: SET STORAGE DEFAULT on ` +
+        `${renderTable(table)} column ${quoteIdentifier(name)} needs PostgreSQL ` +
+        `${STORAGE_DEFAULT_MIN_MAJOR} or newer`,
+    );
+  }
   const target = storage === undefined ? 'DEFAULT' : storage.toUpperCase();
   return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET STORAGE ${target};`;
 }
+
+/** The first PostgreSQL major that accepts the synthesized `SET COMPRESSION default` reset. */
+const COMPRESSION_DEFAULT_MIN_MAJOR = 14;
 
 /**
  * One `SET COMPRESSION` statement for a column: the explicit method, or `default` when the
  * target states none (the compression removal). Every form — the `CREATE TABLE`/`ADD COLUMN`
  * tail, the post-`TYPE` restatement, and the standalone change — carries the dump's post-data
- * `ONLY` form; inheritance is out of scope.
+ * `ONLY` form; inheritance is out of scope. `default` is a form the renderer synthesizes, not
+ * one the model declares, so it consults the declared target: below PostgreSQL 14 the statement
+ * does not exist and the renderer refuses rather than emit SQL the declared server would
+ * reject. An explicit method renders at every target.
  */
 function renderSetCompression(
   table: TableIdentity,
   name: string,
   compression: ColumnCompression | undefined,
+  targetVersion: number,
 ): string {
+  if (compression === undefined && targetVersion < COMPRESSION_DEFAULT_MIN_MAJOR) {
+    throw new RenderRefusalError(
+      `refusing to render for PostgreSQL ${targetVersion}: SET COMPRESSION default on ` +
+        `${renderTable(table)} column ${quoteIdentifier(name)} needs PostgreSQL ` +
+        `${COMPRESSION_DEFAULT_MIN_MAJOR} or newer`,
+    );
+  }
   const target = compression === undefined ? 'default' : compression;
   return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
 }
@@ -919,6 +984,7 @@ function renderAlterColumn(
   name: string,
   fields: readonly ColumnFieldChange[],
   attributes: ColumnAttributes | undefined,
+  targetVersion: number,
 ): string {
   const statement = `ALTER TABLE ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)}`;
   const merged = fields.some((field) => field.field === 'type' || field.field === 'collation');
@@ -937,17 +1003,17 @@ function renderAlterColumn(
     // The TYPE statement's reset matches a target that states no value, so only the explicit
     // ones restate.
     if (carrier.storage !== undefined) {
-      statements.push(renderSetStorage(table, name, carrier.storage));
+      statements.push(renderSetStorage(table, name, carrier.storage, targetVersion));
     }
     if (carrier.compression !== undefined) {
-      statements.push(renderSetCompression(table, name, carrier.compression));
+      statements.push(renderSetCompression(table, name, carrier.compression, targetVersion));
     }
   } else {
     for (const field of fields) {
       if (field.field === 'storage') {
-        statements.push(renderSetStorage(table, name, field.after));
+        statements.push(renderSetStorage(table, name, field.after, targetVersion));
       } else if (field.field === 'compression') {
-        statements.push(renderSetCompression(table, name, field.after));
+        statements.push(renderSetCompression(table, name, field.after, targetVersion));
       }
     }
   }
