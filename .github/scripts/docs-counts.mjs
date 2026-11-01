@@ -1,7 +1,7 @@
 // Report stale count claims in the docs against counts derived from code.
 //
-// The four classes are the plan's step-kind classification, its table-phase list, and the live
-// suite's scenes and tests. Run `pnpm build` first: `live-scenes.ts` resolves `@schemamill/core`
+// The classes are the plan's step-kind classification, its table-phase list, and the live suite's
+// scenes and tests. Run `pnpm build` first: `live-scenes.ts` resolves `@schemamill/core`
 // through the workspace link to `packages/core/dist`. Report mode is deliberately non-failing
 // (exit 0 even on a stale claim or a derivation error); `--check` exits 1 on either.
 //
