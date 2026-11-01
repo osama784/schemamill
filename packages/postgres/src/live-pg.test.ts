@@ -38,12 +38,19 @@ import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts
  * `minServerMajor` exceeds the server's major is skipped with a named reason, so a scene
  * carrying PostgreSQL 18 shapes still lets older local servers run the rest of the corpus.
  *
+ * Every render in this file targets that major: the baseline and target builds, the plan
+ * checks' probe renders, and the migration all pass `{ targetVersion: serverMajor }`, so the
+ * SQL is generated for the server that will apply it. A synthesized reset form the server
+ * cannot accept therefore refuses by name before any statement runs, instead of reaching
+ * `psql` as SQL the server rejects.
+ *
  * Per scene, sequentially: both databases are created fresh and any raw `setupSql` the scene
  * declares is applied to both, for ambient state like a non-public schema; the baseline
  * database gets the build SQL for the baseline model (the plan from an empty model), the
  * target database the build SQL for the target model plus any raw `targetExtraSql` the scene
  * declares for objects the model cannot represent; the baseline database then gets
- * `renderSql(plan(baseline, target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
+ * `renderSql(plan(baseline, target))`, rendered for the server under test. The scene's plan
+ * checks run against that plan before any SQL, its catalog checks
  * run against the baseline database after its build, its target checks against the target
  * database after its build, and its probes and remaining checks after the migration. Both
  * databases are dumped with `pg_dump --schema-only --no-owner
@@ -93,26 +100,26 @@ test(
                 : false,
           },
           async () => {
-            await runScene(baseUrl, workDir, scene);
+            await runScene(baseUrl, workDir, scene, serverMajor);
           },
         );
       }
       await t.test(
         'transaction rollback: a failed statement leaves no partial effect',
         async () => {
-          await assertRollbackLeavesNoPartialEffect(baseUrl, workDir);
+          await assertRollbackLeavesNoPartialEffect(baseUrl, workDir, serverMajor);
         },
       );
       await t.test(
         'falsification: without the wrappers a failed statement leaves partial effect',
         async () => {
-          await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir);
+          await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir, serverMajor);
         },
       );
       await t.test(
         'falsification: wrapping the standalone concurrent build is refused',
         async () => {
-          await assertConcurrentBuildRejectsWrapping(baseUrl, workDir);
+          await assertConcurrentBuildRejectsWrapping(baseUrl, workDir, serverMajor);
         },
       );
     } finally {
@@ -215,7 +222,12 @@ async function assertReachable(baseUrl: string): Promise<void> {
  * One scene's whole round trip, against fresh databases named after the scene and this run's
  * token, so concurrent runs against one cluster never touch each other's databases.
  */
-async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Promise<void> {
+async function runScene(
+  baseUrl: string,
+  workDir: string,
+  scene: LiveScene,
+  serverMajor: number,
+): Promise<void> {
   const slug = scene.name.replace(/[^a-z0-9]+/g, '_');
   const appliedDb = `schemamill_w6_${slug}_${runToken}`;
   const targetDb = `${appliedDb}_target`;
@@ -228,8 +240,8 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     await createDatabase(baseUrl, appliedDb);
     await createDatabase(baseUrl, targetDb);
 
-    const files = await writeSceneFiles(workDir, slug, scene);
-    assertPlanChecks(scene);
+    const files = await writeSceneFiles(workDir, slug, scene, serverMajor);
+    assertPlanChecks(scene, serverMajor);
 
     if (files.setup !== undefined) {
       await applyFile(appliedUrl, files.setup);
@@ -335,13 +347,18 @@ interface CorruptedMigration {
 const MISSING_RELATION = 'public.t_missing';
 
 /**
- * Renders `scene`'s migration and corrupts exactly its last statement: the table reference is
- * replaced with `missing`, a relation that does not exist, so PostgreSQL fails the statement
- * with `relation "…" does not exist`. The plan is pinned first — two steps, `alter-column` then
- * `add-primary-key` — and the corruption is pinned to change exactly one rendered line, so the
- * failure is attributable to the retargeted statement and nothing else.
+ * Renders `scene`'s migration for `serverMajor` — the server that will apply it — and corrupts
+ * exactly its last statement: the table reference is replaced with `missing`, a relation that
+ * does not exist, so PostgreSQL fails the statement with `relation "…" does not exist`. The
+ * plan is pinned first — two steps, `alter-column` then `add-primary-key` — and the corruption
+ * is pinned to change exactly one rendered line, so the failure is attributable to the
+ * retargeted statement and nothing else.
  */
-function corruptLastStatement(scene: LiveScene, missing: string): CorruptedMigration {
+function corruptLastStatement(
+  scene: LiveScene,
+  missing: string,
+  serverMajor: number,
+): CorruptedMigration {
   const steps = plan(scene.baseline, scene.target).steps;
   assert.deepEqual(
     steps.map((step) => step.kind),
@@ -349,7 +366,9 @@ function corruptLastStatement(scene: LiveScene, missing: string): CorruptedMigra
     `${scene.name}: the transaction tests require the two-step shape`,
   );
 
-  const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+  const lines = renderSql(plan(scene.baseline, scene.target), {
+    targetVersion: serverMajor,
+  }).split('\n');
   const commit = lines.lastIndexOf('COMMIT;');
   assert.ok(commit > 0, `${scene.name}: the rendered migration must end with COMMIT;`);
   const statement = lines[commit - 1]!;
@@ -387,6 +406,7 @@ async function applyExpectingFailure(url: string, path: string): Promise<string>
 async function assertRollbackLeavesNoPartialEffect(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = transactionScene();
   const database = `schemamill_w6_txn_rollback_${runToken}`;
@@ -399,14 +419,16 @@ async function assertRollbackLeavesNoPartialEffect(
     const baselineFile = join(workDir, 'rollback.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
     const baseline = await importDump(await dump(url));
     assertNoErrors(`${database}: the baseline before the corrupted migration`, baseline);
 
-    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION, serverMajor);
     const migrationFile = join(workDir, 'rollback.corrupted.sql');
     await writeFile(migrationFile, corrupted.sql, 'utf8');
     const failure = await applyExpectingFailure(url, migrationFile);
@@ -438,6 +460,7 @@ async function assertRollbackLeavesNoPartialEffect(
 async function assertStrippedWrappersLeavePartialEffect(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = transactionScene();
   const database = `schemamill_w6_txn_stripped_${runToken}`;
@@ -450,12 +473,14 @@ async function assertStrippedWrappersLeavePartialEffect(
     const baselineFile = join(workDir, 'stripped.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
 
-    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION, serverMajor);
     const allLines = corrupted.sql.split('\n');
     assert.deepEqual(
       allLines.filter((line) => line === 'BEGIN;' || line === 'COMMIT;'),
@@ -507,6 +532,7 @@ async function assertStrippedWrappersLeavePartialEffect(
 async function assertConcurrentBuildRejectsWrapping(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = concurrentScene();
   const database = `schemamill_w6_concurrent_wrapped_${runToken}`;
@@ -519,12 +545,16 @@ async function assertConcurrentBuildRejectsWrapping(
     const baselineFile = join(workDir, 'concurrent.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
 
-    const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+    const lines = renderSql(plan(scene.baseline, scene.target), {
+      targetVersion: serverMajor,
+    }).split('\n');
     const concurrent = lines.filter((line) => line.startsWith('CREATE INDEX CONCURRENTLY '));
     assert.equal(concurrent.length, 1, `${scene.name}: exactly one concurrent statement renders`);
     const statement = concurrent[0]!;
@@ -588,11 +618,12 @@ interface SceneFiles {
   readonly targetDump: string;
 }
 
-/** Writes the scene's SQL files into `workDir` and returns every path. */
+/** Writes the scene's SQL files into `workDir`, every render targeting `serverMajor`. */
 async function writeSceneFiles(
   workDir: string,
   slug: string,
   scene: LiveScene,
+  serverMajor: number,
 ): Promise<SceneFiles> {
   const setup = scene.setupSql === undefined ? undefined : join(workDir, `${slug}.setup.sql`);
   if (setup !== undefined) await writeFile(setup, `${scene.setupSql}\n`, 'utf8');
@@ -601,15 +632,22 @@ async function writeSceneFiles(
   const migration = join(workDir, `${slug}.migrate.sql`);
   await writeFile(
     baselineBuild,
-    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline)),
+    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+      targetVersion: serverMajor,
+    }),
     'utf8',
   );
   const targetSql = renderSql(
     plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.target),
+    { targetVersion: serverMajor },
   );
   const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
-  await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
+  await writeFile(
+    migration,
+    renderSql(plan(scene.baseline, scene.target), { targetVersion: serverMajor }),
+    'utf8',
+  );
   return {
     ...(setup === undefined ? {} : { setup }),
     baselineBuild,
@@ -627,11 +665,15 @@ async function assertChecks(url: string, checks: readonly SceneCheck[]): Promise
   }
 }
 
-/** Asserts every plan fact in order against `plan(baseline, target)`. */
-function assertPlanChecks(scene: LiveScene): void {
+/**
+ * Asserts every plan fact in order against `plan(baseline, target)`. Each check also receives
+ * the server's major, so a check that renders can generate the SQL for the same target the
+ * harness applies it to.
+ */
+function assertPlanChecks(scene: LiveScene, serverMajor: number): void {
   const migration = plan(scene.baseline, scene.target);
   for (const check of scene.planChecks ?? []) {
-    const failure = check.failure(migration.steps, migration);
+    const failure = check.failure(migration.steps, migration, serverMajor);
     assert.ok(
       failure === undefined,
       `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
