@@ -35,10 +35,12 @@ import { renderSql } from './render.ts';
  * Each scene pairs a baseline and a target model that the harness takes through a full round
  * trip: build the baseline database, build the target database from its own model, apply
  * `renderSql(plan(baseline, target))` to the baseline database, then dump and import both and
- * compare. The five golden scenes carry the catalog spot-checks ported from the first slice's
- * scratch evidence runs; the harness reads them in phases: `baselineChecks` after the baseline
- * build, `targetChecks` after the target build, then `probes` and `checks` after the migration,
- * in that order.
+ * compare. Every render targets the server under test: the harness passes its major as
+ * `renderSql`'s `targetVersion`, and a scene plan check that renders receives the same major as
+ * `ScenePlanCheck.failure`'s third argument. The five golden scenes carry the catalog
+ * spot-checks ported from the first slice's scratch evidence runs; the harness reads them in
+ * phases: `baselineChecks` after the baseline build, `targetChecks` after the target build, then
+ * `probes` and `checks` after the migration, in that order.
  *
  * The regression scenes are the shapes that caught real ordering bugs while the first slice
  * was built: table-removal cycles (`twocycle`, `smallvictim`), a primary key that changes
@@ -307,10 +309,15 @@ export interface SceneCheck {
  * right. Plan facts are asserted before any SQL runs — they pin what the plan does, which the
  * live round trip alone cannot name, such as a step the plan must not emit because a cascade
  * would make it redundant, or the standalone group a concurrent statement must stand in.
+ *
+ * `serverMajor` is the major of the server the harness applies the SQL to. A check that
+ * renders the plan passes it through as `renderSql`'s `targetVersion`, so the probe sees the
+ * same SQL the server will, and a synthesized form the server cannot accept refuses here
+ * rather than on apply.
  */
 export interface ScenePlanCheck {
   readonly description: string;
-  readonly failure: (steps: readonly Step[], plan: Plan) => string | undefined;
+  readonly failure: (steps: readonly Step[], plan: Plan, serverMajor: number) => string | undefined;
 }
 
 /**
@@ -365,7 +372,11 @@ export interface LiveScene {
    * The oldest server major the scene can run against. Absent means the harness's base floor
    * (PostgreSQL 13); a scene that needs a newer major declares it and is skipped with a named
    * reason on older servers, so PostgreSQL 18 shapes still run on CI while a local PostgreSQL
-   * 16 run keeps the rest of the corpus green.
+   * 16 run keeps the rest of the corpus green. The floor must cover every declaration the
+   * scene's models render: the harness renders every build and migration for the server under
+   * test (`renderSql(plan, { targetVersion: serverMajor })`), so a synthesized reset form below
+   * its floor refuses by name, and an explicit declaration above the floor — an explicit
+   * `COMPRESSION` needs 14 — must still be gated by the scene's own `minServerMajor`.
    */
   readonly minServerMajor?: number;
   /** The model the baseline database is built from. */
@@ -4429,8 +4440,8 @@ const columnAttributesScene = (): LiveScene => {
     planChecks: [
       {
         description: 'the type-and-collation change renders one merged TYPE statement',
-        failure: (_steps, migration) => {
-          const lines = renderSql(migration).split('\n');
+        failure: (_steps, migration, serverMajor) => {
+          const lines = renderSql(migration, { targetVersion: serverMajor }).split('\n');
           const statements = lines.filter((line) =>
             line.startsWith('ALTER TABLE public.merged ALTER COLUMN m_type_coll '),
           );
@@ -4551,9 +4562,10 @@ const columnAttributesScene = (): LiveScene => {
  * The live-introspection flags scene: the covered column and table states now read back
  * instead of flagging, and the deferred states stay flagged, each asserted as an exact
  * diagnostic. The model declares `flag_covered` — a default, an explicit collation, storage,
- * and compression — and `flag_identity`; raw setup SQL adds an unlogged table whose
- * persistence reads back, a generated column whose flag must suppress its `atthasdef` default
- * flag, a partitioned table with one partition — both partitioned relations skipped and
+ * and compression — and `flag_identity`; the explicit compression renders `SET COMPRESSION
+ * pglz`, so the scene declares `minServerMajor: 14` and a PostgreSQL 13 server skips it. Raw
+ * setup SQL adds an unlogged table whose persistence reads back, a generated column whose flag
+ * must suppress its `atthasdef` default flag, a partitioned table with one partition — both partitioned relations skipped and
  * named, and neither mapped — and a table carrying expression, partial, and `INCLUDE` indexes
  * plus an index marked invalid by a catalog write (a model cannot declare an invalid index),
  * each outside the model's envelope and skipped whole with the read's reason. The covered
@@ -4579,6 +4591,7 @@ const introspectionFlagsScene = (): LiveScene => {
 
   return {
     name: 'introspection-flags',
+    minServerMajor: 14,
     setupSql: [
       'CREATE UNLOGGED TABLE public.flag_unlogged (x integer);',
       'CREATE TABLE public.flag_generated (a integer DEFAULT 1, b integer GENERATED ALWAYS AS (a * 2) STORED);',
@@ -4913,10 +4926,10 @@ const truncatedNameRoundTripScene = (): LiveScene => {
       },
       {
         description: 'the rendered drop names the index server form, not the assembled long form',
-        failure: (_steps, migration) => {
+        failure: (_steps, migration, serverMajor) => {
           const line =
             'DROP INDEX public.settlement_ledger_entries_superseded_originator_reference_v_idx;';
-          return renderSql(migration).includes(line)
+          return renderSql(migration, { targetVersion: serverMajor }).includes(line)
             ? undefined
             : `the rendered migration does not carry ${line}`;
         },

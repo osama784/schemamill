@@ -20,20 +20,26 @@ const execFileAsync = promisify(execFile);
 /** The built entry point; the package's test script builds first. */
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
+/** One golden scene: the fixture base name and any extra arguments only `plan` receives. */
+interface GoldenScene {
+  readonly name: string;
+  readonly planArgs?: readonly string[];
+}
+
 /** Every golden scene, by fixture base name. */
-const SCENES = [
-  'all-changes',
-  'column-attributes',
-  'comments',
-  'constraint-attributes',
-  'constraints-indexes',
-  'extensions',
-  'hazards',
-  'identity',
-  'schema-edges',
-  'sequences',
-  'views',
-] as const;
+const SCENES: readonly GoldenScene[] = [
+  { name: 'all-changes' },
+  { name: 'column-attributes', planArgs: ['--target-version', '16'] },
+  { name: 'comments' },
+  { name: 'constraint-attributes' },
+  { name: 'constraints-indexes' },
+  { name: 'extensions' },
+  { name: 'hazards' },
+  { name: 'identity' },
+  { name: 'schema-edges' },
+  { name: 'sequences' },
+  { name: 'views' },
+];
 
 /** Every command whose stdout a golden pins. */
 const COMMANDS = ['compare', 'plan'] as const;
@@ -80,18 +86,23 @@ function hazardsBlock(golden: string): string | null {
 
 for (const scene of SCENES) {
   for (const command of COMMANDS) {
-    test(`${command} prints exactly the ${scene} golden`, async () => {
-      const baseline = fixturePath(`../test/fixtures/${scene}.baseline.sql`);
-      const target = fixturePath(`../test/fixtures/${scene}.target.sql`);
+    test(`${command} prints exactly the ${scene.name} golden`, async () => {
+      const baseline = fixturePath(`../test/fixtures/${scene.name}.baseline.sql`);
+      const target = fixturePath(`../test/fixtures/${scene.name}.target.sql`);
 
-      const result = await runCli(command, baseline, target);
+      const result = await runCli(
+        command,
+        baseline,
+        target,
+        ...(command === 'plan' ? (scene.planArgs ?? []) : []),
+      );
 
       assert.equal(
         result.code,
         0,
         `schemamill ${command} exited ${String(result.code)}; stderr:\n${result.stderr}`,
       );
-      assert.equal(result.stdout, readText(`../test/goldens/${scene}.${command}.txt`));
+      assert.equal(result.stdout, readText(`../test/goldens/${scene.name}.${command}.txt`));
     });
   }
 }

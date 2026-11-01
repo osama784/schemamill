@@ -400,14 +400,15 @@ const PLAN_HELP = [
   'Print the migration plan and its SQL between a baseline and a target.',
   '',
   'Arguments:',
-  '  baseline              path to the baseline DDL dump',
-  '  target                path to the target DDL dump',
+  '  baseline                  path to the baseline DDL dump',
+  '  target                    path to the target DDL dump',
   '',
   'Options:',
-  '  --baseline-workspace  resolve the baseline from the workspace',
-  '  --target-workspace    resolve the target from the workspace',
-  '  --verbose             list every import diagnostic',
-  '  -h, --help            display help for command',
+  '  --baseline-workspace      resolve the baseline from the workspace',
+  '  --target-workspace        resolve the target from the workspace',
+  '  --verbose                 list every import diagnostic',
+  '  --target-version <major>  PostgreSQL major (13-18) (default: "13")',
+  '  -h, --help                display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
   '',
@@ -620,6 +621,98 @@ test('plan prints the display before a render refusal, then one stderr line, exi
     result.stderr,
     'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)\n',
   );
+  assert.equal(result.code, 1);
+});
+
+test('plan --target-version 13 refuses the synthesized resets, display first', async () => {
+  // The display is version-free: the golden's text before its SQL carries the plan and the
+  // hazards. Target 13 refuses the first reset in plan order — the storage removal on
+  // `public.attrs.s_remove` — before the compression reset later in the same plan.
+  const baseline = fixturePath('column-attributes.baseline.sql');
+  const target = fixturePath('column-attributes.target.sql');
+  const golden = testText('goldens/column-attributes.plan.txt');
+  const sqlAt = golden.indexOf('BEGIN;');
+  assert.notEqual(sqlAt, -1, 'the golden carries the migration SQL');
+  const display = golden.slice(0, sqlAt);
+  assert.notEqual(display, '');
+  assert.match(display, /steps in one transaction:/u);
+
+  const refused = await runCli('plan', baseline, target, '--target-version', '13');
+
+  assert.equal(refused.stdout, display);
+  assert.equal(
+    refused.stderr,
+    'schemamill: refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.attrs column s_remove needs PostgreSQL 16 or newer\n',
+  );
+  assert.equal(refused.code, 1);
+
+  // Target 14 admits the compression reset (its floor) and still refuses the storage reset:
+  // the first refusal names the storage form, not the compression one.
+  const boundary = await runCli('plan', baseline, target, '--target-version', '14');
+
+  assert.equal(boundary.stdout, display);
+  assert.equal(
+    boundary.stderr,
+    'schemamill: refusing to render for PostgreSQL 14: SET STORAGE DEFAULT on public.attrs column s_remove needs PostgreSQL 16 or newer\n',
+  );
+  assert.equal(boundary.code, 1);
+});
+
+test('an invalid --target-version is a usage error before any filesystem access, exit 1', async () => {
+  // The paths do not exist: reaching a read would produce a `cannot read` line instead, so the
+  // pinned usage error proves the flag is validated before any filesystem access.
+  for (const value of ['12', '19', '13.4', 'abc']) {
+    const result = await runCli(
+      'plan',
+      'definitely-missing-baseline.sql',
+      'definitely-missing-target.sql',
+      '--target-version',
+      value,
+    );
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'error: --target-version must be a PostgreSQL major from 13 to 18\n',
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test("plan --target-version without a value is Commander's usage error", async () => {
+  const result = await runCli('plan', '--target-version');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: option '--target-version <major>' argument missing\n");
+  assert.equal(result.code, 1);
+});
+
+test('an explicit target never changes the output of a reset-free plan', async () => {
+  // `constraints-indexes` renders no storage or compression statement, so both runs must emit
+  // the same bytes: the flag is inert above the closed list of two synthesized forms.
+  const baseline = fixturePath('constraints-indexes.baseline.sql');
+  const target = fixturePath('constraints-indexes.target.sql');
+
+  const implicit = await runCli('plan', baseline, target);
+  const explicit = await runCli('plan', baseline, target, '--target-version', '16');
+
+  assert.notEqual(implicit.stdout, '');
+  assert.equal(implicit.stderr, '');
+  assert.equal(implicit.code, 0);
+  assert.equal(explicit.stderr, '');
+  assert.equal(explicit.code, 0);
+  assert.equal(explicit.stdout, implicit.stdout);
+});
+
+test('compare takes no --target-version', async () => {
+  // `compare` renders nothing, so the flag is deliberately absent and Commander rejects it.
+  const baseline = fixturePath('column-attributes.baseline.sql');
+  const target = fixturePath('column-attributes.target.sql');
+
+  const result = await runCli('compare', baseline, target, '--target-version', '13');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: unknown option '--target-version'\n");
   assert.equal(result.code, 1);
 });
 
