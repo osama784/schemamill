@@ -1128,6 +1128,197 @@ test('keeps a not-null name through DROP IDENTITY', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('marks a plain ADD PRIMARY KEY column not null', async () => {
+  const declared = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE public.t ADD PRIMARY KEY (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(declared);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key implies the not-null fact, and the implied fact is unnamed.
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(diagnostics, []);
+
+  // The hand-written DDL now matches the pg_dump shape of the same database.
+  const serverDump = [
+    `CREATE TABLE public.t (a integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+  ].join('\n');
+  const { model: serverModel } = await importDump(serverDump);
+  assert.deepEqual(diff(model, serverModel), []);
+});
+
+test('marks every column of a composite ADD PRIMARY KEY not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks the consumed USING INDEX columns not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_ab_idx ON public.t USING btree (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_ab_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Both columns the consumed index backed are key columns, so both gain the not-null fact.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a', 'b'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('preserves a named not-null constraint when a primary key is added', async () => {
+  const namedFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+  ];
+  const primaryFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+  ];
+
+  for (const statements of [namedFirst, primaryFirst]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('marks an inline CREATE TABLE primary-key column not null', async () => {
+  const dump = `CREATE TABLE public.t (a integer PRIMARY KEY);`;
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks a table-level CREATE TABLE primary key declared before its column not null', async () => {
+  const dump = `CREATE TABLE public.t (PRIMARY KEY (a), a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks an ADD COLUMN primary-key column not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE public.t ADD COLUMN b integer PRIMARY KEY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: false },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['b'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('does not mark the columns of a rejected additional primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the retained key's column is marked; the rejected key cannot mark `b`.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped additional primary key from public.t'],
+  );
+});
+
+test('marks known key columns and ignores an unknown one', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a, ghost);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The absent key column is skipped silently; the known one gains the fact.
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a', 'ghost'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test("marks a temporal primary key's period column not null", async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during int4range);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The period column is the last key and is not exempt; the temporal attribute itself is
+  // still outside the model and flagged.
+  assert.deepEqual(table.columns, [
+    { name: 'id', type: 'integer', notNull: true },
+    { name: 'during', type: 'int4range', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+});
+
 test('attribute-carrying declarations round-trip against the unnamed model with an empty diff', async () => {
   const declared = [
     `CREATE TABLE public.parent (id integer PRIMARY KEY);`,

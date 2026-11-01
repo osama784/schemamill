@@ -48,6 +48,9 @@
  *   `<table>_<column>_not_null` is stripped the same way; no twin guard is needed, because one
  *   not-null fact per column is the only shape the model carries and the duplicate declaration
  *   is already collapsed by the merge (see `mergeNotNullDeclaration`).
+ * - PostgreSQL marks every primary-key key column NOT NULL whichever statement form created the
+ *   key: the finalizer applies that implied fact, unnamed, to the retained key's columns after
+ *   the name canonicalizations, so an explicit named NOT NULL keeps its name.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
@@ -4046,6 +4049,7 @@ function finalizeTable(draft: TableDraft): Table {
   canonicalizeConstraintNames(draft);
   canonicalizeIndexNames(draft);
   canonicalizeNotNullNames(draft);
+  reconcilePrimaryKeyNullability(draft);
   const table: Mutable<Table> = {
     schema: draft.schema,
     name: draft.name,
@@ -4059,6 +4063,25 @@ function finalizeTable(draft: TableDraft): Table {
   if (draft.persistence !== undefined) table.persistence = draft.persistence;
   if (draft.comment !== undefined) table.comment = draft.comment;
   return table;
+}
+
+/**
+ * Applies the not-null fact PostgreSQL gives every primary-key key column, whichever statement
+ * form created the key. The fact is implied and therefore unnamed: `mergeNotNullDeclaration`
+ * leaves an already-not-null column untouched, so an explicit named NOT NULL keeps its name. A
+ * key column the model never saw is skipped silently, matching `attachPrimaryKey`.
+ */
+function reconcilePrimaryKeyNullability(draft: TableDraft): void {
+  if (draft.primaryKey === undefined) return;
+  for (const name of draft.primaryKey.columns) {
+    const position = draft.columns.findIndex((column) => column.name === name);
+    if (position === -1) continue;
+    draft.columns[position] = mergeNotNullDeclaration(
+      draft.columns[position]!,
+      draft.name,
+      undefined,
+    ).column;
+  }
 }
 
 /**
