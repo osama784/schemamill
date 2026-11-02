@@ -31,7 +31,7 @@ import type { RenderOptions } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin fifteen whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin sixteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -2933,6 +2933,48 @@ test('golden: renders constraint attributes in every position', () => {
     'constraint-attributes',
     model(events, users, orders),
     model(eventsTarget, usersTarget, ordersTarget),
+  );
+});
+
+test('golden: renders two in-place enforcement flips at their drop positions', () => {
+  // The CLI's `constraint-enforcement` fixture shape: an untouched `teams` parent with one
+  // child relaxed and one tightened. The plan keeps its phase-major drop+add decomposition —
+  // `drop guests, drop members, add guests, add members` — and target 18 renders one ALTER at
+  // each drop position instead. This golden is target-18-only and stays out of the 13 floor.
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'teams_pkey', columns: ['id'] },
+  });
+  const teamKey = (name: string, enforcement?: ConstraintEnforcement): ForeignKey =>
+    foreignKey(['team_id'], identity('teams'), {
+      name,
+      referencedColumns: ['id'],
+      ...(enforcement === undefined ? {} : { enforcement }),
+    });
+  const guests = (enforcement?: ConstraintEnforcement): Table =>
+    table('guests', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'guests_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('guests_team_fk', enforcement)],
+    });
+  const members = (enforcement?: ConstraintEnforcement): Table =>
+    table('members', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'members_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('members_team_fk', enforcement)],
+    });
+
+  assertGolden(
+    'foreign-key-enforcement',
+    model(teams, guests(undefined), members('not-enforced')),
+    model(teams, guests('not-enforced'), members(undefined)),
+    { targetVersion: 18 },
   );
 });
 
