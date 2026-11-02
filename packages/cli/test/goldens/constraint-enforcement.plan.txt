@@ -1,0 +1,10 @@
+4 steps in one transaction:
+ 1. drop-foreign-key  public.guests: foreign key guests_team_fk (team_id) → public.teams (id)
+ 2. drop-foreign-key  public.members: foreign key members_team_fk (team_id) → public.teams (id)
+ 3. add-foreign-key   public.guests: foreign key guests_team_fk (team_id) → public.teams (id)
+ 4. add-foreign-key   public.members: foreign key members_team_fk (team_id) → public.teams (id)
+
+BEGIN;
+ALTER TABLE public.guests ALTER CONSTRAINT guests_team_fk ENFORCED;
+ALTER TABLE public.members ALTER CONSTRAINT members_team_fk NOT ENFORCED;
+COMMIT;

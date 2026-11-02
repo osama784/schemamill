@@ -32,6 +32,7 @@ const SCENES: readonly GoldenScene[] = [
   { name: 'column-attributes', planArgs: ['--target-version', '16'] },
   { name: 'comments' },
   { name: 'constraint-attributes' },
+  { name: 'constraint-enforcement', planArgs: ['--target-version', '18'] },
   { name: 'constraints-indexes' },
   { name: 'extensions' },
   { name: 'hazards' },
