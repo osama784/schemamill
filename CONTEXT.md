@@ -179,7 +179,7 @@ The SQL rendering of a migration plan — deterministic and reviewable, for the 
 _Avoid_: script, patch, changeset
 
 **Target version**:
-The PostgreSQL major a migration plan's SQL is generated for, declared offline — `plan --target-version <major>`, default 13, the documented floor. The renderer synthesizes nothing above it: a synthesized statement whose form postdates the target is refused by name, while a declaration the model carries still renders as declared. Distinct from the diff's **Target** side, which is a model, not a server major.
+The PostgreSQL major a migration plan's SQL is generated for, declared offline — `plan --target-version <major>`, default 13, the documented floor. The renderer synthesizes nothing above it: a synthesized statement whose form postdates the target is refused by name, while a declaration the model carries still renders as declared. A form with an equivalent fallback renders the fallback below its floor — the in-place foreign-key enforcement flip does exactly that — which is distinct from a declaration (rendered as declared) and from a synthesized reset (refused). Distinct from the diff's **Target** side, which is a model, not a server major.
 _Avoid_: server version, PG version, dialect, version
 
 **Transaction group**:
