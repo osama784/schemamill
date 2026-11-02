@@ -1,0 +1,5 @@
+~ table public.guests
+    ~ foreign key (team_id) → public.teams: enforcement not-enforced → (none)
+
+~ table public.members
+    ~ foreign key (team_id) → public.teams: enforcement (none) → not-enforced

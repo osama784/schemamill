@@ -80,9 +80,11 @@ import { renderSql } from './render.ts';
  *
  * The constraint-attribute scenes cover the PostgreSQL 18 shapes: enforcement and deferrability
  * on every constraint kind that carries them, pinned against the catalog's
- * `pg_get_constraintdef` (`constraint-attributes`), and the generated not-null-constraint name,
+ * `pg_get_constraintdef` (`constraint-attributes`), the generated not-null-constraint name,
  * canonicalized back to unnamed on import while a comment keeps the name in the target dump
- * (`not-null-constraint-names`). Both declare `minServerMajor: 18` and skip with a named reason
+ * (`not-null-constraint-names`), and a pure foreign-key enforcement change in both directions
+ * rendered as `ALTER TABLE … ALTER CONSTRAINT … ENFORCED|NOT ENFORCED` instead of drop/add
+ * (`enforcement-in-place`). All three declare `minServerMajor: 18` and skip with a named reason
  * on older servers.
  *
  * The introspection scenes are the tracer bullet for the `CatalogReader` seam:
@@ -3578,6 +3580,154 @@ const notNullConstraintNamesScene = (): LiveScene => {
 };
 
 /**
+ * The in-place enforcement flip: PostgreSQL 18's `ALTER TABLE … ALTER CONSTRAINT … ENFORCED` and
+ * `… NOT ENFORCED` state a pure foreign-key enforcement change without dropping the constraint.
+ * Two child tables reference one untouched parent, one in each direction — `guests` relaxes
+ * (`absent` → `not-enforced`) and `members` tightens (`not-enforced` → `absent`) — under explicit
+ * non-conventional names the import cannot canonicalize away. The plan keeps its semantic
+ * drop/add decomposition (`drop`, `drop`, `add`, `add`); the plan checks pin that shape, the
+ * before/after enforcement values on both pairs, and the two rendered `ALTER` statements at the
+ * server's major. The baseline and post-migration catalog checks pin `conenforced`/`convalidated`
+ * and the exact `pg_get_constraintdef` spellings, and the import checks prove both dumps carry
+ * the target enforcement back onto the model, so the empty diff is a real attribute round trip.
+ */
+const enforcementInPlaceScene = (): LiveScene => {
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const childColumns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('team_id', { type: 'integer' }),
+  ];
+  const child = (
+    name: string,
+    foreignKeyName: string,
+    enforcement?: ForeignKey['enforcement'],
+  ): Table =>
+    table(name, {
+      columns: childColumns,
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [
+        foreignKey(['team_id'], identity('teams'), {
+          name: foreignKeyName,
+          ...(enforcement === undefined ? {} : { enforcement }),
+        }),
+      ],
+    });
+  const enforcementStates =
+    "select string_agg(conname || '|' || convalidated || '|' || conenforced," +
+    " ',' order by conname) from pg_constraint" +
+    " where conname in ('guests_team_fk', 'members_team_fk')";
+
+  return {
+    name: 'enforcement-in-place',
+    minServerMajor: 18,
+    baseline: model(
+      teams,
+      child('guests', 'guests_team_fk'),
+      child('members', 'members_team_fk', 'not-enforced'),
+    ),
+    target: model(
+      teams,
+      child('guests', 'guests_team_fk', 'not-enforced'),
+      child('members', 'members_team_fk'),
+    ),
+    baselineChecks: [
+      {
+        description: 'the two foreign keys start at opposite enforcement states',
+        sql: enforcementStates,
+        expected: 'guests_team_fk|true|true,members_team_fk|false|false',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan keeps the semantic drop/add shape, one change per child table',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds === 'drop-foreign-key,drop-foreign-key,add-foreign-key,add-foreign-key'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+      {
+        description: 'the two pairs carry the before and after enforcement values',
+        failure: (steps) => {
+          const facts = steps
+            .map((step) => {
+              if (step.kind !== 'drop-foreign-key' && step.kind !== 'add-foreign-key') {
+                return `${step.kind}:unexpected`;
+              }
+              const name = step.foreignKey.name ?? '<unnamed>';
+              const enforcement = String(step.foreignKey.enforcement);
+              return `${step.kind}:${step.table.name}:${name}:${enforcement}`;
+            })
+            .join(',');
+          const expected =
+            'drop-foreign-key:guests:guests_team_fk:undefined,' +
+            'drop-foreign-key:members:members_team_fk:not-enforced,' +
+            'add-foreign-key:guests:guests_team_fk:not-enforced,' +
+            'add-foreign-key:members:members_team_fk:undefined';
+          return facts === expected ? undefined : `steps: ${facts}`;
+        },
+      },
+      {
+        description: 'at PostgreSQL 18 both flips render one ALTER each, with no drop and no add',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = [
+            'BEGIN;',
+            'ALTER TABLE public.guests ALTER CONSTRAINT guests_team_fk NOT ENFORCED;',
+            'ALTER TABLE public.members ALTER CONSTRAINT members_team_fk ENFORCED;',
+            'COMMIT;',
+            '',
+          ].join('\n');
+          return sql === expected ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the relaxation deparses with the PostgreSQL 18 suffix',
+        sql: constraintDef('guests_team_fk'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id) NOT ENFORCED',
+      },
+      {
+        description: 'the tightening deparses as the plain enforced form',
+        sql: constraintDef('members_team_fk'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id)',
+      },
+      {
+        description: 'the enforcement states flipped, each with its validation bit',
+        sql: enforcementStates,
+        expected: 'guests_team_fk|false|false,members_team_fk|true|true',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'both dumps import the target enforcement, the explicit names intact and the directions distinct',
+        failure: (imported) => {
+          const facts = ['guests', 'members']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              const key = found?.foreignKeys.find(
+                (constraint) => constraint.columns.join(',') === 'team_id',
+              );
+              if (key === undefined) return `${name}:not imported`;
+              return `${name}:${key.name ?? '<unnamed>'}:${String(key.enforcement)}`;
+            })
+            .join(' ');
+          const expected = 'guests:guests_team_fk:not-enforced members:members_team_fk:undefined';
+          return facts === expected ? undefined : `imported enforcement: ${facts}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
  * The standalone-index round trip: a target adding a plain and a unique index, plus raw target
  * SQL declaring a partial and an expression index the model cannot represent. The plan renders
  * only the two modeled indexes; the target dump carries all four, and the import skips the two
@@ -6585,6 +6735,7 @@ export const scenes: readonly LiveScene[] = [
   introspectionConstraintsScene(),
   constraintAttributesScene(),
   notNullConstraintNamesScene(),
+  enforcementInPlaceScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),

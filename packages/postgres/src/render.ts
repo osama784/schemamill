@@ -302,6 +302,9 @@ export const MIN_TARGET_VERSION = 13;
 /** The newest PostgreSQL major whose forms the renderer knows. */
 export const MAX_TARGET_VERSION = 18;
 
+/** The first PostgreSQL major that accepts an in-place foreign-key enforcement change. */
+const FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR = 18;
+
 /** Options for {@link renderSql}. */
 export interface RenderOptions {
   /**
@@ -344,12 +347,18 @@ export function renderSql(plan: Plan, options?: RenderOptions): string {
   assertGroupsTileSteps(plan);
   assertIndexNamesUnique(plan);
   if (plan.steps.length === 0) return '';
+  const collapsed =
+    targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
+      ? collapseEnforcementFlips(plan)
+      : undefined;
   const groups: string[] = [];
   for (const group of plan.groups) {
     const lines: string[] = [];
     if (group.transactional) lines.push('BEGIN;');
     for (let index = group.start; index < group.end; index += 1) {
-      lines.push(renderStep(plan.steps[index]!, targetVersion));
+      if (collapsed !== undefined && collapsed.suppressed.has(index)) continue;
+      const replacement = collapsed?.statements.get(index);
+      lines.push(replacement ?? renderStep(plan.steps[index]!, targetVersion));
     }
     if (group.transactional) lines.push('COMMIT;');
     groups.push(lines.join('\n'));
@@ -515,6 +524,262 @@ function describeIndex(table: TableIdentity, index: Index, serverName: string): 
  */
 function untruncatedIndexName(table: TableIdentity, index: Index): string {
   return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+}
+
+/** One indexed step of a foreign-key polarity, for the in-place collapse pass. */
+type ForeignKeyDropStep = Extract<Step, { kind: 'drop-foreign-key' }>;
+type ForeignKeyAddStep = Extract<Step, { kind: 'add-foreign-key' }>;
+
+/** The PostgreSQL 18 form an in-place enforcement change emits. */
+type ForeignKeyEnforcementForm = 'ENFORCED' | 'NOT ENFORCED';
+
+/** One indexed step, keeping the plan position the emission loop walks. */
+interface IndexedStep<StepType extends Step> {
+  readonly index: number;
+  readonly step: StepType;
+}
+
+/** One drop's single matching add, with the in-place form the pair would emit. */
+interface EnforcementFlipMatch {
+  readonly add: IndexedStep<ForeignKeyAddStep>;
+  readonly form: ForeignKeyEnforcementForm;
+}
+
+/** The replacement statements and suppressed steps of the in-place collapse pass. */
+interface EnforcementCollapse {
+  readonly statements: ReadonlyMap<number, string>;
+  readonly suppressed: ReadonlySet<number>;
+}
+
+/**
+ * Pairs the `drop-foreign-key` and `add-foreign-key` halves of a pure enforcement change when
+ * PostgreSQL 18 can state it in place, and returns the drop-positioned `ALTER` plus the add
+ * positions to suppress. A pair must share one table identity, differ only in `enforcement`
+ * (strict raw equality, comments ignored), take one of the two legal directions, sit in one
+ * transaction group, carry no deferrable tightening, and have no other non-`comment` step
+ * whose principal table is either the referencing or the referenced table. A drop matching more
+ * than one add, or an add matching more than one drop, is a malformed plan and throws before
+ * anything renders; a lone half is normal and renders unchanged.
+ *
+ * The plan keeps its semantic drop+add shape — this pass reads it, never rewrites it — so
+ * targets below PostgreSQL 18 run no pass at all and render exactly today's pair.
+ */
+function collapseEnforcementFlips(plan: Plan): EnforcementCollapse {
+  const drops: IndexedStep<ForeignKeyDropStep>[] = [];
+  const adds: IndexedStep<ForeignKeyAddStep>[] = [];
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    const step = plan.steps[index]!;
+    if (step.kind === 'drop-foreign-key') drops.push({ index, step });
+    else if (step.kind === 'add-foreign-key') adds.push({ index, step });
+  }
+
+  const statements = new Map<number, string>();
+  const suppressed = new Set<number>();
+  if (drops.length === 0 || adds.length === 0) return { statements, suppressed };
+
+  const matches = new Map<number, EnforcementFlipMatch[]>();
+  for (const drop of drops) {
+    const candidates: EnforcementFlipMatch[] = [];
+    for (const add of adds) {
+      const form = sameTableIdentity(drop.step.table, add.step.table)
+        ? enforcementFlipForm(drop.step.foreignKey, add.step.foreignKey)
+        : undefined;
+      if (form !== undefined) candidates.push({ add, form });
+    }
+    if (candidates.length > 1) {
+      throw new Error(
+        `render: drop-foreign-key on ${renderTable(drop.step.table)} matches more than one add-foreign-key`,
+      );
+    }
+    matches.set(drop.index, candidates);
+  }
+  for (const add of adds) {
+    const candidates = drops.filter(
+      (drop) =>
+        sameTableIdentity(drop.step.table, add.step.table) &&
+        enforcementFlipForm(drop.step.foreignKey, add.step.foreignKey) !== undefined,
+    );
+    if (candidates.length > 1) {
+      throw new Error(
+        `render: add-foreign-key on ${renderTable(add.step.table)} matches more than one drop-foreign-key`,
+      );
+    }
+  }
+
+  const groupOf = stepGroupIndices(plan);
+  for (const drop of drops) {
+    const match = matches.get(drop.index)?.[0];
+    if (match === undefined) continue;
+    const add = match.add;
+    const dropGroup = groupOf[drop.index];
+    const addGroup = groupOf[add.index];
+    if (dropGroup === undefined || dropGroup !== addGroup) continue;
+    if (match.form === 'ENFORCED' && tighteningLosesDeferrability(add.step.foreignKey)) continue;
+    if (enforcementPairCrowded(plan, drop, add)) continue;
+    statements.set(
+      drop.index,
+      renderAlterConstraint(drop.step.table, add.step.foreignKey, match.form),
+    );
+    suppressed.add(add.index);
+  }
+  return { statements, suppressed };
+}
+
+/**
+ * The in-place form for a drop/add pair, or `undefined` when the two are not one pure
+ * enforcement change. Every field but `enforcement` compares raw — including
+ * `referencedColumns` as a plain array, unlike the diff's empty-vs-explicit-primary-key
+ * equivalence — and `comment` never participates. Only the two directions PostgreSQL 18 can
+ * state are legal: any transition into `not-enforced` relaxes, `not-enforced` back to the
+ * absent default tightens, and validation-only changes (`absent ↔ not-valid`) and
+ * `not-enforced → not-valid` stay drop/add.
+ */
+function enforcementFlipForm(
+  before: ForeignKey,
+  after: ForeignKey,
+): ForeignKeyEnforcementForm | undefined {
+  if (!sameForeignKeyExceptEnforcement(before, after)) return undefined;
+  if (after.enforcement === 'not-enforced') return 'NOT ENFORCED';
+  if (before.enforcement === 'not-enforced' && after.enforcement === undefined) return 'ENFORCED';
+  return undefined;
+}
+
+/** Whether two foreign keys are equal in every field but `enforcement` and `comment`. */
+function sameForeignKeyExceptEnforcement(before: ForeignKey, after: ForeignKey): boolean {
+  return (
+    before.name === after.name &&
+    sameStringList(before.columns, after.columns) &&
+    sameTableIdentity(before.referencedTable, after.referencedTable) &&
+    sameStringList(before.referencedColumns, after.referencedColumns) &&
+    before.onUpdate === after.onUpdate &&
+    before.onDelete === after.onDelete &&
+    before.deferrable === after.deferrable &&
+    before.initiallyDeferred === after.initiallyDeferred &&
+    before.enforcement !== after.enforcement
+  );
+}
+
+/** Raw, order-sensitive equality of two string arrays. */
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** Raw equality of two table identities: schema and name. */
+function sameTableIdentity(left: TableIdentity, right: TableIdentity): boolean {
+  return left.schema === right.schema && left.name === right.name;
+}
+
+/**
+ * Whether the tightening direction would lose a deferrable foreign key's trigger attributes on
+ * PostgreSQL 18.0–18.3 — fixed in 18.4, which a major target cannot distinguish — so the pair
+ * falls back to drop/add. Relaxation directions are unaffected.
+ */
+function tighteningLosesDeferrability(foreignKey: ForeignKey): boolean {
+  return foreignKey.deferrable === true || foreignKey.initiallyDeferred === true;
+}
+
+/**
+ * One in-place enforcement statement, named after the target foreign key: an explicit name
+ * quoted as stored, an unnamed one by the same conventional formula the drop path uses.
+ */
+function renderAlterConstraint(
+  table: TableIdentity,
+  after: ForeignKey,
+  form: ForeignKeyEnforcementForm,
+): string {
+  const name = after.name ?? synthesizedForeignKeyName(table, after);
+  return `ALTER TABLE ${renderTable(table)} ALTER CONSTRAINT ${quoteIdentifier(name)} ${form};`;
+}
+
+/**
+ * Whether another step's principal table is the pair's referencing or referenced table. The
+ * pair's own drop and add are excluded, and `comment` steps never count. Steps that merely
+ * mention a table in their payload — a different foreign key's `referencedTable`, a sequence's
+ * `ownedBy`, a view body — carry no ordering dependency on this pair and never count either.
+ */
+function enforcementPairCrowded(
+  plan: Plan,
+  drop: IndexedStep<ForeignKeyDropStep>,
+  add: IndexedStep<ForeignKeyAddStep>,
+): boolean {
+  const referencing = drop.step.table;
+  const referenced = add.step.foreignKey.referencedTable;
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    if (index === drop.index || index === add.index) continue;
+    const step = plan.steps[index]!;
+    if (step.kind === 'comment') continue;
+    const principal = stepPrincipalTable(step);
+    if (principal === undefined) continue;
+    if (sameTableIdentity(principal, referencing) || sameTableIdentity(principal, referenced)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The group index of every step, from the plan's walked groups. `assertGroupsTileSteps` has
+ * already pinned the partition, so every step index is assigned.
+ */
+function stepGroupIndices(plan: Plan): number[] {
+  const groupOf: number[] = [];
+  for (let groupIndex = 0; groupIndex < plan.groups.length; groupIndex += 1) {
+    const group = plan.groups[groupIndex]!;
+    for (let index = group.start; index < group.end; index += 1) {
+      groupOf[index] = groupIndex;
+    }
+  }
+  return groupOf;
+}
+
+/**
+ * The table a step principally alters, or `undefined` for a step that only carries tables
+ * inside its payload. Every table-level kind — create/drop-table, column, not-null,
+ * persistence, identity, primary-key, foreign-key, unique-constraint, check-constraint, and
+ * index — answers with its `table`; schema, sequence, extension, view, and comment steps answer
+ * `undefined`, because a `referencedTable`, an `ownedBy`, or a view body is never a step's
+ * principal table. The switch is exhaustive over `Step`, so a new kind cannot quietly acquire
+ * an accidental answer.
+ */
+function stepPrincipalTable(step: Step): TableIdentity | undefined {
+  switch (step.kind) {
+    case 'create-table':
+    case 'drop-table':
+    case 'add-column':
+    case 'drop-column':
+    case 'alter-column':
+    case 'drop-not-null':
+    case 'add-not-null':
+    case 'alter-persistence':
+    case 'add-identity':
+    case 'drop-identity':
+    case 'alter-identity':
+    case 'add-primary-key':
+    case 'drop-primary-key':
+    case 'add-foreign-key':
+    case 'drop-foreign-key':
+    case 'add-unique-constraint':
+    case 'drop-unique-constraint':
+    case 'add-check-constraint':
+    case 'drop-check-constraint':
+    case 'create-index':
+    case 'drop-index':
+    case 'create-index-concurrently':
+    case 'drop-index-concurrently':
+      return step.table;
+    case 'create-schema':
+    case 'create-sequence':
+    case 'drop-sequence':
+    case 'alter-sequence':
+    case 'create-extension':
+    case 'alter-extension':
+    case 'drop-extension':
+    case 'create-view':
+    case 'replace-view':
+    case 'drop-view':
+    case 'comment':
+      return undefined;
+  }
 }
 
 /** Binds `renderSql` to the `SqlRenderer` seam. */

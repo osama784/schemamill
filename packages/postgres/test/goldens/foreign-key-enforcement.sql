@@ -1,0 +1,4 @@
+BEGIN;
+ALTER TABLE public.guests ALTER CONSTRAINT guests_team_fk NOT ENFORCED;
+ALTER TABLE public.members ALTER CONSTRAINT members_team_fk ENFORCED;
+COMMIT;

@@ -7,6 +7,7 @@ import type {
   CheckConstraint,
   Column,
   CommentTarget,
+  ConstraintEnforcement,
   Extension,
   ForeignKey,
   Identity,
@@ -30,7 +31,7 @@ import type { RenderOptions } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin fifteen whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin sixteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -100,6 +101,31 @@ const foreignKey = (
   referencedColumns: [],
   ...rest,
 });
+
+/**
+ * The child-side foreign key the in-place enforcement tests flip: `parent_id` referencing
+ * `public.parent(id)`, named and enforcing `enforcement` when stated.
+ */
+const enforcementKey = (
+  enforcement: ConstraintEnforcement | undefined,
+  rest: Partial<Omit<ForeignKey, 'enforcement'>> = {},
+): ForeignKey =>
+  foreignKey(['parent_id'], identity('parent'), {
+    name: 'child_parent_id_fkey',
+    referencedColumns: ['id'],
+    ...(enforcement === undefined ? {} : { enforcement }),
+    ...rest,
+  });
+
+/** The drop and add steps one foreign-key change on `table` decomposes to. */
+const foreignKeyPairSteps = (
+  before: ForeignKey,
+  after: ForeignKey,
+  table: TableIdentity = identity('child'),
+): readonly [Step, Step] => [
+  { kind: 'drop-foreign-key', table, foreignKey: before },
+  { kind: 'add-foreign-key', table, foreignKey: after },
+];
 
 /** A model of the given tables. */
 const model = (...tables: Table[]): Model => ({
@@ -796,6 +822,418 @@ test('renders foreign-key enforcement and deferrability after its actions', () =
       'COMMIT;',
       '',
     ].join('\n'),
+  );
+});
+
+test('target 18 renders an absent-to-not-enforced flip in place', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(sql.match(/ALTER CONSTRAINT/g)?.length, 1, 'exactly one ALTER CONSTRAINT');
+  assert.ok(!sql.includes('DROP CONSTRAINT'), 'the drop half is collapsed');
+  assert.ok(!sql.includes('ADD CONSTRAINT'), 'the add half is collapsed');
+});
+
+test('target 18 renders a not-enforced-to-absent flip in place', () => {
+  const before = enforcementKey('not-enforced');
+  const after = enforcementKey(undefined);
+  const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(sql.match(/ALTER CONSTRAINT/g)?.length, 1, 'exactly one ALTER CONSTRAINT');
+  assert.ok(!sql.includes('DROP CONSTRAINT'), 'the drop half is collapsed');
+  assert.ok(!sql.includes('ADD CONSTRAINT'), 'the add half is collapsed');
+});
+
+test('targets below 18 render a pure enforcement flip as the drop and add pair', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const planned = planOf(...foreignKeyPairSteps(before, after));
+  const expected = [
+    'BEGIN;',
+    'ALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;',
+    'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) NOT ENFORCED;',
+    'COMMIT;',
+    '',
+  ].join('\n');
+
+  assert.equal(renderSql(planned), expected, 'the default target keeps the pair');
+  for (const targetVersion of [13, 16, 17]) {
+    assert.equal(renderSql(planned, { targetVersion }), expected, `target ${targetVersion}`);
+    assert.equal(
+      renderSql(planned, { targetVersion }),
+      renderSql(planned),
+      `target ${targetVersion}`,
+    );
+  }
+});
+
+test('target 18 keeps a deferrable tightening as drop and add', () => {
+  const deferrableForms = [
+    ['deferrable', { deferrable: true }],
+    ['initially deferred', { initiallyDeferred: true }],
+  ] as const;
+
+  for (const [label, fields] of deferrableForms) {
+    const before = enforcementKey('not-enforced', fields);
+    const after = enforcementKey(undefined, fields);
+    const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY .* DEFERRABLE/, label);
+  }
+});
+
+test('work on either table keeps a pure enforcement flip as drop and add', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+
+  const crowds: readonly (readonly [string, Step])[] = [
+    [
+      'an alter-column on the referencing table',
+      {
+        kind: 'alter-column',
+        table: identity('child'),
+        name: 'parent_id',
+        fields: [{ field: 'notNull', before: false, after: true }],
+      },
+    ],
+    [
+      'an add-column on the referenced table',
+      { kind: 'add-column', table: identity('parent'), column: column('extra') },
+    ],
+  ];
+
+  for (const [label, crowd] of crowds) {
+    const sql = renderSql(planOf(drop, crowd, add), { targetVersion: 18 });
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/, label);
+  }
+
+  const comment: Step = {
+    kind: 'comment',
+    target: { kind: 'foreign-key', table: identity('child'), foreignKey: after },
+    text: 'kept',
+  };
+  const withComment = renderSql(planOf(drop, add, comment), { targetVersion: 18 });
+  assert.match(withComment, /ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;/);
+  assert.ok(!withComment.includes('DROP CONSTRAINT'), 'a comment never blocks the collapse');
+  assert.ok(!withComment.includes('ADD CONSTRAINT'), 'a comment never blocks the collapse');
+});
+
+test('a concurrent index between the halves keeps a pure enforcement flip as drop and add', () => {
+  const [drop, add] = foreignKeyPairSteps(
+    enforcementKey(undefined),
+    enforcementKey('not-enforced'),
+  );
+  const concurrent: Step = {
+    kind: 'create-index-concurrently',
+    table: identity('log'),
+    index: tableIndex(['at'], { name: 'log_at_idx' }),
+  };
+  const sql = renderSql(
+    {
+      steps: [drop, concurrent, add],
+      groups: [
+        { start: 0, end: 1, transactional: true },
+        { start: 1, end: 2, transactional: false },
+        { start: 2, end: 3, transactional: true },
+      ],
+    },
+    { targetVersion: 18 },
+  );
+
+  assert.ok(!sql.includes('ALTER CONSTRAINT'));
+  assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/);
+});
+
+test('an in-place enforcement flip synthesizes and quotes the constraint name', () => {
+  const unnamedBefore = enforcementKey(undefined, { name: undefined });
+  const unnamedAfter = enforcementKey('not-enforced', { name: undefined });
+  assert.equal(
+    renderSql(planOf(...foreignKeyPairSteps(unnamedBefore, unnamedAfter)), { targetVersion: 18 }),
+    'BEGIN;\nALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;\nCOMMIT;\n',
+  );
+
+  const quotedBefore = enforcementKey('not-enforced', { name: 'we"ird' });
+  const quotedAfter = enforcementKey(undefined, { name: 'we"ird' });
+  const quoted = renderSql(planOf(...foreignKeyPairSteps(quotedBefore, quotedAfter)), {
+    targetVersion: 18,
+  });
+  assert.match(quoted, /ALTER TABLE public\.child ALTER CONSTRAINT "we""ird" ENFORCED;/);
+});
+
+test('ambiguous enforcement matches are a plain Error', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+
+  assert.throws(
+    () =>
+      renderSql(
+        planOf(drop, add, {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: after,
+        }),
+        { targetVersion: 18 },
+      ),
+    { name: 'Error', message: /matches more than one add-foreign-key/ },
+  );
+  assert.throws(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+          drop,
+          add,
+        ),
+        { targetVersion: 18 },
+      ),
+    { name: 'Error', message: /matches more than one drop-foreign-key/ },
+  );
+
+  assert.equal(
+    renderSql(planOf(drop), { targetVersion: 18 }),
+    'BEGIN;\nALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;\nCOMMIT;\n',
+  );
+  assert.equal(
+    renderSql(planOf(add), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('two independent enforcement pairs collapse at their drop positions', () => {
+  const beforeA = enforcementKey(undefined, { name: 'child_a_parent_id_fkey' });
+  const afterA = enforcementKey('not-enforced', { name: 'child_a_parent_id_fkey' });
+  const beforeB = enforcementKey('not-enforced', { name: 'child_b_parent_id_fkey' });
+  const afterB = enforcementKey(undefined, { name: 'child_b_parent_id_fkey' });
+  const [dropA, addA] = foreignKeyPairSteps(beforeA, afterA, identity('child_a'));
+  const [dropB, addB] = foreignKeyPairSteps(beforeB, afterB, identity('child_b'));
+
+  assert.equal(
+    renderSql(planOf(dropA, dropB, addA, addB), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child_a ALTER CONSTRAINT child_a_parent_id_fkey NOT ENFORCED;',
+      'ALTER TABLE public.child_b ALTER CONSTRAINT child_b_parent_id_fkey ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('in-place ALTERs stay at their drop positions across an unrelated step', () => {
+  // The plan's phase-major shape is `drop child_a, drop child_b, …add`s`. The ALTERs replace the
+  // drop positions, so an unrelated step that sits between the phases must render after them.
+  const [dropA, addA] = foreignKeyPairSteps(
+    enforcementKey(undefined, { name: 'child_a_parent_id_fkey' }),
+    enforcementKey('not-enforced', { name: 'child_a_parent_id_fkey' }),
+    identity('child_a'),
+  );
+  const [dropB, addB] = foreignKeyPairSteps(
+    enforcementKey('not-enforced', { name: 'child_b_parent_id_fkey' }),
+    enforcementKey(undefined, { name: 'child_b_parent_id_fkey' }),
+    identity('child_b'),
+  );
+  const middle: Step = { kind: 'add-column', table: identity('other'), column: column('extra') };
+
+  assert.equal(
+    renderSql(planOf(dropA, dropB, middle, addA, addB), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child_a ALTER CONSTRAINT child_a_parent_id_fkey NOT ENFORCED;',
+      'ALTER TABLE public.child_b ALTER CONSTRAINT child_b_parent_id_fkey ENFORCED;',
+      'ALTER TABLE public.other ADD COLUMN extra text;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a comment on the flipped foreign key survives the collapse', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+  const comment: Step = {
+    kind: 'comment',
+    target: { kind: 'foreign-key', table: identity('child'), foreignKey: after },
+    text: 'kept',
+  };
+
+  assert.equal(
+    renderSql(planOf(drop, add, comment), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;',
+      "COMMENT ON CONSTRAINT child_parent_id_fkey ON public.child IS 'kept';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('non-eligible enforcement transitions keep drop and add at target 18', () => {
+  const transitions: readonly (readonly [
+    string,
+    ConstraintEnforcement | undefined,
+    ConstraintEnforcement | undefined,
+  ])[] = [
+    ['absent to not-valid', undefined, 'not-valid'],
+    ['not-valid to absent', 'not-valid', undefined],
+    ['not-enforced to not-valid', 'not-enforced', 'not-valid'],
+  ];
+
+  for (const [label, beforeEnforcement, afterEnforcement] of transitions) {
+    const sql = renderSql(
+      planOf(
+        ...foreignKeyPairSteps(enforcementKey(beforeEnforcement), enforcementKey(afterEnforcement)),
+      ),
+      { targetVersion: 18 },
+    );
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/, label);
+  }
+});
+
+test('an equal-enforcement pair keeps drop and add at target 18', () => {
+  const direct = renderSql(
+    planOf(...foreignKeyPairSteps(enforcementKey('not-enforced'), enforcementKey('not-enforced'))),
+    { targetVersion: 18 },
+  );
+  assert.ok(!direct.includes('ALTER CONSTRAINT'), 'equal enforcement is not a flip');
+  assert.match(direct, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(direct, /ADD CONSTRAINT child_parent_id_fkey/);
+
+  // A primary-key change drops and restores the surviving dependent key with equal enforcement.
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const child = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [
+      foreignKey(['parent_id'], identity('parent'), {
+        name: 'child_parent_id_fkey',
+        referencedColumns: ['id'],
+      }),
+    ],
+  });
+  const parentTarget = {
+    ...parent,
+    primaryKey: { name: 'parent_pkey_v2', columns: ['id'] },
+  };
+  const dependent = renderSql(plan(model(parent, child), model(parentTarget, child)), {
+    targetVersion: 18,
+  });
+  assert.ok(!dependent.includes('ALTER CONSTRAINT'), 'the dependent-key pair is not a flip');
+  assert.match(dependent, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(dependent, /ADD CONSTRAINT child_parent_id_fkey/);
+});
+
+test('a diff-produced empty-vs-explicit referenced-columns flip keeps drop and add', () => {
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const child = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [foreignKey(['parent_id'], identity('parent'), { name: 'child_parent_id_fkey' })],
+  });
+  const childTarget = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [
+      foreignKey(['parent_id'], identity('parent'), {
+        name: 'child_parent_id_fkey',
+        referencedColumns: ['id'],
+        enforcement: 'not-enforced',
+      }),
+    ],
+  });
+
+  const sql = renderSql(plan(model(parent, child), model(parent, childTarget)), {
+    targetVersion: 18,
+  });
+  assert.ok(!sql.includes('ALTER CONSTRAINT'), 'raw referenced columns must be equal');
+  assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(
+    sql,
+    /ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY \(parent_id\) REFERENCES public\.parent\(id\) NOT ENFORCED;/,
+  );
+});
+
+test('a diff-produced columns change alongside enforcement keeps drop and add', () => {
+  // The diff groups foreign keys by referencing columns, so a changed column list is a drop and
+  // an add even when the enforcement flips too. Only a pair equal in every field but
+  // `enforcement` may collapse, and `columns` is one of those fields.
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const columns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('parent_id', { type: 'integer' }),
+    column('other_id', { type: 'integer' }),
+  ];
+  const child = (referencing: string, enforcement?: ConstraintEnforcement): Table =>
+    table('child', {
+      columns,
+      foreignKeys: [
+        foreignKey([referencing], identity('parent'), {
+          name: 'child_fk',
+          referencedColumns: ['id'],
+          ...(enforcement === undefined ? {} : { enforcement }),
+        }),
+      ],
+    });
+
+  const sql = renderSql(
+    plan(model(parent, child('parent_id')), model(parent, child('other_id', 'not-enforced'))),
+    { targetVersion: 18 },
+  );
+
+  assert.ok(!sql.includes('ALTER CONSTRAINT'), 'raw referencing columns must be equal');
+  assert.match(sql, /DROP CONSTRAINT child_fk;/);
+  assert.match(
+    sql,
+    /ADD CONSTRAINT child_fk FOREIGN KEY \(other_id\) REFERENCES public\.parent\(id\) NOT ENFORCED;/,
   );
 });
 
@@ -2561,6 +2999,48 @@ test('golden: renders constraint attributes in every position', () => {
     'constraint-attributes',
     model(events, users, orders),
     model(eventsTarget, usersTarget, ordersTarget),
+  );
+});
+
+test('golden: renders two in-place enforcement flips at their drop positions', () => {
+  // The CLI's `constraint-enforcement` fixture shape: an untouched `teams` parent with one
+  // child relaxed and one tightened. The plan keeps its phase-major drop+add decomposition —
+  // `drop guests, drop members, add guests, add members` — and target 18 renders one ALTER at
+  // each drop position instead. This golden is target-18-only and stays out of the 13 floor.
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'teams_pkey', columns: ['id'] },
+  });
+  const teamKey = (name: string, enforcement?: ConstraintEnforcement): ForeignKey =>
+    foreignKey(['team_id'], identity('teams'), {
+      name,
+      referencedColumns: ['id'],
+      ...(enforcement === undefined ? {} : { enforcement }),
+    });
+  const guests = (enforcement?: ConstraintEnforcement): Table =>
+    table('guests', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'guests_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('guests_team_fk', enforcement)],
+    });
+  const members = (enforcement?: ConstraintEnforcement): Table =>
+    table('members', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'members_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('members_team_fk', enforcement)],
+    });
+
+  assertGolden(
+    'foreign-key-enforcement',
+    model(teams, guests(undefined), members('not-enforced')),
+    model(teams, guests('not-enforced'), members(undefined)),
+    { targetVersion: 18 },
   );
 });
 
