@@ -32,7 +32,10 @@
  *   element, partial `WHERE`, `INCLUDE (…)`, a non-btree access method, a non-default
  *   ordering, operator class, collation, or NULLS ordering, a tablespace, storage parameters,
  *   or `NULLS NOT DISTINCT` — is skipped and named whole; an index is never partially
- *   imported. A constraint-backed index is never a standalone `Index`: inline and
+ *   imported. `IF NOT EXISTS` on the named form is flagged and dropped: the plan renders
+ *   plain creates, so the drift surfaces at apply rather than being hidden by a re-run, and
+ *   the clause is grammatically available only on the named form. A constraint-backed index
+ *   is never a standalone `Index`: inline and
  *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, `ADD CONSTRAINT` primary
  *   keys produce `PrimaryKey`s, and `USING INDEX` consumes the index it names for either kind.
  *   Once every statement is translated, a standalone index whose name
@@ -2432,6 +2435,9 @@ function translateCreateIndex(
   const index: Mutable<Index> = { unique: envelope.unique, columns: envelope.columns };
   if (create.idxname !== undefined) index.name = create.idxname;
   if (create.concurrent === true) index.concurrently = true;
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, object, 'IF NOT EXISTS'));
+  }
   attachIndex(draft, index);
 }
 

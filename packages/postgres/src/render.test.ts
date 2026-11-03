@@ -26,7 +26,7 @@ import type {
   View,
 } from '@schemamill/core';
 
-import { RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
+import { importDump, RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
 import type { RenderOptions } from './index.ts';
 
 /**
@@ -2111,6 +2111,26 @@ test('renders an unnamed index beside a differently named explicit one', () => {
       '',
     ].join('\n'),
   );
+});
+
+test('renders a plain create for an imported index whose IF NOT EXISTS clause was flagged', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  // The clause is flagged and dropped at import (`import.test.ts` pins the flag) and the
+  // conventional name strips, so the plan renders the plain create: a `CREATE INDEX IF NOT
+  // EXISTS` re-run would hide the drift, which surfaces at apply instead.
+  const { model: imported } = await importDump(dump);
+  const sql = renderSql(plan(model(), imported));
+  assert.ok(sql.includes('CREATE INDEX ON public.t USING btree (a);'));
+  assert.ok(
+    sql.indexOf('CREATE INDEX ON public.t USING btree (a);') > sql.indexOf('BEGIN;') &&
+      sql.indexOf('CREATE INDEX ON public.t USING btree (a);') < sql.indexOf('COMMIT;'),
+    'the index create renders inside the transaction',
+  );
+  assert.doesNotMatch(sql, /IF NOT EXISTS/);
 });
 
 test('renders a drop and a create of one name across the polarity', () => {

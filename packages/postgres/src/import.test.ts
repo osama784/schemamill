@@ -1979,6 +1979,145 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
   assert.match(messages, /CREATE INDEX t_nd_idx \(NULLS NOT DISTINCT\)/);
 });
 
+test('flags and drops IF NOT EXISTS on a named standalone index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The conventional `t_a_idx` still canonicalizes to unnamed; the flag names the
+  // source-stated name, which the model no longer carries.
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 't_a_idx',
+      message: 'dropped IF NOT EXISTS from t_a_idx',
+    },
+  ]);
+});
+
+test('rejects IF NOT EXISTS on an unnamed CREATE INDEX as a syntax error', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS ON public.t (a);`,
+    `CREATE TABLE public.after (id integer);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The grammar admits the clause only on the named form: the parser reads `ON` as the index
+  // name and then wants a second `ON`, so the statement never imports and its neighbours do.
+  assert.deepEqual(
+    model.tables.map((table) => table.name),
+    ['after', 't'],
+  );
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(table.indexes, []);
+  assert.equal(diagnostics.length, 1);
+  const [diagnostic] = diagnostics;
+  assert.ok(diagnostic, 'the failure is reported');
+  assert.deepEqual(summarize(diagnostic), { kind: 'error', code: 'parse-failure' });
+  assert.match(diagnostic.message, /syntax error at or near "ON"/);
+  assert.deepEqual(diagnostic.position, {
+    offset: dump.indexOf('ON public'),
+    line: 2,
+    column: 28,
+  });
+});
+
+test('flags IF NOT EXISTS on a unique concurrent named index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (b integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS custom_b_idx ON public.t USING btree (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // A non-conventional name survives canonicalization, so the flag and the model name agree.
+  assert.deepEqual(table.indexes, [
+    { name: 'custom_b_idx', unique: true, columns: ['b'], concurrently: true },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'custom_b_idx',
+      message: 'dropped IF NOT EXISTS from custom_b_idx',
+    },
+  ]);
+});
+
+test('skips an IF NOT EXISTS index whole when INCLUDE falls outside the envelope', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX IF NOT EXISTS t_i_idx ON public.t USING btree (a) INCLUDE (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // An index is never partially imported: the whole-statement skip is the only finding, and
+  // the dropped clause is moot.
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_i_idx',
+      message: 'skipped CREATE INDEX t_i_idx (INCLUDE)',
+    },
+  ]);
+});
+
+test('skips an IF NOT EXISTS index whole when its table is not imported', async () => {
+  const dump = `CREATE INDEX IF NOT EXISTS x_idx ON public.missing (a);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The table gate wins: the clause is moot on an index that never imports.
+  assert.deepEqual(model.tables, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'x_idx',
+      message: 'skipped CREATE INDEX x_idx (table not imported)',
+    },
+  ]);
+});
+
+test('flags IF NOT EXISTS once per statement, in statement order', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX IF NOT EXISTS custom_a_idx ON public.t (a);`,
+    `CREATE INDEX IF NOT EXISTS custom_b_idx ON public.t (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Two flags, one per statement, in source order; the named indexes sort by name.
+  assert.deepEqual(table.indexes, [
+    { name: 'custom_a_idx', unique: false, columns: ['a'] },
+    { name: 'custom_b_idx', unique: false, columns: ['b'] },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped IF NOT EXISTS from custom_a_idx', 'dropped IF NOT EXISTS from custom_b_idx'],
+  );
+});
+
 test('consumes a plain unique index into a USING INDEX constraint', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
