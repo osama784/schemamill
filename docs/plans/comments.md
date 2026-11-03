@@ -1,6 +1,6 @@
 # Comments — model, import, diff, plan, render, round-trip
 
-**Status:** built · **Last updated:** 2026-10-29
+**Status:** built · **Last updated:** 2026-11-03
 
 Every comment on a modeled entity survives dump import → model → diff → plan → render → apply → dump import: tables, columns, sequences, plain and materialized views, primary keys, unique/check/foreign-key constraints, standalone indexes, and — since [#91](https://github.com/osama784/schemamill/issues/91) — extensions; a consumed unique index's comment travels onto the constraint it becomes, and the remaining consumed-index boundary, a constraint deduped or rejected as an additional primary key, is named in §Deferred. The slice shipped in [#87](https://github.com/osama784/schemamill/issues/87) as Slice C of the [import long-tail plan](./import-long-tail.md), after views, so comments were modeled once, on the families that existed when they landed; the extension target followed in the [extensions slice](./extensions.md). Its durable decisions are recorded in [ADR 0021](../adr/0021-comments-travel-the-model.md).
 
@@ -49,6 +49,21 @@ A dump's comments — the seven `COMMENT ON` object forms this slice modeled, pl
 
 Constraint resolution searches the table draft's primary key, unique constraints, check constraints, and foreign keys by stored or synthesized name, then the columns' named not-null facts (the deferral flag), then the generic flag — the fixed order recorded in ADR 0021. A view or materialized-view output-column comment resolves in no table draft, so it takes the generic `dropped comment` flag; view output columns are [still unmodeled](./views.md) ([#143](https://github.com/osama784/schemamill/issues/143)).
 
+## Display
+
+A comment target prints as the `COMMENT ON` object form, then the identity the model carries:
+
+- named, non-unique: `index public.users (email) — users_email_idx`
+- named, unique: `unique index public.users (email) — users_email_idx`
+- unnamed, non-unique: `index public.users (email)` — unchanged
+- unnamed, unique: `unique index public.users (email)` — only the `unique ` modifier is new
+
+The modifier and the em-dash name suffix follow `formatIndex`'s established grammar, so a comment line and a structural index line name an index the same way. A named index's stored name is its identity — `indexIdentity` pairs and compares by name — so it is printed; a constraint's stored name is not identity (a constraint pairs by structure), so it stays off the line. An unnamed index is keyed by its structure — `unique` plus ordered columns — and its server name is synthesized only at render time.
+
+The unnamed unique shape deviates from [#148](https://github.com/osama784/schemamill/issues/148)'s literal "unnamed indexes keep their current rendering": with no name to print, the `unique ` modifier is the only thing that makes a uniqueness difference produce a distinct line, so it gains that modifier and nothing else. This is a recorded deviation, not an accident.
+
+Identifiers print raw, as everywhere else in CLI display: an index name containing spaces, quotes, or newlines is neither quoted nor escaped (the deferred raw-identifier residual). The `comments` golden scene pins the named-unique and unnamed non-unique shapes in compare and plan, including the unnamed status line's unchanged spelling.
+
 ## Test matrix
 
 **Workspace (`packages/core/src/workspace.test.ts`)** — `serializeModel round-trips a comment on every entity kind through resolveWorkspace`, `serializeModel emits each entity comment as its last key`, `serializeModel round-trips comment text with escapes and unicode byte-exactly`, `resolveWorkspace fails closed on an empty comment at every entity kind`, `resolveWorkspace fails closed on a non-string comment at every entity kind`, `resolveWorkspace fails closed on a comment containing NUL at every entity kind`, and `resolveWorkspace reads a pre-comment model as entities without a comment property`.
@@ -61,7 +76,7 @@ Constraint resolution searches the table draft's primary key, unique constraints
 
 **Render (`packages/postgres/src/render.test.ts`)** — `comment statements quote identifiers and keep explicit names as stored`, `a comment removal renders IS NULL`, `comment text renders plainly when line-safe and escapes otherwise`, `a comment containing NUL is refused with RenderRefusalError`, `a comment step's text wins over a stale comment on its target node`, and the `comments.sql` golden via `golden: comments on every modeled family, a removal, and escaping`.
 
-**CLI (`packages/cli/src/format.test.ts`, `packages/cli/src/goldens.test.ts`)** — `comment changes print every target shape with the signed texts`, `comment text is JSON-quoted so quotes, backslashes, newlines, and unicode stay visible`, `comment plan steps print every target shape and the text or (none)`, and the `comments` golden scene covering adds, changes, removals, every target kind, unnamed nodes, five recreate re-assertions, and one check constraint whose comment and enforcement both change.
+**CLI (`packages/cli/src/format.test.ts`, `packages/cli/src/goldens.test.ts`)** — `comment changes print every target shape with the signed texts`, `comment text is JSON-quoted so quotes, backslashes, newlines, and unicode stay visible`, `comment plan steps print every target shape and the text or (none)`, `same-column index comment targets stay distinct by name and uniqueness`, and the `comments` golden scene covering adds, changes, removals, every target kind, unnamed nodes, five recreate re-assertions, and one check constraint whose comment and enforcement both change.
 
 **Live (`packages/postgres/src/live-scenes.ts`)** — the `comment-round-trip` scene builds a baseline and target across all seven families with additions, changes, removals, an unnamed conventional-name constraint and index, a special-character comment, and recreated objects with unchanged comments. Its `baselineChecks`/`targetChecks`/`checks` pin the server's stored text, `planChecks` pin that every comment step is terminal and each recreated object re-asserts its comment, `importChecks` pin both imports' comment inventories and the unnamed nodes, and `crossImportChecks` compare the applied and target imports by structure, a comment inventory, and a full deep equality. The PostgreSQL 18 scene `not-null-constraint-names` flips its pinned skip to the named deferral flag.
 
