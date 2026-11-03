@@ -82,7 +82,7 @@ Identifiers print raw, as everywhere else in CLI display: an index name containi
 
 ## Evidence
 
-The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 459 tests across 51 scenes, 4 skipped — the four PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
+The package suites pin the contract level by level; the CLI `comments` scene pins compare and plan bytes, including the terminal phase and the JSON-quoted display; and the postgres `comments.sql` golden pins all seven statement forms, `IS NULL`, and the escape matrix. On a scratch PostgreSQL 16.15 the live suite is 465 tests across 51 scenes, 4 skipped — the four PostgreSQL 18 scenes, `not-null-constraint-names` among them — and the `verify-postgres` job runs the same harness on PostgreSQL 18. The new scene is PostgreSQL 16-compatible and carries no `introspection` check: a comment-carrying model is intentionally not what the catalog read returns yet.
 
 ## Acceptance
 
