@@ -2511,6 +2511,167 @@ test('copies an index comment into a consumed primary key', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('flags a dropped comment when a consumed unique index dedupes onto a commented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL rejects a duplicate constraint name; the importer keeps the existing constraint
+  // and its comment, so the consumed index's differing comment has nowhere to land and is named.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'existing' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
+test('flags a dropped comment when a consumed unique index dedupes onto an uncommented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The retained constraint has no comment to compare, so the consumed text is still dropped
+  // and named rather than merged into the existing node.
+  assert.deepEqual(table.uniqueConstraints, [{ name: 't_a_unique', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
+test('silences the comment flag when a consumed unique index and the retained constraint agree', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'same';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'same';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The retained constraint already carries the consumed text, so no model fact is lost.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'same' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags a dropped comment when a consumed primary key is rejected as an additional key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `COMMENT ON INDEX t_b_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL allows one primary key; the importer keeps the first and names the rejected
+  // declaration, then names its differing comment because the retained key keeps its own.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'existing' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_b_idx',
+      message: 'dropped comment from public.t_b_idx',
+    },
+  ]);
+});
+
+test('silences the comment flag when a rejected primary key matches the retained comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'same';`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `COMMENT ON INDEX t_b_idx IS 'same';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the rejected declaration is a dropped fact; its comment duplicates the retained text.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'same' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+  ]);
+});
+
+test('emits no comment flag when a deduped consumed index carries no comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // No consumed comment exists to lose, so the dedupe stays silent.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'existing' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
 test('flags a comment on an index consumed by a constraint', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,

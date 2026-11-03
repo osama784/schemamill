@@ -3282,19 +3282,24 @@ function withoutIdentity(column: Column): Column {
   return copy;
 }
 
+/**
+ * Attaches the table's one primary key. Returns the retained key when the incoming one is
+ * deduped or rejected as an additional primary key, `undefined` when it attaches.
+ */
 function attachPrimaryKey(
   statement: ParsedStatement,
   draft: TableDraft,
   primaryKey: PrimaryKey,
   identity: string,
   diagnostics: PositionedDiagnostic[],
-): void {
+): PrimaryKey | undefined {
   if (draft.primaryKey === undefined) {
     draft.primaryKey = primaryKey;
-    return;
+    return undefined;
   }
-  if (samePrimaryKey(draft.primaryKey, primaryKey)) return;
+  if (samePrimaryKey(draft.primaryKey, primaryKey)) return draft.primaryKey;
   diagnostics.push(flagAttribute(statement, identity, 'additional primary key'));
+  return draft.primaryKey;
 }
 
 function attachForeignKey(draft: TableDraft, foreignKey: ForeignKey): void {
@@ -3302,13 +3307,20 @@ function attachForeignKey(draft: TableDraft, foreignKey: ForeignKey): void {
   draft.foreignKeys.push(foreignKey);
 }
 
-function attachUniqueConstraint(draft: TableDraft, uniqueConstraint: UniqueConstraint): void {
-  if (
-    draft.uniqueConstraints.some((existing) => sameUniqueConstraint(existing, uniqueConstraint))
-  ) {
-    return;
-  }
+/**
+ * Attaches a unique constraint unless an equal one is present. Returns the retained constraint
+ * when the incoming one is deduped, `undefined` when it attaches.
+ */
+function attachUniqueConstraint(
+  draft: TableDraft,
+  uniqueConstraint: UniqueConstraint,
+): UniqueConstraint | undefined {
+  const existing = draft.uniqueConstraints.find((candidate) =>
+    sameUniqueConstraint(candidate, uniqueConstraint),
+  );
+  if (existing !== undefined) return existing;
   draft.uniqueConstraints.push(uniqueConstraint);
+  return undefined;
 }
 
 function attachCheckConstraint(draft: TableDraft, checkConstraint: CheckConstraint): void {
@@ -3603,11 +3615,31 @@ function flagConsumedIndexConcurrently(
 }
 
 /**
+ * Flags a consumed index's comment when the constraint it becomes is deduplicated or rejected:
+ * the comment travelled onto the built constraint, but the retained constraint keeps its own, so
+ * the consumed declaration's comment is dropped. An equal retained comment loses no fact.
+ */
+function flagDroppedConsumedComment(
+  statement: ParsedStatement,
+  schema: string,
+  indexname: string,
+  comment: string | undefined,
+  retained: { readonly comment?: string } | undefined,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  if (retained === undefined) return;
+  if (comment === undefined || retained.comment === comment) return;
+  diagnostics.push(
+    flagAttribute(statement, tableIdentityName({ schema, name: indexname }), 'comment'),
+  );
+}
+
+/**
  * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
  * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
  * column-list unique index; otherwise the whole constraint is skipped and named. The consumed
- * index's comment travels onto the constraint, and its `CONCURRENTLY` apply metadata is
- * flagged because the constraint cannot carry it.
+ * index's comment travels onto the constraint, its `CONCURRENTLY` apply metadata is flagged
+ * because the constraint cannot carry it, and a dedupe flags the comment it cannot place.
  */
 function attachAlteredUniqueConstraint(
   statement: ParsedStatement,
@@ -3647,7 +3679,8 @@ function attachAlteredUniqueConstraint(
   applyConstraintDeferrability(constraint, uniqueConstraint);
   flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
-  attachUniqueConstraint(draft, uniqueConstraint);
+  const retained = attachUniqueConstraint(draft, uniqueConstraint);
+  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
 }
 
 /**
@@ -3655,8 +3688,8 @@ function attachAlteredUniqueConstraint(
  * `primaryKeyFromConstraint` — which owns the primary-key attribute flags — while a constraint
  * stated `USING INDEX` consumes the named standalone index when it is a plain column-list
  * unique index; otherwise the whole constraint is skipped and named. The consumed index's
- * comment travels onto the key, and its `CONCURRENTLY` apply metadata is flagged because the
- * constraint cannot carry it.
+ * comment travels onto the key, its `CONCURRENTLY` apply metadata is flagged because the
+ * constraint cannot carry it, and a rejection flags the comment it cannot place.
  */
 function attachAlteredPrimaryKey(
   statement: ParsedStatement,
@@ -3699,7 +3732,8 @@ function attachAlteredPrimaryKey(
   applyConstraintDeferrability(constraint, primaryKey);
   flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
   flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
-  attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
+  const retained = attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
+  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
 }
 
 /**
