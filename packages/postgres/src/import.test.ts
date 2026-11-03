@@ -2011,8 +2011,9 @@ test('rejects IF NOT EXISTS on an unnamed CREATE INDEX as a syntax error', async
 
   const { model, diagnostics } = await importDump(dump);
 
-  // The grammar admits the clause only on the named form: the parser reads `ON` as the index
-  // name and then wants a second `ON`, so the statement never imports and its neighbours do.
+  // After `IF NOT EXISTS` the grammar needs an index name; `ON` is reserved and cannot be one, so
+  // the unnamed form cannot carry the clause. The statement fails at that `ON` with `syntax error
+  // at or near "ON"`, while its neighbours still import.
   assert.deepEqual(
     model.tables.map((table) => table.name),
     ['after', 't'],
