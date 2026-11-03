@@ -1147,6 +1147,26 @@ const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
     { kind: 'index', table: users, index: { unique: false, columns: ['email'] } },
   ],
   [
+    'index public.users (email) — users_email_idx',
+    {
+      kind: 'index',
+      table: users,
+      index: { name: 'users_email_idx', unique: false, columns: ['email'] },
+    },
+  ],
+  [
+    'unique index public.users (email) — users_email_idx',
+    {
+      kind: 'index',
+      table: users,
+      index: { name: 'users_email_idx', unique: true, columns: ['email'] },
+    },
+  ],
+  [
+    'unique index public.users (email)',
+    { kind: 'index', table: users, index: { unique: true, columns: ['email'] } },
+  ],
+  [
     'primary key public.users (id)',
     { kind: 'primary-key', table: users, primaryKey: { columns: ['id'] } },
   ],
@@ -1242,6 +1262,38 @@ test('comment plan steps print every target shape and the text or (none)', () =>
       `comment steps on ${spelling}`,
     );
   }
+});
+
+test('same-column index comment targets stay distinct by name and uniqueness', () => {
+  const indexTarget = (index: {
+    readonly name?: string;
+    readonly unique: boolean;
+  }): CommentTarget => ({
+    kind: 'index',
+    table: users,
+    index: { ...index, columns: ['email'] },
+  });
+
+  assert.equal(
+    formatChanges([
+      commentChanged(indexTarget({ name: 'users_email_idx', unique: false }), 'old', 'new'),
+    ]),
+    '~ comment on index public.users (email) — users_email_idx: "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([
+      commentChanged(indexTarget({ name: 'users_email_alt_idx', unique: false }), 'old', 'new'),
+    ]),
+    '~ comment on index public.users (email) — users_email_alt_idx: "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([commentChanged(indexTarget({ unique: true }), 'old', 'new')]),
+    '~ comment on unique index public.users (email): "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([commentChanged(indexTarget({ unique: false }), 'old', 'new')]),
+    '~ comment on index public.users (email): "old" → "new"\n',
+  );
 });
 
 test('a comment step prints its text JSON-quoted, not as raw whitespace', () => {
