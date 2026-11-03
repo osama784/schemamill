@@ -53,7 +53,7 @@ ALTER TABLE ONLY public.teams
 ALTER TABLE ONLY public.members
     ADD CONSTRAINT members_team_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id);
 
-CREATE INDEX accounts_email_lookup ON public.accounts USING btree (email, id);
+CREATE UNIQUE INDEX accounts_email_lookup ON public.accounts USING btree (email, id);
 
 CREATE INDEX accounts_status_idx ON public.accounts USING btree (status);
 
@@ -68,7 +68,7 @@ COMMENT ON SEQUENCE public.invoice_seq IS 'invoice numbers
 
 COMMENT ON MATERIALIZED VIEW public.account_totals IS 'totals snapshot';
 
-COMMENT ON INDEX accounts_email_lookup IS 'email lookup';
+COMMENT ON INDEX accounts_email_lookup IS 'email lookup v2';
 
 COMMENT ON INDEX accounts_status_idx IS 'status filter v2';
 

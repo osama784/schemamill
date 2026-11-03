@@ -13,6 +13,8 @@
 
 ~ comment on column public.accounts.email: "login address" → "login address (unique)"
 
+~ comment on unique index public.accounts (email, id) — accounts_email_lookup: "email lookup" → "email lookup v2"
+
 ~ comment on index public.accounts (status): "status filter" → "status filter v2"
 
 ~ comment on table public.accounts: "accounts v1" → "accounts \"ledger\" \\ v2"

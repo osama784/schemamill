@@ -625,8 +625,9 @@ function formatCommentChange(
 
 /**
  * A comment target's spelling: the `COMMENT ON` object form, then the identity the model
- * carries. A constraint's or index's stored name is not identity and is not printed; an
- * unnamed node's server name is synthesized at render time.
+ * carries. A named index's stored name is its identity and is printed when present; an
+ * unnamed index is keyed by its structure and its server name is synthesized only at render
+ * time. A constraint's stored name is not identity and is not printed.
  */
 function formatCommentTarget(target: CommentTarget): string {
   switch (target.kind) {
@@ -640,8 +641,13 @@ function formatCommentTarget(target: CommentTarget): string {
       return `${target.materialized ? 'materialized view' : 'view'} ${formatIdentity(target.view)}`;
     case 'extension':
       return `extension ${target.extension.name}`;
-    case 'index':
-      return `index ${formatIdentity(target.table)} (${target.index.columns.join(', ')})`;
+    case 'index': {
+      const unique = target.index.unique ? 'unique ' : '';
+      const name = target.index.name === undefined ? '' : ` — ${target.index.name}`;
+      return `${unique}index ${formatIdentity(target.table)} (${target.index.columns.join(
+        ', ',
+      )})${name}`;
+    }
     case 'primary-key':
       return `primary key ${formatIdentity(target.table)} (${target.primaryKey.columns.join(
         ', ',

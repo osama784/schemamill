@@ -53,7 +53,7 @@ ALTER TABLE ONLY public.teams
 ALTER TABLE ONLY public.members
     ADD CONSTRAINT members_team_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id);
 
-CREATE INDEX accounts_email_lookup ON public.accounts USING btree (email);
+CREATE UNIQUE INDEX accounts_email_lookup ON public.accounts USING btree (email);
 
 CREATE INDEX accounts_status_idx ON public.accounts USING btree (status);
 
