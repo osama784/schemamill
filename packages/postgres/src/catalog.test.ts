@@ -24,6 +24,7 @@ const table = (schema: string, name: string, rest: Record<string, unknown> = {})
   relkind: 'r',
   relispartition: false,
   relpersistence: 'p',
+  comment: null,
   ...rest,
 });
 
@@ -51,6 +52,7 @@ const column = (
   attstorage: 'x',
   typstorage: 'x',
   attcompression: '',
+  comment: null,
   ...rest,
 });
 
@@ -231,6 +233,21 @@ const sequence = (schema: string, name: string, rest: Record<string, unknown> = 
   ownerSchema: null,
   ownerTable: null,
   ownerColumn: null,
+  comment: null,
+  ...rest,
+});
+
+/**
+ * A `views` row: a plain, permanent public view named `v` with no check option or comment
+ * unless overridden.
+ */
+const viewRow = (schema = 'public', name = 'v', rest: Record<string, unknown> = {}) => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1 AS one',
+  checkOption: null,
+  comment: null,
   ...rest,
 });
 
@@ -243,6 +260,7 @@ const payload = (sections: {
   readonly constraints?: readonly unknown[];
   readonly notNullConstraints?: readonly unknown[];
   readonly sequences?: readonly unknown[];
+  readonly views?: readonly unknown[];
 }) => ({
   tables: [],
   columns: [],
@@ -251,6 +269,7 @@ const payload = (sections: {
   constraints: [],
   notNullConstraints: [],
   sequences: [],
+  views: [],
   ...sections,
 });
 
@@ -1103,6 +1122,244 @@ test('maps a serial-owned sequence beside an identity column on the same column'
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('reads table and column comments verbatim, absent when the catalog states none', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [
+        table('public', 'plain'),
+        table('public', 'with_comment', { comment: "a table's comment\nwith ünïcode" }),
+      ],
+      columns: [
+        column('public', 'with_comment', 1, 'a', { comment: "a column's comment" }),
+        column('public', 'with_comment', 2, 'b'),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables, [
+    {
+      schema: 'public',
+      name: 'plain',
+      columns: [],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+    },
+    {
+      schema: 'public',
+      name: 'with_comment',
+      columns: [
+        { name: 'a', type: 'text', notNull: false, comment: "a column's comment" },
+        { name: 'b', type: 'text', notNull: false },
+      ],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+      comment: "a table's comment\nwith ünïcode",
+    },
+  ]);
+  assert.equal(
+    Object.hasOwn(read.model.tables[0]!, 'comment'),
+    false,
+    'a table without a comment carries no comment key',
+  );
+  assert.equal(
+    Object.hasOwn(read.model.tables[1]!.columns[1]!, 'comment'),
+    false,
+    'a column without a comment carries no comment key',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('attaches standalone and owned sequence comments after effective values', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'users')],
+      columns: [column('public', 'users', 1, 'id')],
+      sequences: [
+        sequence('public', 'plain'),
+        sequence('public', 'standalone', { comment: 'standalone comment' }),
+        sequence('public', 'users_id_seq', {
+          ownerKind: 'owned',
+          ownerSchema: 'public',
+          ownerTable: 'users',
+          ownerColumn: 'id',
+          comment: "owned sequence's comment",
+        }),
+      ],
+    }),
+  );
+
+  const effective = {
+    dataType: 'bigint',
+    increment: '1',
+    minValue: '1',
+    maxValue: '9223372036854775807',
+    start: '1',
+    cache: '1',
+    cycle: false,
+  };
+  assert.deepEqual(read.model.sequences, [
+    { schema: 'public', name: 'plain', ...effective },
+    { schema: 'public', name: 'standalone', ...effective, comment: 'standalone comment' },
+    {
+      schema: 'public',
+      name: 'users_id_seq',
+      ...effective,
+      ownedBy: { table: { schema: 'public', name: 'users' }, column: 'id' },
+      comment: "owned sequence's comment",
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('ignores a comment on an identity row, which has no model slot', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'id', { type: 'integer', attidentity: 'a' })],
+      sequences: [
+        sequence('public', 't_id_seq', {
+          dataType: 'integer',
+          maxValue: '2147483647',
+          ownerKind: 'identity',
+          ownerSchema: 'public',
+          ownerTable: 't',
+          ownerColumn: 'id',
+          comment: 'identity comment',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.sequences, []);
+  const identity = read.model.tables[0]?.columns[0]?.identity;
+  assert.notEqual(identity, undefined);
+  assert.equal(
+    Object.hasOwn(identity!, 'comment'),
+    false,
+    'the identity descriptor carries no comment',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps plain and materialized views with normalized definitions and comments', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'active', {
+          definition:
+            " SELECT u.id,\n        u.name,\n        'semi;colon' AS note\n   FROM public.users u\n  WHERE (u.id > 0);",
+          comment: 'plain view',
+        }),
+        viewRow('public', 'plain', { definition: '\n  SELECT  2  AS  two;' }),
+        viewRow('public', 'snapshot', {
+          materialized: true,
+          definition: '\n  SELECT  count(*) AS n\n    FROM public.users;',
+          comment: "materialized view's comment",
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.views, [
+    {
+      schema: 'public',
+      name: 'active',
+      materialized: false,
+      definition: "SELECT u.id,u.name,'semi;colon' AS note FROM public.users u WHERE(u.id > 0)",
+      comment: 'plain view',
+    },
+    {
+      schema: 'public',
+      name: 'plain',
+      materialized: false,
+      definition: 'SELECT 2 AS two',
+    },
+    {
+      schema: 'public',
+      name: 'snapshot',
+      materialized: true,
+      definition: 'SELECT count(*) AS n FROM public.users',
+      comment: "materialized view's comment",
+    },
+  ]);
+  assert.equal(
+    Object.hasOwn(read.model.views[1]!, 'comment'),
+    false,
+    'a view without a comment carries no comment key',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps view check options local and cascaded, absent when null', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'none'),
+        viewRow('public', 'local', {
+          definition: 'SELECT id FROM public.t;',
+          checkOption: 'local',
+        }),
+        viewRow('public', 'cascaded', {
+          definition: 'SELECT id FROM public.t;',
+          checkOption: 'cascaded',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.views.map((view) => [view.name, view.checkOption]),
+    [
+      ['cascaded', 'cascaded'],
+      ['local', 'local'],
+      ['none', undefined],
+    ],
+  );
+  assert.equal(
+    Object.hasOwn(read.model.views[2]!, 'checkOption'),
+    false,
+    'a view without a check option carries no checkOption key',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('refuses a check option on a materialized view row', async () => {
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          views: [viewRow('public', 'mv', { materialized: true, checkOption: 'local' })],
+        }),
+      ),
+    /catalog payload\.views\[0\]: materialized view "public\.mv" cannot carry a check option/,
+    'a materialized view cannot carry a check option',
+  );
+});
+
+test('sorts views by JavaScript schema-then-name order, ignoring payload order', async () => {
+  const views = [
+    viewRow('apple', 'a', { materialized: true }),
+    viewRow('Zebra', 'a'),
+    viewRow('apple', 'A'),
+    viewRow('Zebra', 'B', { comment: 'zebra' }),
+  ];
+  const forward = await mapCatalog(payload({ views }));
+  const reversed = await mapCatalog(payload({ views: [...views].reverse() }));
+
+  assert.deepEqual(forward, reversed, 'the mapper does not depend on view payload order');
+  assert.deepEqual(
+    forward.model.views.map(
+      (view) => `${view.schema}.${view.name}${view.materialized ? ' (materialized)' : ''}`,
+    ),
+    ['Zebra.B', 'Zebra.a', 'apple.A', 'apple.a (materialized)'],
+    'views sort by plain string comparison on schema then name; materialized interleaves',
+  );
+});
+
 test('reads defaults whitespace-normalized, only with atthasdef and an attrdef row', async () => {
   const read = await mapCatalog(
     payload({
@@ -1792,6 +2049,44 @@ test('throws on malformed payloads', async () => {
       'a definition that is not CREATE INDEX',
       payload({ indexes: [index('public', 't', 't_a_idx', 'SELECT 1')] }),
       /catalog payload\.indexes\[0\]\.definition is not a CREATE INDEX statement/,
+    ],
+    [
+      'a missing views section',
+      {
+        tables: [],
+        columns: [],
+        primaryKeys: [],
+        indexes: [],
+        constraints: [],
+        notNullConstraints: [],
+        sequences: [],
+      },
+      /catalog payload\.views must be an array/,
+    ],
+    [
+      'a non-array views section',
+      { ...payload({}), views: {} },
+      /catalog payload\.views must be an array/,
+    ],
+    [
+      'an unknown views row field',
+      payload({ views: [{ ...viewRow(), extra: true }] }),
+      /catalog payload\.views\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'a non-boolean materialized flag',
+      payload({ views: [viewRow('public', 'v', { materialized: 'yes' })] }),
+      /catalog payload\.views\[0\]\.materialized must be a boolean/,
+    ],
+    [
+      'an unknown check option',
+      payload({ views: [viewRow('public', 'v', { checkOption: 'cascaded-ish' })] }),
+      /catalog payload\.views\[0\]\.checkOption must be "local", "cascaded", or null/,
+    ],
+    [
+      'a non-string view definition',
+      payload({ views: [viewRow('public', 'v', { definition: 7 })] }),
+      /catalog payload\.views\[0\]\.definition must be a string/,
     ],
   ];
 
