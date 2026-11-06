@@ -75,11 +75,15 @@ const TRANSACTIONAL_PATTERNS = [
   { name: 'transactional', pattern: /the ([\w-]+) transactional asserted/g },
 ];
 
-/** Whether a path is in the scanned surface: docs/**, except accepted ADRs and snapshots. */
+/** Root docs that state counts; CHANGELOG.md stays exempt as a per-item snapshot. */
+const ROOT_DOCS = new Set(['README.md', 'AGENTS.md', 'CONTEXT.md', 'DESIGN.md']);
+
+/** Whether a path is in the scanned surface: docs/**, plus the root docs, minus exemptions. */
 export function isScannedDoc(path) {
   const normalized = path.split(sep).join('/');
   if (normalized === 'CHANGELOG.md') return false;
   if (normalized === 'docs/adr' || normalized.startsWith('docs/adr/')) return false;
+  if (ROOT_DOCS.has(normalized)) return true;
   return normalized.startsWith('docs/') && normalized.endsWith('.md');
 }
 
@@ -275,17 +279,23 @@ async function listMarkdownFiles(directory, docsRoot) {
   return files;
 }
 
-/** Scans every documented claim line under docs/, with one-based line numbers. */
+/** Scans every documented claim line under docs/ and the root docs, with one-based line numbers. */
 export async function collectDocClaims(repoRoot) {
   const docsRoot = join(repoRoot, 'docs');
-  const files = await listMarkdownFiles(docsRoot, docsRoot);
+  const files = (await listMarkdownFiles(docsRoot, docsRoot)).map((file) =>
+    relative(repoRoot, file).split(sep).join('/'),
+  );
+  for (const entry of await readdir(repoRoot, { withFileTypes: true })) {
+    if (entry.isFile() && ROOT_DOCS.has(entry.name)) files.push(entry.name);
+  }
+  files.sort();
+
   const claims = [];
   const errors = [];
 
-  for (const file of files) {
-    const relativePath = relative(repoRoot, file).split(sep).join('/');
+  for (const relativePath of files) {
     if (!isScannedDoc(relativePath)) continue;
-    const text = await readFile(file, 'utf8');
+    const text = await readFile(join(repoRoot, relativePath), 'utf8');
     for (const [index, line] of text.split(/\r?\n/).entries()) {
       const extracted = extractLineClaims(line);
       for (const claim of extracted.claims)
@@ -352,17 +362,29 @@ export async function runDocsCounts({
   check = false,
   write = console.log,
 } = {}) {
+  let actuals;
   try {
-    const actuals = await loadActuals(repoRoot);
-    const { claims, errors } = await collectDocClaims(repoRoot);
-    const stale = findStaleClaims(claims, actuals);
-    for (const line of formatReport({ actuals, claims, stale, errors })) write(line);
-    return resolveExitCode({ check, staleCount: stale.length, errorCount: errors.length });
+    actuals = await loadActuals(repoRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const hint = check ? ' (run `pnpm build` first)' : '';
+    write(`docs-counts: error ${message}${hint}`);
+    return check ? 1 : 0;
+  }
+
+  let claims;
+  let errors;
+  try {
+    ({ claims, errors } = await collectDocClaims(repoRoot));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     write(`docs-counts: error ${message}`);
     return check ? 1 : 0;
   }
+
+  const stale = findStaleClaims(claims, actuals);
+  for (const line of formatReport({ actuals, claims, stale, errors })) write(line);
+  return resolveExitCode({ check, staleCount: stale.length, errorCount: errors.length });
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === SCRIPT_PATH) {

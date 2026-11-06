@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { access } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
   classifyToken,
+  collectDocClaims,
   countAlwaysOnLiveSubtests,
   countPostgresTests,
   deriveActuals,
@@ -16,10 +18,17 @@ import {
   loadActuals,
   parseTablePhases,
   resolveExitCode,
+  runDocsCounts,
   stripParentheses,
 } from './docs-counts.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+async function tempRepo(t) {
+  const repoRoot = await mkdtemp(join(tmpdir(), 'schemamill-docs-counts-'));
+  t.after(() => rm(repoRoot, { recursive: true, force: true }));
+  return repoRoot;
+}
 
 // Copied verbatim from the docs at base fe55f35. Extraction is independent of freshness: these
 // fixtures pin the literal lines and the historical 315, not today's actual.
@@ -116,6 +125,58 @@ test('ignores changelog-like snapshots and non-scanned files', () => {
   assert.equal(isScannedDoc('CHANGELOG.md'), false);
   assert.equal(isScannedDoc('docs/adr/0016-catalog-constraint-canonicalization.md'), false);
   assert.equal(isScannedDoc('docs/plans/identity.md'), true);
+});
+
+test('scans the four root docs and keeps changelog and adr exempt', () => {
+  for (const file of ['README.md', 'AGENTS.md', 'CONTEXT.md', 'DESIGN.md']) {
+    assert.equal(isScannedDoc(file), true, file);
+  }
+  assert.equal(isScannedDoc('CHANGELOG.md'), false);
+  assert.equal(isScannedDoc('docs/adr/0016-catalog-constraint-canonicalization.md'), false);
+  assert.equal(isScannedDoc('docs/plans/identity.md'), true);
+});
+
+test('collects claims from root docs and docs plans in path order', async (t) => {
+  const repoRoot = await tempRepo(t);
+  await writeFile(join(repoRoot, 'README.md'), '# Readme\n\nThe step union is twenty-six kinds.\n');
+  await writeFile(join(repoRoot, 'CHANGELOG.md'), 'The step union is twenty-six kinds.\n');
+  await mkdir(join(repoRoot, 'docs/plans'), { recursive: true });
+  await writeFile(
+    join(repoRoot, 'docs/plans/x.md'),
+    '# Plan\n\n\n\nall twenty-six kinds are covered.\n',
+  );
+
+  const { claims, errors } = await collectDocClaims(repoRoot);
+
+  assert.deepEqual(errors, []);
+  assert.deepEqual(
+    claims.map(({ file, line, name, value }) => ({ file, line, name, value })),
+    [
+      { file: 'README.md', line: 3, name: 'stepKinds', value: 26 },
+      { file: 'docs/plans/x.md', line: 5, name: 'stepKinds', value: 26 },
+    ],
+  );
+});
+
+test('--check hints at the build when derivation fails, report mode does not', async (t) => {
+  const repoRoot = await tempRepo(t);
+  const checkLines = [];
+  assert.equal(
+    await runDocsCounts({ repoRoot, check: true, write: (line) => checkLines.push(line) }),
+    1,
+  );
+  assert.equal(checkLines.length, 1);
+  assert.match(checkLines[0], /^docs-counts: error /);
+  assert.match(checkLines[0], /\(run `pnpm build` first\)$/);
+
+  const reportLines = [];
+  assert.equal(
+    await runDocsCounts({ repoRoot, check: false, write: (line) => reportLines.push(line) }),
+    0,
+  );
+  assert.equal(reportLines.length, 1);
+  assert.match(reportLines[0], /^docs-counts: error /);
+  assert.doesNotMatch(reportLines[0], /pnpm build/);
 });
 
 test('parses digits and number words 0 through 99, and errors on unknown words', () => {

@@ -1,8 +1,12 @@
 # Docs counts
 
-**Status:** built 2026-10-24 · living document
+**Status:** built 2026-10-24 · updated 2026-11-06 · living document
 
-Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the count figures from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. It is **report-only** for now; `--check` is implemented and unit-tested but not wired into CI.
+Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the count figures from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. The command itself stays in report mode for browsing; the gate is `pnpm docs:counts --check`, which ends the root `pnpm test` chain. A stale claim or a claim/derivation error fails that same gate, and both `verify` legs — Node 24 and Node 26 — reach it through the identical chain.
+
+## Coverage
+
+The scanner reads every Markdown file under `docs/` except `docs/adr/`, plus `README.md`, `AGENTS.md`, `CONTEXT.md`, and `DESIGN.md`. `CHANGELOG.md` and `docs/adr/**` stay exempt, with the reasons in [Exemptions](#exemptions). Relative links in the scanned docs are checked separately; see [the links guide](docs-links.md).
 
 ## Count classes and sources
 
@@ -21,7 +25,7 @@ The **live-suite tests** figure is a repo convention, not a runner fact: it is t
 
 ## Claims and patterns
 
-Claims are extracted line by line from `docs/**/*.md`. Parenthesized spans are stripped before live and table-phase matching, so a historical aside such as `(34 scenes at the time)` stays out. The step-kind and transactional patterns read the full line, because `transactions.md` states its classification claims inside a parenthetical list.
+Claims are extracted line by line from every scanned file. Parenthesized spans are stripped before live and table-phase matching, so a historical aside such as `(34 scenes at the time)` stays out. The step-kind and transactional patterns read the full line, because `transactions.md` states its classification claims inside a parenthetical list.
 
 A line is a **live** claim only when it relates tests and scenes (`tests.*scenes` or `scenes.*tests`). From it the tool reads:
 
@@ -41,14 +45,17 @@ A number token may be digits or an English word from 0 through 99, hyphen compou
 
 ## Exemptions
 
-- **`CHANGELOG.md`** — every entry is a per-item snapshot of the counts at release or merge time.
-- **`docs/adr/**`** — accepted ADRs are immutable per the ADR README. ADR 0016's 315 is the accept-time snapshot; the fix for a changed count is a new ADR, never an edit to an accepted one.
-- **Code comments** — `plan.ts`'s phase prose and the like are not scanned; the phase count is parsed from the numbered list, not from the "eighteen table phases" sentence.
-- **`CONTEXT.md`, `README.md`, `AGENTS.md`** — no count claims today; add them to the surface if one appears.
+| Path | Reason |
+| --- | --- |
+| `CHANGELOG.md` | Every entry is a per-item snapshot of the counts at merge or release time; the numbers are history, not current claims. |
+| `docs/adr/**` | Accepted ADRs are immutable. A count that changed after acceptance is handled by a new ADR, never an edit; ADR 0016's 315 is the accept-time snapshot. |
+| Code comments | `plan.ts`'s phase prose and the like are not documentation; the phase count is parsed from the numbered list, not from the "eighteen table phases" sentence. |
+
+`README.md`, `AGENTS.md`, `CONTEXT.md`, and `DESIGN.md` are scanned like the rest of the docs — they had no count claims when the surface was widened, and a new one would now be checked.
 
 ## Running it
 
-From the repo root, after a build:
+From the repo root:
 
 ```
 pnpm build
@@ -57,7 +64,9 @@ pnpm docs:counts
 
 The report prints one line per actual component, one line per stale claim (`docs-counts: <file>:<line> <class> claimed <x> actual <y>`), any claim errors, and a summary (`docs-counts: <claims> claims checked, <stale> stale`). It exits 0 in report mode even when a claim is stale or a derivation fails.
 
-`pnpm docs:counts --check` exits 1 on any stale claim or claim/derivation error and 0 on a clean tree. It is deliberately not wired yet: the surface needs a false-positive-free run first. The companion unit tests in `.github/scripts/docs-counts.test.mjs` pin the patterns against real doc lines copied verbatim, the number-word parser, the phase-list contiguity check, the total formula, the report format, and the `--check` exit codes; the root `pnpm test` runs them and then the report.
+`pnpm docs:counts --check` is the gate: it exits 1 on any stale claim or claim/derivation error and 0 on a clean tree. It ends the root `pnpm test` chain, after the package tests and the docs-count unit tests. `pnpm test` builds core and postgres inline through the package test scripts, so the gate has what it needs; a standalone run needs `pnpm build` first. When check mode cannot derive — for example when `packages/core/dist` is absent — the error line appends a hint to run `pnpm build` first.
+
+The companion unit tests in `.github/scripts/docs-counts.test.mjs` pin the patterns against real doc lines copied verbatim, the number-word parser, the phase-list contiguity check, the total formula, the report format, and the `--check` exit codes.
 
 ## Residuals
 
@@ -66,4 +75,3 @@ The report prints one line per actual component, one line per stale claim (`docs
 - **Always-on subtests** — derived from `t.test(` calls after the scene loop; reshaping that loop requires the derivation to move with it.
 - **Parenthesized claims** — live and phase claims inside parentheses are not checked (that is what keeps historical asides out); classification claims are, because their patterns read the full line.
 - **Unscanned surfaces** — `CHANGELOG.md`, `docs/adr/**`, and code comments stay exempt as above.
-- **`--check` in CI** — deferred until the report has run clean long enough to trust; flipping it is the follow-up, not a silent change.
