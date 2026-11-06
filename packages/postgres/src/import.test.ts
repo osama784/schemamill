@@ -2968,6 +2968,118 @@ test('skips a partition and flags a partitioned table', async () => {
   assert.match(diagnostics[1]?.message ?? '', /partition app\.events_2026/);
 });
 
+test('flags and drops IF NOT EXISTS on a table, importing it', async () => {
+  const dump = `CREATE TABLE IF NOT EXISTS public.t (a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The clause is dropped with a flag; the table still imports into the model.
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'public',
+      name: 't',
+      columns: [{ name: 'a', type: 'integer', notNull: false }],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+  ]);
+});
+
+test('imports a plain CREATE TABLE without diagnostics', async () => {
+  const dump = `CREATE TABLE public.t (a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(
+    model.tables.map((table) => `${table.schema}.${table.name}`),
+    ['public.t'],
+  );
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags IF NOT EXISTS on every repeated CREATE TABLE and keeps the last draft', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS public.t (a integer);`,
+    `CREATE TABLE IF NOT EXISTS public.t (b text NOT NULL);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // Diagnostics are per statement: both clauses flag, in statement order. The repeated create
+  // still replaces the draft wholesale, so only the last definition's column survives.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+  ]);
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'public',
+      name: 't',
+      columns: [{ name: 'b', type: 'text', notNull: true }],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+    },
+  ]);
+});
+
+test('flags IF NOT EXISTS on a partitioned parent but not on a partition child', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS app.events (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+    `CREATE TABLE IF NOT EXISTS app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The parent imports: its existing partitioning flag comes first, then the clause flag. The
+  // child early-returns before the clause is read, so its skip is the only finding.
+  assert.deepEqual(
+    model.tables.map((table) => `${table.schema}.${table.name}`),
+    ['app.events'],
+  );
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.events',
+      message: 'dropped partitioning clauses from app.events',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.events',
+      message: 'dropped IF NOT EXISTS from app.events',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.events_2026',
+      message: 'skipped partition app.events_2026 (a partition is not a plain table)',
+    },
+  ]);
+});
+
 test('isolates a parse failure and imports the statements around it', async () => {
   const dump = [
     `CREATE TABLE public.before (id integer);`,
@@ -3509,6 +3621,111 @@ test('replaces a repeated CREATE SEQUENCE wholesale', async () => {
 
   assert.deepEqual(model.sequences, [sequence('s')]);
   assert.deepEqual(diagnostics, []);
+});
+
+test('flags and drops IF NOT EXISTS on a sequence, importing it', async () => {
+  const dump = `CREATE SEQUENCE IF NOT EXISTS public.s;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The clause is dropped with a flag; the sequence still imports into the model.
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.s',
+      message: 'dropped IF NOT EXISTS from public.s',
+    },
+  ]);
+});
+
+test('imports a plain CREATE SEQUENCE without diagnostics', async () => {
+  const dump = `CREATE SEQUENCE public.s;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reports only the last repeated CREATE SEQUENCE clause and keeps the last draft', async () => {
+  const clause = {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'public.s',
+    message: 'dropped IF NOT EXISTS from public.s',
+  };
+  const last = sequence('s', { dataType: 'integer', maxValue: '2147483647' });
+
+  // clause → clause: the findings buffer is replaced, so one flag for the last statement.
+  const both = await importDump(
+    [
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS smallint CYCLE;`,
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(both.model.sequences, [last]);
+  assert.deepEqual(both.diagnostics.map(describeDiagnostic), [clause]);
+
+  // clause → plain: the replacement clears the earlier flag.
+  const cleared = await importDump(
+    [
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS smallint;`,
+      `CREATE SEQUENCE public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(cleared.model.sequences, [last]);
+  assert.deepEqual(cleared.diagnostics, []);
+
+  // plain → clause: only the last statement's clause flags.
+  const flagged = await importDump(
+    [
+      `CREATE SEQUENCE public.s AS smallint;`,
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(flagged.model.sequences, [last]);
+  assert.deepEqual(flagged.diagnostics.map(describeDiagnostic), [clause]);
+});
+
+test('drops an IF NOT EXISTS sequence flag with a sequence dropped by owner reconciliation', async () => {
+  const dump = [
+    `CREATE TABLE public.kept (id bigint);`,
+    `CREATE SEQUENCE IF NOT EXISTS public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.kept.missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The findings buffer is discarded with the dropped sequence: only the owner skip remains.
+  assert.deepEqual(model.sequences, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.s',
+      message:
+        'skipped sequence public.s belongs to unread column public.kept.missing; it is not represented',
+    },
+  ]);
+});
+
+test('reports only the unsupported-option skip when IF NOT EXISTS is also present', async () => {
+  const dump = `CREATE SEQUENCE IF NOT EXISTS public.bad AS numeric;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The option gate returns before the clause is read, so the clause is moot.
+  assert.deepEqual(model.sequences, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.bad',
+      message: 'skipped CREATE SEQUENCE public.bad (unsupported data type)',
+    },
+  ]);
 });
 
 test('skips sequence state, missing sequences, and unmapped options by name', async () => {

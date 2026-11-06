@@ -587,6 +587,13 @@ function translateCreateTable(
   }
 
   translateCreateTableExtras(statement, create, identity, draft, diagnostics);
+
+  // The model has no create-time idempotence and the plan renders a plain create, so the
+  // clause is flagged and dropped; the table itself still imports. A repeated CREATE TABLE
+  // flags per statement even though the draft is replaced.
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
+  }
 }
 
 /** A column and its constraints while `translateColumn` assembles them. */
@@ -1699,6 +1706,11 @@ function translateCreateSequence(
   }
   if (create.sequence?.relpersistence === 't') {
     findings.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+  }
+  // Like table persistence, the clause is flagged and dropped; it rides the findings buffer so
+  // a skipped or owner-dropped sequence reports only its skip.
+  if (create.if_not_exists === true) {
+    findings.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
   }
 
   // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE:
