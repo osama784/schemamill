@@ -24,7 +24,7 @@ A live database's column defaults and its persistence, collation, storage, and c
 
 ## Acceptance
 
-- The gated scene round-trips for the covered states — introspected model `diff`-empty and deep-equal against the dump import — on the versions CI pins (PostgreSQL 18; 16 and 18 locally where available).
+- The gated scene round-trips for the covered states — introspected model `diff`-empty and deep-equal against the dump import — on the versions CI pins (PostgreSQL 13 and 18; 16 and 18 locally where available).
 - The covered states' flags disappear from the diagnostics and the deferred states' flags stay, pinned by the flags scene; the mapper's canonicalization rules are pinned by unit tests (explicit versus default collation and storage, compression absent on the floor).
 - `pnpm build`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm format:check` pass from the repo root.
 
