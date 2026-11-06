@@ -145,7 +145,7 @@ import { renderSql } from './render.ts';
  *
  * `comment-introspection` is the five-family comment read's server-derived equality evidence:
  * the table (with a changed special-character comment), a column comment changed and another
- * added, a standalone sequence whose comment is removed, two plain views (one comment changed,
+ * added, a standalone sequence whose comment changes, two plain views (one comment changed,
  * the check-option view's removed), and a materialized view whose comment changes — the
  * structure is otherwise identical, so the plan carries comment steps only. `matches-import`
  * compares the catalog read with the applied dump's import, the catalog checks pin the stored
@@ -5696,7 +5696,7 @@ function commentInventoryDifferences(
  * comment-carrying model. Baseline and target hold the same table, standalone sequence, two
  * plain views, and one materialized view; only comments move — the table's
  * special-character comment changes, one column comment changes, another is added, the
- * sequence comment is removed, one view comment changes, the check-option view's comment is
+ * sequence comment changes, one view comment changes, the check-option view's comment is
  * removed, and the materialized view's comment changes. The plan check proves that a
  * comment-only change emits comment steps and no structural work, so the matview and views are
  * never rebuilt. `matches-import` then compares the catalog read with the applied dump's
@@ -5759,7 +5759,7 @@ const commentIntrospectionScene = (): LiveScene => {
         comment: specialTarget,
       }),
     ],
-    sequences: [sequence('audit_seq')],
+    sequences: [sequence('audit_seq', { comment: 'audit sequence, target' })],
     views: [
       view('account_summary', {
         materialized: true,
@@ -5857,9 +5857,9 @@ const commentIntrospectionScene = (): LiveScene => {
         'identifier, added in target',
       ),
       commentCheck(
-        'the migrated database cleared the standalone sequence comment',
+        'the migrated database changed the standalone sequence comment',
         relationComment('audit_seq'),
-        undefined,
+        'audit sequence, target',
       ),
       commentCheck(
         'the migrated database changed the plain-view comment',
