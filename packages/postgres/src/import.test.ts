@@ -2541,6 +2541,37 @@ test('flags a dropped comment when a consumed unique index dedupes onto a commen
   ]);
 });
 
+test('flags a dropped comment when a consumed primary key dedupes onto a commented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The conventional `t_pkey` name is stripped by finalization, so that model carries no name to
+  // assert (the issue's `{ name: 't_pkey', … }` expectation is wrong); the non-conventional
+  // `t_a_pk` keeps the retained name assertable, as the unique-side pin and consumed-PK siblings
+  // do. Both forms reach this `samePrimaryKey` dedupe — the whole-array diagnostic comparison
+  // below separates its one comment flag from the rejection branch's additional-key flag.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'existing' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
 test('flags a dropped comment when a consumed unique index dedupes onto an uncommented constraint', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
