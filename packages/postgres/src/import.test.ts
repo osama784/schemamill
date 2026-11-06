@@ -2555,10 +2555,11 @@ test('flags a dropped comment when a consumed primary key dedupes onto a comment
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The name is `t_a_pk`, not the conventional `t_pkey`: the conventional form canonicalizes to
-  // unnamed, so the later `USING INDEX` statement would miss `samePrimaryKey` and hit the
-  // rejection branch (two flags) instead of deduping. Here the retained key keeps its own
-  // comment, so the consumed index's differing comment has nowhere to land and is named.
+  // The conventional `t_pkey` name is stripped by finalization, so that model carries no name to
+  // assert (the issue's `{ name: 't_pkey', … }` expectation is wrong); the non-conventional
+  // `t_a_pk` keeps the retained name assertable, as the unique-side pin and consumed-PK siblings
+  // do. Both forms reach this `samePrimaryKey` dedupe — the whole-array diagnostic comparison
+  // below separates its one comment flag from the rejection branch's additional-key flag.
   assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'existing' });
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
