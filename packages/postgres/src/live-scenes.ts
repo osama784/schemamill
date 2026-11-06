@@ -84,8 +84,9 @@ import { renderSql } from './render.ts';
  * canonicalized back to unnamed on import while a comment keeps the name in the target dump
  * (`not-null-constraint-names`), and a pure foreign-key enforcement change in both directions
  * rendered as `ALTER TABLE … ALTER CONSTRAINT … ENFORCED|NOT ENFORCED` instead of drop/add
- * (`enforcement-in-place`). All three declare `minServerMajor: 18` and skip with a named reason
- * on older servers.
+ * (`enforcement-in-place`). These three constraint-attribute scenes declare `minServerMajor: 18`
+ * and skip with a named reason on older servers, and so does the fourth PostgreSQL 18 scene,
+ * `introspection-flags-constraints-18`.
  *
  * The introspection scenes are the tracer bullet for the `CatalogReader` seam:
  * `introspection-tracer` builds two raw schemas beside `public` and a model exercising the
@@ -5019,6 +5020,91 @@ const introspectionFlagsConstraints18Scene = (): LiveScene => ({
 });
 
 /**
+ * The partition-child and dropped-column guard scene: raw setup SQL builds a partitioned
+ * parent `part` and its child `part_1`, carrying a parent-declared check beside a child-local
+ * check, a child-local index, and a child-local primary key. The inherited copies are excluded
+ * by `conislocal` alone, so only the child-local rows exercise the catalog read's
+ * `NOT relispartition` guards; a read that lets one through throws via `requireOrdinaryTable`
+ * instead of silently modeling a partition child. Both partitioned relations stay skipped and
+ * named. The models carry one ordinary table whose target drops a column, so the migrated
+ * database physically holds the `attisdropped` row the column read must filter. The scene pins
+ * the two partition skips exactly, the physical dropped-column row, and — on both imports —
+ * that pg_dump's `CREATE TABLE` plus `ATTACH PARTITION` form imports the child exactly once as
+ * a plain table and no diagnostic names it.
+ */
+const partitionChildGuardsScene = (): LiveScene => ({
+  name: 'partition-child-guards',
+  setupSql: [
+    'CREATE TABLE public.part (k integer, payload text) PARTITION BY RANGE (k);',
+    'CREATE TABLE public.part_1 PARTITION OF public.part FOR VALUES FROM (0) TO (10);',
+    "ALTER TABLE public.part ADD CONSTRAINT part_payload_check CHECK (payload <> '');",
+    "ALTER TABLE public.part_1 ADD CONSTRAINT part_1_payload_check CHECK (payload <> '');",
+    'CREATE INDEX part_1_payload_idx ON public.part_1 (payload);',
+    'ALTER TABLE public.part_1 ADD CONSTRAINT part_1_pkey PRIMARY KEY (k);',
+  ].join('\n'),
+  baseline: model(
+    table('drop_probe', {
+      columns: [column('stay', { type: 'integer' }), column('gone')],
+    }),
+  ),
+  target: model(
+    table('drop_probe', {
+      columns: [column('stay', { type: 'integer' })],
+    }),
+  ),
+  checks: [
+    {
+      description: 'the dropped column physically survives as an attisdropped row',
+      sql:
+        "select attisdropped from pg_attribute where attrelid = 'public.drop_probe'::regclass" +
+        ' and attnum = 2',
+      expected: 't',
+    },
+  ],
+  importChecks: [
+    {
+      description: 'the partition child imports exactly once and no diagnostic names it',
+      failure: (imported, source) => {
+        const children = imported.model.tables.filter(
+          (candidate) => candidate.schema === 'public' && candidate.name === 'part_1',
+        );
+        if (children.length !== 1) {
+          return `${source}: expected exactly one public.part_1 table, found ${children.length}`;
+        }
+        const named = imported.diagnostics.filter(
+          (diagnostic) =>
+            (diagnostic.kind !== 'error' && diagnostic.object.includes('part_1')) ||
+            diagnostic.message.includes('part_1'),
+        );
+        if (named.length > 0) {
+          return `${source}: diagnostics name part_1: ${named
+            .map((diagnostic) => diagnostic.message)
+            .join('; ')}`;
+        }
+        return undefined;
+      },
+    },
+  ],
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.part',
+        message: 'table public.part is partitioned; partitioning is not represented yet',
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.part_1',
+        message: 'table public.part_1 is partitioned; partitioning is not represented yet',
+      },
+    ],
+  },
+});
+
+/**
  * The truncated-name round trip: a table whose unnamed index, unique constraint, check
  * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
  * limit, plus an unnamed baseline index the target drops. The sizes are qualified so the
@@ -7000,6 +7086,7 @@ export const scenes: readonly LiveScene[] = [
   introspectionFlagsConstraintsScene(),
   introspectionFlagsConstraints15Scene(),
   introspectionFlagsConstraints18Scene(),
+  partitionChildGuardsScene(),
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
