@@ -2777,6 +2777,10 @@ const sequenceToIdentityScene = (): LiveScene => {
  * PostgreSQL assigned, and the import check proves those names came back unnamed, the
  * constraint-backed indexes are not modeled as standalone `Index` entries, and the known miss
  * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name.
+ *
+ * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
+ * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
+ * deparse-pinning scene skips 13.
  */
 const constraintCreateScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -2805,6 +2809,7 @@ const constraintCreateScene = (): LiveScene => {
 
   return {
     name: 'constraint-create',
+    minServerMajor: 14,
     baseline: model(),
     target: model(accounts),
     baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],
@@ -2947,6 +2952,10 @@ const constraintCreateScene = (): LiveScene => {
  * at a unique index on its own table (a foreign key's `conindid` is that index, so only the
  * `contype` filter keeps the read from consuming it). The live read must return no diagnostics
  * and a model deep-equal to the applied dump's import.
+ *
+ * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
+ * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
+ * deparse-pinning scene skips 13.
  */
 const introspectionConstraintsScene = (): LiveScene => {
   const parents = table('parents', {
@@ -3045,6 +3054,7 @@ const introspectionConstraintsScene = (): LiveScene => {
 
   return {
     name: 'introspection-constraints',
+    minServerMajor: 14,
     baseline: model(),
     target,
     baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],

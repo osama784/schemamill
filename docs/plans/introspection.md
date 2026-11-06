@@ -1,6 +1,6 @@
 # Introspection tracer bullet — tables, columns, primary keys
 
-**Status:** built — the indexes, constraints, attributes, and sequences/identity follow-ups shipped ([#76](https://github.com/osama784/schemamill/issues/76), [#79](https://github.com/osama784/schemamill/issues/79), [#77](https://github.com/osama784/schemamill/issues/77), [#80](https://github.com/osama784/schemamill/issues/80)) · **Last updated:** 2026-11-05
+**Status:** built — the indexes, constraints, attributes, and sequences/identity follow-ups shipped ([#76](https://github.com/osama784/schemamill/issues/76), [#79](https://github.com/osama784/schemamill/issues/79), [#77](https://github.com/osama784/schemamill/issues/77), [#80](https://github.com/osama784/schemamill/issues/80)) · **Last updated:** 2026-11-06
 
 `CatalogReader.introspect(connection)` was declared in [`packages/core/src/seam.ts`](../../packages/core/src/seam.ts) with no implementation behind it, and DDL import was the only inbound path. The vision puts live introspection beside dumps in the Import stage ([vision §Import](../domain/vision.md)), and [ADR 0008](../adr/0008-index-concurrency-is-declaration-metadata.md) already named canonicalization debt introspection must eventually pay. This slice was the tracer bullet: it proved the seam end-to-end for the smallest meaningful catalog surface — tables, columns, and primary keys — read-only, so the remaining object families inherit a working pattern (connection type, catalog queries, diagnostics, live scenes) instead of a blank socket. It shipped in [#55](https://github.com/osama784/schemamill/issues/55) (PR [#70](https://github.com/osama784/schemamill/pull/70), merge commit `d3ca120`); the transport decision is recorded in [ADR 0011](../adr/0011-introspection-transport.md).
 
@@ -22,14 +22,14 @@ A live, read-only PostgreSQL catalog reads back as the canonical model, such tha
 
 ## Acceptance
 
-- The gated scene round-trips: build → introspect → compare against the dump import, exactly empty diff for the covered subset, on the versions CI pins (PostgreSQL 18 in CI; 16 and 18 locally where available).
+- The gated scene round-trips: build → introspect → compare against the dump import, exactly empty diff for the covered subset, on the versions CI pins (PostgreSQL 13 and 18; 16 and 18 locally where available).
 - The implementation is injected as `CatalogReader` and consumed as such by at least one test, proving the seam carries the work.
 - Falsification: dropping one covered fact from the tracer's queries (for example, column order or a primary key) makes the scene fail — the coverage is load-bearing, not decorative.
 - `pnpm build`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm format:check` pass from the repo root.
 
 ## Done means
 
-- The tracer scene is green in the gated suite, and a live run summary (PostgreSQL versions, scene names, pass counts) is recorded on the slice's tracker issue — [#55](https://github.com/osama784/schemamill/issues/55) carries the local PostgreSQL 16.15 run (34 scenes at the time) and the CI `verify-postgres` run on PostgreSQL 18. The suite has since grown to 52 scenes; on PostgreSQL 16.15 it is 473 tests with the four PostgreSQL 18 scenes skipping by name, and all 52 run on the CI's PostgreSQL 18.
+- The tracer scene is green in the gated suite, and a live run summary (PostgreSQL versions, scene names, pass counts) is recorded on the slice's tracker issue — [#55](https://github.com/osama784/schemamill/issues/55) carries the local PostgreSQL 16.15 run (34 scenes at the time) and the CI `verify-postgres` run on PostgreSQL 18. The suite has since grown to 52 scenes; on PostgreSQL 16.15 it is 473 tests with the four PostgreSQL 18 scenes skipping by name, and all 52 run on the CI's PostgreSQL 18 leg, while the CI's PostgreSQL 13 leg skips the scenes floored above 13 by name.
 - The five gates pass from the repo root.
 
 ## Deferred
