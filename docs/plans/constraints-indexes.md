@@ -1,6 +1,6 @@
 # Constraints and indexes — model, import, diff, plan, render, verify
 
-**Status:** built · **Last updated:** 2026-11-03
+**Status:** built · **Last updated:** 2026-11-06
 
 Unique and check constraints and standalone indexes are first-class table members: the forms a dump or script carries — inline and `ALTER TABLE … ADD CONSTRAINT` unique and check constraints, and `CREATE [UNIQUE] INDEX`, `CONCURRENTLY` included — travel the whole import → diff → plan → render path, and the result was verified against live PostgreSQL. The slice also landed the plan's first non-transactional step kinds and the multi-group display that came due: a concurrent index build applies bare between wrapped transaction groups. The settled decisions are on [#33](https://github.com/osama784/schemamill/issues/33) (design review rounds 1–3, the folded-in `pg_dump` fact report, and the approved brief), the slice's ledger; the durable decision is recorded in [ADR 0008](../adr/0008-index-concurrency-is-declaration-metadata.md).
 
