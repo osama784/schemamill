@@ -16,7 +16,9 @@
  *   schema-qualified identity replaces the table wholesale, clearing its foreign keys, unique
  *   constraints, check constraints, indexes, and comment. `IF NOT EXISTS` is flagged and
  *   dropped — one `dropped IF NOT EXISTS from <schema.table>` flag — and the table still
- *   imports; a repeated create flags per statement even though the last definition wins.
+ *   imports; a repeated create flags per statement even though the last definition wins. A
+ *   `PARTITION OF` child reports only its partition skip, never the clause flag; a partitioned
+ *   parent still imports, with the `partitioning clauses` flag then the clause flag.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
  *   order the statement lists them; `ALTER COLUMN … SET STORAGE` and `SET COMPRESSION` apply
