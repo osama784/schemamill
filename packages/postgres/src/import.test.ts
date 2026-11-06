@@ -3624,13 +3624,20 @@ test('replaces a repeated CREATE SEQUENCE wholesale', async () => {
 });
 
 test('flags and drops IF NOT EXISTS on a sequence, importing it', async () => {
-  const dump = `CREATE SEQUENCE IF NOT EXISTS public.s;`;
+  const dump = `CREATE UNLOGGED SEQUENCE IF NOT EXISTS public.s;`;
 
   const { model, diagnostics } = await importDump(dump);
 
-  // The clause is dropped with a flag; the sequence still imports into the model.
+  // The sequence still imports, as a plain one; an unlogged sequence carries both findings, so
+  // their order pins the clause after the persistence flag.
   assert.deepEqual(model.sequences, [sequence('s')]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.s',
+      message: 'dropped unlogged-sequence persistence from public.s',
+    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
