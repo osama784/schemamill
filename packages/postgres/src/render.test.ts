@@ -2133,6 +2133,22 @@ test('renders a plain create for an imported index whose IF NOT EXISTS clause wa
   assert.doesNotMatch(sql, /IF NOT EXISTS/);
 });
 
+test('renders plain creates for imported tables and sequences whose IF NOT EXISTS was flagged', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS public.t (a integer);`,
+    `CREATE SEQUENCE IF NOT EXISTS public.s;`,
+  ].join('\n');
+
+  // Both clauses are flagged and dropped at import (`import.test.ts` pins the flags), so the
+  // plan renders plain creates; a re-run with the clause would hide drift instead of surfacing
+  // it at apply.
+  const { model: imported } = await importDump(dump);
+  const sql = renderSql(plan(model(), imported));
+  assert.ok(sql.includes('CREATE TABLE public.t ('));
+  assert.ok(sql.includes('CREATE SEQUENCE public.s AS bigint'));
+  assert.doesNotMatch(sql, /IF NOT EXISTS/);
+});
+
 test('renders a drop and a create of one name across the polarity', () => {
   // `index-changed` decomposes into a drop and a create of the same name, which is
   // legitimate; only same-polarity duplicates are refused.

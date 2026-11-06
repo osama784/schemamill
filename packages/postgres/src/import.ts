@@ -14,7 +14,11 @@
  *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
  *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
  *   schema-qualified identity replaces the table wholesale, clearing its foreign keys, unique
- *   constraints, check constraints, indexes, and comment.
+ *   constraints, check constraints, indexes, and comment. `IF NOT EXISTS` is flagged and
+ *   dropped — one `dropped IF NOT EXISTS from <schema.table>` flag — and the table still
+ *   imports; a repeated create flags per statement even though the last definition wins. A
+ *   `PARTITION OF` child reports only its partition skip, never the clause flag; a partitioned
+ *   parent still imports, with the `partitioning clauses` flag then the clause flag.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
  *   order the statement lists them; `ALTER COLUMN … SET STORAGE` and `SET COMPRESSION` apply
@@ -58,9 +62,13 @@
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
  *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale, and unlogged or
- *   temporary sequence persistence is flagged. A sequence whose `OWNED BY` is not in the
- *   imported model — an unread relation, a partitioned parent, or an absent column — is
- *   omitted whole and named, judged on the final drafts so a forward reference is kept.
+ *   temporary sequence persistence is flagged. `IF NOT EXISTS` is flagged and dropped the
+ *   same way — one `dropped IF NOT EXISTS from <schema.sequence>` flag — and the sequence
+ *   still imports; the findings ride the per-sequence buffer, so a repeated create reports
+ *   only the last statement's clause and a dropped sequence reports only its skip. A sequence
+ *   whose `OWNED BY` is not in the imported model — an unread relation, a partitioned parent,
+ *   or an absent column — is omitted whole and named, judged on the final drafts so a forward
+ *   reference is kept.
  * - `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max,
  *   start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — apply to the already imported
  *   sequence, in the order the engine processes them, and are skipped and named when the
@@ -587,6 +595,13 @@ function translateCreateTable(
   }
 
   translateCreateTableExtras(statement, create, identity, draft, diagnostics);
+
+  // The model has no create-time idempotence and the plan renders a plain create, so the
+  // clause is flagged and dropped; the table itself still imports. A repeated CREATE TABLE
+  // flags per statement even though the draft is replaced.
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
+  }
 }
 
 /** A column and its constraints while `translateColumn` assembles them. */
@@ -1699,6 +1714,11 @@ function translateCreateSequence(
   }
   if (create.sequence?.relpersistence === 't') {
     findings.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+  }
+  // Like table persistence, the clause is flagged and dropped; it rides the findings buffer so
+  // a skipped or owner-dropped sequence reports only its skip.
+  if (create.if_not_exists === true) {
+    findings.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
   }
 
   // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE:
