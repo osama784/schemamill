@@ -3,9 +3,9 @@
  *
  * The transport is the `psql` binary — the live harness's choice, so no client-library
  * dependency is added. One `-c` batch carries one `SELECT` returning one `json` document with
- * the `tables`, `columns`, `primaryKeys`, `indexes`, `constraints`, `notNullConstraints`, and
- * `sequences` sections; `psql` runs a single `-c` batch as one implicit transaction, so the
- * sections share one snapshot. The child
+ * the `tables`, `columns`, `primaryKeys`, `indexes`, `constraints`, `notNullConstraints`,
+ * `sequences`, and `views` sections; `psql` runs a single `-c` batch as one implicit
+ * transaction, so the sections share one snapshot. The child
  * environment's `PGOPTIONS` sets `search_path=''` — the congruence with `pg_dump`, which
  * reads the catalog under the same empty path, so `format_type`'s spelling matches the dumped
  * DDL — and `default_transaction_read_only=on` as read-only posture. The read itself is the
@@ -73,6 +73,8 @@ import type {
   TableIdentity,
   TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
 } from '@schemamill/core';
 import { canonicalIntType, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import { parse, type IndexStmt } from 'libpg-query';
@@ -108,9 +110,9 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
 
 /**
  * The one read: a single `json` document with the tables, columns, primary keys, indexes,
- * constraints, and sequences sections of every user schema, system schemas excluded. Tables
- * carry what the deferred-states pass needs (`relkind`, `relispartition`, `relpersistence`);
- * columns are read
+ * constraints, sequences, and views sections of every user schema, system schemas excluded.
+ * Tables carry what the deferred-states pass needs (`relkind`, `relispartition`,
+ * `relpersistence`); columns are read
  * for ordinary tables only, in attribute order, with the type spelling `format_type` gives,
  * the `pg_attrdef` default expression `pg_get_expr` renders (null when there is none), the
  * explicit collation's `pg_dump` spelling (`format('%I.%I', …)` over `pg_collation` and its
@@ -138,10 +140,19 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  *
  * The `sequences` section reads every sequence relation in the same schema scope. Each row
  * carries `pg_sequence`'s declared options as exact decimal text (never a JSON number, so a
- * bigint bound survives the trip), the relation's persistence, and the optional owning column
+ * bigint bound survives the trip), the relation's persistence, the optional owning column
  * that `pg_depend` names: `deptype 'a'` is `OWNED BY`, `'i'` is an identity column's internal
  * sequence. Every owner-side join is a left join, so a standalone sequence carries nulls there
  * and does not multiply; the inner `pg_sequence` join follows `relkind = 'S'`.
+ *
+ * The `views` section reads every view and materialized view in the same schema scope, with
+ * `pg_get_viewdef`'s definition text, the `check_option` reloption decoded to the model's
+ * `local`/`cascaded` spelling (null when absent), and the relation's object description. A
+ * materialized view cannot carry a check option; the mapper refuses one defensively.
+ *
+ * The comment columns are the PostgreSQL catalog's own: `obj_description` for a table,
+ * sequence, or view (`pg_class`), and `col_description` for a column. Null means the object
+ * carries no comment; a server comment is never empty (PostgreSQL deletes on empty).
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -153,7 +164,8 @@ SELECT json_build_object(
         relation.relname AS name,
         relation.relkind AS relkind,
         relation.relispartition AS relispartition,
-        relation.relpersistence AS relpersistence
+        relation.relpersistence AS relpersistence,
+        pg_catalog.obj_description(relation.oid, 'pg_class') AS comment
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
       WHERE relation.relkind IN ('r', 'p')
@@ -185,7 +197,8 @@ SELECT json_build_object(
         END AS collation,
         attribute.attstorage AS attstorage,
         attribute_type.typstorage AS typstorage,
-        COALESCE(to_jsonb(attribute) ->> 'attcompression', '') AS attcompression
+        COALESCE(to_jsonb(attribute) ->> 'attcompression', '') AS attcompression,
+        pg_catalog.col_description(attribute.attrelid, attribute.attnum) AS comment
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
       JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = relation.oid
@@ -426,7 +439,8 @@ SELECT json_build_object(
         END AS "ownerKind",
         owner_namespace.nspname AS "ownerSchema",
         owner_relation.relname AS "ownerTable",
-        owner_attribute.attname AS "ownerColumn"
+        owner_attribute.attname AS "ownerColumn",
+        pg_catalog.obj_description(sequence_relation.oid, 'pg_class') AS comment
       FROM pg_catalog.pg_class AS sequence_relation
       JOIN pg_catalog.pg_namespace AS sequence_namespace
         ON sequence_namespace.oid = sequence_relation.relnamespace
@@ -451,6 +465,27 @@ SELECT json_build_object(
         AND sequence_namespace.nspname NOT LIKE 'pg\\_%'
       ORDER BY sequence_namespace.nspname, sequence_relation.relname
     ) AS sequence_row
+  ), '[]'::json),
+  'views', COALESCE((
+    SELECT json_agg(row_to_json(view_row))
+    FROM (
+      SELECT
+        namespace.nspname AS schema,
+        relation.relname AS name,
+        relation.relkind = 'm' AS materialized,
+        pg_catalog.pg_get_viewdef(relation.oid) AS definition,
+        CASE
+          WHEN 'check_option=local' = ANY(relation.reloptions) THEN 'local'
+          WHEN 'check_option=cascaded' = ANY(relation.reloptions) THEN 'cascaded'
+        END AS "checkOption",
+        pg_catalog.obj_description(relation.oid, 'pg_class') AS comment
+      FROM pg_catalog.pg_class AS relation
+      JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      WHERE relation.relkind IN ('v', 'm')
+        AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND namespace.nspname NOT LIKE 'pg\\_%'
+      ORDER BY namespace.nspname, relation.relname
+    ) AS view_row
   ), '[]'::json)
 ) AS document
 `.trim();
@@ -513,6 +548,7 @@ interface TableRow {
   readonly relkind: 'r' | 'p';
   readonly relispartition: boolean;
   readonly relpersistence: 'p' | 'u' | 't';
+  readonly comment: string | null;
 }
 
 /** One `columns` row of the payload, after validation. */
@@ -533,6 +569,7 @@ interface ColumnRow {
   readonly attstorage: string;
   readonly typstorage: string;
   readonly attcompression: string;
+  readonly comment: string | null;
 }
 
 /** One `primaryKeys` row of the payload, after validation. */
@@ -626,6 +663,21 @@ interface SequenceRow {
   readonly ownerSchema: string | null;
   readonly ownerTable: string | null;
   readonly ownerColumn: string | null;
+  readonly comment: string | null;
+}
+
+/**
+ * One `views` row of the payload after validation: the view's identity, whether it is
+ * materialized, `pg_get_viewdef`'s definition text, the decoded `check_option` reloption, and
+ * the relation's object description. A materialized row never carries a check option.
+ */
+interface ViewRow {
+  readonly schema: string;
+  readonly name: string;
+  readonly materialized: boolean;
+  readonly definition: string;
+  readonly checkOption: ViewCheckOption | null;
+  readonly comment: string | null;
 }
 
 /** One identity sequence attached to its mapped table and column. */
@@ -648,7 +700,9 @@ interface SequenceMapping {
  * plain string comparison) and columns in attribute order regardless of payload order, since
  * the model's ordering contract is the mapper's, not SQL's collation's. Sequences come back in
  * the same schema-then-name order as the importer; identity sequences attach to their columns
- * and never enter `Model.sequences`. Contract violations throw; only the deferred catalog
+ * and never enter `Model.sequences`. Views and materialized views come back in the importer's
+ * schema-then-name order, definitions normalized with the importer's canonicalizer. Contract
+ * violations throw; only the deferred catalog
  * states become diagnostics, in canonical table order with table-level flags before a table's
  * column flags, columns in attribute order, not-null flags in the same attribute order,
  * constraint findings in stored `conname` order, index findings after them in stored-name
@@ -668,6 +722,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     'constraints',
     'notNullConstraints',
     'sequences',
+    'views',
   ]);
   const tables = expectArray(document, 'tables', 'catalog payload').map((row, index) =>
     parseTableRow(row, `catalog payload.tables[${index}]`),
@@ -690,6 +745,9 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   }
   const sequenceRows = expectArray(document, 'sequences', 'catalog payload').map((row, index) =>
     parseSequenceRow(row, `catalog payload.sequences[${index}]`),
+  );
+  const viewRows = expectArray(document, 'views', 'catalog payload').map((row, index) =>
+    parseViewRow(row, `catalog payload.views[${index}]`),
   );
 
   const tablesByKey = new Map<string, TableRow>();
@@ -850,6 +908,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   }
 
   const sequenceMapping = mapSequences(sequenceRows, tablesByKey, columnsByTable);
+  const modelViews = [...viewRows].sort(compareViewRows).map(viewFromRow);
 
   const diagnostics: Diagnostic[] = [];
   const modelTables: Table[] = [];
@@ -1028,6 +1087,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           ...(notNullName === undefined ? {} : { notNullName }),
           ...(identity === undefined ? {} : { identity }),
           ...columnAttributes(column),
+          ...(column.comment === null ? {} : { comment: column.comment }),
         };
       }),
       ...(constraints.primaryKey === undefined ? {} : { primaryKey: constraints.primaryKey }),
@@ -1036,6 +1096,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       checkConstraints: [...constraints.checkConstraints].sort(compareCheckConstraints),
       indexes: canonicalizeIndexNames(identity, namedIndexes).sort(compareIndexes),
       ...(persistence === undefined ? {} : { persistence }),
+      ...(row.comment === null ? {} : { comment: row.comment }),
     });
   }
 
@@ -1045,7 +1106,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     model: {
       tables: modelTables,
       sequences: sequenceMapping.sequences,
-      views: [],
+      views: modelViews,
       extensions: [],
     },
     diagnostics,
@@ -1234,18 +1295,48 @@ function resolveSequenceOwner(
 
 /** One ordinary sequence row, with its owner when it has one, in effective values. */
 function sequenceFromRow(row: SequenceRow, ownedBy?: SequenceOwner): Sequence {
-  return effectiveSequence({
+  return {
+    ...effectiveSequence({
+      schema: row.schema,
+      name: row.name,
+      dataType: row.dataType,
+      increment: row.increment,
+      minValue: row.minValue,
+      maxValue: row.maxValue,
+      start: row.start,
+      cache: row.cache,
+      cycle: row.cycle,
+      ...(ownedBy === undefined ? {} : { ownedBy }),
+    }),
+    ...(row.comment === null ? {} : { comment: row.comment }),
+  };
+}
+
+/**
+ * One view row as the model spells it: `pg_get_viewdef`'s statement terminator dropped and
+ * the body whitespace-normalized with the dump importer's canonicalizer, so both sides of the
+ * import congruence agree. `checkOption` and `comment` are present exactly when the catalog
+ * states them, never as undefined keys.
+ */
+function viewFromRow(row: ViewRow): View {
+  return {
     schema: row.schema,
     name: row.name,
-    dataType: row.dataType,
-    increment: row.increment,
-    minValue: row.minValue,
-    maxValue: row.maxValue,
-    start: row.start,
-    cache: row.cache,
-    cycle: row.cycle,
-    ...(ownedBy === undefined ? {} : { ownedBy }),
-  });
+    materialized: row.materialized,
+    definition: viewDefinition(row.definition),
+    ...(row.checkOption === null ? {} : { checkOption: row.checkOption }),
+    ...(row.comment === null ? {} : { comment: row.comment }),
+  };
+}
+
+/**
+ * The model's definition text for a `pg_get_viewdef` body: exactly one trailing statement
+ * terminator drops, as `pg_dump` strips it, and then `normalizeSourceText` canonicalizes the
+ * rest — the same forms the dump importer stores from the dumped DDL.
+ */
+function viewDefinition(definition: string): string {
+  const body = definition.endsWith(';') ? definition.slice(0, -1) : definition;
+  return normalizeSourceText(body);
 }
 
 /** The flag an ordinary sequence's non-default persistence carries; the sequence still maps. */
@@ -1319,6 +1410,11 @@ function sequenceOwnerKey(schema: string, name: string, column: string): string 
 
 /** Payload sequence order, the order the duplicate and contract checks walk. */
 function compareSequenceRows(left: SequenceRow, right: SequenceRow): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** Canonical view order, mirroring the importer's `compareViews`: schema, then name. */
+function compareViewRows(left: ViewRow, right: ViewRow): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
 }
 
@@ -1977,7 +2073,14 @@ function expectInteger(
 /** A `tables` row, validated field by field. */
 function parseTableRow(value: unknown, path: string): TableRow {
   const row = expectObject(value, path);
-  expectFields(row, path, ['schema', 'name', 'relkind', 'relispartition', 'relpersistence']);
+  expectFields(row, path, [
+    'schema',
+    'name',
+    'relkind',
+    'relispartition',
+    'relpersistence',
+    'comment',
+  ]);
   const relkind = expectString(row, path, 'relkind');
   if (relkind !== 'r' && relkind !== 'p') {
     throw new Error(`${path}.relkind must be "r" or "p"`);
@@ -1992,6 +2095,7 @@ function parseTableRow(value: unknown, path: string): TableRow {
     relkind,
     relispartition: expectBoolean(row, path, 'relispartition'),
     relpersistence,
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2015,6 +2119,7 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     'attstorage',
     'typstorage',
     'attcompression',
+    'comment',
   ]);
   return {
     schema: expectString(row, path, 'schema'),
@@ -2033,6 +2138,7 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     attstorage: expectString(row, path, 'attstorage'),
     typstorage: expectString(row, path, 'typstorage'),
     attcompression: expectString(row, path, 'attcompression'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2179,6 +2285,7 @@ function parseSequenceRow(value: unknown, path: string): SequenceRow {
     'ownerSchema',
     'ownerTable',
     'ownerColumn',
+    'comment',
   ]);
   const dataType = expectString(row, path, 'dataType');
   if (dataType !== 'smallint' && dataType !== 'integer' && dataType !== 'bigint') {
@@ -2207,6 +2314,41 @@ function parseSequenceRow(value: unknown, path: string): SequenceRow {
     ownerSchema: expectNullableString(row, path, 'ownerSchema'),
     ownerTable: expectNullableString(row, path, 'ownerTable'),
     ownerColumn: expectNullableString(row, path, 'ownerColumn'),
+    comment: expectNullableString(row, path, 'comment'),
+  };
+}
+
+/**
+ * A `views` row, validated field by field. The check option is `local`, `cascaded`, or null;
+ * a materialized row carrying one is a contract throw, since PostgreSQL never stores it.
+ */
+function parseViewRow(value: unknown, path: string): ViewRow {
+  const row = expectObject(value, path);
+  expectFields(row, path, [
+    'schema',
+    'name',
+    'materialized',
+    'definition',
+    'checkOption',
+    'comment',
+  ]);
+  const schema = expectString(row, path, 'schema');
+  const name = expectString(row, path, 'name');
+  const materialized = expectBoolean(row, path, 'materialized');
+  const checkOption = expectNullableString(row, path, 'checkOption');
+  if (checkOption !== null && checkOption !== 'local' && checkOption !== 'cascaded') {
+    throw new Error(`${path}.checkOption must be "local", "cascaded", or null`);
+  }
+  if (materialized && checkOption !== null) {
+    throw new Error(`${path}: materialized view "${schema}.${name}" cannot carry a check option`);
+  }
+  return {
+    schema,
+    name,
+    materialized,
+    definition: expectString(row, path, 'definition'),
+    checkOption,
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 

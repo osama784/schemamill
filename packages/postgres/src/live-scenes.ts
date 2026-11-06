@@ -143,6 +143,18 @@ import { renderSql } from './render.ts';
  * PostgreSQL 18 run. The target build adds a unique index on the materialized view through raw
  * SQL, which the import must skip by name because a materialized view is not a table.
  *
+ * `comment-introspection` is the five-family comment read's server-derived equality evidence:
+ * the table (with a changed special-character comment), a column comment changed and another
+ * added, a standalone sequence whose comment changes, two plain views (one comment changed,
+ * the check-option view's removed), and a materialized view whose comment changes — the
+ * structure is otherwise identical, so the plan carries comment steps only. `matches-import`
+ * compares the catalog read with the applied dump's import, the catalog checks pin the stored
+ * text and the `check_option=local` reloption on both sides, and the plan check proves a
+ * comment-only change never rebuilds a view. `comment-round-trip` still declares no
+ * `introspection` assertion: its target also carries constraint and index comments, which
+ * catalog introspection does not read until slice 2 (#146 follow-up), so a comment-carrying
+ * model is intentionally not what it returns.
+ *
  * The comment scene carries `comment` through every modeled family: the table (with a changed
  * special-character comment), columns (changed, removed, added), sequences (changed, removed),
  * plain views (added, changed, removed), materialized views (removed, and an unchanged comment
@@ -152,9 +164,8 @@ import { renderSql } from './render.ts';
  * re-asserted named comment, a removed named comment, and a changed unnamed conventional-name
  * comment). Its catalog checks pin the stored text on the target build and after the migration,
  * its import checks compare every imported comment to the target model by structural identity,
- * and its cross-import check adds a comment inventory to the structural `diff` — `diff` is
- * deliberately blind to comments. It declares no `introspection` assertion: the catalog reader
- * does not read comments yet, so a comment-carrying model is intentionally not what it returns.
+ * and its cross-import check adds a comment inventory on top of the structural `diff` — `diff`
+ * does compare comments, but the inventory names a mismatch by entity with both texts.
  *
  * The extension scene carries the whole extension lifecycle: `extension-round-trip` moves a
  * commented `hstore` from `hs1` to `hs2` with a changed comment, installs a commented `pgcrypto`
@@ -557,6 +568,11 @@ const relKindOf = (relationName: string, schema = 'public'): string =>
 /** Whether a materialized view's data is populated: `t` or `f`, via `pg_class.relispopulated`. */
 const relIsPopulated = (relationName: string, schema = 'public'): string =>
   `select relispopulated from pg_class where oid = '${schema}.${relationName}'::regclass`;
+
+/** One relation's `pg_class.reloptions`, comma-joined in stored order, or the empty string. */
+const relOptionsOf = (relationName: string, schema = 'public'): string =>
+  `select array_to_string(reloptions, ',') from pg_class` +
+  ` where oid = '${schema}.${relationName}'::regclass`;
 
 /** Whether the relation named `name` exists, as `t` or `f`: no cast failure for an absent object. */
 const relationExists = (name: string, schema = 'public'): string =>
@@ -5675,6 +5691,230 @@ function commentInventoryDifferences(
   return differences;
 }
 
+/**
+ * The comment-introspection scene: the first scene that asks the catalog read to return a
+ * comment-carrying model. Baseline and target hold the same table, standalone sequence, two
+ * plain views, and one materialized view; only comments move — the table's
+ * special-character comment changes, one column comment changes, another is added, the
+ * sequence comment changes, one view comment changes, the check-option view's comment is
+ * removed, and the materialized view's comment changes. The plan check proves that a
+ * comment-only change emits comment steps and no structural work, so the matview and views are
+ * never rebuilt. `matches-import` then compares the catalog read with the applied dump's
+ * import, so a comment the read drops, invents, or attaches to the wrong entity fails by name.
+ *
+ * `account_summary` is created `WITH NO DATA` on both sides, as the renderer always does. The
+ * check-option view is a single-table SELECT because PostgreSQL only accepts a check option on
+ * an auto-updatable view, and its `check_option=local` reloption is pinned directly, giving the
+ * read's reloption decode live evidence.
+ */
+const commentIntrospectionScene = (): LiveScene => {
+  const specialBaseline = "owner's \\ draft\nline one — naïve ☃";
+  const specialTarget = "owner's \\ revised draft\nline two — naïve ☃ ✓";
+
+  const baseline: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, baseline' }),
+          column('balance', { type: 'integer' }),
+          column('active', { type: 'boolean', notNull: true }),
+        ],
+        comment: specialBaseline,
+      }),
+    ],
+    sequences: [sequence('audit_seq', { comment: 'audit sequence, baseline' })],
+    views: [
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: 'summary, baseline',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE active',
+        comment: 'active accounts, baseline',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, balance FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+        comment: 'positive accounts, baseline',
+      }),
+    ],
+    extensions: [],
+  };
+
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', {
+            type: 'integer',
+            notNull: true,
+            comment: 'identifier, added in target',
+          }),
+          column('email', { notNull: true, comment: 'contact email, target' }),
+          column('balance', { type: 'integer' }),
+          column('active', { type: 'boolean', notNull: true }),
+        ],
+        comment: specialTarget,
+      }),
+    ],
+    sequences: [sequence('audit_seq', { comment: 'audit sequence, target' })],
+    views: [
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: 'summary, target',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE active',
+        comment: 'active accounts, target',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, balance FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+    ],
+    extensions: [],
+  };
+
+  return {
+    name: 'comment-introspection',
+    baseline,
+    target,
+    baselineChecks: [
+      commentCheck(
+        'the baseline stored the special-character accounts table comment exactly',
+        relationComment('accounts'),
+        specialBaseline,
+      ),
+      commentCheck(
+        'the baseline accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, baseline',
+      ),
+      commentCheck(
+        'the baseline accounts.id carries no comment',
+        columnComment('accounts', 'id'),
+        undefined,
+      ),
+      commentCheck(
+        'the baseline standalone sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence, baseline',
+      ),
+      commentCheck(
+        'the baseline plain-view comment',
+        relationComment('active_accounts'),
+        'active accounts, baseline',
+      ),
+      commentCheck(
+        'the baseline check-option view comment',
+        relationComment('positive_accounts'),
+        'positive accounts, baseline',
+      ),
+      commentCheck(
+        'the baseline materialized-view comment',
+        relationComment('account_summary'),
+        'summary, baseline',
+      ),
+      {
+        description: 'the baseline check-option view stores check_option=local',
+        sql: relOptionsOf('positive_accounts'),
+        expected: 'check_option=local',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'a comment-only change plans comment steps and no structural work',
+        failure: (steps) => {
+          const structural = steps.filter((step) => step.kind !== 'comment');
+          if (structural.length > 0) {
+            return `non-comment steps: ${structural.map((step) => step.kind).join(', ')}`;
+          }
+          return steps.length === 7
+            ? undefined
+            : `comment steps: ${steps.length}, expected 7 (${steps
+                .map((step) => step.kind)
+                .join(', ')})`;
+        },
+      },
+    ],
+    checks: [
+      commentCheck(
+        'the migrated database stored the changed special-character table comment exactly',
+        relationComment('accounts'),
+        specialTarget,
+      ),
+      commentCheck(
+        'the migrated database changed the accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, target',
+      ),
+      commentCheck(
+        'the migrated database added the accounts.id comment',
+        columnComment('accounts', 'id'),
+        'identifier, added in target',
+      ),
+      commentCheck(
+        'the migrated database changed the standalone sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence, target',
+      ),
+      commentCheck(
+        'the migrated database changed the plain-view comment',
+        relationComment('active_accounts'),
+        'active accounts, target',
+      ),
+      commentCheck(
+        'the migrated database cleared the check-option view comment',
+        relationComment('positive_accounts'),
+        undefined,
+      ),
+      commentCheck(
+        'the migrated database changed the materialized-view comment',
+        relationComment('account_summary'),
+        'summary, target',
+      ),
+      {
+        description: 'the migrated check-option view still stores check_option=local',
+        sql: relOptionsOf('positive_accounts'),
+        expected: 'check_option=local',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry every target comment, keyed by entity identity',
+        failure: (imported) => {
+          const differences = commentInventoryDifferences(
+            commentInventory(imported.model),
+            commentInventory(target),
+            'imported',
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported comments differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the import names no dropped comment',
+        failure: (imported, source) => {
+          const dropped = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.startsWith('dropped comment'),
+          );
+          return dropped.length === 0
+            ? undefined
+            : `${source}: dropped comments: ${dropped
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
 /** One comment the plan must re-assert after a recreate. */
 interface ReassertedComment {
   readonly label: string;
@@ -5699,10 +5939,11 @@ interface ReassertedComment {
  * intended text, including the special-character comment on both sides; the import checks
  * compare every entity's imported comment, keyed by its model identity, against the target model,
  * so a dump-import loss fails by object and text. The cross-import check then compares the two
- * server-derived imports — structure through `diff`, comments through the inventory — because
- * `diff` is deliberately blind to comments and cannot be the whole guard. There is no
- * `introspection` assertion: the catalog reader does not read comments yet (D13), so a
- * comment-carrying model is intentionally not what it returns.
+ * server-derived imports — structure through `diff`, comments through the inventory — so a
+ * comment mismatch fails by entity with both texts. There is no `introspection` assertion: the
+ * target also carries constraint and index comments, and catalog introspection does not read
+ * those until slice 2 (#146 follow-up), so a comment-carrying model is intentionally not what
+ * it returns.
  */
 const commentRoundTripScene = (): LiveScene => {
   const specialBaseline = "Owner's \\ draft\nline one — naïve ☃";
@@ -6752,6 +6993,7 @@ export const scenes: readonly LiveScene[] = [
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
+  commentIntrospectionScene(),
   commentRoundTripScene(),
   extensionRoundTripScene(),
   exportRoundTripScene(),
