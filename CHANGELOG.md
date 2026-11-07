@@ -61,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ADD PRIMARY KEY USING INDEX imports the key instead of a column-less key** — `@schemamill/postgres`'s dump importer now consumes the named plain column-list unique index for an `ALTER TABLE … ADD [CONSTRAINT name] PRIMARY KEY USING INDEX` — key columns, the constraint's stated name else the index's, and deferrability — and removes the index from the model; a reference it cannot consume skips the whole primary key with a named skip instead of importing a column-less key. The table-level `CREATE TABLE … PRIMARY KEY USING INDEX` shape, which PostgreSQL rejects (`cannot use an existing index in CREATE TABLE`), still imports the table but flags the dropped key ([#140](https://github.com/osama784/schemamill/issues/140)).
 - **Import marks primary-key columns not null** — `@schemamill/postgres`'s dump importer now marks every primary-key key column `notNull` on the model, whichever statement form created the key — inline or table-level `CREATE TABLE`, `ADD COLUMN … PRIMARY KEY`, `ADD PRIMARY KEY`, and `ADD PRIMARY KEY USING INDEX` — matching PostgreSQL, which never leaves a primary-key column nullable; the implied not-null fact is unnamed, so an explicit named `NOT NULL` keeps its name ([#154](https://github.com/osama784/schemamill/issues/154)).
 
+### Documentation
+
+- **README install and quickstart** — `README.md` became a stranger's entry point: prerequisites from `engines` and `packageManager`, a build-from-source install with the real `node packages/cli/dist/index.js` invocation, and a quickstart that writes two small dumps and runs `compare`, `plan`, `init`, and `export` with verified output; the "Where things live" list kept its links and names `CONTEXT.md` and `CHANGELOG.md`.
+
 ## [0.6.0] - 2026-10-03
 
 ### Added
