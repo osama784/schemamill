@@ -3,8 +3,13 @@ import type {
   CheckConstraint,
   Column,
   ColumnFieldChange,
+  CommentTarget,
+  Extension,
+  ExtensionFieldChange,
+  ExtensionIdentity,
   ForeignKey,
   Hazard,
+  HazardEntity,
   IdentityChange,
   IdentityFieldChange,
   IdentityGeneration,
@@ -18,7 +23,11 @@ import type {
   Table,
   TableChange,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
+  ViewFieldChange,
+  ViewIdentity,
 } from '@schemamill/core';
 
 /**
@@ -35,20 +44,34 @@ import type {
  * A diff renders as one block per change, blank-line separated: `+`, `-`, or `~` then
  * `table <schema>.<name>`, followed by four-space-indented member lines; a changed column
  * carries its scalar fields on the `~ column` line and one `identity:` sub-line per identity
- * change after it; sequences render the same way after the table changes, as
- * `sequence <schema>.<name>` with one option per line. A plan renders as a numbered header
+ * change after it; a changed primary key, unique constraint, check constraint, or foreign key
+ * appends the attribute fields that differ — `enforcement`, `deferrable`, `initially deferred`,
+ * in that order — as raw model values (`true`/`false`, with `(none)` for an absent side),
+ * comma-joined after `: ` on the same line and omitted when none differ, so no sub-lines are
+ * added; sequences render the same way after the table changes, as
+ * `sequence <schema>.<name>` with one option per line, views follow the sequences as
+ * `view <schema>.<name>`, a changed view listing its differing `materialized`, `definition`,
+ * and `checkOption` fields, extensions follow the views as `extension <name>` (a name is never
+ * schema-qualified, and a changed extension lists its `schema` change after `: `), and a
+ * comment change closes the diff as
+ * `comment on <target>: <text> → <text>` — signed `+` when the target gains a comment and `-`
+ * when it loses one, both sides `JSON.stringify`-quoted with `(none)` for an absent side. A plan
+ * renders as a numbered header
  * and one line per step: a plan that is a single transactional group covering every step
  * reads `N steps in one transaction:` (singular `1 step in one transaction:`); a plan whose
  * only group is non-transactional reads `N steps outside a transaction:`; a multi-group plan
  * reads `N steps in M groups:` with a `group k of M:` or `group k of M (standalone):` section
  * per group, its steps indented four spaces and numbered continuously; and an empty plan
  * reads `No changes.`. A step's kind label is padded to the longest label in the plan so
- * the details align, and a step's details expose every payload field it carries. A hazards
- * block renders as a `Hazards:` header and one two-space-indented `step <n> <kind>: <clause>`
- * line per hazard, numbered by the step it belongs to, in the payload's order; each clause
- * states the failure PostgreSQL would hit at apply. SQL is not rendered here: the `plan`
- * command prints the plan, then the hazards block when the analysis finds any, then
- * `renderSql`'s output, blank-line separated.
+ * the details align; the details print the member spellings, and the rendered SQL carries a
+ * constraint's attributes. A hazards
+ * block renders as a `Hazards:` header and one two-space-indented
+ * `step <n> <kind> <entity>: <clause>` line per hazard, numbered by the step it belongs to, in
+ * the payload's order; the entity names the sequence (`schema.name`), the identity column
+ * (`schema.table.column`), or the table (`schema.table`) the hazard belongs to, and each
+ * clause states the failure PostgreSQL would hit at apply, the failure it may hit, or the
+ * certain cost it pays. SQL is not rendered here: the `plan` command prints the plan, then the
+ * hazards block when the analysis finds any, then `renderSql`'s output, blank-line separated.
  */
 
 /** The whole diff as `compare` prints it: `No changes.` or one block per change, in order. */
@@ -118,18 +141,39 @@ function formatStepLine(
 
 /**
  * The whole hazards block as `plan` prints it, when the analysis finds any: the `Hazards:`
- * header and one two-space-indented line per hazard, numbered by the hazard's step, in the
- * payload's order. An empty array renders the header alone; `plan` skips the block instead.
+ * header and one two-space-indented `step <n> <kind> <entity>: <clause>` line per hazard,
+ * numbered by the hazard's step and naming the entity it belongs to, in the payload's order.
+ * An empty array renders the header alone; `plan` skips the block instead.
  */
 export function formatHazards(hazards: readonly Hazard[]): string {
   const lines = ['Hazards:'];
   for (const hazard of hazards) {
-    lines.push(`  step ${hazard.step + 1} ${hazard.kind}: ${formatHazard(hazard)}`);
+    lines.push(
+      `  step ${hazard.step + 1} ${hazard.kind} ${formatEntity(hazard.entity)}: ${formatHazard(hazard)}`,
+    );
   }
   return `${lines.join('\n')}\n`;
 }
 
-/** One hazard's clause: the definite failure PostgreSQL hits at apply, or the conditional one. */
+/**
+ * The hazard entity's label: `schema.name` for a sequence or table, `schema.table.column` for
+ * a column.
+ */
+function formatEntity(entity: HazardEntity): string {
+  switch (entity.kind) {
+    case 'sequence':
+      return formatIdentity(entity.sequence);
+    case 'identity-column':
+      return `${formatIdentity(entity.table)}.${entity.column}`;
+    case 'table':
+      return formatIdentity(entity.table);
+  }
+}
+
+/**
+ * One hazard's clause: the definite failure PostgreSQL hits at apply, the conditional one it
+ * may hit, or the certain cost of a table rewrite.
+ */
 function formatHazard(hazard: Hazard): string {
   switch (hazard.kind) {
     case 'increment-zero':
@@ -146,6 +190,8 @@ function formatHazard(hazard: Hazard): string {
       return `${formatBoundField(hazard.field)} ${hazard.value} is out of range for sequence data type ${hazard.dataType} — PostgreSQL rejects this at apply.`;
     case 'bound-tightened':
       return `${formatBoundField(hazard.field, true)} ${hazard.before} → ${hazard.after} — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.`;
+    case 'table-rewrite':
+      return `${hazard.persistence === undefined ? 'SET LOGGED' : 'SET UNLOGGED'} rewrites the table under an ACCESS EXCLUSIVE lock.`;
   }
 }
 
@@ -179,6 +225,20 @@ function formatChange(change: Change): string {
       }
       return lines.join('\n');
     }
+    case 'view-added':
+      return formatView('+', change.view);
+    case 'view-removed':
+      return formatView('-', change.view);
+    case 'view-changed':
+      return formatViewChange(change.view, change.changes);
+    case 'extension-added':
+      return formatExtension('+', change.extension);
+    case 'extension-removed':
+      return formatExtension('-', change.extension);
+    case 'extension-changed':
+      return formatExtensionChange(change.extension, change.changes);
+    case 'comment-changed':
+      return formatCommentChange(change.target, change.before, change.after);
   }
 }
 
@@ -214,34 +274,100 @@ function formatTableChange(change: TableChange): string {
       return `+ ${formatPrimaryKey(change.primaryKey)}`;
     case 'primary-key-removed':
       return `- ${formatPrimaryKey(change.primaryKey)}`;
-    case 'primary-key-changed':
-      return `~ primary key ${formatPrimaryKeySide(change.before)} → ${formatPrimaryKeySide(
+    case 'primary-key-changed': {
+      const fields: string[] = [];
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      const sides = `~ primary key ${formatPrimaryKeySide(change.before)} → ${formatPrimaryKeySide(
         change.after,
       )}`;
+      return fields.length === 0 ? sides : `${sides}: ${fields.join(', ')}`;
+    }
     case 'foreign-key-added':
       return `+ ${formatForeignKey(change.foreignKey)}`;
     case 'foreign-key-removed':
       return `- ${formatForeignKey(change.foreignKey)}`;
-    case 'foreign-key-changed':
-      return `~ foreign key (${change.before.columns.join(', ')}) → ${formatIdentity(
+    case 'foreign-key-changed': {
+      const fields = formatForeignKeyChanges(change.before, change.after);
+      if (change.before.enforcement !== change.after.enforcement) {
+        fields.push(
+          `enforcement ${formatOptional(change.before.enforcement)} → ${formatOptional(
+            change.after.enforcement,
+          )}`,
+        );
+      }
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      const base = `~ foreign key (${change.before.columns.join(', ')}) → ${formatIdentity(
         change.before.referencedTable,
-      )}: ${formatForeignKeyChanges(change.before, change.after)}`;
+      )}`;
+      return fields.length === 0 ? base : `${base}: ${fields.join(', ')}`;
+    }
     case 'unique-constraint-added':
       return `+ ${formatUniqueConstraint(change.uniqueConstraint)}`;
     case 'unique-constraint-removed':
       return `- ${formatUniqueConstraint(change.uniqueConstraint)}`;
-    case 'unique-constraint-changed':
-      return `~ unique constraint (${change.before.columns.join(
-        ', ',
-      )}): name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`;
+    case 'unique-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      return `~ unique constraint (${change.before.columns.join(', ')}): ${fields.join(', ')}`;
+    }
     case 'check-constraint-added':
       return `+ ${formatCheckConstraint(change.checkConstraint)}`;
     case 'check-constraint-removed':
       return `- ${formatCheckConstraint(change.checkConstraint)}`;
-    case 'check-constraint-changed':
-      return `~ check constraint (${change.before.expression}): name ${formatOptional(
-        change.before.name,
-      )} → ${formatOptional(change.after.name)}`;
+    case 'check-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.enforcement !== change.after.enforcement) {
+        fields.push(
+          `enforcement ${formatOptional(change.before.enforcement)} → ${formatOptional(
+            change.after.enforcement,
+          )}`,
+        );
+      }
+      return `~ check constraint (${change.before.expression}): ${fields.join(', ')}`;
+    }
     case 'index-added':
       return `+ ${formatIndex(change.index)}`;
     case 'index-removed':
@@ -251,12 +377,20 @@ function formatTableChange(change: TableChange): string {
         change.before,
         change.after,
       )}`;
+    case 'persistence-changed':
+      return `persistence ${formatPersistence(change.before)} → ${formatPersistence(change.after)}`;
   }
 }
 
-/** One step's details: every payload field the step carries, in the step kind's order. */
+/**
+ * One step's details: the identity and member spellings, plus an `alter-*` step's changed
+ * values and a comment step's quoted text; constraint attributes and create-time bodies are
+ * carried by the rendered SQL.
+ */
 function formatStep(step: Step): string {
   switch (step.kind) {
+    case 'create-schema':
+      return step.schema;
     case 'create-table':
     case 'drop-table':
       return formatIdentity(step.table);
@@ -265,6 +399,13 @@ function formatStep(step: Step): string {
       return `${formatIdentity(step.table)}.${formatColumn(step.column)}`;
     case 'alter-column':
       return `${formatIdentity(step.table)}.${step.name}: ${formatColumnFields(step.fields)}`;
+    case 'drop-not-null':
+    case 'add-not-null':
+      return step.name === undefined
+        ? `${formatIdentity(step.table)}.${step.column}`
+        : `${formatIdentity(step.table)}.${step.column} (${step.name})`;
+    case 'alter-persistence':
+      return `${formatIdentity(step.table)}: persistence ${formatPersistence(step.persistence)}`;
     case 'add-identity':
     case 'drop-identity':
       return `${formatIdentity(step.table)}.${step.name}`;
@@ -294,6 +435,17 @@ function formatStep(step: Step): string {
       return formatIdentity(step.sequence);
     case 'alter-sequence':
       return `${formatIdentity(step.sequence)}: ${step.fields.map(formatSequenceField).join(', ')}`;
+    case 'create-extension':
+    case 'drop-extension':
+      return step.extension.name;
+    case 'alter-extension':
+      return `${step.extension.name}: ${step.fields.map(formatExtensionField).join(', ')}`;
+    case 'create-view':
+    case 'replace-view':
+    case 'drop-view':
+      return formatIdentity(step.view);
+    case 'comment':
+      return `${formatCommentTarget(step.target)}: ${formatCommentText(step.text)}`;
   }
 }
 
@@ -303,14 +455,18 @@ function formatIdentity(identity: TableIdentity): string {
 }
 
 /**
- * A column as `<name> <type>` plus ` NOT NULL`, ` DEFAULT <default>`, and, when it carries one,
- * a compact `identity: GENERATED …` clause naming the generation mode. The identity descriptor's
- * sequence name and options are not spelled out here; a changed column's identity options get
- * their own `identity:` sub-lines.
+ * A column as `<name> <type>` plus, when present, `collation <c>`, `storage <word>`, and
+ * `compression <word>`, then ` NOT NULL`, ` DEFAULT <default>`, and, when it carries one,
+ * a compact `identity: GENERATED …` clause naming the generation mode. The identity
+ * descriptor's sequence name and options are not spelled out here; a changed column's
+ * identity options get their own `identity:` sub-lines.
  */
 function formatColumn(column: Column): string {
   const nameAndType = [column.name, column.type].filter((part) => part !== '').join(' ');
   const clauses: string[] = [];
+  if (column.collation !== undefined) clauses.push(`collation ${column.collation}`);
+  if (column.storage !== undefined) clauses.push(`storage ${column.storage}`);
+  if (column.compression !== undefined) clauses.push(`compression ${column.compression}`);
   if (column.notNull) clauses.push('NOT NULL');
   if (column.default !== undefined && column.default !== '') {
     clauses.push(`DEFAULT ${column.default}`);
@@ -404,6 +560,119 @@ function formatSequenceField(field: SequenceFieldChange): string {
 }
 
 /**
+ * A view's line: `view <schema>.<name>`; an addition or removal prefixes the change sign, and
+ * a changed view's differing fields follow it on their own indented lines.
+ */
+function formatView(sign: string, view: View): string {
+  return `${sign} view ${formatIdentity(view)}`;
+}
+
+/** A changed view: the identity line, then one line per differing field in the diff's order. */
+function formatViewChange(view: ViewIdentity, changes: readonly ViewFieldChange[]): string {
+  const lines = [`~ view ${formatIdentity(view)}`];
+  for (const change of changes) lines.push(`    ${formatViewField(change)}`);
+  return lines.join('\n');
+}
+
+/** One changed view field; an absent check option prints `(none)`. */
+function formatViewField(field: ViewFieldChange): string {
+  switch (field.field) {
+    case 'materialized':
+      return `materialized ${String(field.before)} → ${String(field.after)}`;
+    case 'definition':
+      return `definition ${field.before} → ${field.after}`;
+    case 'checkOption':
+      return `checkOption ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+  }
+}
+
+/** An extension's line: `extension <name>`; a name is never schema-qualified. */
+function formatExtension(sign: string, extension: Extension): string {
+  return `${sign} extension ${extension.name}`;
+}
+
+/** A changed extension: the identity, then each differing field after `: `. */
+function formatExtensionChange(
+  extension: ExtensionIdentity,
+  changes: readonly ExtensionFieldChange[],
+): string {
+  return `~ extension ${extension.name}: ${changes.map(formatExtensionField).join(', ')}`;
+}
+
+/** One changed extension field; `schema` is the union's only member today. */
+function formatExtensionField(field: ExtensionFieldChange): string {
+  switch (field.field) {
+    case 'schema':
+      return `schema ${field.before} → ${field.after}`;
+  }
+}
+
+/**
+ * A comment change: `+` when the target gains a comment, `-` when it loses one, `~` when the
+ * text changes. Each side is `JSON.stringify`-quoted so whitespace and escapes stay visible,
+ * and an absent side prints `(none)`.
+ */
+function formatCommentChange(
+  target: CommentTarget,
+  before: string | undefined,
+  after: string | undefined,
+): string {
+  const sign = before === undefined ? '+' : after === undefined ? '-' : '~';
+  return `${sign} comment on ${formatCommentTarget(target)}: ${formatCommentText(
+    before,
+  )} → ${formatCommentText(after)}`;
+}
+
+/**
+ * A comment target's spelling: the `COMMENT ON` object form, then the identity the model
+ * carries. A named index's stored name is its identity and is printed when present; an
+ * unnamed index is keyed by its structure and its server name is synthesized only at render
+ * time. A constraint's stored name is not identity and is not printed.
+ */
+function formatCommentTarget(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return `table ${formatIdentity(target.table)}`;
+    case 'column':
+      return `column ${formatIdentity(target.table)}.${target.column}`;
+    case 'sequence':
+      return `sequence ${formatIdentity(target.sequence)}`;
+    case 'view':
+      return `${target.materialized ? 'materialized view' : 'view'} ${formatIdentity(target.view)}`;
+    case 'extension':
+      return `extension ${target.extension.name}`;
+    case 'index': {
+      const unique = target.index.unique ? 'unique ' : '';
+      const name = target.index.name === undefined ? '' : ` — ${target.index.name}`;
+      return `${unique}index ${formatIdentity(target.table)} (${target.index.columns.join(
+        ', ',
+      )})${name}`;
+    }
+    case 'primary-key':
+      return `primary key ${formatIdentity(target.table)} (${target.primaryKey.columns.join(
+        ', ',
+      )})`;
+    case 'unique-constraint':
+      return `unique constraint ${formatIdentity(target.table)} (${target.uniqueConstraint.columns.join(
+        ', ',
+      )})`;
+    case 'check-constraint':
+      return `check constraint ${formatIdentity(target.table)} (${
+        target.checkConstraint.expression
+      })`;
+    case 'foreign-key':
+      return `foreign key ${formatIdentity(target.table)} (${target.foreignKey.columns.join(
+        ', ',
+      )}) → ${formatIdentity(target.foreignKey.referencedTable)}`;
+  }
+}
+
+/** A comment's text as a plan line prints it: `JSON.stringify`-quoted, `(none)` when absent. */
+function formatCommentText(text: string | undefined): string {
+  return text === undefined ? '(none)' : JSON.stringify(text);
+}
+
+/**
  * A `minValue`/`maxValue` change; `(converted)` marks a `before` value the engine's type
  * conversion produced rather than one the baseline stated, so the line never presents a
  * converted value as the as-written baseline.
@@ -427,15 +696,26 @@ function formatColumnFields(fields: readonly ColumnFieldChange[]): string {
   return fields.map(formatColumnField).join(', ');
 }
 
-/** One column field change; `default` names the absent side `(none)`. */
+/**
+ * One column field change; `default`, `notNullName`, `collation`, `storage`, and
+ * `compression` name the absent side `(none)`.
+ */
 function formatColumnField(field: ColumnFieldChange): string {
   switch (field.field) {
     case 'type':
       return `type ${field.before} → ${field.after}`;
     case 'notNull':
       return `not null ${String(field.before)} → ${String(field.after)}`;
+    case 'notNullName':
+      return `not null name ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
     case 'default':
       return `default ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'collation':
+      return `collation ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'storage':
+      return `storage ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'compression':
+      return `compression ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
   }
 }
 
@@ -507,10 +787,10 @@ function formatGeneration(generation: IdentityGeneration): string {
 
 /**
  * A changed foreign-key pair's differing fields — name, referenced columns, `ON UPDATE`,
- * `ON DELETE`, in that order, joined `, `. The pairing identity (referencing columns →
- * referenced table) anchors the line and is never repeated here.
+ * `ON DELETE`, in that order. The pairing identity (referencing columns → referenced table)
+ * anchors the line and is never repeated here.
  */
-function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string {
+function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string[] {
   const fields: string[] = [];
   if (before.name !== after.name) {
     fields.push(`name ${formatOptional(before.name)} → ${formatOptional(after.name)}`);
@@ -528,7 +808,7 @@ function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string 
   if (before.onDelete !== after.onDelete) {
     fields.push(`on delete ${formatOptional(before.onDelete)} → ${formatOptional(after.onDelete)}`);
   }
-  return fields.join(', ');
+  return fields;
 }
 
 /**
@@ -547,9 +827,19 @@ function formatIndexChanges(before: Index, after: Index): string {
   return fields.join(', ');
 }
 
+/** The effective persistence word: absent means `LOGGED`, PostgreSQL's default. */
+function formatPersistence(persistence: TablePersistence | undefined): string {
+  return persistence ?? 'logged';
+}
+
 /** The value when present, `(none)` when the payload omits it. */
 function formatOptional(value: string | undefined): string {
   return value === undefined ? '(none)' : value;
+}
+
+/** A boolean as stored, `(none)` when the payload omits it. */
+function formatBooleanOptional(value: boolean | undefined): string {
+  return value === undefined ? '(none)' : String(value);
 }
 
 /** Whether two column-name arrays hold exactly the same names in the same order. */

@@ -1,0 +1,24 @@
+10 steps in one transaction:
+  1. drop-view     public.account_totals
+  2. drop-view     public.obsolete_accounts
+  3. drop-view     public.obsolete_totals
+  4. drop-view     public.promote_me
+  5. create-view   public.account_totals
+  6. create-view   public.positive_accounts
+  7. create-view   public.promote_me
+  8. create-view   public.recent_accounts
+  9. replace-view  public.active_accounts
+ 10. replace-view  public.checked_accounts
+
+BEGIN;
+DROP MATERIALIZED VIEW public.account_totals;
+DROP VIEW public.obsolete_accounts;
+DROP MATERIALIZED VIEW public.obsolete_totals;
+DROP VIEW public.promote_me;
+CREATE MATERIALIZED VIEW public.account_totals AS SELECT count(*) AS n FROM public.accounts WHERE active WITH NO DATA;
+CREATE VIEW public.positive_accounts AS SELECT id FROM public.accounts WHERE balance >= 0 WITH LOCAL CHECK OPTION;
+CREATE MATERIALIZED VIEW public.promote_me AS SELECT id FROM public.accounts WITH NO DATA;
+CREATE MATERIALIZED VIEW public.recent_accounts AS SELECT id FROM public.accounts WHERE active WITH NO DATA;
+CREATE OR REPLACE VIEW public.active_accounts AS SELECT id,email,active FROM public.accounts WHERE active AND email IS NOT NULL;
+CREATE OR REPLACE VIEW public.checked_accounts AS SELECT id FROM public.accounts WHERE balance > 0 WITH CASCADED CHECK OPTION;
+COMMIT;

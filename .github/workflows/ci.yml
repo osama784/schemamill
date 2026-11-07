@@ -49,11 +49,15 @@ jobs:
         run: pnpm format:check
 
   verify-postgres:
-    name: verify-postgres (node 24, postgres 18)
+    name: verify-postgres (node 24, postgres ${{ matrix.postgres }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['13', '18']
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -81,16 +85,16 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # The live-PostgreSQL harness spawns psql and pg_dump from PATH; install the PGDG client
-      # tools so they match the postgres:18 service. On the next PostgreSQL major, bump all
-      # three pins together: the `postgres:18` service image above, the `postgresql-client-18`
-      # package below, and the `/usr/lib/postgresql/18/bin` prefix on the test step's PATH.
-      - name: Install PostgreSQL 18 client tools
+      # tools so they match the postgres:${{ matrix.postgres }} service. The service image,
+      # client package, and PATH prefix move together per matrix entry; keep the two entries
+      # aligned with MIN_TARGET_VERSION (13) and MAX_TARGET_VERSION (18).
+      - name: Install PostgreSQL ${{ matrix.postgres }} client tools
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl --retry 3 --retry-delay 2 --retry-connrefused -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 -y install postgresql-client-18
+          sudo apt-get -o Acquire::Retries=3 -y install postgresql-client-${{ matrix.postgres }}
 
       - name: Build
         run: pnpm build
@@ -98,4 +102,4 @@ jobs:
       - name: Test against live PostgreSQL
         env:
           SCHEMAMILL_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: PATH="/usr/lib/postgresql/18/bin:$PATH" pnpm --filter @schemamill/postgres test
+        run: PATH="/usr/lib/postgresql/${{ matrix.postgres }}/bin:$PATH" pnpm --filter @schemamill/postgres test

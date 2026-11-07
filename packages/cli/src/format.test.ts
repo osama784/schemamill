@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { Change, Hazard, Identity, IdentityChange, Plan } from '@schemamill/core';
+import type {
+  Change,
+  Column,
+  CommentTarget,
+  Hazard,
+  Identity,
+  IdentityChange,
+  Plan,
+} from '@schemamill/core';
 
 import { formatChanges, formatHazards, formatPlan } from './format.ts';
 
@@ -9,7 +17,8 @@ import { formatChanges, formatHazards, formatPlan } from './format.ts';
  * Tests for the CLI renderings: the converted-bound wording on a sequence or identity type
  * conversion, where the diff reports the value in effect after the engine's conversion rather
  * than the as-written baseline value; the identity change lines; the identity plan steps and
- * the plan header's one-transaction wording; and the hazard clauses.
+ * the plan header's one-transaction wording; the comment change and comment step lines; and
+ * the hazard clauses.
  */
 
 test('a converted sequence bound prints with the converted mark', () => {
@@ -292,6 +301,132 @@ test('added and removed columns and added tables surface an identity column', ()
   );
 });
 
+test('column attribute changes print the collation, storage, and compression samples', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'label',
+          fields: [
+            { field: 'collation', after: 'pg_catalog."C"' },
+            { field: 'storage', before: 'extended' },
+            { field: 'compression', after: 'lz4' },
+          ],
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    ~ column label: collation (none) → pg_catalog."C", storage extended → (none), compression (none) → lz4',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a persistence change prints the effective words in both directions', () => {
+  const toUnlogged: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [{ kind: 'persistence-changed', after: 'unlogged' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(toUnlogged),
+    ['~ table public.users', '    persistence logged → unlogged', ''].join('\n'),
+  );
+
+  const toLogged: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [{ kind: 'persistence-changed', before: 'unlogged' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(toLogged),
+    ['~ table public.users', '    persistence unlogged → logged', ''].join('\n'),
+  );
+});
+
+test('an alter-persistence step prints the target persistence, absent reading logged', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'alter-persistence',
+        table: { schema: 'public', name: 'users' },
+        persistence: 'unlogged',
+      },
+      { kind: 'alter-persistence', table: { schema: 'public', name: 'audit' } },
+    ],
+    groups: [{ start: 0, end: 2, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '2 steps in one transaction:',
+      ' 1. alter-persistence  public.users: persistence unlogged',
+      ' 2. alter-persistence  public.audit: persistence logged',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('added and removed columns print their attributes before the constraints', () => {
+  const attributed: Column = {
+    name: 'label',
+    type: 'text',
+    notNull: true,
+    default: "'x'",
+    collation: 'pg_catalog."C"',
+    storage: 'extended',
+    compression: 'lz4',
+  };
+
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-added',
+      table: {
+        schema: 'public',
+        name: 'users',
+        columns: [attributed],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+        persistence: 'unlogged',
+      },
+    },
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'kept' },
+      changes: [{ kind: 'column-added', column: attributed }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '+ table public.users',
+      '    label text collation pg_catalog."C" storage extended compression lz4 NOT NULL DEFAULT \'x\'',
+      '',
+      '~ table public.kept',
+      '    + column label text collation pg_catalog."C" storage extended compression lz4 NOT NULL DEFAULT \'x\'',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('constraint and index plan steps print the table and the constrained member', () => {
   const plan: Plan = {
     steps: [
@@ -432,6 +567,96 @@ test('constraint and index member changes print in the diff vocabulary', () => {
   );
 });
 
+test('constraint attribute changes print their enforcement and deferrability', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 'users' },
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { columns: ['id'] },
+          after: { columns: ['id'], deferrable: true, initiallyDeferred: true },
+        },
+        {
+          kind: 'primary-key-changed',
+          before: { name: 'u_pkey', columns: ['id'] },
+          after: { name: 'u_pkey', columns: ['id', 'org_id'] },
+        },
+        {
+          kind: 'primary-key-changed',
+          before: { columns: ['id'], deferrable: false },
+          after: { columns: ['id'], deferrable: true },
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: { columns: ['email'] },
+          after: { columns: ['email'], deferrable: true },
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: { name: 'u1', columns: ['email'], deferrable: true },
+          after: { name: 'u2', columns: ['email'] },
+        },
+        {
+          kind: 'check-constraint-changed',
+          before: { expression: 'x > 0' },
+          after: { name: 'c2', expression: 'x > 0', enforcement: 'not-enforced' },
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          },
+          after: {
+            name: 'fk2',
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            enforcement: 'not-enforced',
+            deferrable: true,
+            initiallyDeferred: true,
+          },
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            onDelete: 'RESTRICT',
+          },
+          after: {
+            columns: ['team_id'],
+            referencedTable: { schema: 'public', name: 'teams' },
+            referencedColumns: ['id'],
+            onDelete: 'CASCADE',
+          },
+        },
+      ],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ table public.users',
+      '    ~ primary key (id) → (id): deferrable (none) → true, initially deferred (none) → true',
+      '    ~ primary key u_pkey (id) → u_pkey (id, org_id)',
+      '    ~ primary key (id) → (id): deferrable false → true',
+      '    ~ unique constraint (email): name (none) → (none), deferrable (none) → true',
+      '    ~ unique constraint (email): name u1 → u2, deferrable true → (none)',
+      '    ~ check constraint (x > 0): name (none) → c2, enforcement (none) → not-enforced',
+      '    ~ foreign key (team_id) → public.teams: name (none) → fk2, enforcement not-valid → not-enforced, deferrable (none) → true, initially deferred (none) → true',
+      '    ~ foreign key (team_id) → public.teams: on delete RESTRICT → CASCADE',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('added and removed tables list their constraints and indexes', () => {
   const changes: readonly Change[] = [
     {
@@ -481,23 +706,35 @@ test('added and removed tables list their constraints and indexes', () => {
 
 test('an increment-zero hazard states the rejection at apply', () => {
   assert.equal(
-    formatHazards([{ kind: 'increment-zero', step: 0, increment: '0' }]),
+    formatHazards([
+      {
+        kind: 'increment-zero',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        increment: '0',
+      },
+    ]),
     [
       'Hazards:',
-      '  step 1 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
+      '  step 1 increment-zero public.s: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
       '',
     ].join('\n'),
   );
 });
 
 test('a cache-nonpositive hazard states the rejection at apply with the actual cache', () => {
-  const cache = (value: string): Hazard => ({ kind: 'cache-nonpositive', step: 0, cache: value });
+  const cache = (value: string): Hazard => ({
+    kind: 'cache-nonpositive',
+    step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+    cache: value,
+  });
 
   assert.equal(
     formatHazards([cache('0')]),
     [
       'Hazards:',
-      '  step 1 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      '  step 1 cache-nonpositive public.s: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
       '',
     ].join('\n'),
   );
@@ -505,7 +742,7 @@ test('a cache-nonpositive hazard states the rejection at apply with the actual c
     formatHazards([cache('-5')]),
     [
       'Hazards:',
-      '  step 1 cache-nonpositive: CACHE -5 — PostgreSQL rejects this at apply (CACHE (-5) must be greater than zero).',
+      '  step 1 cache-nonpositive public.s: CACHE -5 — PostgreSQL rejects this at apply (CACHE (-5) must be greater than zero).',
       '',
     ].join('\n'),
   );
@@ -513,18 +750,34 @@ test('a cache-nonpositive hazard states the rejection at apply with the actual c
 
 test('a bounds-inverted hazard states the rejection at apply with both bounds', () => {
   assert.equal(
-    formatHazards([{ kind: 'bounds-inverted', step: 0, minValue: '100', maxValue: '100' }]),
+    formatHazards([
+      {
+        kind: 'bounds-inverted',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        minValue: '100',
+        maxValue: '100',
+      },
+    ]),
     [
       'Hazards:',
-      '  step 1 bounds-inverted: MINVALUE 100 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
+      '  step 1 bounds-inverted public.s: MINVALUE 100 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
   assert.equal(
-    formatHazards([{ kind: 'bounds-inverted', step: 0, minValue: '500', maxValue: '100' }]),
+    formatHazards([
+      {
+        kind: 'bounds-inverted',
+        step: 0,
+        entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+        minValue: '500',
+        maxValue: '100',
+      },
+    ]),
     [
       'Hazards:',
-      '  step 1 bounds-inverted: MINVALUE 500 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
+      '  step 1 bounds-inverted public.s: MINVALUE 500 must be less than MAXVALUE 100 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -534,6 +787,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
   const outOfBounds = (start: string, minValue: string, maxValue: string): Hazard => ({
     kind: 'start-out-of-bounds',
     step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
     start,
     minValue,
     maxValue,
@@ -543,7 +797,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
     formatHazards([outOfBounds('100', '1', '50')]),
     [
       'Hazards:',
-      '  step 1 start-out-of-bounds: START 100 is greater than MAXVALUE 50 — PostgreSQL rejects this at apply.',
+      '  step 1 start-out-of-bounds public.s: START 100 is greater than MAXVALUE 50 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -551,7 +805,7 @@ test('a start-out-of-bounds hazard names the edge the start crosses', () => {
     formatHazards([outOfBounds('-100', '0', '100')]),
     [
       'Hazards:',
-      '  step 1 start-out-of-bounds: START -100 is less than MINVALUE 0 — PostgreSQL rejects this at apply.',
+      '  step 1 start-out-of-bounds public.s: START -100 is less than MINVALUE 0 — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -562,13 +816,20 @@ test('a bound-out-of-type-range hazard names the bound, value, and data type', (
     field: 'min' | 'max',
     value: string,
     dataType: 'smallint' | 'integer' | 'bigint',
-  ): Hazard => ({ kind: 'bound-out-of-type-range', step: 0, dataType, field, value });
+  ): Hazard => ({
+    kind: 'bound-out-of-type-range',
+    step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+    dataType,
+    field,
+    value,
+  });
 
   assert.equal(
     formatHazards([outOfRange('max', '9999999999', 'integer')]),
     [
       'Hazards:',
-      '  step 1 bound-out-of-type-range: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.',
+      '  step 1 bound-out-of-type-range public.s: MAXVALUE 9999999999 is out of range for sequence data type integer — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -576,7 +837,7 @@ test('a bound-out-of-type-range hazard names the bound, value, and data type', (
     formatHazards([outOfRange('min', '-32769', 'smallint')]),
     [
       'Hazards:',
-      '  step 1 bound-out-of-type-range: MINVALUE -32769 is out of range for sequence data type smallint — PostgreSQL rejects this at apply.',
+      '  step 1 bound-out-of-type-range public.s: MINVALUE -32769 is out of range for sequence data type smallint — PostgreSQL rejects this at apply.',
       '',
     ].join('\n'),
   );
@@ -586,6 +847,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
   const tightened = (field: 'min' | 'max', before: string, after: string): Hazard => ({
     kind: 'bound-tightened',
     step: 0,
+    entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
     field,
     before,
     after,
@@ -595,7 +857,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
     formatHazards([tightened('max', '2147483647', '99')]),
     [
       'Hazards:',
-      "  step 1 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      "  step 1 bound-tightened public.s: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -603,7 +865,7 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
     formatHazards([tightened('min', '1', '10')]),
     [
       'Hazards:',
-      "  step 1 bound-tightened: min value 1 → 10 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      "  step 1 bound-tightened public.s: min value 1 → 10 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -611,18 +873,35 @@ test('a bound-tightened hazard names the field, both values, and the unmodeled s
 
 test('multiple hazards render in payload order, numbered by their step', () => {
   const hazards: readonly Hazard[] = [
-    { kind: 'cache-nonpositive', step: 4, cache: '0' },
-    { kind: 'increment-zero', step: 0, increment: '0' },
-    { kind: 'bound-tightened', step: 11, field: 'max', before: '2147483647', after: '99' },
+    {
+      kind: 'cache-nonpositive',
+      step: 4,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'a' } },
+      cache: '0',
+    },
+    {
+      kind: 'increment-zero',
+      step: 0,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 'b' } },
+      increment: '0',
+    },
+    {
+      kind: 'bound-tightened',
+      step: 11,
+      entity: { kind: 'identity-column', table: { schema: 'public', name: 't' }, column: 'id' },
+      field: 'max',
+      before: '2147483647',
+      after: '99',
+    },
   ];
 
   assert.equal(
     formatHazards(hazards),
     [
       'Hazards:',
-      '  step 5 cache-nonpositive: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
-      '  step 1 increment-zero: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
-      "  step 12 bound-tightened: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      '  step 5 cache-nonpositive public.a: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      '  step 1 increment-zero public.b: INCREMENT 0 — PostgreSQL rejects this at apply (INCREMENT must not be zero).',
+      "  step 12 bound-tightened public.t.id: max value 2147483647 → 99 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
       '',
     ].join('\n'),
   );
@@ -630,4 +909,431 @@ test('multiple hazards render in payload order, numbered by their step', () => {
 
 test('no hazards render as the header alone', () => {
   assert.equal(formatHazards([]), 'Hazards:\n');
+});
+
+test('mixed sequence and identity column hazards print two- and three-part labels', () => {
+  const hazards: readonly Hazard[] = [
+    {
+      kind: 'cache-nonpositive',
+      step: 0,
+      entity: { kind: 'sequence', sequence: { schema: 'public', name: 's' } },
+      cache: '0',
+    },
+    {
+      kind: 'bound-tightened',
+      step: 3,
+      entity: { kind: 'identity-column', table: { schema: 'app', name: 'users' }, column: 'id' },
+      field: 'max',
+      before: '100',
+      after: '50',
+    },
+  ];
+
+  assert.equal(
+    formatHazards(hazards),
+    [
+      'Hazards:',
+      '  step 1 cache-nonpositive public.s: CACHE 0 — PostgreSQL rejects this at apply (CACHE (0) must be greater than zero).',
+      "  step 4 bound-tightened app.users.id: max value 100 → 50 — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.",
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a table-rewrite hazard labels the table and states the certain cost in both directions', () => {
+  const hazards: readonly Hazard[] = [
+    {
+      kind: 'table-rewrite',
+      step: 0,
+      entity: { kind: 'table', table: { schema: 'public', name: 'flipped' } },
+      persistence: 'unlogged',
+    },
+    {
+      kind: 'table-rewrite',
+      step: 1,
+      entity: { kind: 'table', table: { schema: 'public', name: 'backed' } },
+    },
+  ];
+
+  assert.equal(
+    formatHazards(hazards),
+    [
+      'Hazards:',
+      '  step 1 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.',
+      '  step 2 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('view additions and removals print as a view line', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-added',
+      view: { schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' },
+    },
+    {
+      kind: 'view-removed',
+      view: { schema: 'app', name: 'totals', materialized: true, definition: 'SELECT 2' },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    ['+ view public.active', '', '- view app.totals', ''].join('\n'),
+  );
+});
+
+test('a changed view appends its differing fields in the diff order', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-changed',
+      view: { schema: 'public', name: 'active' },
+      changes: [
+        { field: 'materialized', before: false, after: true },
+        { field: 'definition', before: 'SELECT 1', after: 'SELECT 2' },
+        { field: 'checkOption', after: 'local' },
+      ],
+      before: { schema: 'public', name: 'active', materialized: false, definition: 'SELECT 1' },
+      after: {
+        schema: 'public',
+        name: 'active',
+        materialized: true,
+        definition: 'SELECT 2',
+      },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ view public.active',
+      '    materialized false → true',
+      '    definition SELECT 1 → SELECT 2',
+      '    checkOption (none) → local',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a check option removal prints the absent target as (none)', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-changed',
+      view: { schema: 'public', name: 'v' },
+      changes: [{ field: 'checkOption', before: 'cascaded' }],
+      before: {
+        schema: 'public',
+        name: 'v',
+        materialized: false,
+        definition: 'SELECT 1',
+        checkOption: 'cascaded',
+      },
+      after: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    ['~ view public.v', '    checkOption cascaded → (none)', ''].join('\n'),
+  );
+});
+
+test('view plan steps print their identity', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'create-view',
+        view: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+      },
+      {
+        kind: 'replace-view',
+        view: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 2' },
+      },
+      { kind: 'drop-view', view: { schema: 'public', name: 'w' }, materialized: false },
+    ],
+    groups: [{ start: 0, end: 3, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '3 steps in one transaction:',
+      ' 1. create-view   public.v',
+      ' 2. replace-view  public.v',
+      ' 3. drop-view     public.w',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('extension changes print additions, removals, and schema moves', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'extension-added',
+      extension: { name: 'btree_gist', schema: 'public', comment: 'GiST index support' },
+    },
+    {
+      kind: 'extension-removed',
+      extension: { name: 'citext', schema: 'public', comment: 'case-insensitive text' },
+    },
+    {
+      kind: 'extension-changed',
+      extension: { name: 'hstore' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '+ extension btree_gist',
+      '',
+      '- extension citext',
+      '',
+      '~ extension hstore: schema hs1 → hs2',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('extension plan steps print the bare name and the moved schema', () => {
+  const plan: Plan = {
+    steps: [
+      { kind: 'create-extension', extension: { name: 'btree_gist', schema: 'public' } },
+      {
+        kind: 'alter-extension',
+        extension: { name: 'hstore' },
+        fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+      { kind: 'drop-extension', extension: { name: 'citext' } },
+    ],
+    groups: [{ start: 0, end: 3, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '3 steps in one transaction:',
+      ' 1. create-extension  btree_gist',
+      ' 2. alter-extension   hstore: schema hs1 → hs2',
+      ' 3. drop-extension    citext',
+      '',
+    ].join('\n'),
+  );
+});
+
+const users = { schema: 'public', name: 'users' } as const;
+
+/** Every comment target shape, with the exact spelling the CLI prints for it. */
+const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
+  ['table public.users', { kind: 'table', table: users }],
+  ['column public.users.email', { kind: 'column', table: users, column: 'email' }],
+  [
+    'sequence public.invoice_seq',
+    { kind: 'sequence', sequence: { schema: 'public', name: 'invoice_seq' } },
+  ],
+  [
+    'view public.active_accounts',
+    { kind: 'view', view: { schema: 'public', name: 'active_accounts' }, materialized: false },
+  ],
+  [
+    'materialized view public.account_totals',
+    { kind: 'view', view: { schema: 'public', name: 'account_totals' }, materialized: true },
+  ],
+  ['extension uuid-ossp', { kind: 'extension', extension: { name: 'uuid-ossp' } }],
+  [
+    'index public.users (email)',
+    { kind: 'index', table: users, index: { unique: false, columns: ['email'] } },
+  ],
+  [
+    'index public.users (email) — users_email_idx',
+    {
+      kind: 'index',
+      table: users,
+      index: { name: 'users_email_idx', unique: false, columns: ['email'] },
+    },
+  ],
+  [
+    'unique index public.users (email) — users_email_idx',
+    {
+      kind: 'index',
+      table: users,
+      index: { name: 'users_email_idx', unique: true, columns: ['email'] },
+    },
+  ],
+  [
+    'unique index public.users (email)',
+    { kind: 'index', table: users, index: { unique: true, columns: ['email'] } },
+  ],
+  [
+    'primary key public.users (id)',
+    { kind: 'primary-key', table: users, primaryKey: { columns: ['id'] } },
+  ],
+  [
+    'unique constraint public.users (email)',
+    {
+      kind: 'unique-constraint',
+      table: users,
+      uniqueConstraint: { columns: ['email'] },
+    },
+  ],
+  [
+    "check constraint public.users (email <> '')",
+    {
+      kind: 'check-constraint',
+      table: users,
+      checkConstraint: { expression: "email <> ''" },
+    },
+  ],
+  [
+    'foreign key public.users (team_id) → public.teams',
+    {
+      kind: 'foreign-key',
+      table: users,
+      foreignKey: {
+        columns: ['team_id'],
+        referencedTable: { schema: 'public', name: 'teams' },
+        referencedColumns: ['id'],
+      },
+    },
+  ],
+];
+
+/** One `comment-changed` change, omitting the absent sides so `(none)` can print. */
+function commentChanged(commentTarget: CommentTarget, before?: string, after?: string): Change {
+  return {
+    kind: 'comment-changed',
+    target: commentTarget,
+    ...(before === undefined ? {} : { before }),
+    ...(after === undefined ? {} : { after }),
+  };
+}
+
+test('comment changes print every target shape with the signed texts', () => {
+  for (const [spelling, target] of COMMENT_TARGETS) {
+    assert.equal(
+      formatChanges([commentChanged(target, undefined, 'new')]),
+      `+ comment on ${spelling}: (none) → "new"\n`,
+      `addition on ${spelling}`,
+    );
+    assert.equal(
+      formatChanges([commentChanged(target, 'old', 'new')]),
+      `~ comment on ${spelling}: "old" → "new"\n`,
+      `change on ${spelling}`,
+    );
+    assert.equal(
+      formatChanges([commentChanged(target, 'old', undefined)]),
+      `- comment on ${spelling}: "old" → (none)\n`,
+      `removal on ${spelling}`,
+    );
+  }
+});
+
+test('comment text is JSON-quoted so quotes, backslashes, newlines, and unicode stay visible', () => {
+  const text = 'quote " slash \\ line\nbreak — naïve 日本語';
+  assert.equal(
+    formatChanges([commentChanged({ kind: 'table', table: users }, 'old', text)]),
+    [
+      '~ comment on table public.users: "old" → "quote \\" slash \\\\ line\\nbreak — naïve 日本語"',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('comment plan steps print every target shape and the text or (none)', () => {
+  for (const [spelling, target] of COMMENT_TARGETS) {
+    const plan: Plan = {
+      steps: [
+        { kind: 'comment', target, text: 'new' },
+        { kind: 'comment', target },
+      ],
+      groups: [{ start: 0, end: 2, transactional: true }],
+    };
+
+    assert.equal(
+      formatPlan(plan),
+      [
+        '2 steps in one transaction:',
+        ` 1. comment  ${spelling}: "new"`,
+        ` 2. comment  ${spelling}: (none)`,
+        '',
+      ].join('\n'),
+      `comment steps on ${spelling}`,
+    );
+  }
+});
+
+test('same-column index comment targets stay distinct by name and uniqueness', () => {
+  const indexTarget = (index: {
+    readonly name?: string;
+    readonly unique: boolean;
+  }): CommentTarget => ({
+    kind: 'index',
+    table: users,
+    index: { ...index, columns: ['email'] },
+  });
+
+  assert.equal(
+    formatChanges([
+      commentChanged(indexTarget({ name: 'users_email_idx', unique: false }), 'old', 'new'),
+    ]),
+    '~ comment on index public.users (email) — users_email_idx: "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([
+      commentChanged(indexTarget({ name: 'users_email_alt_idx', unique: false }), 'old', 'new'),
+    ]),
+    '~ comment on index public.users (email) — users_email_alt_idx: "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([commentChanged(indexTarget({ unique: true }), 'old', 'new')]),
+    '~ comment on unique index public.users (email): "old" → "new"\n',
+  );
+  assert.equal(
+    formatChanges([commentChanged(indexTarget({ unique: false }), 'old', 'new')]),
+    '~ comment on index public.users (email): "old" → "new"\n',
+  );
+});
+
+test('a comment step prints its text JSON-quoted, not as raw whitespace', () => {
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'comment',
+        target: { kind: 'sequence', sequence: { schema: 'public', name: 'invoice_seq' } },
+        text: 'invoice numbers\n(legacy)',
+      },
+    ],
+    groups: [{ start: 0, end: 1, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '1 step in one transaction:',
+      ' 1. comment  sequence public.invoice_seq: "invoice numbers\\n(legacy)"',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('schema plan steps print the bare schema name', () => {
+  const plan: Plan = {
+    steps: [
+      { kind: 'create-schema', schema: 'app' },
+      { kind: 'create-extension', extension: { name: 'btree_gist', schema: 'public' } },
+    ],
+    groups: [{ start: 0, end: 2, transactional: true }],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '2 steps in one transaction:',
+      ' 1. create-schema     app',
+      ' 2. create-extension  btree_gist',
+      '',
+    ].join('\n'),
+  );
 });

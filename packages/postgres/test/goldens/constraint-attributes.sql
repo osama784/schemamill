@@ -1,0 +1,12 @@
+BEGIN;
+ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey;
+ALTER TABLE public.users DROP CONSTRAINT users_email_key;
+ALTER TABLE public.users DROP CONSTRAINT users_email_not_null;
+ALTER TABLE public.users ALTER COLUMN nickname DROP NOT NULL;
+ALTER TABLE public.users ALTER COLUMN email SET NOT NULL;
+ALTER TABLE public.users ADD CONSTRAINT users_handle_not_null NOT NULL handle;
+ALTER TABLE public.events ADD CONSTRAINT events_pkey PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE public.users ADD CONSTRAINT users_nickname_check CHECK (nickname <> '') NOT ENFORCED;
+ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED NOT VALID;
+COMMIT;

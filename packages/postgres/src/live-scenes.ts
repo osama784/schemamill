@@ -1,8 +1,12 @@
-import { effectiveIdentity, effectiveSequence } from '@schemamill/core';
+import { isDeepStrictEqual } from 'node:util';
+
+import { diff, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
+  CommentTarget,
   Diagnostic,
+  Extension,
   ForeignKey,
   Identity,
   IdentityInput,
@@ -18,8 +22,12 @@ import type {
   Step,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
+
+import { renderSql } from './render.ts';
 
 /**
  * Scenes for the live-PostgreSQL harness (`live-pg.test.ts`).
@@ -27,9 +35,12 @@ import type {
  * Each scene pairs a baseline and a target model that the harness takes through a full round
  * trip: build the baseline database, build the target database from its own model, apply
  * `renderSql(plan(baseline, target))` to the baseline database, then dump and import both and
- * compare. The five golden scenes carry the catalog spot-checks ported from the first slice's
- * scratch evidence runs; the harness reads them in phases: `baselineChecks` after the baseline
- * build, then `probes` and `checks` after the migration, in that order.
+ * compare. Every render targets the server under test: the harness passes its major as
+ * `renderSql`'s `targetVersion`, and a scene plan check that renders receives the same major as
+ * `ScenePlanCheck.failure`'s third argument. The five golden scenes carry the catalog
+ * spot-checks ported from the first slice's scratch evidence runs; the harness reads them in
+ * phases: `baselineChecks` after the baseline build, `targetChecks` after the target build, then
+ * `probes` and `checks` after the migration, in that order.
  *
  * The regression scenes are the shapes that caught real ordering bugs while the first slice
  * was built: table-removal cycles (`twocycle`, `smallvictim`), a primary key that changes
@@ -56,13 +67,125 @@ import type {
  * (`identity-drop`) — and both conversions between an identity and an owned `nextval` default
  * reusing the same sequence name (`identity-to-sequence`, `sequence-to-identity`).
  *
- * The constraint and index scenes cover this slice's shapes: named and unnamed unique and
- * check constraints on a new table (`constraint-create`), a plain and a unique standalone
+ * The constraint and index scenes cover this slice's shapes: named and unnamed primary-key,
+ * unique, foreign-key, and check constraints on a new table (`constraint-create`), a plain and
+ * a unique standalone
  * index beside a partial and an expression index the model cannot declare (`index-create`),
  * a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
- * transactional steps (`index-concurrently`), and a non-public-schema index drop whose
+ * transactional steps (`index-concurrently`), a target whose unnamed single-column,
+ * multi-column, and concurrent indexes are server-named on apply and canonicalized back to
+ * unnamed on import (`unnamed-index-round-trip`), and a non-public-schema index drop whose
  * schema qualification is real only because the scene's setup SQL creates the `app` schema
  * (`non-public-index-drop`).
+ *
+ * The constraint-attribute scenes cover the PostgreSQL 18 shapes: enforcement and deferrability
+ * on every constraint kind that carries them, pinned against the catalog's
+ * `pg_get_constraintdef` (`constraint-attributes`), the generated not-null-constraint name,
+ * canonicalized back to unnamed on import while a comment keeps the name in the target dump
+ * (`not-null-constraint-names`), and a pure foreign-key enforcement change in both directions
+ * rendered as `ALTER TABLE … ALTER CONSTRAINT … ENFORCED|NOT ENFORCED` instead of drop/add
+ * (`enforcement-in-place`). These three constraint-attribute scenes declare `minServerMajor: 18`
+ * and skip with a named reason on older servers, and so does the fourth PostgreSQL 18 scene,
+ * `introspection-flags-constraints-18`.
+ *
+ * The introspection scenes are the tracer bullet for the `CatalogReader` seam:
+ * `introspection-tracer` builds two raw schemas beside `public` and a model exercising the
+ * covered catalog surface — quoted and mixed-case identifiers, a composite primary key
+ * declared out of name order, an unnamed conventional `<table>_pkey` beside an explicitly
+ * named one, a spread of type spellings, and a column the baseline declares and the target
+ * drops so the migrated database physically holds the `attisdropped` row the read must filter —
+ * and asserts the read matches the applied dump's import; `introspection-indexes` does the
+ * same for the covered index surface — a constraint-backed primary-key index the read must
+ * consume through `conindid`, a named index, two unnamed indexes whose tie order is the
+ * stored-name order, a standalone unique index, and an unnamed index whose generated name
+ * exceeds the 63-byte limit and strips only in its server form; `introspection-sequences-identity`
+ * does the same for the covered sequence and identity surface — a standalone sequence with
+ * non-default options including the bigint bound, an owned sequence behind a `nextval` default,
+ * and both identity generation modes, the `ALWAYS` one with non-default options and a custom
+ * `SEQUENCE NAME`; `column-attributes` is the
+ * attribute round trip on PostgreSQL 16 or newer — defaults, a system and a user collation,
+ * storage, compression, and persistence — with the physical catalog state pinned so a
+ * renderer omission cannot hide behind the two dumps agreeing; `introspection-flags` pins the
+ * exact deferred-state diagnostics the read still reports (generation, the partitioned-table
+ * skip, and the invalid, expression, partial, and `INCLUDE` index skips)
+ * while the covered states read back instead of flagging; and
+ * `introspection-flags-nulls-not-distinct` pins the `NULLS NOT DISTINCT` skip gated on
+ * PostgreSQL 15 or newer.
+ *
+ * The constraint-introspection scenes prove the catalog read and the dump importer agree on
+ * every representable constraint shape: `introspection-constraints` carries named, unnamed,
+ * composite, and deferrable unique constraints, a deparse-congruent check-expression battery,
+ * composite and self-referencing foreign keys, every non-default referential action,
+ * deferrability, and `NOT VALID` on a check and a foreign key, and two foreign keys whose
+ * referenced columns are a standalone unique index — one on the same table, which pins the
+ * read's `contype` filter. `introspection-flags-constraints` pins the diagnostics for the
+ * unrepresentable attributes (an exclusion constraint, check `NO INHERIT`, unique `INCLUDE`,
+ * foreign-key `MATCH FULL`), its PostgreSQL 15 companion adds `NULLS NOT DISTINCT` and the
+ * foreign-key delete-column list, and its PostgreSQL 18 companion adds named not-null
+ * `NOT VALID`/`NO INHERIT` and the temporal `WITHOUT OVERLAPS`/`PERIOD` grammar.
+ *
+ * The render-refusal scenes cover generated-name truncation and omitted declarations:
+ * `truncated-name-round-trip` builds a table whose unnamed index, unique constraint, check
+ * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
+ * limit, so the catalog pins the balanced server forms (the assembled long form and the server
+ * form differ) and the migration must drop a long-name unnamed index through the dropped
+ * index's server form — the pre-fix renderer named the assembled form, which PostgreSQL clipped
+ * at parse time to a different name and refused to drop — and `unnamed-fk-round-trip` applies a
+ * foreign key that omits its referenced-column list, pins that the catalog resolves it to the
+ * referenced table's primary key, and proves the dump's explicit list still diffs empty against
+ * the omitting model.
+ *
+ * The view scene is the first server-derived equality evidence: `view-round-trip` redefines one
+ * plain view in place (`CREATE OR REPLACE`), rewrites a materialized view (drop and create),
+ * removes a view, adds two views (one with a check option), and changes one view from plain to
+ * materialized. Its `crossImportChecks` compare the applied database's import with the target
+ * database's import — both produced by the same server from its own dumps — so no
+ * `pg_get_viewdef` spelling is pinned and a PostgreSQL 16-authored definition cannot fail a
+ * PostgreSQL 18 run. The target build adds a unique index on the materialized view through raw
+ * SQL, which the import must skip by name because a materialized view is not a table.
+ *
+ * `comment-introspection` is the five-family comment read's server-derived equality evidence:
+ * the table (with a changed special-character comment), a column comment changed and another
+ * added, a standalone sequence whose comment changes, two plain views (one comment changed,
+ * the check-option view's removed), and a materialized view whose comment changes — the
+ * structure is otherwise identical, so the plan carries comment steps only. `matches-import`
+ * compares the catalog read with the applied dump's import, the catalog checks pin the stored
+ * text and the `check_option=local` reloption on both sides, and the plan check proves a
+ * comment-only change never rebuilds a view. `comment-round-trip` still declares no
+ * `introspection` assertion: its target also carries constraint and index comments, which
+ * catalog introspection does not read until slice 2 (#146 follow-up), so a comment-carrying
+ * model is intentionally not what it returns.
+ *
+ * The comment scene carries `comment` through every modeled family: the table (with a changed
+ * special-character comment), columns (changed, removed, added), sequences (changed, removed),
+ * plain views (added, changed, removed), materialized views (removed, and an unchanged comment
+ * re-asserted through a definition rewrite), every constraint kind (a primary-key comment through
+ * a rename, a removed named unique, a changed unnamed conventional-name unique, a re-asserted
+ * check, and the dependent foreign key a primary-key change drops and re-adds), and indexes (a
+ * re-asserted named comment, a removed named comment, and a changed unnamed conventional-name
+ * comment). Its catalog checks pin the stored text on the target build and after the migration,
+ * its import checks compare every imported comment to the target model by structural identity,
+ * and its cross-import check adds a comment inventory on top of the structural `diff` — `diff`
+ * does compare comments, but the inventory names a mismatch by entity with both texts.
+ *
+ * The extension scene carries the whole extension lifecycle: `extension-round-trip` moves a
+ * commented `hstore` from `hs1` to `hs2` with a changed comment, installs a commented `pgcrypto`
+ * in `public`, and removes a commented `citext`. The plan creates each build's non-public
+ * install schema itself — the baseline build creates `hs1`, the target build and migration
+ * create the target-only `hs2` — so the scene needs no `setupSql`. Its plan check pins the
+ * global phase order — the schema create, the extension create, then the two terminal comments,
+ * then the move and the drop — and its catalog checks pin `extnamespace` through `pg_namespace`
+ * and the comment through `obj_description(oid, 'pg_extension')`. It declares no `introspection`
+ * assertion either: the catalog reader returns `extensions: []` until the follow-up, so a model
+ * carrying extensions is intentionally not what it returns.
+ *
+ * The export scene is the apply-to-a-fresh-database probe: `export-round-trip` has an empty
+ * baseline and no `setupSql` or `targetExtraSql`, so its baseline build is empty and both the
+ * target build and the migration are exactly `renderSql(plan(empty, target))` — the DDL
+ * `schemamill export --format ddl` prints. Both non-public schemas, including a quoted
+ * mixed-case name, hold at least two tables, and one schema also hosts a sequence, a view, and
+ * the scene's comments, so the database that starts with only `public` can only reach the
+ * target through the export's own `CREATE SCHEMA` steps.
  *
  * Every primary-key column is marked `NOT NULL`, as a real `pg_dump` reports it: PostgreSQL
  * sets `attnotnull` when it creates a primary key, and dropping the key leaves the attribute
@@ -84,6 +207,8 @@ const column = (name: string, fields: Partial<Omit<Column, 'name'>> = {}): Colum
 interface TableParts {
   schema?: string;
   columns?: readonly Column[];
+  comment?: string;
+  persistence?: TablePersistence;
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
@@ -96,6 +221,8 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   schema: parts.schema ?? 'public',
   name,
   columns: parts.columns ?? [],
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
@@ -116,17 +243,50 @@ const foreignKey = (
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A model of the given tables and sequences together. */
 const withSequences = (tables: readonly Table[], sequences: readonly Sequence[]): Model => ({
   tables,
   sequences,
+  views: [],
+  extensions: [],
+});
+
+/** An extension named `name`, uncommented and installed in `public` unless the schema is given. */
+const extension = (name: string, schema = 'public', comment?: string): Extension => ({
+  name,
+  schema,
+  ...(comment === undefined ? {} : { comment }),
+});
+
+/** A model of the given extensions and nothing else. */
+const extensionModel = (...extensions: Extension[]): Model => ({
+  tables: [],
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** A sequence named `name`: the effective defaults for its stated options. */
-const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence =>
-  effectiveSequence({ schema: 'public', name, ...fields });
+const sequence = (name: string, fields: Partial<Omit<Sequence, 'name'>> = {}): Sequence => ({
+  ...effectiveSequence({ schema: 'public', name, ...fields }),
+  ...(fields.comment === undefined ? {} : { comment: fields.comment }),
+});
+
+/** A view named `name`: plain, with an empty definition unless overridden. */
+const view = (name: string, fields: Partial<Omit<View, 'name'>> = {}): View => ({
+  schema: 'public',
+  name,
+  materialized: false,
+  definition: '',
+  ...fields,
+});
 
 /** The owner link for a sequence: `tableName.columnName`, `public` unless overridden. */
 const sequenceOwner = (
@@ -163,10 +323,15 @@ export interface SceneCheck {
  * right. Plan facts are asserted before any SQL runs — they pin what the plan does, which the
  * live round trip alone cannot name, such as a step the plan must not emit because a cascade
  * would make it redundant, or the standalone group a concurrent statement must stand in.
+ *
+ * `serverMajor` is the major of the server the harness applies the SQL to. A check that
+ * renders the plan passes it through as `renderSql`'s `targetVersion`, so the probe sees the
+ * same SQL the server will, and a synthesized form the server cannot accept refuses here
+ * rather than on apply.
  */
 export interface ScenePlanCheck {
   readonly description: string;
-  readonly failure: (steps: readonly Step[], plan: Plan) => string | undefined;
+  readonly failure: (steps: readonly Step[], plan: Plan, serverMajor: number) => string | undefined;
 }
 
 /**
@@ -185,10 +350,49 @@ export interface SceneImportCheck {
   ) => string | undefined;
 }
 
+/**
+ * One cross-import fact: `failure` reads both imports — the migrated database's and the target
+ * database's, each produced by the same server from its own dump — and returns what is wrong,
+ * or `undefined` when the two agree. This is the server-derived equality evidence for an object
+ * family the `matches-import` introspection assertion does not cover: comparing the two
+ * imports catches an asymmetric import loss and is the server-derived equality bar, and it pins
+ * no deparse spelling, so a server-version change cannot fail the scene. The scene's per-source
+ * import checks and its catalog checks on the migrated database keep the comparison from being
+ * vacuous when both imports lose the same thing.
+ */
+export interface SceneCrossImportCheck {
+  readonly description: string;
+  readonly failure: (
+    applied: ReadResult<Model, Diagnostic>,
+    target: ReadResult<Model, Diagnostic>,
+  ) => string | undefined;
+}
+
+/**
+ * How a scene's live-introspection assertion is checked: `matches-import` requires an empty
+ * diagnostic list, an empty `diff` against the applied dump's import, and a model deep-equal to
+ * that import (order-significant — the real order guard); `flags` pins the diagnostics list
+ * exactly.
+ */
+export type SceneIntrospection =
+  | { readonly assert: 'matches-import' }
+  | { readonly assert: 'flags'; readonly expected: readonly Diagnostic[] };
+
 /** One scene of the live-PostgreSQL harness. */
 export interface LiveScene {
   /** Stable scene name; the harness derives its database names from it. */
   readonly name: string;
+  /**
+   * The oldest server major the scene can run against. Absent means the harness's base floor
+   * (PostgreSQL 13); a scene that needs a newer major declares it and is skipped with a named
+   * reason on older servers, so PostgreSQL 18 shapes still run on CI while a local PostgreSQL
+   * 16 run keeps the rest of the corpus green. The floor must cover every declaration the
+   * scene's models render: the harness renders every build and migration for the server under
+   * test (`renderSql(plan, { targetVersion: serverMajor })`), so a synthesized reset form below
+   * its floor refuses by name, and an explicit declaration above the floor — an explicit
+   * `COMPRESSION` needs 14 — must still be gated by the scene's own `minServerMajor`.
+   */
+  readonly minServerMajor?: number;
   /** The model the baseline database is built from. */
   readonly baseline: Model;
   /** The model the target database is built from and the migration aims at. */
@@ -207,6 +411,8 @@ export interface LiveScene {
   readonly targetExtraSql?: string;
   /** Catalog facts to assert after the baseline build, before the migration. */
   readonly baselineChecks?: readonly SceneCheck[];
+  /** Catalog facts to assert after the target build, before the migration. */
+  readonly targetChecks?: readonly SceneCheck[];
   /** Plan facts to assert on `plan(baseline, target)`, before any SQL runs. */
   readonly planChecks?: readonly ScenePlanCheck[];
   /** Statements to run after the migration; a non-zero exit fails the scene. */
@@ -215,6 +421,18 @@ export interface LiveScene {
   readonly checks?: readonly SceneCheck[];
   /** Import facts to assert on both dumps' imports, after the round trip. */
   readonly importChecks?: readonly SceneImportCheck[];
+  /**
+   * Facts about both imports together, asserted after the per-source import facts. The two
+   * imports are server-derived — each database is dumped by the same server and imported by the
+   * same importer — so a check can compare them without pinning the server's deparse spelling.
+   */
+  readonly crossImportChecks?: readonly SceneCrossImportCheck[];
+  /**
+   * Live-introspection facts: when present, the harness reads the migrated database through
+   * `catalogReader` — consumed as `CatalogReader<string, Model, Diagnostic>` — after the
+   * imports and asserts the scene's claim.
+   */
+  readonly introspection?: SceneIntrospection;
 }
 
 /** `public` tables in name order, or the empty string when there are none. */
@@ -277,6 +495,93 @@ const indexIsValid = (name: string, schema = 'public'): string =>
 /** A named table is present: `name|0` or `name|1`, pinned as one text fact. */
 const tableExists = (tableName: string): string =>
   `select '${tableName}' || '|' || count(*) from pg_tables where schemaname = 'public' and tablename = '${tableName}'`;
+
+/**
+ * One table's column defaults, in attribute order, each as `name|expression` or `name|<none>`,
+ * joined by spaces: the `pg_attrdef` text `pg_get_expr` renders, the physical read behind the
+ * covered default state.
+ */
+const defaultsOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || coalesce(pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid), '<none>'), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' left join pg_catalog.pg_attrdef AS attrdef' +
+  ' on attrdef.adrelid = attribute.attrelid and attrdef.adnum = attribute.attnum' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's collation states, in attribute order, each as `name|qualified-name`, with
+ * `default` for the type's own collation and `none` for a non-collatable type (oid zero): the
+ * physical read behind the covered explicit-collation state, pinning the oid against the
+ * type's.
+ */
+const collationsOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || case` +
+  " when attribute.attcollation = 0 then 'none'" +
+  " when attribute.attcollation = attribute_type.typcollation then 'default'" +
+  " else pg_catalog.format('%I.%I', collation_namespace.nspname, collation_row.collname) end, ' ' order by attribute.attnum)" +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' join pg_catalog.pg_type AS attribute_type on attribute_type.oid = attribute.atttypid' +
+  ' left join pg_catalog.pg_collation AS collation_row on collation_row.oid = attribute.attcollation' +
+  ' left join pg_catalog.pg_namespace AS collation_namespace' +
+  ' on collation_namespace.oid = collation_row.collnamespace' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/** One table's column types, in attribute order, each as `name|format_type`, joined by spaces. */
+const typesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's storage letters, in attribute order, each as `name|attstorage|typstorage`, joined
+ * by spaces: the physical read behind the covered explicit-storage state, the type's letter
+ * beside it so an explicit state cannot hide behind the type's default.
+ */
+const storageModesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || attribute.attstorage::text || '|' || attribute_type.typstorage::text, ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ' join pg_catalog.pg_type AS attribute_type on attribute_type.oid = attribute.atttypid' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's compression letters, in attribute order, each as `name|letter`, the letter read
+ * from the row's `jsonb` form — empty for no explicit method — exactly as the catalog read sees
+ * it: the physical read behind the covered explicit-compression state.
+ */
+const compressionModesOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || (to_jsonb(attribute) ->> 'attcompression'), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/** One table's `pg_class.relpersistence` letter: `p`, `u`, or `t`. */
+const relPersistenceOf = (tableName: string, schema = 'public'): string =>
+  `select relpersistence::text from pg_class where oid = '${schema}.${tableName}'::regclass`;
+
+/** One relation's `pg_class.relkind` code: `r`, `v`, `m`, … */
+const relKindOf = (relationName: string, schema = 'public'): string =>
+  `select relkind::text from pg_class where oid = '${schema}.${relationName}'::regclass`;
+
+/** Whether a materialized view's data is populated: `t` or `f`, via `pg_class.relispopulated`. */
+const relIsPopulated = (relationName: string, schema = 'public'): string =>
+  `select relispopulated from pg_class where oid = '${schema}.${relationName}'::regclass`;
+
+/** One relation's `pg_class.reloptions`, comma-joined in stored order, or the empty string. */
+const relOptionsOf = (relationName: string, schema = 'public'): string =>
+  `select array_to_string(reloptions, ',') from pg_class` +
+  ` where oid = '${schema}.${relationName}'::regclass`;
+
+/** Whether the relation named `name` exists, as `t` or `f`: no cast failure for an absent object. */
+const relationExists = (name: string, schema = 'public'): string =>
+  `select to_regclass('${schema}.${name}') is not null`;
+
+/** Whether a view's server deparse contains `fragment`: an anchor with no pinned definition text. */
+const viewDefinitionContains = (viewName: string, fragment: string, schema = 'public'): string =>
+  `select pg_get_viewdef('${schema}.${viewName}'::regclass) LIKE '%${fragment}%'`;
 
 /** `public` sequences in name order, or the empty string when there are none. */
 const SEQUENCES =
@@ -1530,6 +1835,7 @@ const serialCreateScene = (): LiveScene => {
         expected: '1,2',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -1595,6 +1901,7 @@ const sequenceAddDropScene = (): LiveScene => {
       },
       { description: 'tables left', sql: TABLES, expected: 'users' },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -1695,6 +2002,7 @@ $do$;`,
         expected: '2',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -1772,6 +2080,7 @@ const ownerDropOrderScene = (): LiveScene => {
         expected: '1',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -1824,6 +2133,7 @@ const detachedDropScene = (): LiveScene => {
         expected: '1',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -2364,6 +2674,7 @@ const identityToSequenceScene = (): LiveScene => {
         expected: '1000,1010',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -2453,17 +2764,24 @@ const sequenceToIdentityScene = (): LiveScene => {
         expected: '100,103',
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
 /**
- * The constraint round trip: a target whose unique and check constraints span named and
- * unnamed declarations, single- and multi-column. The model canonicalizes every declaration to
- * table level — PostgreSQL does not record whether a constraint was declared on a column or on
- * the table — so the scene proves the canonical shape renders, applies under `ON_ERROR_STOP=1`,
- * dumps, and imports back with the constraints intact: `pg_constraint` spot-checks the
- * PostgreSQL-assigned names, and the import check proves the constraint-backed indexes are not
- * modeled as standalone `Index` entries.
+ * The constraint round trip: a target whose primary key, unique, foreign-key, and check
+ * constraints span named and unnamed declarations (the unnamed foreign key states its
+ * referenced column list). The model canonicalizes every declaration to table level —
+ * PostgreSQL does not record whether a constraint was declared on a column or on the table —
+ * so the scene proves the canonical shape renders, applies under `ON_ERROR_STOP=1`, dumps, and
+ * imports back with the constraints intact: `pg_constraint` spot-checks the conventional names
+ * PostgreSQL assigned, and the import check proves those names came back unnamed, the
+ * constraint-backed indexes are not modeled as standalone `Index` entries, and the known miss
+ * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name.
+ *
+ * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
+ * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
+ * deparse-pinning scene skips 13.
  */
 const constraintCreateScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -2473,8 +2791,11 @@ const constraintCreateScene = (): LiveScene => {
       column('tenant', { notNull: true }),
       column('name', { notNull: true }),
       column('age', { type: 'integer' }),
+      column('manager_id', { type: 'bigint' }),
+      column('created_at', { type: 'timestamp' }),
     ],
-    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+    primaryKey: { columns: ['id'] },
+    foreignKeys: [foreignKey(['manager_id'], identity('accounts'), { referencedColumns: ['id'] })],
     uniqueConstraints: [
       { name: 'accounts_email_key', columns: ['email'] },
       { columns: ['tenant', 'name'] },
@@ -2483,11 +2804,13 @@ const constraintCreateScene = (): LiveScene => {
       { name: 'accounts_age_check', expression: 'age >= 0' },
       { expression: 'age >= 0 AND char_length(name) > 0' },
       { expression: 'char_length(email) > 0' },
+      { expression: 'EXTRACT(epoch FROM created_at) = 0' },
     ],
   });
 
   return {
     name: 'constraint-create',
+    minServerMajor: 14,
     baseline: model(),
     target: model(accounts),
     baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],
@@ -2498,7 +2821,8 @@ const constraintCreateScene = (): LiveScene => {
           const kinds = steps.map((step) => step.kind).join(',');
           return kinds ===
             'create-table,add-unique-constraint,add-unique-constraint,' +
-              'add-check-constraint,add-check-constraint,add-check-constraint'
+              'add-check-constraint,add-check-constraint,add-check-constraint,' +
+              'add-check-constraint,add-foreign-key'
             ? undefined
             : `unexpected steps: ${kinds}`;
         },
@@ -2506,26 +2830,40 @@ const constraintCreateScene = (): LiveScene => {
     ],
     importChecks: [
       {
-        description: 'the import models every constraint and no constraint-backed index',
+        description:
+          'the import canonicalizes conventional constraint names and keeps the formula miss',
         failure: (imported) => {
           const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
           if (table === undefined) return 'accounts is not imported';
           const indexes = table.indexes.map((index) => index.name ?? '<unnamed>');
           if (indexes.length > 0) return `standalone indexes imported: ${indexes.join(',')}`;
+          if (table.primaryKey === undefined) return 'the primary key is not imported';
+          if (table.primaryKey.name !== undefined) {
+            return `primary key name: ${table.primaryKey.name}`;
+          }
+          const foreign = table.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}->` +
+                constraint.referencedColumns.join(','),
+            )
+            .join(' ');
+          if (foreign !== '<unnamed>:manager_id->id') return `foreign keys: ${foreign}`;
           const unique = table.uniqueConstraints
             .map(
               (constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}`,
             )
             .join(' ');
-          if (unique !== 'accounts_email_key:email accounts_tenant_name_key:tenant,name') {
+          if (unique !== '<unnamed>:email <unnamed>:tenant,name') {
             return `unique constraints: ${unique}`;
           }
           const checks = table.checkConstraints
             .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
             .join(' ');
           const expectedChecks =
-            'accounts_check:((age >= 0) AND(char_length(name) > 0))' +
-            ' accounts_age_check:(age >= 0) accounts_email_check:(char_length(email) > 0)';
+            '<unnamed>:((age >= 0) AND(char_length(name) > 0))' +
+            ' accounts_created_at_check:(EXTRACT(epoch FROM created_at) =(0)::numeric)' +
+            ' <unnamed>:(age >= 0) <unnamed>:(char_length(email) > 0)';
           if (checks !== expectedChecks) return `check constraints: ${checks}`;
           return undefined;
         },
@@ -2534,14 +2872,35 @@ const constraintCreateScene = (): LiveScene => {
     checks: [
       { description: 'tables', sql: TABLES, expected: 'accounts' },
       {
-        description: 'unique constraint names',
+        description: 'the primary-key name, assigned by PostgreSQL',
+        sql: constraintNames('accounts', 'p'),
+        expected: 'accounts_pkey',
+      },
+      {
+        description: 'the foreign-key name, assigned by PostgreSQL',
+        sql: constraintNames('accounts', 'f'),
+        expected: 'accounts_manager_id_fkey',
+      },
+      {
+        description: 'unique constraint names, assigned by PostgreSQL',
         sql: constraintNames('accounts', 'u'),
         expected: 'accounts_email_key,accounts_tenant_name_key',
       },
       {
         description: 'check constraint names, assigned by PostgreSQL',
         sql: constraintNames('accounts', 'c'),
-        expected: 'accounts_age_check,accounts_check,accounts_email_check',
+        expected:
+          'accounts_age_check,accounts_check,accounts_created_at_check,accounts_email_check',
+      },
+      {
+        description: 'the unnamed primary-key definition',
+        sql: constraintDef('accounts_pkey'),
+        expected: 'PRIMARY KEY (id)',
+      },
+      {
+        description: 'the unnamed foreign-key definition',
+        sql: constraintDef('accounts_manager_id_fkey'),
+        expected: 'FOREIGN KEY (manager_id) REFERENCES accounts(id)',
       },
       {
         description: 'the unnamed unique constraint definition',
@@ -2564,6 +2923,11 @@ const constraintCreateScene = (): LiveScene => {
         expected: 'CHECK (((age >= 0) AND (char_length(name) > 0)))',
       },
       {
+        description: 'the check the best-effort formula does not predict',
+        sql: constraintDef('accounts_created_at_check'),
+        expected: 'CHECK ((EXTRACT(epoch FROM created_at) = (0)::numeric))',
+      },
+      {
         description: 'the unique constraint owns its backing index',
         sql: constraintBackedByIndex('accounts_email_key'),
         expected: 't',
@@ -2574,6 +2938,819 @@ const constraintCreateScene = (): LiveScene => {
         expected: '3',
       },
     ],
+  };
+};
+
+/**
+ * The constraint-introspection round trip: every representable constraint shape on tables the
+ * model creates whole. The unique constraints cover named, unnamed, composite, and deferrable
+ * declarations; the check battery is pinned to the spellings `pg_get_expr` returns on the
+ * server (the outer parentheses included), so the authored target and both dumps' imports carry
+ * the same text. The foreign keys cover a composite reference, a self-reference, all four
+ * non-default referential actions, `DEFERRABLE INITIALLY DEFERRED`, and `NOT VALID`, and two of
+ * them reference a standalone unique index rather than a primary key: `children`' composite key
+ * points at `parents`' unique index (the `conrelid` guard), and `nodes`' self-reference points
+ * at a unique index on its own table (a foreign key's `conindid` is that index, so only the
+ * `contype` filter keeps the read from consuming it). The live read must return no diagnostics
+ * and a model deep-equal to the applied dump's import.
+ *
+ * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
+ * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
+ * deparse-pinning scene skips 13.
+ */
+const introspectionConstraintsScene = (): LiveScene => {
+  const parents = table('parents', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('code', { notNull: true }),
+      column('variant', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { columns: ['id'] },
+    uniqueConstraints: [
+      { name: 'parents_code_named_key', columns: ['code'], deferrable: true },
+      { columns: ['variant', 'code'] },
+    ],
+    indexes: [{ name: 'parents_code_variant_unique', unique: true, columns: ['code', 'variant'] }],
+  });
+  const children = table('children', {
+    columns: [
+      column('id', { type: 'bigint', notNull: true }),
+      column('parent_code'),
+      column('parent_variant', { type: 'integer' }),
+      column('parent_id', { type: 'bigint' }),
+      column('parent_default', { type: 'bigint', default: '0' }),
+      column('parent_plain', { type: 'bigint' }),
+      column('parent_deferred', { type: 'bigint' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    foreignKeys: [
+      foreignKey(['parent_code', 'parent_variant'], identity('parents'), {
+        referencedColumns: ['code', 'variant'],
+        onDelete: 'RESTRICT',
+        onUpdate: 'CASCADE',
+      }),
+      foreignKey(['parent_id'], identity('parents'), {
+        name: 'children_fk_parent_id',
+        referencedColumns: ['id'],
+        onDelete: 'SET NULL',
+      }),
+      foreignKey(['parent_default'], identity('parents'), {
+        name: 'children_fk_parent_default',
+        referencedColumns: ['id'],
+        onUpdate: 'SET DEFAULT',
+      }),
+      foreignKey(['parent_plain'], identity('parents'), {
+        name: 'children_fk_parent_plain',
+        referencedColumns: ['id'],
+      }),
+      foreignKey(['parent_deferred'], identity('parents'), {
+        name: 'children_fk_parent_deferred',
+        referencedColumns: ['id'],
+        deferrable: true,
+        initiallyDeferred: true,
+        enforcement: 'not-valid',
+      }),
+    ],
+  });
+  const nodes = table('nodes', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { notNull: true }),
+      column('variant', { type: 'integer', notNull: true }),
+      column('parent_code'),
+      column('parent_variant', { type: 'integer' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    indexes: [{ name: 'nodes_code_variant_unique', unique: true, columns: ['code', 'variant'] }],
+    foreignKeys: [
+      foreignKey(['parent_code', 'parent_variant'], identity('nodes'), {
+        name: 'nodes_parent_fkey',
+        referencedColumns: ['code', 'variant'],
+      }),
+    ],
+  });
+  const checks = table('checks', {
+    columns: [
+      column('a', { type: 'integer' }),
+      column('b', { type: 'integer' }),
+      column('c', { type: 'integer' }),
+      column('Mixed Case'),
+      column('ts', { type: 'timestamp with time zone' }),
+    ],
+    checkConstraints: [
+      { name: 'checks_age_check', expression: '(a > 0)' },
+      { name: 'checks_nested_check', expression: '((a > 0) AND(b > 0))' },
+      {
+        name: 'checks_epoch_check',
+        expression: '(EXTRACT(epoch FROM ts) =(0)::numeric)',
+      },
+      { name: 'checks_cast_check', expression: '((b)::bigint > 0)' },
+      { name: 'checks_quoted_check', expression: '("Mixed Case" <> \'\'::text)' },
+      { name: 'checks_whole_row_check', expression: '(checks.* IS NOT NULL)' },
+      { name: 'checks_not_valid_check', expression: '(a < 1000)', enforcement: 'not-valid' },
+      { expression: '(c > 0)' },
+    ],
+  });
+  const target = model(checks, children, nodes, parents);
+
+  return {
+    name: 'introspection-constraints',
+    minServerMajor: 14,
+    baseline: model(),
+    target,
+    baselineChecks: [{ description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' }],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'checks,children,nodes,parents' },
+      {
+        description: 'the foreign-key names, including the unnamed composite reference',
+        sql: constraintNames('children', 'f'),
+        expected:
+          'children_fk_parent_default,children_fk_parent_deferred,children_fk_parent_id,' +
+          'children_fk_parent_plain,children_parent_code_parent_variant_fkey',
+      },
+      {
+        description: 'the named and unnamed unique constraints',
+        sql: constraintNames('parents', 'u'),
+        expected: 'parents_code_named_key,parents_variant_code_key',
+      },
+      {
+        description: 'the check-constraint names, including the unnamed single-column check',
+        sql: constraintNames('checks', 'c'),
+        expected:
+          'checks_age_check,checks_c_check,checks_cast_check,checks_epoch_check,' +
+          'checks_nested_check,checks_not_valid_check,checks_quoted_check,' +
+          'checks_whole_row_check',
+      },
+      {
+        description: 'the parents indexes: two constraint-backed, one standalone, one primary key',
+        sql: indexesOf('parents'),
+        expected:
+          'parents_code_named_key,parents_code_variant_unique,parents_pkey,parents_variant_code_key',
+      },
+      {
+        description: 'the nodes standalone unique index beside its primary key',
+        sql: indexesOf('nodes'),
+        expected: 'nodes_code_variant_unique,nodes_pkey',
+      },
+      {
+        description: 'the standalone unique index beside its referencing foreign key',
+        sql: indexIsUnique('nodes_code_variant_unique'),
+        expected: 't',
+      },
+      {
+        description: 'the other-table standalone unique index',
+        sql: indexIsUnique('parents_code_variant_unique'),
+        expected: 't',
+      },
+      {
+        description: 'the composite foreign key with its referential actions',
+        sql: constraintDef('children_parent_code_parent_variant_fkey'),
+        expected:
+          'FOREIGN KEY (parent_code, parent_variant) REFERENCES parents(code, variant)' +
+          ' ON UPDATE CASCADE ON DELETE RESTRICT',
+      },
+      {
+        description: 'the self-referencing foreign key over the standalone unique index',
+        sql: constraintDef('nodes_parent_fkey'),
+        expected: 'FOREIGN KEY (parent_code, parent_variant) REFERENCES nodes(code, variant)',
+      },
+      {
+        description: 'the ON DELETE SET NULL foreign key',
+        sql: constraintDef('children_fk_parent_id'),
+        expected: 'FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE SET NULL',
+      },
+      {
+        description: 'the ON UPDATE SET DEFAULT foreign key',
+        sql: constraintDef('children_fk_parent_default'),
+        expected: 'FOREIGN KEY (parent_default) REFERENCES parents(id) ON UPDATE SET DEFAULT',
+      },
+      {
+        description: 'the deferrable and not-valid foreign key',
+        sql: constraintDef('children_fk_parent_deferred'),
+        expected:
+          'FOREIGN KEY (parent_deferred) REFERENCES parents(id)' +
+          ' DEFERRABLE INITIALLY DEFERRED NOT VALID',
+      },
+      {
+        description: 'the named deferrable unique constraint',
+        sql: constraintDef('parents_code_named_key'),
+        expected: 'UNIQUE (code) DEFERRABLE',
+      },
+      {
+        description: 'the unnamed composite unique constraint',
+        sql: constraintDef('parents_variant_code_key'),
+        expected: 'UNIQUE (variant, code)',
+      },
+      {
+        description: 'the simple deparse-congruent check',
+        sql: constraintDef('checks_age_check'),
+        expected: 'CHECK ((a > 0))',
+      },
+      {
+        description: 'the nested-AND deparse-congruent check',
+        sql: constraintDef('checks_nested_check'),
+        expected: 'CHECK (((a > 0) AND (b > 0)))',
+      },
+      {
+        description: 'the EXTRACT deparse-congruent check',
+        sql: constraintDef('checks_epoch_check'),
+        expected: 'CHECK ((EXTRACT(epoch FROM ts) = (0)::numeric))',
+      },
+      {
+        description: 'the cast deparse-congruent check',
+        sql: constraintDef('checks_cast_check'),
+        expected: 'CHECK (((b)::bigint > 0))',
+      },
+      {
+        description: 'the quoted-identifier deparse-congruent check',
+        sql: constraintDef('checks_quoted_check'),
+        expected: 'CHECK (("Mixed Case" <> \'\'::text))',
+      },
+      {
+        description: 'the whole-row deparse-congruent check',
+        sql: constraintDef('checks_whole_row_check'),
+        expected: 'CHECK ((checks.* IS NOT NULL))',
+      },
+      {
+        description: 'the unnamed single-column check',
+        sql: constraintDef('checks_c_check'),
+        expected: 'CHECK ((c > 0))',
+      },
+      {
+        description: 'the not-valid check',
+        sql: constraintDef('checks_not_valid_check'),
+        expected: 'CHECK ((a < 1000)) NOT VALID',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'the unnamed unique and foreign keys canonicalize back to unnamed; named ones stay named',
+        failure: (imported) => {
+          const parentsTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'parents',
+          );
+          const childrenTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'children',
+          );
+          if (parentsTable === undefined || childrenTable === undefined) {
+            return 'parents or children is not imported';
+          }
+          const unique = parentsTable.uniqueConstraints
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}:` +
+                `${String(constraint.deferrable)}:${String(constraint.initiallyDeferred)}`,
+            )
+            .join(' ');
+          if (
+            unique !==
+            'parents_code_named_key:code:true:undefined <unnamed>:variant,code:undefined:undefined'
+          ) {
+            return `unique constraints: ${unique}`;
+          }
+          const foreign = childrenTable.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.name ?? '<unnamed>'}:${constraint.columns.join(',')}->` +
+                `${constraint.referencedTable.name}(${constraint.referencedColumns.join(',')}):` +
+                `${constraint.onUpdate ?? '-'}:${constraint.onDelete ?? '-'}:` +
+                `${String(constraint.deferrable)}:${String(constraint.initiallyDeferred)}:` +
+                `${constraint.enforcement ?? 'valid'}`,
+            )
+            .join(' ');
+          const expected =
+            '<unnamed>:parent_code,parent_variant->parents(code,variant):CASCADE:RESTRICT:' +
+            'undefined:undefined:valid' +
+            ' children_fk_parent_default:parent_default->parents(id):SET DEFAULT:-:' +
+            'undefined:undefined:valid' +
+            ' children_fk_parent_deferred:parent_deferred->parents(id):-:-:true:true:not-valid' +
+            ' children_fk_parent_id:parent_id->parents(id):-:SET NULL:undefined:undefined:valid' +
+            ' children_fk_parent_plain:parent_plain->parents(id):-:-:undefined:undefined:valid';
+          return foreign === expected ? undefined : `foreign keys: ${foreign}`;
+        },
+      },
+      {
+        description:
+          'the standalone unique indexes stay modeled beside the foreign keys that reference them',
+        failure: (imported) => {
+          const facts = ['parents', 'nodes']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              if (found === undefined) return `${name}:not imported`;
+              const indexes = found.indexes
+                .map(
+                  (index) =>
+                    `${index.name ?? '<unnamed>'}:${index.unique ? 'unique' : 'plain'}:` +
+                    `${index.columns.join(',')}`,
+                )
+                .join(';');
+              const foreign = found.foreignKeys
+                .map(
+                  (constraint) =>
+                    `${constraint.columns.join(',')}->${constraint.referencedColumns.join(',')}`,
+                )
+                .join(';');
+              return `${name}:${indexes}:${foreign}`;
+            })
+            .join(' ');
+          const expected =
+            'parents:parents_code_variant_unique:unique:code,variant: ' +
+            'nodes:nodes_code_variant_unique:unique:code,variant:parent_code,parent_variant->code,variant';
+          return facts === expected ? undefined : `indexes: ${facts}`;
+        },
+      },
+      {
+        description: 'both dumps equal the authored target, check battery included',
+        failure: (imported, source) => {
+          const checksTable = imported.model.tables.find(
+            (candidate) => candidate.name === 'checks',
+          );
+          if (checksTable === undefined) return 'checks is not imported';
+          const expressions = checksTable.checkConstraints
+            .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
+            .join(' ');
+          const expected =
+            'checks_quoted_check:("Mixed Case" <> \'\'::text)' +
+            ' checks_nested_check:((a > 0) AND(b > 0))' +
+            ' checks_cast_check:((b)::bigint > 0)' +
+            ' checks_epoch_check:(EXTRACT(epoch FROM ts) =(0)::numeric)' +
+            ' checks_not_valid_check:(a < 1000)' +
+            ' checks_age_check:(a > 0)' +
+            ' <unnamed>:(c > 0)' +
+            ' checks_whole_row_check:(checks.* IS NOT NULL)';
+          if (expressions !== expected) return `${source}: check constraints: ${expressions}`;
+          const changes = diff(target, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the import diffs as ${changes.map((change) => change.kind).join(',')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The constraint-attribute round trip: a target changing the enforcement and deferrability of
+ * constraints of every kind PostgreSQL 18 lets carry them. The primary key gains `DEFERRABLE
+ * INITIALLY DEFERRED`, the unique constraint `DEFERRABLE`, one foreign key `NOT VALID`, the
+ * other `DEFERRABLE INITIALLY DEFERRED NOT ENFORCED`, and a new check constraint `NOT
+ * ENFORCED` — the two enforcement wordings never conflated. The migration drops and re-adds
+ * each changed constraint, the catalog checks pin `pg_get_constraintdef` exactly — the
+ * PostgreSQL 18 suffixes included — and the import checks prove every attribute came back on
+ * the model, so the empty diff is a whole-attribute round trip rather than a collapse.
+ */
+const constraintAttributesScene = (): LiveScene => {
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const baselineUsers = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true }),
+      column('team_id', { type: 'integer' }),
+      column('other_id', { type: 'integer' }),
+      column('age', { type: 'integer' }),
+    ],
+    primaryKey: { columns: ['id'] },
+    uniqueConstraints: [{ columns: ['email'] }],
+    foreignKeys: [
+      foreignKey(['team_id'], identity('teams')),
+      foreignKey(['other_id'], identity('teams')),
+    ],
+  });
+  const targetUsers = table('users', {
+    columns: baselineUsers.columns,
+    primaryKey: { columns: ['id'], deferrable: true, initiallyDeferred: true },
+    uniqueConstraints: [{ columns: ['email'], deferrable: true }],
+    foreignKeys: [
+      foreignKey(['team_id'], identity('teams'), { enforcement: 'not-valid' }),
+      foreignKey(['other_id'], identity('teams'), {
+        enforcement: 'not-enforced',
+        deferrable: true,
+        initiallyDeferred: true,
+      }),
+    ],
+    checkConstraints: [
+      { name: 'users_age_check_v2', expression: 'age >= 0', enforcement: 'not-enforced' },
+    ],
+  });
+
+  return {
+    name: 'constraint-attributes',
+    minServerMajor: 18,
+    baseline: model(teams, baselineUsers),
+    target: model(teams, targetUsers),
+    baselineChecks: [
+      {
+        description: 'the baseline foreign-key names are the conventional ones',
+        sql: constraintNames('users', 'f'),
+        expected: 'users_other_id_fkey,users_team_id_fkey',
+      },
+      {
+        description: 'the baseline primary key is plain',
+        sql: constraintDef('users_pkey'),
+        expected: 'PRIMARY KEY (id)',
+      },
+      {
+        description: 'the baseline foreign keys are plain',
+        sql: constraintDef('users_team_id_fkey'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id)',
+      },
+      {
+        description: 'the baseline has no check constraint',
+        sql: constraintCount('users_age_check_v2', 'c'),
+        expected: '0',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'every changed constraint decomposes into a drop and an add',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds ===
+            'drop-foreign-key,drop-foreign-key,drop-unique-constraint,drop-primary-key,' +
+              'add-primary-key,add-unique-constraint,add-check-constraint,add-foreign-key,' +
+              'add-foreign-key'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the primary key definition, with its deferrability',
+        sql: constraintDef('users_pkey'),
+        expected: 'PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED',
+      },
+      {
+        description: 'the unique constraint definition, with its deferrability',
+        sql: constraintDef('users_email_key'),
+        expected: 'UNIQUE (email) DEFERRABLE',
+      },
+      {
+        description: 'the not-valid foreign-key definition',
+        sql: constraintDef('users_team_id_fkey'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id) NOT VALID',
+      },
+      {
+        description: 'the not-enforced foreign-key definition, with its deferrability',
+        sql: constraintDef('users_other_id_fkey'),
+        expected:
+          'FOREIGN KEY (other_id) REFERENCES teams(id) DEFERRABLE INITIALLY DEFERRED NOT ENFORCED',
+      },
+      {
+        description: 'the not-enforced check definition',
+        sql: constraintDef('users_age_check_v2'),
+        expected: 'CHECK ((age >= 0)) NOT ENFORCED',
+      },
+      {
+        description: 'the conventional names survive the drop and add',
+        sql:
+          "select string_agg(conname, ',' order by conname) from pg_constraint" +
+          " where conrelid = 'public.users'::regclass and contype in ('p', 'u', 'f')",
+        expected: 'users_email_key,users_other_id_fkey,users_pkey,users_team_id_fkey',
+      },
+      {
+        description: 'the enforcement states are distinct in the catalog',
+        sql:
+          "select string_agg(conname || '|' || convalidated || '|' || conenforced," +
+          " ',' order by conname) from pg_constraint" +
+          " where conname in ('users_age_check_v2', 'users_other_id_fkey', 'users_team_id_fkey')",
+        expected:
+          'users_age_check_v2|false|false,users_other_id_fkey|false|false,users_team_id_fkey|false|true',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'every enforcement and deferrability attribute comes back, the two wordings distinct',
+        failure: (imported) => {
+          const users = imported.model.tables.find((candidate) => candidate.name === 'users');
+          if (users === undefined) return 'users is not imported';
+          const primaryKey = users.primaryKey;
+          const unique = users.uniqueConstraints.find(
+            (constraint) => constraint.columns.join(',') === 'email',
+          );
+          const team = users.foreignKeys.find(
+            (constraint) => constraint.columns.join(',') === 'team_id',
+          );
+          const other = users.foreignKeys.find(
+            (constraint) => constraint.columns.join(',') === 'other_id',
+          );
+          const check = users.checkConstraints.find(
+            (constraint) => constraint.name === 'users_age_check_v2',
+          );
+          if (
+            primaryKey === undefined ||
+            unique === undefined ||
+            team === undefined ||
+            other === undefined ||
+            check === undefined
+          ) {
+            return 'a constraint is missing from the import';
+          }
+          const facts =
+            `primary key:${String(primaryKey.deferrable)}:${String(primaryKey.initiallyDeferred)}` +
+            ` unique:${String(unique.deferrable)}:${String(unique.initiallyDeferred)}` +
+            ` team:${String(team.enforcement)}:${String(team.deferrable)}` +
+            `:${String(team.initiallyDeferred)}` +
+            ` other:${String(other.enforcement)}:${String(other.deferrable)}` +
+            `:${String(other.initiallyDeferred)} check:${String(check.enforcement)}`;
+          const expected =
+            'primary key:true:true unique:true:undefined team:not-valid:undefined:undefined' +
+            ' other:not-enforced:true:true check:not-enforced';
+          return facts === expected ? undefined : `imported attributes: ${facts}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The generated-not-null-name round trip: a target adding a not-null fact to a previously
+ * nullable column, so the migration's `SET NOT NULL` gives PostgreSQL 18 the generated name
+ * `t_c_not_null`. Raw target SQL comments that constraint, which keeps the name in the target
+ * dump — pg_dump suppresses a generated name only when the constraint carries no comment —
+ * while the migrated database's dump suppresses it, so the empty diff is load-bearing on the
+ * import's formula strip, which reads the generated name back as unnamed. The comment itself
+ * cannot be attached to a not-null fact the model does not carry: its `COMMENT ON CONSTRAINT`
+ * takes the named not-null deferral flag, which the target import pins while still stripping
+ * the generated name. The probes pin the catalog behavior of `DROP NOT NULL` and `SET NOT NULL`
+ * on the baseline-built not-null fact of `d`, and the catalog checks pin the generated names
+ * and the not-null definition.
+ */
+const notNullConstraintNamesScene = (): LiveScene => {
+  const baseline = table('t', {
+    columns: [column('c'), column('d', { notNull: true })],
+  });
+  const target = table('t', {
+    columns: [column('c', { notNull: true }), column('d', { notNull: true })],
+  });
+  // `DROP NOT NULL` must remove the column's `contype = 'n'` row (PostgreSQL 18 records
+  // not-null constraints in `pg_constraint`); the row is looked up by the column's attnum, so
+  // the assertion does not assume the name under test.
+  const assertNoNotNullRowForD = [
+    'DO $$',
+    'BEGIN',
+    '  IF EXISTS (',
+    '    SELECT 1 FROM pg_constraint',
+    "    WHERE conrelid = 'public.t'::regclass",
+    "      AND contype = 'n'",
+    '      AND conkey = ARRAY[(SELECT attnum FROM pg_attribute',
+    "        WHERE attrelid = 'public.t'::regclass AND attname = 'd')::smallint]",
+    '  ) THEN',
+    "    RAISE EXCEPTION 'DROP NOT NULL left a not-null constraint row for t.d';",
+    '  END IF;',
+    'END',
+    '$$;',
+  ].join('\n');
+  // `SET NOT NULL` regenerates the conventional name through `ChooseConstraintName`.
+  const assertGeneratedNameForD = [
+    'DO $$',
+    'BEGIN',
+    '  IF NOT EXISTS (',
+    '    SELECT 1 FROM pg_constraint',
+    "    WHERE conrelid = 'public.t'::regclass",
+    "      AND contype = 'n'",
+    "      AND conname = 't_d_not_null'",
+    '  ) THEN',
+    "    RAISE EXCEPTION 'SET NOT NULL did not regenerate t_d_not_null';",
+    '  END IF;',
+    'END',
+    '$$;',
+  ].join('\n');
+
+  return {
+    name: 'not-null-constraint-names',
+    minServerMajor: 18,
+    baseline: model(baseline),
+    target: model(target),
+    targetExtraSql:
+      "COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'a comment keeps the generated name in the dump';",
+    planChecks: [
+      {
+        description: 'the added not-null fact is one name-free alter-column step',
+        failure: (steps) => {
+          if (steps.length !== 1) return `steps: ${steps.map((step) => step.kind).join(',')}`;
+          const step = steps[0]!;
+          if (step.kind !== 'alter-column') return `step kind: ${step.kind}`;
+          const fields = step.fields
+            .map((field) => `${field.field}:${String(field.before)}:${String(field.after)}`)
+            .join(',');
+          return fields === 'notNull:false:true' ? undefined : `fields: ${fields}`;
+        },
+      },
+    ],
+    probes: [
+      'ALTER TABLE public.t ALTER COLUMN d DROP NOT NULL;',
+      assertNoNotNullRowForD,
+      'ALTER TABLE public.t ALTER COLUMN d SET NOT NULL;',
+      assertGeneratedNameForD,
+    ],
+    checks: [
+      {
+        description: 'the generated not-null-constraint names',
+        sql: constraintNames('t', 'n'),
+        expected: 't_c_not_null,t_d_not_null',
+      },
+      {
+        description: 'the generated not-null definition',
+        sql: constraintDef('t_c_not_null'),
+        expected: 'NOT NULL c',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'both dumps import the columns as unnamed not-null facts; the target carries the comment flag',
+        failure: (imported, source) => {
+          const t = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (t === undefined) return 't is not imported';
+          const facts = t.columns
+            .map(
+              (column) => `${column.name}:${String(column.notNull)}:${String(column.notNullName)}`,
+            )
+            .join(' ');
+          if (facts !== 'c:true:undefined d:true:undefined') return `columns: ${facts}`;
+          const comments = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.message.startsWith('dropped comment') ||
+              diagnostic.message.startsWith('skipped COMMENT ON'),
+          );
+          if (source === 'applied') {
+            return comments.length === 0
+              ? undefined
+              : `the migrated database's dump carries comments: ${comments
+                  .map((diagnostic) => diagnostic.message)
+                  .join('; ')}`;
+          }
+          const shape = comments
+            .map((diagnostic) =>
+              diagnostic.kind === 'error'
+                ? `error:${diagnostic.code}:${diagnostic.message}`
+                : `${diagnostic.kind}:${diagnostic.code}:${diagnostic.object}:${diagnostic.message}`,
+            )
+            .join('; ');
+          const expected =
+            'flag:unsupported-attribute:public.t.t_c_not_null:' +
+            'dropped comment on a not-null constraint from public.t.t_c_not_null';
+          return shape === expected ? undefined : `comment diagnostics: ${shape}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The in-place enforcement flip: PostgreSQL 18's `ALTER TABLE … ALTER CONSTRAINT … ENFORCED` and
+ * `… NOT ENFORCED` state a pure foreign-key enforcement change without dropping the constraint.
+ * Two child tables reference one untouched parent, one in each direction — `guests` relaxes
+ * (`absent` → `not-enforced`) and `members` tightens (`not-enforced` → `absent`) — under explicit
+ * non-conventional names the import cannot canonicalize away. The plan keeps its semantic
+ * drop/add decomposition (`drop`, `drop`, `add`, `add`); the plan checks pin that shape, the
+ * before/after enforcement values on both pairs, and the two rendered `ALTER` statements at the
+ * server's major. The baseline and post-migration catalog checks pin `conenforced`/`convalidated`
+ * and the exact `pg_get_constraintdef` spellings, and the import checks prove both dumps carry
+ * the target enforcement back onto the model, so the empty diff is a real attribute round trip.
+ */
+const enforcementInPlaceScene = (): LiveScene => {
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const childColumns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('team_id', { type: 'integer' }),
+  ];
+  const child = (
+    name: string,
+    foreignKeyName: string,
+    enforcement?: ForeignKey['enforcement'],
+  ): Table =>
+    table(name, {
+      columns: childColumns,
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [
+        foreignKey(['team_id'], identity('teams'), {
+          name: foreignKeyName,
+          ...(enforcement === undefined ? {} : { enforcement }),
+        }),
+      ],
+    });
+  const enforcementStates =
+    "select string_agg(conname || '|' || convalidated || '|' || conenforced," +
+    " ',' order by conname) from pg_constraint" +
+    " where conname in ('guests_team_fk', 'members_team_fk')";
+
+  return {
+    name: 'enforcement-in-place',
+    minServerMajor: 18,
+    baseline: model(
+      teams,
+      child('guests', 'guests_team_fk'),
+      child('members', 'members_team_fk', 'not-enforced'),
+    ),
+    target: model(
+      teams,
+      child('guests', 'guests_team_fk', 'not-enforced'),
+      child('members', 'members_team_fk'),
+    ),
+    baselineChecks: [
+      {
+        description: 'the two foreign keys start at opposite enforcement states',
+        sql: enforcementStates,
+        expected: 'guests_team_fk|true|true,members_team_fk|false|false',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan keeps the semantic drop/add shape, one change per child table',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds === 'drop-foreign-key,drop-foreign-key,add-foreign-key,add-foreign-key'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+      {
+        description: 'the two pairs carry the before and after enforcement values',
+        failure: (steps) => {
+          const facts = steps
+            .map((step) => {
+              if (step.kind !== 'drop-foreign-key' && step.kind !== 'add-foreign-key') {
+                return `${step.kind}:unexpected`;
+              }
+              const name = step.foreignKey.name ?? '<unnamed>';
+              const enforcement = String(step.foreignKey.enforcement);
+              return `${step.kind}:${step.table.name}:${name}:${enforcement}`;
+            })
+            .join(',');
+          const expected =
+            'drop-foreign-key:guests:guests_team_fk:undefined,' +
+            'drop-foreign-key:members:members_team_fk:not-enforced,' +
+            'add-foreign-key:guests:guests_team_fk:not-enforced,' +
+            'add-foreign-key:members:members_team_fk:undefined';
+          return facts === expected ? undefined : `steps: ${facts}`;
+        },
+      },
+      {
+        description: 'at PostgreSQL 18 both flips render one ALTER each, with no drop and no add',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = [
+            'BEGIN;',
+            'ALTER TABLE public.guests ALTER CONSTRAINT guests_team_fk NOT ENFORCED;',
+            'ALTER TABLE public.members ALTER CONSTRAINT members_team_fk ENFORCED;',
+            'COMMIT;',
+            '',
+          ].join('\n');
+          return sql === expected ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the relaxation deparses with the PostgreSQL 18 suffix',
+        sql: constraintDef('guests_team_fk'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id) NOT ENFORCED',
+      },
+      {
+        description: 'the tightening deparses as the plain enforced form',
+        sql: constraintDef('members_team_fk'),
+        expected: 'FOREIGN KEY (team_id) REFERENCES teams(id)',
+      },
+      {
+        description: 'the enforcement states flipped, each with its validation bit',
+        sql: enforcementStates,
+        expected: 'guests_team_fk|false|false,members_team_fk|true|true',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          'both dumps import the target enforcement, the explicit names intact and the directions distinct',
+        failure: (imported) => {
+          const facts = ['guests', 'members']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              const key = found?.foreignKeys.find(
+                (constraint) => constraint.columns.join(',') === 'team_id',
+              );
+              if (key === undefined) return `${name}:not imported`;
+              return `${name}:${key.name ?? '<unnamed>'}:${String(key.enforcement)}`;
+            })
+            .join(' ');
+          const expected = 'guests:guests_team_fk:not-enforced members:members_team_fk:undefined';
+          return facts === expected ? undefined : `imported enforcement: ${facts}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
@@ -2643,7 +3820,7 @@ const indexCreateScene = (): LiveScene => {
                 `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`,
             )
             .join('; ');
-          if (indexes !== 'accounts_age_idx|plain|age; accounts_email_idx|unique|email') {
+          if (indexes !== '<unnamed>|plain|age; <unnamed>|unique|email') {
             return `modeled indexes: ${indexes}`;
           }
           const skips = imported.diagnostics
@@ -2774,8 +3951,7 @@ const indexConcurrentlyScene = (): LiveScene => {
                 `${index.columns.join(',')}|${index.concurrently === true ? 'concurrently' : 'ordinary'}`,
             )
             .join('; ');
-          return indexes ===
-            'accounts_email_idx|plain|email|ordinary; accounts_note_idx|plain|note|ordinary'
+          return indexes === '<unnamed>|plain|email|ordinary; <unnamed>|plain|note|ordinary'
             ? undefined
             : `indexes: ${indexes}`;
         },
@@ -2796,6 +3972,101 @@ const indexConcurrentlyScene = (): LiveScene => {
         description: 'the concurrently built index is valid',
         sql: indexIsValid('accounts_email_idx'),
         expected: 't',
+      },
+    ],
+  };
+};
+
+/**
+ * The unnamed-index round trip: a target declaring three standalone indexes without names —
+ * a single-column one, a multi-column one, and one built `CONCURRENTLY`. PostgreSQL names them
+ * on apply (`t_age_idx`, `t_a_b_idx`, `t_note_idx`); the dump import canonicalizes those
+ * server-generated names back to unnamed, so the catalog check pins the generated names and
+ * the import checks pin that every imported index is unnamed in both dumps. A dump never
+ * carries `CONCURRENTLY`, so the concurrent index is ordinary on both imported sides.
+ */
+const unnamedIndexRoundTripScene = (): LiveScene => {
+  const columns = [
+    column('a', { type: 'integer' }),
+    column('b', { type: 'integer' }),
+    column('age', { type: 'integer' }),
+    column('note'),
+  ];
+  const target = table('t', {
+    columns,
+    indexes: [
+      { unique: false, columns: ['age'] },
+      { unique: false, columns: ['a', 'b'] },
+      { unique: false, columns: ['note'], concurrently: true },
+    ],
+  });
+
+  return {
+    name: 'unnamed-index-round-trip',
+    baseline: model(table('t', { columns })),
+    target: model(target),
+    planChecks: [
+      {
+        description:
+          'the plan creates the two plain indexes transactionally and the concurrent one bare',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'create-index,create-index,create-index-concurrently') {
+            return `unexpected steps: ${kinds}`;
+          }
+          const columnsCreated = steps
+            .map((step) =>
+              step.kind === 'create-index' || step.kind === 'create-index-concurrently'
+                ? step.index.columns.join('+')
+                : '<other>',
+            )
+            .join(',');
+          if (columnsCreated !== 'a+b,age,note') {
+            return `unexpected index columns: ${columnsCreated}`;
+          }
+          const groups = plan.groups
+            .map(
+              (group) =>
+                `${group.transactional ? 'wrapped' : 'standalone'}[${group.start},${group.end})`,
+            )
+            .join(' ');
+          return groups === 'wrapped[0,2) standalone[2,3)'
+            ? undefined
+            : `unexpected groups: ${groups}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the catalog carries the three server-generated names',
+        sql: indexesOf('t'),
+        expected: 't_a_b_idx,t_age_idx,t_note_idx',
+      },
+      {
+        description: 'the concurrently built index is valid',
+        sql: indexIsValid('t_note_idx'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry every index unnamed, with its structure intact',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (table === undefined) return 't is not imported';
+          const named = table.indexes.filter((index) => index.name !== undefined);
+          if (named.length > 0) {
+            return `${source}: server-generated names survived: ${named
+              .map((index) => index.name)
+              .join(',')}`;
+          }
+          const structures = table.indexes
+            .map((index) => `${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`)
+            .join('; ');
+          return structures === 'plain|a,b; plain|age; plain|note'
+            ? undefined
+            : `${source}: structures: ${structures}`;
+        },
       },
     ],
   };
@@ -2881,6 +4152,2896 @@ const nonPublicIndexDropScene = (): LiveScene => {
   };
 };
 
+/**
+ * The live-introspection tracer: a database whose model exercises the covered catalog surface
+ * — two raw schemas beside `public`, quoted and mixed-case identifiers, a composite primary
+ * key declared out of name order, an unnamed conventional `<table>_pkey` that must strip and an
+ * explicitly named primary key that must stay, nullable and `NOT NULL` columns, a spread of
+ * type spellings, and a column the baseline declares and the target drops so the migrated
+ * database physically holds the `attisdropped` row the read must filter. The scene asserts
+ * `matches-import`: no diagnostics, an empty `diff` against the applied dump's import, and a
+ * model deep-equal to that import.
+ */
+const introspectionTracerScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('account_id', { type: 'uuid', notNull: true }),
+      column('tenant'),
+      column('created_at', { type: 'timestamp with time zone', notNull: true }),
+      column('tags', { type: 'integer[]' }),
+      column('score', { type: 'numeric(10,2)' }),
+    ],
+    primaryKey: { columns: ['account_id'] },
+  });
+  const report = table('report', {
+    schema: 'app',
+    columns: [
+      column('id', { type: 'uuid', notNull: true }),
+      column('label', { type: 'character varying(255)', notNull: true }),
+      column('amount', { type: 'numeric(10,2)' }),
+    ],
+    primaryKey: { name: 'report_label_pkey', columns: ['label'] },
+  });
+  const mixed = table('Mixed Table', {
+    columns: [
+      column('Zed', { type: 'integer', notNull: true }),
+      column('alpha', { type: 'integer' }),
+      column('beta', { type: 'integer', notNull: true }),
+      column('note'),
+    ],
+    primaryKey: { columns: ['beta', 'Zed'] },
+  });
+  const composite = table('composite', {
+    columns: [
+      column('a', { type: 'integer', notNull: true }),
+      column('b', { type: 'integer' }),
+      column('c', { type: 'integer', notNull: true }),
+    ],
+    primaryKey: { columns: ['c', 'a'] },
+  });
+  const odd = table('Odd Table', {
+    schema: 'Weird Schema',
+    columns: [column('select', { type: 'integer', notNull: true }), column('with "quote')],
+    primaryKey: { columns: ['select'] },
+  });
+  const keep = table('keep', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+
+  return {
+    name: 'introspection-tracer',
+    setupSql: 'CREATE SCHEMA app;\nCREATE SCHEMA "Weird Schema";',
+    baseline: model(
+      accounts,
+      report,
+      mixed,
+      composite,
+      odd,
+      keep,
+      table('lost_cols', {
+        columns: [column('stay', { type: 'integer' }), column('gone')],
+      }),
+    ),
+    target: model(
+      accounts,
+      report,
+      mixed,
+      composite,
+      odd,
+      keep,
+      table('lost_cols', { columns: [column('stay', { type: 'integer' })] }),
+    ),
+    checks: [
+      {
+        description: 'the dropped column physically survives as an attisdropped row',
+        sql:
+          "select attisdropped from pg_attribute where attrelid = 'public.lost_cols'::regclass" +
+          ' and attnum = 2',
+        expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live-introspection index round trip: a model exercising the covered index surface — an
+ * ordinary table with a primary key, so the constraint-backed `accounts_pkey` index must be
+ * consumed through `conindid` rather than modeled as a standalone index; a named plain index;
+ * two unnamed indexes on one table whose tie order is the stored-name order; a standalone
+ * unique index; and an unnamed index whose generated name exceeds PostgreSQL's 63-byte
+ * identifier limit, so it strips only in its server form (the assembled long form is a
+ * different name). The scene asserts `matches-import`: no diagnostics, an empty `diff` against
+ * the applied dump's import, and a model deep-equal to that import — the order-significant
+ * guard over the two unnamed ties.
+ */
+const introspectionIndexesScene = (): LiveScene => {
+  const accountsColumns = [
+    column('id', { type: 'bigint', notNull: true }),
+    column('tenant', { notNull: true }),
+    column('email', { notNull: true }),
+    column('alpha', { type: 'integer' }),
+    column('beta', { type: 'integer' }),
+  ];
+  const accounts = table('accounts', {
+    columns: accountsColumns,
+    primaryKey: { columns: ['id'] },
+  });
+  const accountsTarget = table('accounts', {
+    columns: accountsColumns,
+    primaryKey: { columns: ['id'] },
+    indexes: [
+      { name: 'accounts_tenant_idx', unique: false, columns: ['tenant'] },
+      { unique: false, columns: ['beta'] },
+      { unique: false, columns: ['alpha'] },
+      { name: 'accounts_email_uniq_idx', unique: true, columns: ['email'] },
+    ],
+  });
+  const ledgerColumns = [column('originator_transaction_reference_number')];
+  const ledger = table('settlement_ledger_entries', { columns: ledgerColumns });
+  const ledgerTarget = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['originator_transaction_reference_number'] }],
+  });
+
+  return {
+    name: 'introspection-indexes',
+    baseline: model(accounts, ledger),
+    target: model(accountsTarget, ledgerTarget),
+    baselineChecks: [
+      {
+        description: 'baseline accounts carries only its constraint-backed primary-key index',
+        sql: indexesOf('accounts'),
+        expected: 'accounts_pkey',
+      },
+      {
+        description: 'baseline settlement_ledger_entries carries no index',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: '',
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated accounts carries the named, unnamed, and unique index names',
+        sql: indexesOf('accounts'),
+        expected:
+          'accounts_alpha_idx,accounts_beta_idx,accounts_email_uniq_idx,accounts_pkey,' +
+          'accounts_tenant_idx',
+      },
+      {
+        description: 'the unnamed long-name index stores the balanced server form',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: 'settlement_ledger_entries_originator_transaction_reference__idx',
+      },
+      {
+        description: 'the standalone unique index is unique in the catalog',
+        sql: indexIsUnique('accounts_email_uniq_idx'),
+        expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live sequence and identity introspection round trip: the target exercises the covered
+ * sequence surface and the two identity generation modes, and the scene asserts
+ * `matches-import` — no diagnostics, an empty `diff` against the applied dump's import, and a
+ * model deep-equal to that import. A standalone bigint sequence carries non-default options
+ * including `MAXVALUE 9223372036854775807`, the exact 64-bit bound that JSON-number transport
+ * would corrupt; an owned sequence sits behind a plain column's `nextval` default; an integer
+ * identity is `GENERATED ALWAYS` with non-default options and a custom `SEQUENCE NAME`; and a
+ * bigint identity is `GENERATED BY DEFAULT` with every option at its default, so the read has
+ * to carry the server-chosen sequence name the model does not state.
+ */
+const introspectionSequencesIdentityScene = (): LiveScene => {
+  const identityCustom = table('identity_custom', {
+    columns: [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        identity: identityColumn('integer', {
+          generated: 'always',
+          sequenceName: sequenceIdentity('custom_identity_seq'),
+          increment: '4',
+          minValue: '10',
+          maxValue: '9000',
+          start: '50',
+          cache: '3',
+        }),
+      }),
+      column('note'),
+    ],
+  });
+  const identityDefaults = table('identity_defaults', {
+    columns: [
+      column('id', {
+        type: 'bigint',
+        notNull: true,
+        identity: identityColumn('bigint', { generated: 'by default' }),
+      }),
+      column('note'),
+    ],
+  });
+  const ownedSequence = table('owned_sequence', {
+    columns: [
+      column('counter', {
+        type: 'bigint',
+        default: "nextval('public.owned_counter_seq'::regclass)",
+      }),
+      column('note'),
+    ],
+  });
+
+  return {
+    name: 'introspection-sequences-identity',
+    baseline: model(),
+    target: withSequences(
+      [identityCustom, identityDefaults, ownedSequence],
+      [
+        sequence('owned_counter_seq', {
+          ownedBy: sequenceOwner('owned_sequence', 'counter'),
+        }),
+        sequence('standalone_seq', {
+          increment: '3',
+          minValue: '5',
+          maxValue: '9223372036854775807',
+          start: '1000',
+          cache: '11',
+        }),
+      ],
+    ),
+    baselineChecks: [
+      { description: 'baseline has no tables', sql: TABLE_COUNT, expected: '0' },
+      { description: 'baseline has no sequences', sql: SEQUENCES, expected: '' },
+    ],
+    checks: [
+      {
+        description: 'sequences, identity internals included',
+        sql: SEQUENCES,
+        expected: 'custom_identity_seq,identity_defaults_id_seq,owned_counter_seq,standalone_seq',
+      },
+      {
+        description: 'the standalone sequence carries the bigint bound and non-default options',
+        sql: sequenceParams('standalone_seq'),
+        expected: 'bigint|1000|5|9223372036854775807|3|false|11',
+      },
+      {
+        description: 'the custom-named identity sequence carries its non-default options',
+        sql: sequenceParams('custom_identity_seq'),
+        expected: 'integer|50|10|9000|4|false|3',
+      },
+      {
+        description: 'the bigint identity sequence carries the default options',
+        sql: sequenceParams('identity_defaults_id_seq'),
+        expected: 'bigint|1|1|9223372036854775807|1|false|1',
+      },
+      {
+        description: 'the owned sequence is owned by the plain column',
+        sql: sequenceOwnership('owned_counter_seq'),
+        expected: 'owned_sequence.counter',
+      },
+      {
+        description: 'the standalone sequence is unowned',
+        sql: sequenceOwnership('standalone_seq'),
+        expected: 'none',
+      },
+      {
+        description: 'the custom identity sequence is internal to its column',
+        sql: identityOwnership('custom_identity_seq'),
+        expected: 'identity_custom.id',
+      },
+      {
+        description: 'the by-default identity sequence is internal to its column',
+        sql: identityOwnership('identity_defaults_id_seq'),
+        expected: 'identity_defaults.id',
+      },
+      {
+        description: 'the integer identity is GENERATED ALWAYS',
+        sql: attributeIdentity('identity_custom', 'id'),
+        expected: 'a',
+      },
+      {
+        description: 'the bigint identity is GENERATED BY DEFAULT',
+        sql: attributeIdentity('identity_defaults', 'id'),
+        expected: 'd',
+      },
+      {
+        description: 'the owned column default references its sequence',
+        sql: columnFact(
+          'owned_sequence',
+          'counter',
+          "position('owned_counter_seq' in column_default) > 0",
+        ),
+        expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live column-attribute round trip: the covered per-column and per-table states on a
+ * PostgreSQL 16 or newer server (the storage removal renders `SET STORAGE DEFAULT`, 16+;
+ * compression reads need 14; the 13–15 residual is named). The pairs carry defaults added,
+ * changed, removed, and written as an expression and in cast shape (`pg_attrdef`/`pg_get_expr`
+ * behind the read); a collation added, changed from `pg_catalog."C"` to a quoted mixed-case
+ * user collation in a non-public schema, and removed; a storage change and a removal; a
+ * compression add and a removal (`pglz` only, so the scene does not depend on `lz4` being
+ * compiled in); a simultaneous type-and-collation change and a type change with explicit
+ * storage and compression, so the merged `TYPE` statement and the post-`TYPE` restatements are
+ * pinned live; and a persistence flip in both directions. `checks` pin the physical catalog
+ * state — the `pg_attrdef` default text, the `attstorage`/`typstorage` letters, the `jsonb`
+ * compression letter, the collation's qualified name against `typcollation`, and
+ * `pg_class.relpersistence` — so a renderer omission cannot hide behind the two dumps agreeing:
+ * `matches-import` alone is renderer-symmetric.
+ */
+const columnAttributesScene = (): LiveScene => {
+  const defaults = table('defaults', {
+    columns: [
+      column('d_add', { type: 'integer' }),
+      column('d_change', { type: 'integer', default: '1' }),
+      column('d_remove', { type: 'integer', default: '7' }),
+      column('d_expr', { type: 'timestamp with time zone' }),
+      column('d_cast'),
+    ],
+  });
+  const defaultsTarget = table('defaults', {
+    columns: [
+      column('d_add', { type: 'integer', default: '1' }),
+      column('d_change', { type: 'integer', default: '2' }),
+      column('d_remove', { type: 'integer' }),
+      column('d_expr', { type: 'timestamp with time zone', default: 'now()' }),
+      column('d_cast', { default: "'x'::text" }),
+    ],
+  });
+  const colls = table('colls', {
+    columns: [
+      column('c_add'),
+      column('c_change', { collation: 'pg_catalog."C"' }),
+      column('c_remove', { collation: 'app."User_C"' }),
+    ],
+  });
+  const collsTarget = table('colls', {
+    columns: [
+      column('c_add', { collation: 'pg_catalog."C"' }),
+      column('c_change', { collation: 'app."User_C"' }),
+      column('c_remove'),
+    ],
+  });
+  const methods = table('methods', {
+    columns: [
+      column('s_change'),
+      column('s_remove', { storage: 'main' }),
+      column('comp_add'),
+      column('comp_remove', { compression: 'pglz' }),
+    ],
+  });
+  const methodsTarget = table('methods', {
+    columns: [
+      column('s_change', { storage: 'external' }),
+      column('s_remove'),
+      column('comp_add', { compression: 'pglz' }),
+      column('comp_remove'),
+    ],
+  });
+  const merged = table('merged', {
+    columns: [
+      column('m_type_coll', { collation: 'pg_catalog."C"' }),
+      column('m_reset', { storage: 'external', compression: 'pglz' }),
+    ],
+  });
+  const mergedTarget = table('merged', {
+    columns: [
+      column('m_type_coll', { type: 'character varying(12)', collation: 'pg_catalog."POSIX"' }),
+      column('m_reset', {
+        type: 'character varying(12)',
+        storage: 'external',
+        compression: 'pglz',
+      }),
+    ],
+  });
+  const flipUp = table('flip_up', { columns: [column('id', { type: 'integer' })] });
+  const flipUpTarget = table('flip_up', {
+    persistence: 'unlogged',
+    columns: [column('id', { type: 'integer' })],
+  });
+  const flipDown = table('flip_down', {
+    persistence: 'unlogged',
+    columns: [column('id', { type: 'integer' })],
+  });
+  const flipDownTarget = table('flip_down', { columns: [column('id', { type: 'integer' })] });
+
+  const baseline = model(defaults, colls, methods, merged, flipUp, flipDown);
+  const target = model(
+    defaultsTarget,
+    collsTarget,
+    methodsTarget,
+    mergedTarget,
+    flipUpTarget,
+    flipDownTarget,
+  );
+
+  return {
+    name: 'column-attributes',
+    minServerMajor: 16,
+    setupSql: [
+      'CREATE SCHEMA app;',
+      'CREATE COLLATION app."User_C" (provider = libc, locale = \'C\');',
+    ].join('\n'),
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'baseline defaults: only d_change and d_remove state one',
+        sql: defaultsOf('defaults'),
+        expected: 'd_add|<none> d_change|1 d_remove|7 d_expr|<none> d_cast|<none>',
+      },
+      {
+        description: 'baseline collations: the system and the user spelling, c_add bare',
+        sql: collationsOf('colls'),
+        expected: 'c_add|default c_change|pg_catalog."C" c_remove|app."User_C"',
+      },
+      {
+        description: 'baseline storage: s_remove explicit main, the rest the type default',
+        sql: storageModesOf('methods'),
+        expected: 's_change|x|x s_remove|m|x comp_add|x|x comp_remove|x|x',
+      },
+      {
+        description: 'baseline compression: comp_remove explicit pglz',
+        sql: compressionModesOf('methods'),
+        expected: 's_change| s_remove| comp_add| comp_remove|p',
+      },
+      {
+        description: 'baseline merged: m_reset explicit external storage, text being the type',
+        sql: storageModesOf('merged'),
+        expected: 'm_type_coll|x|x m_reset|e|x',
+      },
+      {
+        description: 'baseline merged: m_reset explicit pglz compression',
+        sql: compressionModesOf('merged'),
+        expected: 'm_type_coll| m_reset|p',
+      },
+      {
+        description: 'baseline flip_up is logged',
+        sql: relPersistenceOf('flip_up'),
+        expected: 'p',
+      },
+      {
+        description: 'baseline flip_down is unlogged',
+        sql: relPersistenceOf('flip_down'),
+        expected: 'u',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the type-and-collation change renders one merged TYPE statement',
+        failure: (_steps, migration, serverMajor) => {
+          const lines = renderSql(migration, { targetVersion: serverMajor }).split('\n');
+          const statements = lines.filter((line) =>
+            line.startsWith('ALTER TABLE public.merged ALTER COLUMN m_type_coll '),
+          );
+          const expected =
+            'ALTER TABLE public.merged ALTER COLUMN m_type_coll TYPE character varying(12)' +
+            ' COLLATE pg_catalog."POSIX";';
+          return statements.length === 1 && statements[0] === expected
+            ? undefined
+            : `statements: ${statements.join(' | ')}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated defaults, the cast-shaped and expression forms exact',
+        sql: defaultsOf('defaults'),
+        expected: "d_add|1 d_change|2 d_remove|<none> d_expr|now() d_cast|'x'::text",
+      },
+      {
+        description:
+          'the migrated collations: the system spelling, the user collation, the removal',
+        sql: collationsOf('colls'),
+        expected: 'c_add|pg_catalog."C" c_change|app."User_C" c_remove|default',
+      },
+      {
+        description: 'the migrated storage letters; the removal resets to the type default',
+        sql: storageModesOf('methods'),
+        expected: 's_change|e|x s_remove|x|x comp_add|x|x comp_remove|x|x',
+      },
+      {
+        description: 'the migrated compression letters; the removal clears the explicit method',
+        sql: compressionModesOf('methods'),
+        expected: 's_change| s_remove| comp_add|p comp_remove|',
+      },
+      {
+        description: 'the merged type change lands on both columns',
+        sql: typesOf('merged'),
+        expected: 'm_type_coll|character varying(12) m_reset|character varying(12)',
+      },
+      {
+        description: 'the post-TYPE restatement restores the explicit storage',
+        sql: storageModesOf('merged'),
+        expected: 'm_type_coll|x|x m_reset|e|x',
+      },
+      {
+        description: 'the post-TYPE restatement restores the explicit compression',
+        sql: compressionModesOf('merged'),
+        expected: 'm_type_coll| m_reset|p',
+      },
+      {
+        description: 'the logged-to-unlogged flip lands',
+        sql: relPersistenceOf('flip_up'),
+        expected: 'u',
+      },
+      {
+        description: 'the unlogged-to-logged flip lands',
+        sql: relPersistenceOf('flip_down'),
+        expected: 'p',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import every attribute state exactly',
+        failure: (imported, source) => {
+          const facts = (name: string): string => {
+            const found = imported.model.tables.find((candidate) => candidate.name === name);
+            if (found === undefined) return 'not imported';
+            return found.columns
+              .map((column) =>
+                [column.name, column.default, column.collation, column.storage, column.compression]
+                  .map((value) => value ?? '-')
+                  .join('|'),
+              )
+              .join(' ');
+          };
+          const expected: readonly (readonly [string, string])[] = [
+            [
+              'defaults',
+              "d_add|1|-|-|- d_change|2|-|-|- d_remove|-|-|-|- d_expr|now()|-|-|- d_cast|'x'::text|-|-|-",
+            ],
+            ['colls', 'c_add|-|pg_catalog."C"|-|- c_change|-|app."User_C"|-|- c_remove|-|-|-|-'],
+            [
+              'methods',
+              's_change|-|-|external|- s_remove|-|-|-|- comp_add|-|-|-|pglz comp_remove|-|-|-|-',
+            ],
+            ['merged', 'm_type_coll|-|pg_catalog."POSIX"|-|- m_reset|-|-|external|pglz'],
+          ];
+          for (const [name, wanted] of expected) {
+            const actual = facts(name);
+            if (actual !== wanted) return `${source}: ${name}: ${actual}`;
+          }
+          const persistence = ['flip_up', 'flip_down']
+            .map((name) => {
+              const found = imported.model.tables.find((candidate) => candidate.name === name);
+              return `${name}:${found === undefined ? 'not imported' : (found.persistence ?? '-')}`;
+            })
+            .join(' ');
+          return persistence === 'flip_up:unlogged flip_down:-'
+            ? undefined
+            : `${source}: ${persistence}`;
+        },
+      },
+      {
+        description: 'each dump imports to the authored target model, attributes and all',
+        failure: (imported, source) => {
+          const changes = diff(target, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the import diffs as ${changes.map((change) => change.kind).join(',')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live-introspection flags scene: the covered column and table states now read back
+ * instead of flagging, and the deferred states stay flagged, each asserted as an exact
+ * diagnostic. The model declares `flag_covered` — a default, an explicit collation, storage,
+ * and compression — and `flag_identity`; the explicit compression renders `SET COMPRESSION
+ * pglz`, so the scene declares `minServerMajor: 14` and a PostgreSQL 13 server skips it. Raw
+ * setup SQL adds an unlogged table whose persistence reads back, a generated column whose flag
+ * must suppress its `atthasdef` default flag, a partitioned table with one partition — both partitioned relations skipped and
+ * named, and neither mapped — and a table carrying expression, partial, and `INCLUDE` indexes
+ * plus an index marked invalid by a catalog write (a model cannot declare an invalid index),
+ * each outside the model's envelope and skipped whole with the read's reason. The covered
+ * states produce no diagnostic, so the exact list is the pin that their flags stayed gone.
+ */
+const introspectionFlagsScene = (): LiveScene => {
+  const target = model(
+    table('flag_covered', {
+      columns: [
+        column('d', { type: 'integer', default: '42' }),
+        column('c', { collation: 'pg_catalog."C"' }),
+        column('s', { storage: 'main' }),
+        column('m', { compression: 'pglz' }),
+      ],
+    }),
+    table('flag_identity', {
+      columns: [
+        column('id', { type: 'integer', notNull: true, identity: identityColumn('integer') }),
+        column('name'),
+      ],
+    }),
+  );
+
+  return {
+    name: 'introspection-flags',
+    minServerMajor: 14,
+    setupSql: [
+      'CREATE UNLOGGED TABLE public.flag_unlogged (x integer);',
+      'CREATE TABLE public.flag_generated (a integer DEFAULT 1, b integer GENERATED ALWAYS AS (a * 2) STORED);',
+      'CREATE TABLE public.flag_indexed (a integer, b integer, c integer);',
+      'CREATE INDEX flag_expr_idx ON public.flag_indexed USING btree ((a + b));',
+      'CREATE INDEX flag_partial_idx ON public.flag_indexed USING btree (a) WHERE (a > 0);',
+      'CREATE INDEX flag_include_idx ON public.flag_indexed USING btree (a) INCLUDE (b);',
+      'CREATE INDEX flag_invalid_idx ON public.flag_indexed USING btree (c);',
+      "UPDATE pg_catalog.pg_index SET indisvalid = false WHERE indexrelid = 'public.flag_invalid_idx'::regclass;",
+      'CREATE TABLE public.flag_partitioned (k integer, v text) PARTITION BY RANGE (k);',
+      'CREATE TABLE public.flag_partitioned_1 PARTITION OF public.flag_partitioned FOR VALUES FROM (0) TO (10);',
+    ].join('\n'),
+    baseline: model(),
+    target,
+    introspection: {
+      assert: 'flags',
+      expected: [
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.flag_generated',
+          message: 'column b is generated; generation is not represented yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_expr_idx',
+          message: 'skipped CREATE INDEX public.flag_expr_idx (expression element)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_include_idx',
+          message: 'skipped CREATE INDEX public.flag_include_idx (INCLUDE)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_invalid_idx',
+          message:
+            'index public.flag_invalid_idx is not valid and ready; invalid indexes are not represented yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partial_idx',
+          message: 'skipped CREATE INDEX public.flag_partial_idx (partial WHERE)',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partitioned',
+          message:
+            'table public.flag_partitioned is partitioned; partitioning is not represented yet',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.flag_partitioned_1',
+          message:
+            'table public.flag_partitioned_1 is partitioned; partitioning is not represented yet',
+        },
+      ],
+    },
+  };
+};
+
+/**
+ * The PostgreSQL 15 `NULLS NOT DISTINCT` index skip, gated: the base-floor flags scene cannot
+ * carry the shape, so this scene runs only on PostgreSQL 15 or newer — skipped with a named
+ * reason on older servers — and pins the exact diagnostic the read reports for a unique index
+ * whose definition carries the clause.
+ */
+const introspectionFlagsNullsNotDistinctScene = (): LiveScene => ({
+  name: 'introspection-flags-nulls-not-distinct',
+  minServerMajor: 15,
+  setupSql: [
+    'CREATE TABLE public.flag_nulls (a integer);',
+    'CREATE UNIQUE INDEX flag_nulls_idx ON public.flag_nulls USING btree (a) NULLS NOT DISTINCT;',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.flag_nulls_idx',
+        message: 'skipped CREATE INDEX public.flag_nulls_idx (NULLS NOT DISTINCT)',
+      },
+    ],
+  },
+});
+
+/**
+ * The constraint flags scene: the constraint states the model cannot carry stay flagged, one
+ * per table so the canonical table order is part of the pin. Raw setup SQL creates an
+ * exclusion constraint (no model shape, skipped whole and named by its constraint object), a
+ * check marked `NO INHERIT`, a unique constraint with an `INCLUDE` column list, and a foreign
+ * key with `MATCH FULL`; the model and target are empty, so the diagnostics are the whole
+ * claim. The generated names are PostgreSQL 16.15's conventional ones, pinned exactly.
+ */
+const introspectionFlagsConstraintsScene = (): LiveScene => ({
+  name: 'introspection-flags-constraints',
+  setupSql: [
+    'CREATE TABLE public.flag_check (a integer);',
+    'ALTER TABLE public.flag_check ADD CHECK (a > 0) NO INHERIT;',
+    'CREATE TABLE public.flag_excl (id integer, during tsrange, EXCLUDE USING gist (during WITH &&));',
+    'CREATE TABLE public.flag_parent (id integer PRIMARY KEY);',
+    'CREATE TABLE public.flag_fk (parent_id integer REFERENCES public.flag_parent (id) MATCH FULL);',
+    'CREATE TABLE public.flag_unique (a integer, b integer, UNIQUE (a) INCLUDE (b));',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_check',
+        message: 'dropped NO INHERIT on check constraint flag_check_a_check from public.flag_check',
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.flag_excl_during_excl',
+        message: 'skipped exclusion constraint public.flag_excl_during_excl',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fk',
+        message: 'dropped MATCH FULL on foreign key flag_fk_parent_id_fkey from public.flag_fk',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_unique',
+        message: 'dropped INCLUDE on unique constraint flag_unique_a_b_key from public.flag_unique',
+      },
+    ],
+  },
+});
+
+/**
+ * The PostgreSQL 15 constraint flags companion: `NULLS NOT DISTINCT` on a unique constraint
+ * and a foreign key whose `ON DELETE SET NULL` names a column list. Both attributes arrived in
+ * PostgreSQL 15, so the scene is skipped with a named reason on older servers; the diagnostic
+ * order is canonical table order.
+ */
+const introspectionFlagsConstraints15Scene = (): LiveScene => ({
+  name: 'introspection-flags-constraints-15',
+  minServerMajor: 15,
+  setupSql: [
+    'CREATE TABLE public.flag_parent (id integer PRIMARY KEY);',
+    'CREATE TABLE public.flag_fkcols (parent_id integer REFERENCES public.flag_parent (id) ON DELETE SET NULL (parent_id));',
+    'CREATE TABLE public.flag_nnd (a integer, UNIQUE NULLS NOT DISTINCT (a));',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fkcols',
+        message:
+          'dropped column list on foreign key flag_fkcols_parent_id_fkey from public.flag_fkcols',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nnd',
+        message:
+          'dropped NULLS NOT DISTINCT on unique constraint flag_nnd_a_key from public.flag_nnd',
+      },
+    ],
+  },
+});
+
+/**
+ * The PostgreSQL 18 constraint flags scene: the attributes only the PostgreSQL 18 grammar can
+ * state. A not-null constraint carries `NOT VALID` on one column and `NO INHERIT` on another;
+ * a primary key and a unique constraint use `WITHOUT OVERLAPS`; and a `PERIOD` foreign key
+ * references the primary key's temporal key. Every statement is checked against the
+ * PostgreSQL 18 grammar (`gram.y`: `NOT NULL_P ColId ConstraintAttributeSpec`,
+ * `columnList opt_without_overlaps`, and `columnList optionalPeriodName`), and the generated
+ * names are written explicitly so the pinned diagnostics do not depend on a naming rule the
+ * local server cannot exercise. Local PostgreSQL 16 runs skip this scene by name; CI's
+ * PostgreSQL 18 runs it.
+ */
+const introspectionFlagsConstraints18Scene = (): LiveScene => ({
+  name: 'introspection-flags-constraints-18',
+  minServerMajor: 18,
+  setupSql: [
+    'CREATE EXTENSION IF NOT EXISTS btree_gist;',
+    'CREATE TABLE public.flag_nn (c integer, d integer);',
+    'ALTER TABLE public.flag_nn ADD CONSTRAINT flag_nn_c_not_null NOT NULL c NOT VALID;',
+    'ALTER TABLE public.flag_nn ADD CONSTRAINT flag_nn_d_not_null NOT NULL d NO INHERIT;',
+    'CREATE TABLE public.flag_pk (id integer, during tsrange);',
+    'ALTER TABLE public.flag_pk ADD CONSTRAINT flag_pk_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);',
+    'CREATE TABLE public.flag_unique_period (id integer NOT NULL, during tsrange NOT NULL);',
+    'ALTER TABLE public.flag_unique_period ADD CONSTRAINT flag_unique_period_key UNIQUE (id, during WITHOUT OVERLAPS);',
+    'CREATE TABLE public.flag_fk_period (parent_id integer, parent_during tsrange);',
+    'ALTER TABLE public.flag_fk_period ADD CONSTRAINT flag_fk_period_fkey FOREIGN KEY (parent_id, PERIOD parent_during) REFERENCES public.flag_pk (id, PERIOD during);',
+  ].join('\n'),
+  baseline: model(),
+  target: model(),
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_fk_period',
+        message: 'dropped PERIOD on foreign key flag_fk_period_fkey from public.flag_fk_period',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nn',
+        message: 'dropped NOT VALID on not-null constraint flag_nn_c_not_null from public.flag_nn',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_nn',
+        message: 'dropped NO INHERIT on not-null constraint flag_nn_d_not_null from public.flag_nn',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_pk',
+        message: 'dropped WITHOUT OVERLAPS on primary key flag_pk_pkey from public.flag_pk',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.flag_unique_period',
+        message:
+          'dropped WITHOUT OVERLAPS on unique constraint flag_unique_period_key' +
+          ' from public.flag_unique_period',
+      },
+    ],
+  },
+});
+
+/**
+ * The partition-child and dropped-column guard scene: raw setup SQL builds a partitioned
+ * parent `part` and its child `part_1`, carrying a parent-declared check beside a child-local
+ * check, a child-local index, and a child-local primary key. The inherited copies are excluded
+ * by `conislocal` alone, so only the child-local rows exercise the catalog read's
+ * `NOT relispartition` guards; a read that lets one through throws via `requireOrdinaryTable`
+ * instead of silently modeling a partition child. Both partitioned relations stay skipped and
+ * named. The models carry one ordinary table whose target drops a column, so the migrated
+ * database physically holds the `attisdropped` row the column read must filter. The scene pins
+ * the two partition skips exactly, the physical dropped-column row, and — on both imports —
+ * that pg_dump's `CREATE TABLE` plus `ATTACH PARTITION` form imports the child exactly once as
+ * a plain table and no diagnostic names it.
+ */
+const partitionChildGuardsScene = (): LiveScene => ({
+  name: 'partition-child-guards',
+  setupSql: [
+    'CREATE TABLE public.part (k integer, payload text) PARTITION BY RANGE (k);',
+    'CREATE TABLE public.part_1 PARTITION OF public.part FOR VALUES FROM (0) TO (10);',
+    "ALTER TABLE public.part ADD CONSTRAINT part_payload_check CHECK (payload <> '');",
+    "ALTER TABLE public.part_1 ADD CONSTRAINT part_1_payload_check CHECK (payload <> '');",
+    'CREATE INDEX part_1_payload_idx ON public.part_1 (payload);',
+    'ALTER TABLE public.part_1 ADD CONSTRAINT part_1_pkey PRIMARY KEY (k);',
+  ].join('\n'),
+  baseline: model(
+    table('drop_probe', {
+      columns: [column('stay', { type: 'integer' }), column('gone')],
+    }),
+  ),
+  target: model(
+    table('drop_probe', {
+      columns: [column('stay', { type: 'integer' })],
+    }),
+  ),
+  checks: [
+    {
+      description: 'the dropped column physically survives as an attisdropped row',
+      sql:
+        "select attisdropped from pg_attribute where attrelid = 'public.drop_probe'::regclass" +
+        ' and attnum = 2',
+      expected: 't',
+    },
+  ],
+  importChecks: [
+    {
+      description: 'the partition child imports exactly once and no diagnostic names it',
+      failure: (imported, source) => {
+        const children = imported.model.tables.filter(
+          (candidate) => candidate.schema === 'public' && candidate.name === 'part_1',
+        );
+        if (children.length !== 1) {
+          return `${source}: expected exactly one public.part_1 table, found ${children.length}`;
+        }
+        const named = imported.diagnostics.filter(
+          (diagnostic) =>
+            (diagnostic.kind !== 'error' && diagnostic.object.includes('part_1')) ||
+            diagnostic.message.includes('part_1'),
+        );
+        if (named.length > 0) {
+          return `${source}: diagnostics name part_1: ${named
+            .map((diagnostic) => diagnostic.message)
+            .join('; ')}`;
+        }
+        return undefined;
+      },
+    },
+  ],
+  introspection: {
+    assert: 'flags',
+    expected: [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.part',
+        message: 'table public.part is partitioned; partitioning is not represented yet',
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.part_1',
+        message: 'table public.part_1 is partitioned; partitioning is not represented yet',
+      },
+    ],
+  },
+});
+
+/**
+ * The truncated-name round trip: a table whose unnamed index, unique constraint, check
+ * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
+ * limit, plus an unnamed baseline index the target drops. The sizes are qualified so the
+ * assembled long form and the balanced server form differ: these names are
+ * `makeObjectName(table, column, label)`, which shrinks the longer of the two parts until the
+ * whole fits, so each stored name keeps the full 25-byte table name and its label while
+ * clipping the 35–40-byte column part — for example the index stores
+ * `settlement_ledger_entries_originator_transaction_reference__idx`, not the parse-time clip
+ * of the assembled `…_reference_number_idx`. The baseline check pins the server form of the
+ * index the migration's synthesized drop must name (the pre-fix renderer named the assembled
+ * form, which PostgreSQL clipped to a different name and refused to drop), the plan check pins
+ * the rendered drop line, the catalog checks pin the four generated names, and the import
+ * checks prove every dumped name canonicalizes back to unnamed.
+ */
+const truncatedNameRoundTripScene = (): LiveScene => {
+  const members = table('clearing_members', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const ledgerColumns = [
+    column('superseded_originator_reference_value'),
+    column('originator_transaction_reference_number'),
+    column('beneficiary_account_iban_copy_identifier'),
+    column('settlement_window_close_timestamp_marker', { type: 'integer' }),
+    column('originating_bank_clearing_member_id', { type: 'bigint' }),
+  ];
+  const baselineLedger = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['superseded_originator_reference_value'] }],
+  });
+  const targetLedger = table('settlement_ledger_entries', {
+    columns: ledgerColumns,
+    indexes: [{ unique: false, columns: ['originator_transaction_reference_number'] }],
+    uniqueConstraints: [{ columns: ['beneficiary_account_iban_copy_identifier'] }],
+    checkConstraints: [{ expression: 'settlement_window_close_timestamp_marker > 0' }],
+    foreignKeys: [
+      foreignKey(['originating_bank_clearing_member_id'], identity('clearing_members'), {
+        referencedColumns: ['id'],
+      }),
+    ],
+  });
+
+  return {
+    name: 'truncated-name-round-trip',
+    baseline: model(members, baselineLedger),
+    target: model(members, targetLedger),
+    baselineChecks: [
+      {
+        description:
+          'the unnamed baseline index stores the balanced server name, not the assembled long form',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected: 'settlement_ledger_entries_superseded_originator_reference_v_idx',
+      },
+      {
+        description: 'the referenced table carries its conventional primary key',
+        sql: constraintName('clearing_members', 'p'),
+        expected: 'clearing_members_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan drops the unnamed index and rebuilds the target shapes',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (
+            kinds !==
+            'drop-index,add-unique-constraint,add-check-constraint,create-index,add-foreign-key'
+          ) {
+            return `unexpected steps: ${kinds}`;
+          }
+          const drop = steps[0]!;
+          if (drop.kind !== 'drop-index') return `first step: ${drop.kind}`;
+          if (
+            drop.index.name !== undefined ||
+            drop.index.columns.join(',') !== 'superseded_originator_reference_value'
+          ) {
+            return `the drop does not name the unnamed superseded index`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the rendered drop names the index server form, not the assembled long form',
+        failure: (_steps, migration, serverMajor) => {
+          const line =
+            'DROP INDEX public.settlement_ledger_entries_superseded_originator_reference_v_idx;';
+          return renderSql(migration, { targetVersion: serverMajor }).includes(line)
+            ? undefined
+            : `the rendered migration does not carry ${line}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description:
+          'the drop applied; the target index and unique-constraint index names are the server forms',
+        sql: indexesOf('settlement_ledger_entries'),
+        expected:
+          'settlement_ledger_entries_beneficiary_account_iban_copy_ide_key,' +
+          'settlement_ledger_entries_originator_transaction_reference__idx',
+      },
+      {
+        description: 'the unnamed unique constraint stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'u'),
+        expected: 'settlement_ledger_entries_beneficiary_account_iban_copy_ide_key',
+      },
+      {
+        description: 'the unnamed check constraint stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'c'),
+        expected: 'settlement_ledger_entries_settlement_window_close_timesta_check',
+      },
+      {
+        description: 'the unnamed foreign key stores the balanced server name',
+        sql: constraintNames('settlement_ledger_entries', 'f'),
+        expected: 'settlement_ledger_entries_originating_bank_clearing_member_fkey',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps canonicalize every truncated generated name back to unnamed',
+        failure: (imported, source) => {
+          const ledger = imported.model.tables.find(
+            (candidate) => candidate.name === 'settlement_ledger_entries',
+          );
+          if (ledger === undefined) return 'settlement_ledger_entries is not imported';
+          const namedIndexes = ledger.indexes.filter((index) => index.name !== undefined);
+          if (namedIndexes.length > 0) {
+            return `${source}: index names survived: ${namedIndexes
+              .map((index) => index.name)
+              .join(',')}`;
+          }
+          const indexColumns = ledger.indexes.map((index) => index.columns.join(',')).join('; ');
+          if (indexColumns !== 'originator_transaction_reference_number') {
+            return `${source}: indexes: ${indexColumns}`;
+          }
+          const namedUnique = ledger.uniqueConstraints.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedUnique.length > 0) {
+            return `${source}: unique names survived: ${namedUnique
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const uniqueColumns = ledger.uniqueConstraints
+            .map((constraint) => constraint.columns.join(','))
+            .join('; ');
+          if (uniqueColumns !== 'beneficiary_account_iban_copy_identifier') {
+            return `${source}: unique constraints: ${uniqueColumns}`;
+          }
+          const namedChecks = ledger.checkConstraints.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedChecks.length > 0) {
+            return `${source}: check names survived: ${namedChecks
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const checkExpressions = ledger.checkConstraints
+            .map((constraint) => constraint.expression)
+            .join('; ');
+          if (
+            ledger.checkConstraints.length !== 1 ||
+            !checkExpressions.includes('settlement_window_close_timestamp_marker')
+          ) {
+            return `${source}: check constraints: ${checkExpressions}`;
+          }
+          const namedForeign = ledger.foreignKeys.filter(
+            (constraint) => constraint.name !== undefined,
+          );
+          if (namedForeign.length > 0) {
+            return `${source}: foreign-key names survived: ${namedForeign
+              .map((constraint) => constraint.name)
+              .join(',')}`;
+          }
+          const foreign = ledger.foreignKeys
+            .map(
+              (constraint) =>
+                `${constraint.columns.join(',')}->${constraint.referencedColumns.join(',')}`,
+            )
+            .join('; ');
+          return foreign === 'originating_bank_clearing_member_id->id'
+            ? undefined
+            : `${source}: foreign keys: ${foreign}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The unnamed-foreign-key round trip: a target adding a foreign key that omits its
+ * `referencedColumns` list, so the migration renders `REFERENCES category` and PostgreSQL
+ * resolves it to the referenced table's primary key. The plan check pins that the step payload
+ * keeps the omission; the catalog checks pin the resolution to the primary key; and the import
+ * check proves the dump's explicit `(id)` list — a dump always states it — diffs empty against
+ * the omitting model, which a deep-equality assertion could not: the imported foreign key
+ * carries the explicit list by construction.
+ */
+const unnamedFkRoundTripScene = (): LiveScene => {
+  const category = table('category', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('name')],
+    primaryKey: { columns: ['id'] },
+  });
+  const productColumns = [
+    column('id', { type: 'bigint', notNull: true }),
+    column('category_id', { type: 'bigint' }),
+  ];
+  const targetModel = model(
+    category,
+    table('product', {
+      columns: productColumns,
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [foreignKey(['category_id'], identity('category'))],
+    }),
+  );
+
+  return {
+    name: 'unnamed-fk-round-trip',
+    baseline: model(
+      category,
+      table('product', { columns: productColumns, primaryKey: { columns: ['id'] } }),
+    ),
+    target: targetModel,
+    baselineChecks: [
+      {
+        description: 'the baseline product carries no foreign key',
+        sql: constraintCount('product_category_id_fkey', 'f'),
+        expected: '0',
+      },
+      {
+        description: 'the primary key the added foreign key resolves to',
+        sql: constraintNames('category', 'p'),
+        expected: 'category_pkey',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the added foreign key keeps its omitted referenced columns in the step',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'add-foreign-key') return `unexpected steps: ${kinds}`;
+          const step = steps[0]!;
+          if (step.kind !== 'add-foreign-key') return `step kind: ${step.kind}`;
+          const referenced = step.foreignKey.referencedColumns.join(',');
+          return referenced === ''
+            ? undefined
+            : `the step resolved the referenced columns: ${referenced}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the unnamed foreign key resolves to the category primary key',
+        sql: constraintDef('product_category_id_fkey'),
+        expected: 'FOREIGN KEY (category_id) REFERENCES category(id)',
+      },
+      {
+        description: 'the foreign key references exactly the primary-key columns',
+        sql:
+          'select confkey = (select primary_key.conkey from pg_constraint primary_key' +
+          ' where primary_key.conrelid = foreign_key.confrelid and primary_key.contype = ' +
+          "'p') from pg_constraint foreign_key where foreign_key.conname = " +
+          "'product_category_id_fkey'",
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description:
+          "the dump's explicit referenced list equals the omitting model, so the diff is empty",
+        failure: (imported, source) => {
+          const product = imported.model.tables.find((candidate) => candidate.name === 'product');
+          if (product === undefined) return 'product is not imported';
+          if (product.foreignKeys.length !== 1) {
+            return `${source}: foreign keys: ${product.foreignKeys.length}`;
+          }
+          const foreign = product.foreignKeys[0]!;
+          if (foreign.name !== undefined) {
+            return `${source}: the imported foreign key is named ${foreign.name}`;
+          }
+          const referenced = foreign.referencedColumns.join(',');
+          if (referenced !== 'id') {
+            return `${source}: the dump's referenced list is ${JSON.stringify(referenced)}`;
+          }
+          const changes = diff(targetModel, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the imported model diffs as ${changes
+                .map((change) => change.kind)
+                .join(',')}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The view round trip: a view redefined in place, a materialized view rewritten, a view removed,
+ * two views added (one with a local check option), and a view changed from plain to
+ * materialized. The tables are identical on both sides, so every step in the plan is a view
+ * step. The target build additionally carries a unique index on the materialized view through
+ * `targetExtraSql`, an object the model cannot declare; the target dump's import must skip it
+ * by name, and the applied database (which never had it) must not report that skip. Neither
+ * dump pins `pg_get_viewdef` text: the anchor checks only ask that the server's own deparse
+ * mentions the column and table the definition names, and the cross-import check compares the
+ * two server-derived imports to each other.
+ */
+const viewRoundTripScene = (): LiveScene => {
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('name', { notNull: true }),
+      column('active', { type: 'boolean', notNull: true }),
+      column('balance', { type: 'integer', notNull: true }),
+      column('team_id', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'accounts_pkey', columns: ['id'] },
+  });
+
+  const baseline: Model = {
+    tables: [accounts],
+    sequences: [],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT id, name, balance FROM accounts WHERE active',
+      }),
+      view('active_accounts', { definition: 'SELECT id, name FROM accounts WHERE active' }),
+      view('obsolete_accounts', { definition: 'SELECT id FROM accounts WHERE NOT active' }),
+      view('promote_me', { definition: 'SELECT id FROM accounts WHERE active' }),
+    ],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [accounts],
+    sequences: [],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance >= 0',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance > 0',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, name FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+      view('promote_me', {
+        materialized: true,
+        definition: 'SELECT id FROM accounts WHERE balance > 0',
+      }),
+      view('recent_accounts', {
+        definition: 'SELECT id FROM accounts WHERE active AND balance >= 0',
+      }),
+    ],
+    extensions: [],
+  };
+
+  /** The five target views and the `materialized` flag each must import with. */
+  const expectedViews = [
+    ['account_totals', true],
+    ['active_accounts', false],
+    ['positive_accounts', false],
+    ['promote_me', true],
+    ['recent_accounts', false],
+  ] as const;
+
+  /** One view by identity in an imported model, or `undefined`. */
+  const findView = (imported: ReadResult<Model, Diagnostic>, name: string): View | undefined =>
+    imported.model.views.find(
+      (candidate) => candidate.schema === 'public' && candidate.name === name,
+    );
+
+  return {
+    name: 'view-round-trip',
+    baseline,
+    target,
+    targetExtraSql: 'CREATE UNIQUE INDEX account_totals_id_idx ON public.account_totals (id);',
+    baselineChecks: [
+      {
+        description: 'the baseline account_totals is a materialized view',
+        sql: relKindOf('account_totals'),
+        expected: 'm',
+      },
+      {
+        description: 'the baseline promote_me is a plain view',
+        sql: relKindOf('promote_me'),
+        expected: 'v',
+      },
+      {
+        description: 'the baseline account_totals is unpopulated',
+        sql: relIsPopulated('account_totals'),
+        expected: 'f',
+      },
+    ],
+    checks: [
+      {
+        description: 'the applied account_totals is a materialized view',
+        sql: relKindOf('account_totals'),
+        expected: 'm',
+      },
+      {
+        description: 'the applied active_accounts is a plain view',
+        sql: relKindOf('active_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied positive_accounts is a plain view',
+        sql: relKindOf('positive_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied promote_me is a materialized view',
+        sql: relKindOf('promote_me'),
+        expected: 'm',
+      },
+      {
+        description: 'the applied recent_accounts is a plain view',
+        sql: relKindOf('recent_accounts'),
+        expected: 'v',
+      },
+      {
+        description: 'the applied account_totals is unpopulated',
+        sql: relIsPopulated('account_totals'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied promote_me is unpopulated',
+        sql: relIsPopulated('promote_me'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied database dropped obsolete_accounts',
+        sql: relationExists('obsolete_accounts'),
+        expected: 'f',
+      },
+      {
+        description: 'the applied active_accounts definition reads balance',
+        sql: viewDefinitionContains('active_accounts', 'balance'),
+        expected: 't',
+      },
+      {
+        description: 'the applied positive_accounts definition reads accounts',
+        sql: viewDefinitionContains('positive_accounts', 'accounts'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'the five target views import with the expected kinds and check option',
+        failure: (imported, source) => {
+          for (const [name, materialized] of expectedViews) {
+            const found = findView(imported, name);
+            if (found === undefined) return `${source}: ${name} is not imported`;
+            if (found.materialized !== materialized) {
+              return `${source}: ${name}.materialized is ${found.materialized}, expected ${materialized}`;
+            }
+            if (found.definition.trim() === '') {
+              return `${source}: ${name} imported an empty definition`;
+            }
+          }
+          const positive = findView(imported, 'positive_accounts');
+          if (positive?.checkOption !== 'local') {
+            return `${source}: positive_accounts.checkOption is ${String(positive?.checkOption)}, expected local`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the server deparse carries the authored columns and tables',
+        failure: (imported, source) => {
+          const active = findView(imported, 'active_accounts');
+          if (active === undefined) return `${source}: active_accounts is not imported`;
+          if (!active.definition.includes('balance')) {
+            return `${source}: active_accounts.definition does not mention balance: ${JSON.stringify(active.definition)}`;
+          }
+          if (!active.definition.includes('accounts')) {
+            return `${source}: active_accounts.definition does not mention accounts: ${JSON.stringify(active.definition)}`;
+          }
+          const positive = findView(imported, 'positive_accounts');
+          if (positive === undefined) return `${source}: positive_accounts is not imported`;
+          if (!positive.definition.includes('accounts')) {
+            return `${source}: positive_accounts.definition does not mention accounts: ${JSON.stringify(positive.definition)}`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'only the target dump reports the matview index skip, by name',
+        failure: (imported, source) => {
+          const named = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.includes('account_totals_id_idx'),
+          );
+          if (source === 'target') {
+            if (named.length !== 1) {
+              return `expected exactly one account_totals_id_idx diagnostic, got ${named.length}`;
+            }
+            const [diagnostic] = named;
+            const expected = 'skipped CREATE INDEX account_totals_id_idx (table not imported)';
+            if (diagnostic?.kind !== 'skip' || diagnostic.message !== expected) {
+              return `expected skip ${JSON.stringify(expected)}, got ${String(diagnostic?.kind)} ${JSON.stringify(diagnostic?.message)}`;
+            }
+            if (diagnostic.object !== 'account_totals_id_idx') {
+              return `the skip names ${String(diagnostic.object)}, expected account_totals_id_idx`;
+            }
+          } else if (named.length !== 0) {
+            return `the applied import must not report the matview index skip: ${named
+              .map((diagnostic) => diagnostic.message)
+              .join('; ')}`;
+          }
+          const otherViewSkips = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' &&
+              diagnostic.message.toLowerCase().includes('view') &&
+              !diagnostic.message.includes('account_totals_id_idx'),
+          );
+          return otherViewSkips.length === 0
+            ? undefined
+            : `unexpected view skips: ${otherViewSkips
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'the applied and target imports are the same server-derived model',
+        failure: (applied, expected) =>
+          isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ:\n${JSON.stringify(
+                {
+                  changes: diff(applied.model, expected.model),
+                  applied: applied.model,
+                  target: expected.model,
+                },
+                null,
+                2,
+              )}`,
+      },
+    ],
+  };
+};
+
+/** The catalog text of a relation comment: a table, sequence, view, matview, or index. */
+const relationComment = (name: string, schema = 'public'): string =>
+  `select obj_description('${schema}.${name}'::regclass)`;
+
+/** The catalog text of a column's comment. */
+const columnComment = (tableName: string, columnName: string, schema = 'public'): string =>
+  `select col_description('${schema}.${tableName}'::regclass, ` +
+  `(select attnum from pg_attribute where attrelid = '${schema}.${tableName}'::regclass` +
+  ` and attname = '${columnName}' and not attisdropped))`;
+
+/** The catalog text of a table constraint's comment. */
+const constraintComment = (tableName: string, constraintName: string, schema = 'public'): string =>
+  `select obj_description(oid, 'pg_constraint') from pg_constraint` +
+  ` where conrelid = '${schema}.${tableName}'::regclass and conname = '${constraintName}'`;
+
+/** One catalog fact about a comment: the stored text, or the empty string when absent. */
+const commentCheck = (description: string, sql: string, text: string | undefined): SceneCheck => ({
+  description,
+  sql,
+  expected: text ?? '',
+});
+
+/** The install schema of the extension named `name`, via `extnamespace` joined to `pg_namespace`. */
+const extensionSchema = (name: string): string =>
+  `select namespace.nspname from pg_extension extension_row` +
+  ' join pg_namespace namespace on namespace.oid = extension_row.extnamespace' +
+  ` where extension_row.extname = '${name}'`;
+
+/** The catalog text of the extension named `name`. */
+const extensionComment = (name: string): string =>
+  `select obj_description(oid, 'pg_extension') from pg_extension where extname = '${name}'`;
+
+/** How many extensions named `name` are installed: `0` or `1`, pinned as one text fact. */
+const extensionCount = (name: string): string =>
+  `select count(*) from pg_extension where extname = '${name}'`;
+
+/**
+ * Every modeled entity's comment, keyed by a server-independent identity. Names are excluded
+ * from constraint and index identities because the import canonicalizes a conventional server
+ * name back to unnamed whether the source stated it or not, and a check constraint is keyed by
+ * its table because its expression is the server's deparse of the authored text (this scene has
+ * at most one check constraint per table). The label is the relation, member, structure, or
+ * extension the comment belongs to, so a mismatch names the object and both texts. Values are
+ * JSON-quoted, and `absent` (never a JSON-quoted text) means the entity states no comment.
+ */
+function commentInventory(model: Model): ReadonlyMap<string, string> {
+  const inventory = new Map<string, string>();
+  const add = (kind: string, identity: readonly unknown[], comment: string | undefined): void => {
+    inventory.set(
+      `${kind} ${JSON.stringify(identity)}`,
+      comment === undefined ? 'absent' : JSON.stringify(comment),
+    );
+  };
+
+  for (const table of model.tables) {
+    const relation = [table.schema, table.name];
+    add('table', relation, table.comment);
+    for (const column of table.columns) {
+      add('column', [...relation, column.name], column.comment);
+    }
+    if (table.primaryKey !== undefined) {
+      add('primary-key', relation, table.primaryKey.comment);
+    }
+    for (const uniqueConstraint of table.uniqueConstraints) {
+      add(
+        'unique-constraint',
+        [...relation, { columns: uniqueConstraint.columns }],
+        uniqueConstraint.comment,
+      );
+    }
+    for (const checkConstraint of table.checkConstraints) {
+      add('check-constraint', relation, checkConstraint.comment);
+    }
+    for (const foreignKey of table.foreignKeys) {
+      add(
+        'foreign-key',
+        [
+          ...relation,
+          {
+            columns: foreignKey.columns,
+            referencedTable: [foreignKey.referencedTable.schema, foreignKey.referencedTable.name],
+            referencedColumns: foreignKey.referencedColumns,
+          },
+        ],
+        foreignKey.comment,
+      );
+    }
+    for (const index of table.indexes) {
+      add('index', [...relation, { unique: index.unique, columns: index.columns }], index.comment);
+    }
+  }
+
+  for (const sequence of model.sequences) {
+    add('sequence', [sequence.schema, sequence.name], sequence.comment);
+  }
+  for (const view of model.views) {
+    add('view', [view.schema, view.name, view.materialized], view.comment);
+  }
+  for (const extension of model.extensions) {
+    add('extension', [extension.name], extension.comment);
+  }
+  return inventory;
+}
+
+/**
+ * Every extension's install schema and comment, keyed by name: the server-derived inventory
+ * the extension scene compares, so a lost move and a lost comment are both named. Values are
+ * JSON so `null` means no comment and never an empty text.
+ */
+function extensionInventory(model: Model): ReadonlyMap<string, string> {
+  return new Map(
+    model.extensions.map((extension) => [
+      extension.name,
+      JSON.stringify({ schema: extension.schema, comment: extension.comment ?? null }),
+    ]),
+  );
+}
+
+/** The differing entries of two comment inventories, in key order, as failure lines. */
+function commentInventoryDifferences(
+  left: ReadonlyMap<string, string>,
+  right: ReadonlyMap<string, string>,
+  leftLabel: string,
+  rightLabel: string,
+): string[] {
+  const keys = [...new Set([...left.keys(), ...right.keys()])].sort();
+  const differences: string[] = [];
+  for (const key of keys) {
+    const leftValue = left.get(key) ?? '<entity absent>';
+    const rightValue = right.get(key) ?? '<entity absent>';
+    if (leftValue !== rightValue) {
+      differences.push(`${key}: ${leftLabel} ${leftValue}, ${rightLabel} ${rightValue}`);
+    }
+  }
+  return differences;
+}
+
+/**
+ * The comment-introspection scene: the first scene that asks the catalog read to return a
+ * comment-carrying model. Baseline and target hold the same table, standalone sequence, two
+ * plain views, and one materialized view; only comments move — the table's
+ * special-character comment changes, one column comment changes, another is added, the
+ * sequence comment changes, one view comment changes, the check-option view's comment is
+ * removed, and the materialized view's comment changes. The plan check proves that a
+ * comment-only change emits comment steps and no structural work, so the matview and views are
+ * never rebuilt. `matches-import` then compares the catalog read with the applied dump's
+ * import, so a comment the read drops, invents, or attaches to the wrong entity fails by name.
+ *
+ * `account_summary` is created `WITH NO DATA` on both sides, as the renderer always does. The
+ * check-option view is a single-table SELECT because PostgreSQL only accepts a check option on
+ * an auto-updatable view, and its `check_option=local` reloption is pinned directly, giving the
+ * read's reloption decode live evidence.
+ */
+const commentIntrospectionScene = (): LiveScene => {
+  const specialBaseline = "owner's \\ draft\nline one — naïve ☃";
+  const specialTarget = "owner's \\ revised draft\nline two — naïve ☃ ✓";
+
+  const baseline: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, baseline' }),
+          column('balance', { type: 'integer' }),
+          column('active', { type: 'boolean', notNull: true }),
+        ],
+        comment: specialBaseline,
+      }),
+    ],
+    sequences: [sequence('audit_seq', { comment: 'audit sequence, baseline' })],
+    views: [
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: 'summary, baseline',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE active',
+        comment: 'active accounts, baseline',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, balance FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+        comment: 'positive accounts, baseline',
+      }),
+    ],
+    extensions: [],
+  };
+
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', {
+            type: 'integer',
+            notNull: true,
+            comment: 'identifier, added in target',
+          }),
+          column('email', { notNull: true, comment: 'contact email, target' }),
+          column('balance', { type: 'integer' }),
+          column('active', { type: 'boolean', notNull: true }),
+        ],
+        comment: specialTarget,
+      }),
+    ],
+    sequences: [sequence('audit_seq', { comment: 'audit sequence, target' })],
+    views: [
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: 'summary, target',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE active',
+        comment: 'active accounts, target',
+      }),
+      view('positive_accounts', {
+        definition: 'SELECT id, balance FROM accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+    ],
+    extensions: [],
+  };
+
+  return {
+    name: 'comment-introspection',
+    baseline,
+    target,
+    baselineChecks: [
+      commentCheck(
+        'the baseline stored the special-character accounts table comment exactly',
+        relationComment('accounts'),
+        specialBaseline,
+      ),
+      commentCheck(
+        'the baseline accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, baseline',
+      ),
+      commentCheck(
+        'the baseline accounts.id carries no comment',
+        columnComment('accounts', 'id'),
+        undefined,
+      ),
+      commentCheck(
+        'the baseline standalone sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence, baseline',
+      ),
+      commentCheck(
+        'the baseline plain-view comment',
+        relationComment('active_accounts'),
+        'active accounts, baseline',
+      ),
+      commentCheck(
+        'the baseline check-option view comment',
+        relationComment('positive_accounts'),
+        'positive accounts, baseline',
+      ),
+      commentCheck(
+        'the baseline materialized-view comment',
+        relationComment('account_summary'),
+        'summary, baseline',
+      ),
+      {
+        description: 'the baseline check-option view stores check_option=local',
+        sql: relOptionsOf('positive_accounts'),
+        expected: 'check_option=local',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'a comment-only change plans comment steps and no structural work',
+        failure: (steps) => {
+          const structural = steps.filter((step) => step.kind !== 'comment');
+          if (structural.length > 0) {
+            return `non-comment steps: ${structural.map((step) => step.kind).join(', ')}`;
+          }
+          return steps.length === 7
+            ? undefined
+            : `comment steps: ${steps.length}, expected 7 (${steps
+                .map((step) => step.kind)
+                .join(', ')})`;
+        },
+      },
+    ],
+    checks: [
+      commentCheck(
+        'the migrated database stored the changed special-character table comment exactly',
+        relationComment('accounts'),
+        specialTarget,
+      ),
+      commentCheck(
+        'the migrated database changed the accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, target',
+      ),
+      commentCheck(
+        'the migrated database added the accounts.id comment',
+        columnComment('accounts', 'id'),
+        'identifier, added in target',
+      ),
+      commentCheck(
+        'the migrated database changed the standalone sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence, target',
+      ),
+      commentCheck(
+        'the migrated database changed the plain-view comment',
+        relationComment('active_accounts'),
+        'active accounts, target',
+      ),
+      commentCheck(
+        'the migrated database cleared the check-option view comment',
+        relationComment('positive_accounts'),
+        undefined,
+      ),
+      commentCheck(
+        'the migrated database changed the materialized-view comment',
+        relationComment('account_summary'),
+        'summary, target',
+      ),
+      {
+        description: 'the migrated check-option view still stores check_option=local',
+        sql: relOptionsOf('positive_accounts'),
+        expected: 'check_option=local',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry every target comment, keyed by entity identity',
+        failure: (imported) => {
+          const differences = commentInventoryDifferences(
+            commentInventory(imported.model),
+            commentInventory(target),
+            'imported',
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported comments differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the import names no dropped comment',
+        failure: (imported, source) => {
+          const dropped = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.startsWith('dropped comment'),
+          );
+          return dropped.length === 0
+            ? undefined
+            : `${source}: dropped comments: ${dropped
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/** One comment the plan must re-assert after a recreate. */
+interface ReassertedComment {
+  readonly label: string;
+  readonly text: string;
+  readonly matches: (target: CommentTarget) => boolean;
+}
+
+/**
+ * The comment round trip: every modeled family carries a comment through baseline, migration,
+ * target build, and both dumps, with additions, changes, and removals. The scene covers the
+ * table (a special-character comment with a quote, backslash, newline, and unicode, changed),
+ * column (changed, removed, and added), sequence (changed and removed), plain view (added,
+ * changed, and removed), and materialized view (removed, plus an unchanged comment re-asserted
+ * through a definition rewrite); every constraint kind (a primary-key comment re-asserted
+ * through a rename, a named unique comment removed, an unnamed conventional-name unique comment
+ * changed, a check comment re-asserted through an expression change, and a foreign-key comment
+ * re-asserted through the dependent foreign key a referenced primary-key change drops and
+ * re-adds); and indexes (an unchanged named comment re-asserted through a key change, a removed
+ * named comment, and an unnamed conventional-name comment changed).
+ *
+ * The target and migrated databases carry catalog assertions that the server stored exactly the
+ * intended text, including the special-character comment on both sides; the import checks
+ * compare every entity's imported comment, keyed by its model identity, against the target model,
+ * so a dump-import loss fails by object and text. The cross-import check then compares the two
+ * server-derived imports — structure through `diff`, comments through the inventory — so a
+ * comment mismatch fails by entity with both texts. There is no `introspection` assertion: the
+ * target also carries constraint and index comments, and catalog introspection does not read
+ * those until slice 2 (#146 follow-up), so a comment-carrying model is intentionally not what
+ * it returns.
+ */
+const commentRoundTripScene = (): LiveScene => {
+  const specialBaseline = "Owner's \\ draft\nline one — naïve ☃";
+  const specialTarget = "Owner's \\ revised draft\nline two — naïve ☃ ✓";
+  const specialBody = "body 'quoted' \\ slash\nsecond line → naïve ✓";
+  const pkComment = 'accounts primary key (unchanged through the rename)';
+  const emailIndexComment = 'email lookup (unchanged through a recreate)';
+  const checkComment = 'balance stays within range';
+  const foreignKeyComment = 'orders point at one account';
+  const summaryComment = 'account summary comment across a rewrite';
+
+  const baseline = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('tenant', { notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, baseline' }),
+          column('balance', { type: 'integer', notNull: true }),
+          column('nickname', { comment: 'nickname, removed in target' }),
+          column('code', { notNull: true }),
+          column('status', { notNull: true }),
+        ],
+        comment: specialBaseline,
+        primaryKey: { name: 'accounts_pkey', columns: ['id'], comment: pkComment },
+        uniqueConstraints: [
+          {
+            name: 'accounts_email_key',
+            columns: ['email'],
+            comment: 'email uniqueness, removed in target',
+          },
+          { columns: ['tenant', 'email'], comment: 'tenant email, baseline' },
+        ],
+        checkConstraints: [
+          {
+            name: 'accounts_balance_check',
+            expression: 'balance >= 0',
+            comment: checkComment,
+          },
+        ],
+        indexes: [
+          {
+            name: 'accounts_email_idx',
+            unique: false,
+            columns: ['email'],
+            comment: emailIndexComment,
+          },
+          { unique: false, columns: ['code'], comment: 'code lookup, baseline' },
+          {
+            name: 'accounts_balance_idx',
+            unique: false,
+            columns: ['balance'],
+            comment: 'balance lookup, removed in target',
+          },
+        ],
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer', notNull: true }),
+          column('code', { notNull: true }),
+        ],
+        primaryKey: { columns: ['id'] },
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), {
+            name: 'orders_account_id_fkey',
+            referencedColumns: ['id'],
+            comment: foreignKeyComment,
+          }),
+        ],
+      }),
+      table('legacy', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        comment: 'legacy table comment, removed in target',
+      }),
+      table('notes', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('body', { notNull: true }),
+        ],
+      }),
+    ],
+    sequences: [
+      sequence('legacy_seq', { comment: 'legacy sequence comment, removed in target' }),
+      sequence('audit_seq', { comment: 'audit sequence comment, baseline' }),
+    ],
+    views: [
+      view('active_accounts', {
+        definition: 'SELECT id, email FROM accounts WHERE balance >= 0',
+        comment: 'active accounts view comment, removed in target',
+      }),
+      view('account_labels', {
+        definition: 'SELECT id, email AS label FROM accounts',
+        comment: 'account labels view comment, baseline',
+      }),
+      view('recent_accounts', { definition: 'SELECT id FROM accounts WHERE balance > 0' }),
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts',
+        comment: summaryComment,
+      }),
+      view('stale_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts WHERE balance < 0',
+        comment: 'stale summary comment, removed in target',
+      }),
+    ],
+    extensions: [],
+  } satisfies Model;
+
+  const orders = baseline.tables.find((candidate) => candidate.name === 'orders')!;
+
+  const target = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('tenant', { notNull: true }),
+          column('email', { notNull: true, comment: 'contact email, target' }),
+          column('balance', { type: 'integer', notNull: true }),
+          column('nickname'),
+          column('code', { notNull: true }),
+          column('status', { notNull: true }),
+        ],
+        comment: specialTarget,
+        primaryKey: { name: 'accounts_primary', columns: ['id'], comment: pkComment },
+        uniqueConstraints: [
+          { name: 'accounts_email_key', columns: ['email'] },
+          { columns: ['tenant', 'email'], comment: 'tenant email, target' },
+        ],
+        checkConstraints: [
+          {
+            name: 'accounts_balance_check',
+            expression: 'balance >= 0 AND balance <= 1000000',
+            comment: checkComment,
+          },
+        ],
+        indexes: [
+          {
+            name: 'accounts_email_idx',
+            unique: false,
+            columns: ['email', 'status'],
+            comment: emailIndexComment,
+          },
+          { unique: false, columns: ['code'], comment: 'code lookup, target' },
+          { name: 'accounts_balance_idx', unique: false, columns: ['balance'] },
+        ],
+      }),
+      orders,
+      table('legacy', { columns: [column('id', { type: 'integer', notNull: true })] }),
+      table('notes', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('body', { notNull: true, comment: specialBody }),
+        ],
+        comment: 'notes table comment (added in target)',
+        checkConstraints: [
+          {
+            name: 'notes_body_check',
+            expression: 'length(body) > 0',
+            comment: 'body must not be empty',
+          },
+        ],
+      }),
+    ],
+    sequences: [
+      sequence('legacy_seq'),
+      sequence('audit_seq', { comment: 'audit sequence comment, target' }),
+    ],
+    views: [
+      view('active_accounts', { definition: 'SELECT id, email FROM accounts WHERE balance >= 0' }),
+      view('account_labels', {
+        definition: 'SELECT id, email AS label FROM accounts',
+        comment: 'account labels view comment, target',
+      }),
+      view('recent_accounts', {
+        definition: 'SELECT id FROM accounts WHERE balance > 0',
+        comment: 'recent accounts view comment (added in target)',
+      }),
+      view('account_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total, sum(balance) AS total_balance FROM accounts',
+        comment: summaryComment,
+      }),
+      view('stale_summary', {
+        materialized: true,
+        definition: 'SELECT count(*) AS total FROM accounts WHERE balance < 0',
+      }),
+    ],
+    extensions: [],
+  } satisfies Model;
+
+  const targetCommentChecks = (subject: string): readonly SceneCheck[] => [
+    commentCheck(
+      `the ${subject} stores the special-character accounts table comment exactly`,
+      relationComment('accounts'),
+      specialTarget,
+    ),
+    commentCheck(
+      `the ${subject} stores the changed accounts.email comment`,
+      columnComment('accounts', 'email'),
+      'contact email, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the accounts.nickname comment`,
+      columnComment('accounts', 'nickname'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the accounts primary-key comment under its new name`,
+      constraintComment('accounts', 'accounts_primary'),
+      pkComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the named unique-constraint comment`,
+      constraintComment('accounts', 'accounts_email_key'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the unnamed unique-constraint comment`,
+      constraintComment('accounts', 'accounts_tenant_email_key'),
+      'tenant email, target',
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the check-constraint comment`,
+      constraintComment('accounts', 'accounts_balance_check'),
+      checkComment,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the recreated index comment`,
+      relationComment('accounts_email_idx'),
+      emailIndexComment,
+    ),
+    commentCheck(
+      `the ${subject} changed the unnamed index comment`,
+      relationComment('accounts_code_idx'),
+      'code lookup, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the other index comment`,
+      relationComment('accounts_balance_idx'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the dependent foreign-key comment`,
+      constraintComment('orders', 'orders_account_id_fkey'),
+      foreignKeyComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the legacy table comment`,
+      relationComment('legacy'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} removed the legacy sequence comment`,
+      relationComment('legacy_seq'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the audit sequence comment`,
+      relationComment('audit_seq'),
+      'audit sequence comment, target',
+    ),
+    commentCheck(
+      `the ${subject} removed the plain-view comment`,
+      relationComment('active_accounts'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} changed the other plain-view comment`,
+      relationComment('account_labels'),
+      'account labels view comment, target',
+    ),
+    commentCheck(
+      `the ${subject} added the plain-view comment`,
+      relationComment('recent_accounts'),
+      'recent accounts view comment (added in target)',
+    ),
+    commentCheck(
+      `the ${subject} re-asserted the materialized-view comment`,
+      relationComment('account_summary'),
+      summaryComment,
+    ),
+    commentCheck(
+      `the ${subject} removed the other materialized-view comment`,
+      relationComment('stale_summary'),
+      undefined,
+    ),
+    commentCheck(
+      `the ${subject} added the notes table comment`,
+      relationComment('notes'),
+      'notes table comment (added in target)',
+    ),
+    commentCheck(
+      `the ${subject} stores the special-character column comment exactly`,
+      columnComment('notes', 'body'),
+      specialBody,
+    ),
+    commentCheck(
+      `the ${subject} added the notes check-constraint comment`,
+      constraintComment('notes', 'notes_body_check'),
+      'body must not be empty',
+    ),
+    {
+      description: `the ${subject} has the renamed primary key and the conventional constraint names`,
+      sql: constraintNames('accounts', 'p'),
+      expected: 'accounts_primary',
+    },
+    {
+      description: `the ${subject} keeps both unique constraints under their server names`,
+      sql: constraintNames('accounts', 'u'),
+      expected: 'accounts_email_key,accounts_tenant_email_key',
+    },
+    {
+      description: `the ${subject} has the named and conventionally named indexes`,
+      sql: indexesOf('accounts'),
+      expected:
+        'accounts_balance_idx,accounts_code_idx,accounts_email_idx,accounts_email_key,' +
+        'accounts_primary,accounts_tenant_email_key',
+    },
+  ];
+
+  const reasserted: readonly ReassertedComment[] = [
+    {
+      label: 'index accounts_email_idx',
+      text: emailIndexComment,
+      matches: (target) =>
+        target.kind === 'index' &&
+        target.table.name === 'accounts' &&
+        target.index.name === 'accounts_email_idx',
+    },
+    {
+      label: 'check constraint accounts_balance_check',
+      text: checkComment,
+      matches: (target) =>
+        target.kind === 'check-constraint' &&
+        target.table.name === 'accounts' &&
+        target.checkConstraint.name === 'accounts_balance_check',
+    },
+    {
+      label: 'materialized view account_summary',
+      text: summaryComment,
+      matches: (target) =>
+        target.kind === 'view' && target.view.name === 'account_summary' && target.materialized,
+    },
+    {
+      label: 'primary key accounts_primary',
+      text: pkComment,
+      matches: (target) =>
+        target.kind === 'primary-key' &&
+        target.table.name === 'accounts' &&
+        target.primaryKey.name === 'accounts_primary',
+    },
+    {
+      label: 'foreign key orders_account_id_fkey',
+      text: foreignKeyComment,
+      matches: (target) =>
+        target.kind === 'foreign-key' &&
+        target.table.name === 'orders' &&
+        target.foreignKey.name === 'orders_account_id_fkey',
+    },
+  ];
+
+  return {
+    name: 'comment-round-trip',
+    baseline,
+    target,
+    baselineChecks: [
+      commentCheck(
+        'the baseline stored the special-character accounts table comment exactly',
+        relationComment('accounts'),
+        specialBaseline,
+      ),
+      commentCheck(
+        'the baseline accounts.email comment',
+        columnComment('accounts', 'email'),
+        'contact email, baseline',
+      ),
+      commentCheck(
+        'the baseline accounts.nickname comment',
+        columnComment('accounts', 'nickname'),
+        'nickname, removed in target',
+      ),
+      commentCheck(
+        'the baseline accounts primary-key comment',
+        constraintComment('accounts', 'accounts_pkey'),
+        pkComment,
+      ),
+      commentCheck(
+        'the baseline named unique-constraint comment',
+        constraintComment('accounts', 'accounts_email_key'),
+        'email uniqueness, removed in target',
+      ),
+      commentCheck(
+        'the baseline unnamed conventional-name unique-constraint comment',
+        constraintComment('accounts', 'accounts_tenant_email_key'),
+        'tenant email, baseline',
+      ),
+      commentCheck(
+        'the baseline check-constraint comment',
+        constraintComment('accounts', 'accounts_balance_check'),
+        checkComment,
+      ),
+      commentCheck(
+        'the baseline named index comment',
+        relationComment('accounts_email_idx'),
+        emailIndexComment,
+      ),
+      commentCheck(
+        'the baseline unnamed conventional-name index comment',
+        relationComment('accounts_code_idx'),
+        'code lookup, baseline',
+      ),
+      commentCheck(
+        'the baseline removed-later index comment',
+        relationComment('accounts_balance_idx'),
+        'balance lookup, removed in target',
+      ),
+      commentCheck(
+        'the baseline foreign-key comment',
+        constraintComment('orders', 'orders_account_id_fkey'),
+        foreignKeyComment,
+      ),
+      commentCheck(
+        'the baseline legacy table comment',
+        relationComment('legacy'),
+        'legacy table comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline legacy sequence comment',
+        relationComment('legacy_seq'),
+        'legacy sequence comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline audit sequence comment',
+        relationComment('audit_seq'),
+        'audit sequence comment, baseline',
+      ),
+      commentCheck(
+        'the baseline removed-later view comment',
+        relationComment('active_accounts'),
+        'active accounts view comment, removed in target',
+      ),
+      commentCheck(
+        'the baseline changed-later view comment',
+        relationComment('account_labels'),
+        'account labels view comment, baseline',
+      ),
+      commentCheck(
+        'the baseline materialized-view comment',
+        relationComment('account_summary'),
+        summaryComment,
+      ),
+      commentCheck(
+        'the baseline removed-later materialized-view comment',
+        relationComment('stale_summary'),
+        'stale summary comment, removed in target',
+      ),
+      {
+        description: 'the baseline accounts unique constraints are the named and unnamed pair',
+        sql: constraintNames('accounts', 'u'),
+        expected: 'accounts_email_key,accounts_tenant_email_key',
+      },
+      {
+        description: 'the baseline indexes include the conventional unnamed index name',
+        sql: indexesOf('accounts'),
+        expected:
+          'accounts_balance_idx,accounts_code_idx,accounts_email_idx,accounts_email_key,' +
+          'accounts_pkey,accounts_tenant_email_key',
+      },
+    ],
+    targetChecks: targetCommentChecks('target build'),
+    planChecks: [
+      {
+        description:
+          'every comment step is terminal, and each recreated object re-asserts its comment',
+        failure: (steps) => {
+          const firstComment = steps.findIndex((step) => step.kind === 'comment');
+          if (firstComment === -1) return 'the plan carries no comment steps';
+          const trailing = steps.slice(firstComment);
+          const structural = trailing.filter((step) => step.kind !== 'comment');
+          if (structural.length > 0) {
+            return `non-comment steps follow the first comment step: ${structural
+              .map((step) => step.kind)
+              .join(', ')}`;
+          }
+          const comments = trailing.filter(
+            (step): step is Extract<Step, { kind: 'comment' }> => step.kind === 'comment',
+          );
+          const missing = reasserted.filter(
+            (expected) =>
+              !comments.some(
+                (step) => expected.matches(step.target) && step.text === expected.text,
+              ),
+          );
+          if (missing.length > 0) {
+            return `missing re-asserted comments: ${missing
+              .map((entry) => entry.label)
+              .join(', ')}`;
+          }
+          if (comments.length !== 22) {
+            return `comment steps: ${comments.length}, expected 22 (${comments
+              .map((step) => `${step.target.kind}:${step.text ?? '(none)'}`)
+              .join(', ')})`;
+          }
+          return undefined;
+        },
+      },
+    ],
+    checks: targetCommentChecks('migrated database'),
+    importChecks: [
+      {
+        description:
+          'both imports carry every target comment, keyed by structure and including the unnamed nodes',
+        failure: (imported) => {
+          const differences = commentInventoryDifferences(
+            commentInventory(imported.model),
+            commentInventory(target),
+            'imported',
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported comments differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the unnamed conventional-name unique constraint and index import unnamed',
+        failure: (imported, source) => {
+          const accounts = imported.model.tables.find(
+            (candidate) => candidate.schema === 'public' && candidate.name === 'accounts',
+          );
+          if (accounts === undefined) return `${source}: accounts is not imported`;
+          const unique = accounts.uniqueConstraints.find(
+            (candidate) =>
+              candidate.name === undefined && candidate.columns.join(',') === 'tenant,email',
+          );
+          if (unique === undefined) {
+            return `${source}: the unnamed (tenant, email) unique constraint is missing or named: ${JSON.stringify(
+              accounts.uniqueConstraints,
+            )}`;
+          }
+          if (unique.comment !== 'tenant email, target') {
+            return `${source}: the unnamed unique constraint comment is ${JSON.stringify(unique.comment)}`;
+          }
+          const index = accounts.indexes.find(
+            (candidate) =>
+              candidate.name === undefined &&
+              !candidate.unique &&
+              candidate.columns.join(',') === 'code',
+          );
+          if (index === undefined) {
+            return `${source}: the unnamed (code) index is missing or named: ${JSON.stringify(
+              accounts.indexes,
+            )}`;
+          }
+          if (index.comment !== 'code lookup, target') {
+            return `${source}: the unnamed index comment is ${JSON.stringify(index.comment)}`;
+          }
+          return undefined;
+        },
+      },
+      {
+        description: 'the import names no dropped comment and skips no modeled COMMENT ON',
+        failure: (imported, source) => {
+          const dropped = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.startsWith('dropped comment'),
+          );
+          if (dropped.length > 0) {
+            return `${source}: dropped comments: ${dropped
+              .map((diagnostic) => diagnostic.message)
+              .join('; ')}`;
+          }
+          const skipped = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' &&
+              /^skipped COMMENT ON (TABLE|COLUMN|SEQUENCE|VIEW|MATERIALIZED VIEW|INDEX|CONSTRAINT)\b/.test(
+                diagnostic.message,
+              ),
+          );
+          return skipped.length === 0
+            ? undefined
+            : `${source}: skipped modeled comments: ${skipped
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description:
+          'the applied and target imports agree on every identity, structure, and comment',
+        failure: (applied, expected) => {
+          const structural = diff(applied.model, expected.model);
+          if (structural.length > 0) {
+            return `the server-derived imports differ structurally:\n${JSON.stringify(
+              structural,
+              null,
+              2,
+            )}`;
+          }
+          const differences = commentInventoryDifferences(
+            commentInventory(applied.model),
+            commentInventory(expected.model),
+            'applied',
+            'target',
+          );
+          if (differences.length > 0) {
+            return `the server-derived imports differ in their comments:\n${differences.join('\n')}`;
+          }
+          return isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ beyond structure and comments:\n${JSON.stringify(
+                { applied: applied.model, target: expected.model },
+                null,
+                2,
+              )}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The extension scene: a commented `hstore` moves schemas with a changed comment, a commented
+ * `pgcrypto` arrives in `public`, and a commented `citext` leaves. The plan creates the install
+ * schemas itself: the baseline build creates `hs1`, and the target build and the migration
+ * create the target-only `hs2`, so the scene needs no `setupSql`. Every extension statement the
+ * dump carries is the server's `IF NOT EXISTS` form, so the round trip also proves the import
+ * ignores the clause.
+ *
+ * The catalog checks pin `extnamespace` through `pg_namespace` and the comment through
+ * `obj_description(oid, 'pg_extension')`, so a write that updates the model but not the server
+ * cannot pass. The scene declares no introspection assertion: the catalog reader returns
+ * `extensions: []` until the follow-up, so `matches-import` cannot hold for a model carrying
+ * extensions.
+ */
+const extensionRoundTripScene = (): LiveScene => {
+  const hstoreBaselineComment = 'Key-value pairs (baseline)';
+  const hstoreTargetComment = 'Key-value pairs';
+  const citextComment = 'Case-insensitive text';
+  const pgcryptoComment = 'Cryptographic functions';
+
+  const baseline = extensionModel(
+    extension('citext', 'public', citextComment),
+    extension('hstore', 'hs1', hstoreBaselineComment),
+  );
+  const target = extensionModel(
+    extension('hstore', 'hs2', hstoreTargetComment),
+    extension('pgcrypto', 'public', pgcryptoComment),
+  );
+
+  const targetStateChecks = (subject: string): readonly SceneCheck[] => [
+    {
+      description: `the ${subject} installed hstore in hs2`,
+      sql: extensionSchema('hstore'),
+      expected: 'hs2',
+    },
+    commentCheck(
+      `the ${subject} stored the changed hstore comment`,
+      extensionComment('hstore'),
+      hstoreTargetComment,
+    ),
+    {
+      description: `the ${subject} installed pgcrypto in public`,
+      sql: extensionSchema('pgcrypto'),
+      expected: 'public',
+    },
+    commentCheck(
+      `the ${subject} stored the new pgcrypto comment`,
+      extensionComment('pgcrypto'),
+      pgcryptoComment,
+    ),
+    {
+      description: `the ${subject} holds no citext`,
+      sql: extensionCount('citext'),
+      expected: '0',
+    },
+  ];
+
+  const expectedSteps: readonly Step[] = [
+    // Global phase 1: the target-only install schema, then the added extension with its comment.
+    { kind: 'create-schema', schema: 'hs2' },
+    {
+      kind: 'create-extension',
+      extension: { name: 'pgcrypto', schema: 'public', comment: pgcryptoComment },
+    },
+    // Global phase 12: extension comments in target identity order.
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: hstoreTargetComment,
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      text: pgcryptoComment,
+    },
+    // Global phase 13: the schema move, then the removal.
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'drop-extension', extension: { name: 'citext' } },
+  ];
+
+  return {
+    name: 'extension-round-trip',
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the baseline installed hstore in hs1',
+        sql: extensionSchema('hstore'),
+        expected: 'hs1',
+      },
+      commentCheck(
+        'the baseline stored the hstore comment',
+        extensionComment('hstore'),
+        hstoreBaselineComment,
+      ),
+      {
+        description: 'the baseline installed citext in public',
+        sql: extensionSchema('citext'),
+        expected: 'public',
+      },
+      commentCheck(
+        'the baseline stored the citext comment',
+        extensionComment('citext'),
+        citextComment,
+      ),
+      {
+        description: 'the baseline holds no pgcrypto',
+        sql: extensionCount('pgcrypto'),
+        expected: '0',
+      },
+    ],
+    targetChecks: targetStateChecks('target build'),
+    planChecks: [
+      {
+        description:
+          'the plan creates, comments, moves, and drops the extensions in global phase order',
+        failure: (steps, plan) => {
+          const citextComments = steps.filter(
+            (step) =>
+              step.kind === 'comment' &&
+              step.target.kind === 'extension' &&
+              step.target.extension.name === 'citext',
+          );
+          if (citextComments.length > 0) {
+            return 'the plan emits a comment step for the removed citext';
+          }
+          if (!isDeepStrictEqual(steps, expectedSteps)) {
+            return `steps: ${JSON.stringify(steps)}, expected ${JSON.stringify(expectedSteps)}`;
+          }
+          return isDeepStrictEqual(plan.groups, [{ start: 0, end: 6, transactional: true }])
+            ? undefined
+            : `transaction groups: ${JSON.stringify(plan.groups)}`;
+        },
+      },
+    ],
+    checks: targetStateChecks('migrated database'),
+    importChecks: [
+      {
+        description:
+          'both imports carry the target extension inventory: each install schema and comment',
+        failure: (imported, source) => {
+          const differences = commentInventoryDifferences(
+            extensionInventory(imported.model),
+            extensionInventory(target),
+            source,
+            'target',
+          );
+          return differences.length === 0
+            ? undefined
+            : `the imported extensions differ from the target model:\n${differences.join('\n')}`;
+        },
+      },
+      {
+        description: 'the import reports no diagnostic naming an extension',
+        failure: (imported, source) => {
+          const named = imported.diagnostics.filter((diagnostic) =>
+            diagnostic.message.toLowerCase().includes('extension'),
+          );
+          return named.length === 0
+            ? undefined
+            : `${source}: extension diagnostics: ${named
+                .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`)
+                .join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description:
+          'the applied and target imports agree on every extension, install schema, and comment',
+        failure: (applied, expected) => {
+          const structural = diff(applied.model, expected.model);
+          if (structural.length > 0) {
+            return `the server-derived imports differ structurally:\n${JSON.stringify(
+              structural,
+              null,
+              2,
+            )}`;
+          }
+          const differences = commentInventoryDifferences(
+            extensionInventory(applied.model),
+            extensionInventory(expected.model),
+            'applied',
+            'target',
+          );
+          if (differences.length > 0) {
+            return `the server-derived imports differ in their extensions:\n${differences.join('\n')}`;
+          }
+          return isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ beyond their extensions:\n${JSON.stringify(
+                { applied: applied.model, target: expected.model },
+                null,
+                2,
+              )}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * The export round trip: the migrated database is built by applying exactly the SQL `export`
+ * prints. `baseline` is the empty model, and there is no `setupSql` or `targetExtraSql`, so the
+ * applied database starts with only `public`: its baseline build is empty, its target build is
+ * `renderSql(plan(empty, target))` — the exported DDL — and the migration is the same plan.
+ * Both non-public schemas, `app` and the quoted mixed-case `"Weird Schema"`, hold two tables;
+ * `app` also hosts an exported sequence and view, and the tables carry a table comment and a
+ * column comment, so the export must carry `CREATE SCHEMA`, `CREATE TABLE`, `CREATE SEQUENCE`,
+ * `CREATE VIEW`, and `COMMENT ON` statements that all apply to a database with no ambient
+ * namespace.
+ *
+ * The plan check pins both schema creates first in name order and none after an object step;
+ * catalog checks pin the applied database; import checks pin that both server dumps' imports
+ * carry every schema-qualified object and both comments.
+ */
+const exportRoundTripScene = (): LiveScene => {
+  const accountsComment = 'Accounts owned by the app schema';
+  const idComment = 'Surrogate account key';
+
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        schema: 'app',
+        comment: accountsComment,
+        columns: [
+          column('id', { type: 'integer', notNull: true, comment: idComment }),
+          column('email', { notNull: true }),
+        ],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('audit', {
+        schema: 'app',
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('things', {
+        schema: 'Weird Schema',
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { columns: ['id'] },
+      }),
+      table('other', {
+        schema: 'Weird Schema',
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { columns: ['id'] },
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq', { schema: 'app' })],
+    views: [
+      view('active_accounts', {
+        schema: 'app',
+        definition: 'SELECT id, email FROM app.accounts WHERE id > 0',
+      }),
+    ],
+    extensions: [],
+  };
+
+  /** The tables in `schema` in name order, or the empty string when there are none. */
+  const tablesIn = (schema: string): string =>
+    `select string_agg(tablename, ',' order by tablename) from pg_tables` +
+    ` where schemaname = '${schema}'`;
+
+  return {
+    name: 'export-round-trip',
+    baseline: model(),
+    target,
+    planChecks: [
+      {
+        description:
+          'the plan creates both non-public schemas first, in name order, and never later',
+        failure: (steps) => {
+          const [first, second] = steps;
+          if (first?.kind !== 'create-schema' || second?.kind !== 'create-schema') {
+            return `the first two steps are ${JSON.stringify(
+              steps.slice(0, 2).map((step) => step.kind),
+            )}, expected create-schema`;
+          }
+          const names = [first.schema, second.schema];
+          if (!isDeepStrictEqual(names, ['Weird Schema', 'app'])) {
+            return `schema steps: ${JSON.stringify(names)}, expected ["Weird Schema","app"]`;
+          }
+          const later = steps
+            .slice(2)
+            .filter((step) => step.kind === 'create-schema')
+            .map((step) => (step.kind === 'create-schema' ? step.schema : ''));
+          return later.length === 0
+            ? undefined
+            : `schema steps after objects: ${JSON.stringify(later)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database has both non-public schemas',
+        sql: "select count(*) from pg_namespace where nspname in ('app', 'Weird Schema')",
+        expected: '2',
+      },
+      {
+        description: 'app holds the exported tables',
+        sql: tablesIn('app'),
+        expected: 'accounts,audit',
+      },
+      {
+        description: 'the quoted schema holds the exported tables',
+        sql: tablesIn('Weird Schema'),
+        expected: 'other,things',
+      },
+      {
+        description: 'app holds the exported view',
+        sql: relKindOf('active_accounts', 'app'),
+        expected: 'v',
+      },
+      {
+        description: 'app holds the exported sequence',
+        sql: relationExists('accounts_id_seq', 'app'),
+        expected: 't',
+      },
+      commentCheck(
+        'the exported table comment survives the migration',
+        relationComment('accounts', 'app'),
+        accountsComment,
+      ),
+    ],
+    importChecks: [
+      {
+        description:
+          'both imports carry every schema-qualified object, comment, and column comment',
+        failure: (imported, source) => {
+          const tables = imported.model.tables
+            .map((table) => `${table.schema}.${table.name}`)
+            .sort();
+          const expectedTables = [
+            'Weird Schema.other',
+            'Weird Schema.things',
+            'app.accounts',
+            'app.audit',
+          ];
+          if (!isDeepStrictEqual(tables, expectedTables)) {
+            return `${source}: imported tables ${JSON.stringify(tables)}, expected ${JSON.stringify(expectedTables)}`;
+          }
+          const accounts = imported.model.tables.find(
+            (table) => table.schema === 'app' && table.name === 'accounts',
+          );
+          if (accounts === undefined) return `${source}: app.accounts is not imported`;
+          if (accounts.comment !== accountsComment) {
+            return `${source}: accounts.comment is ${JSON.stringify(accounts.comment)}, expected ${JSON.stringify(accountsComment)}`;
+          }
+          const id = accounts.columns.find((column) => column.name === 'id');
+          if (id?.comment !== idComment) {
+            return `${source}: accounts.id.comment is ${JSON.stringify(id?.comment)}, expected ${JSON.stringify(idComment)}`;
+          }
+          if (
+            !imported.model.sequences.some(
+              (sequence) => sequence.schema === 'app' && sequence.name === 'accounts_id_seq',
+            )
+          ) {
+            return `${source}: app.accounts_id_seq is not imported`;
+          }
+          const active = imported.model.views.find(
+            (view) => view.schema === 'app' && view.name === 'active_accounts',
+          );
+          if (active === undefined) return `${source}: app.active_accounts is not imported`;
+          if (active.definition.trim() === '') {
+            return `${source}: app.active_accounts imported an empty definition`;
+          }
+          return undefined;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -2908,7 +7069,29 @@ export const scenes: readonly LiveScene[] = [
   identityToSequenceScene(),
   sequenceToIdentityScene(),
   constraintCreateScene(),
+  introspectionConstraintsScene(),
+  constraintAttributesScene(),
+  notNullConstraintNamesScene(),
+  enforcementInPlaceScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
+  unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
+  introspectionTracerScene(),
+  introspectionIndexesScene(),
+  introspectionSequencesIdentityScene(),
+  columnAttributesScene(),
+  introspectionFlagsScene(),
+  introspectionFlagsNullsNotDistinctScene(),
+  introspectionFlagsConstraintsScene(),
+  introspectionFlagsConstraints15Scene(),
+  introspectionFlagsConstraints18Scene(),
+  partitionChildGuardsScene(),
+  truncatedNameRoundTripScene(),
+  unnamedFkRoundTripScene(),
+  viewRoundTripScene(),
+  commentIntrospectionScene(),
+  commentRoundTripScene(),
+  extensionRoundTripScene(),
+  exportRoundTripScene(),
 ];

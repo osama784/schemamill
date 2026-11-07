@@ -5,53 +5,133 @@
  * `importDump` composes the parse leg (`parseDump`) and translates each statement:
  *
  * - `CREATE TABLE` becomes a `Table`: columns in source order, the primary key (inline,
- *   table-level, or a later `ALTER TABLE`), unique and check constraints, standalone indexes,
- *   and foreign keys. Types and DEFAULT expressions are sliced from the source text — the AST
- *   normalizes types (`int` becomes `int4`), so the model keeps the written spelling,
- *   whitespace-normalized; a check expression is the text between the parentheses after
- *   `CHECK`, normalized the same way. A column declared `GENERATED … AS IDENTITY` becomes the
- *   column's effective identity descriptor (see `identity.ts`): a type PostgreSQL does not
- *   accept for identity columns, and every option the model cannot carry, is flagged by name.
- *   A repeated `CREATE TABLE` for the same schema-qualified identity replaces the table
- *   wholesale, clearing its foreign keys, unique constraints, check constraints, and indexes.
+ *   table-level, or a later `ALTER TABLE`), unique and check constraints, named not-null
+ *   constraints, standalone indexes, and foreign keys. Types and DEFAULT expressions are
+ *   sliced from the source text — the AST normalizes types (`int` becomes `int4`), so the
+ *   model keeps the written spelling, whitespace-normalized; a check expression is the text
+ *   between the parentheses after `CHECK`, normalized the same way. A column declared
+ *   `GENERATED … AS IDENTITY` becomes the column's effective identity descriptor (see
+ *   `identity.ts`): a type PostgreSQL does not accept for identity columns, and every option
+ *   the model cannot carry, is flagged by name. A repeated `CREATE TABLE` for the same
+ *   schema-qualified identity replaces the table wholesale, clearing its foreign keys, unique
+ *   constraints, check constraints, indexes, and comment. `IF NOT EXISTS` is flagged and
+ *   dropped — one `dropped IF NOT EXISTS from <schema.table>` flag — and the table still
+ *   imports; a repeated create flags per statement even though the last definition wins. A
+ *   `PARTITION OF` child reports only its partition skip, never the clause flag; a partitioned
+ *   parent still imports, with the `partitioning clauses` flag then the clause flag.
  * - `ALTER TABLE` imports `ADD COLUMN` (including inline identity), `ADD GENERATED … AS
  *   IDENTITY`, `SET GENERATED`/`SET <option>` identity clauses, and `DROP IDENTITY`, in the
- *   order the statement lists them; `ADD CONSTRAINT` attaches a foreign key, primary key,
- *   unique constraint, or check constraint to an already imported table. A unique constraint
- *   stated `USING INDEX` consumes the named standalone index when it is a plain column-list
- *   unique index, and the whole constraint is skipped and named otherwise. Any other action
- *   is skipped and named, as is an identity action on a column that is not a modeled identity.
+ *   order the statement lists them; `ALTER COLUMN … SET STORAGE` and `SET COMPRESSION` apply
+ *   the stated method to the column, `DEFAULT` clearing it, and `SET LOGGED`/`SET UNLOGGED`
+ *   set the table's persistence; `ADD CONSTRAINT` attaches a foreign key, primary key,
+ *   unique constraint, check constraint, or not-null constraint to an already imported table.
+ *   An `ALTER TABLE … ADD CONSTRAINT` unique constraint or primary key stated
+ *   `USING INDEX` consumes the named standalone index when it is a plain column-list unique
+ *   index, and the whole constraint is skipped and named otherwise; the table-level
+ *   `CREATE TABLE … PRIMARY KEY USING INDEX` form is server-rejected, so it is flagged and
+ *   never consumed. Any other action is skipped and named, as is an identity action on a
+ *   column that is not a modeled identity.
  * - `CREATE [UNIQUE] INDEX` becomes an `Index` with its name (optional), `unique`, ordered
  *   columns, and `concurrently`. A statement outside the minimal envelope — an expression
  *   element, partial `WHERE`, `INCLUDE (…)`, a non-btree access method, a non-default
  *   ordering, operator class, collation, or NULLS ordering, a tablespace, storage parameters,
  *   or `NULLS NOT DISTINCT` — is skipped and named whole; an index is never partially
- *   imported. A constraint-backed index is never a standalone `Index`: inline and
- *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, and `USING INDEX`
- *   consumes the index it names.
+ *   imported. `IF NOT EXISTS` on the named form is flagged and dropped: the plan renders
+ *   plain creates, so the drift surfaces at apply rather than being hidden by a re-run, and
+ *   the clause is grammatically available only on the named form. A constraint-backed index
+ *   is never a standalone `Index`: inline and
+ *   `ADD CONSTRAINT` unique constraints produce `UniqueConstraint`s, `ADD CONSTRAINT` primary
+ *   keys produce `PrimaryKey`s, and `USING INDEX` consumes the index it names for either kind.
+ *   Once every statement is translated, a standalone index whose name
+ *   equals the server form of PostgreSQL's conventional `<table>_<cols>_idx` for its
+ *   structure, and a primary key, unique constraint, foreign key, or check constraint whose
+ *   name equals the server form of the conventional formula for its structure, are
+ *   canonicalized back to unnamed, so a dump of a declaration the model makes unnamed
+ *   round-trips — the server form is what PostgreSQL stores, so a generated name truncated at
+ *   63 bytes strips too. A name is kept when an unnamed entry of the same structure already
+ *   exists, so no duplicate unnamed entry is manufactured, and a name outside the server form
+ *   — collision-suffixed, or an expression the best-effort check formula does not predict —
+ *   stays named. A column's not-null name equal to the server form of the generated
+ *   `<table>_<column>_not_null` is stripped the same way; no twin guard is needed, because one
+ *   not-null fact per column is the only shape the model carries and the duplicate declaration
+ *   is already collapsed by the merge (see `mergeNotNullDeclaration`).
+ * - PostgreSQL marks every primary-key key column NOT NULL whichever statement form created the
+ *   key: the finalizer applies that implied fact, unnamed, to the retained key's columns after
+ *   the name canonicalizations, so an explicit named NOT NULL keeps its name.
  * - `CREATE SEQUENCE` becomes a `Sequence` with effective option values: the `AS` type, the
  *   increment, minimum, maximum, start, cache, cycle, and inline `OWNED BY`, with omitted
  *   options and `NO MINVALUE`/`NO MAXVALUE` resolving to the engine defaults. A repeated
  *   `CREATE SEQUENCE` for the same identity replaces the sequence wholesale, and unlogged or
- *   temporary sequence persistence is flagged.
+ *   temporary sequence persistence is flagged. `IF NOT EXISTS` is flagged and dropped the
+ *   same way — one `dropped IF NOT EXISTS from <schema.sequence>` flag — and the sequence
+ *   still imports; the findings ride the per-sequence buffer, so a repeated create reports
+ *   only the last statement's clause and a dropped sequence reports only its skip. A sequence
+ *   whose `OWNED BY` is not in the imported model — an unread relation, a partitioned parent,
+ *   or an absent column — is omitted whole and named, judged on the final drafts so a forward
+ *   reference is kept.
  * - `ALTER SEQUENCE` options that map to modeled fields — `AS` type, increment, min/max,
  *   start, cache, cycle, and `OWNED BY`/`OWNED BY NONE` — apply to the already imported
  *   sequence, in the order the engine processes them, and are skipped and named when the
  *   sequence was not imported. `RESTART` (sequence state), renames, `SET SCHEMA`, and
  *   `setval` calls are skipped and named; so is a dump-side `DROP SEQUENCE`.
- * - Everything outside the imported subset (schemas, views, functions, comments, grants,
- *   settings, …) is skipped and named.
+ * - `CREATE [OR REPLACE] VIEW` and `CREATE MATERIALIZED VIEW` become a `View` of the matching
+ *   kind: the body between the top-level `AS` and the statement terminator, minus a trailing
+ *   `WITH [LOCAL|CASCADED] CHECK OPTION` (views) or `WITH [NO] DATA` (materialized views),
+ *   whitespace-normalized and opaque to the model. The check option is read from the clause or
+ *   from a `check_option` reloption, the clause winning when both are stated; the other
+ *   `WITH (...)` options, a column list, a materialized view's access method or tablespace,
+ *   `IF NOT EXISTS`, a stated or implied populated state, and non-default persistence are
+ *   flagged and dropped, never silently ignored. A repeated definition of one identity replaces
+ *   the earlier view — the last wins, which is how a pg_dump dependency-loop
+ *   `CREATE OR REPLACE VIEW` repairs its dummy — and so does a duplicate whose `materialized`
+ *   flag differs (an invalid dump). A recursive view is skipped and named: the parser rewrites
+ *   it into a view-named recursive CTE and the body after `AS` omits that CTE, so the stored
+ *   definition could not be re-rendered.
+ * - `CREATE EXTENSION` becomes an `Extension`: its name and the `WITH SCHEMA` install schema,
+ *   plus a later `COMMENT ON EXTENSION`. `IF NOT EXISTS` is pg_dump restore noise and is
+ *   ignored. A definition without `WITH SCHEMA` is skipped and named — the importer never
+ *   invents an install schema — and a skipped definition never replaces an already imported
+ *   extension; a repeated definition replaces it wholesale, clearing its comment. The install
+ *   schema is the only option the model carries: `VERSION`, install-time `CASCADE`, and any
+ *   other option are flagged and dropped. Extension members (`ALTER EXTENSION … ADD`/`DROP`),
+ *   `ALTER EXTENSION … UPDATE`/`SET SCHEMA`, `DROP EXTENSION`, and built-in extensions (never
+ *   dumped) are outside the imported subset and stay skipped and named.
+ * - `COMMENT ON` stores the comment on every modeled family: a table, column, sequence, plain
+ *   or materialized view, index, primary key, unique/check/foreign-key constraint, or
+ *   extension. The target is resolved by its stored server name — the drafts still carry it,
+ *   because canonicalization runs after all statements — or, for a node the source declared
+ *   unnamed, by the conventional name PostgreSQL would have synthesized, so a comment stays on
+ *   the node after the name strip.
+ *   `IS NULL` and `IS ''` clear the comment, a repeated comment replaces the earlier one, and a
+ *   repeated `CREATE` clears it with the entity. A comment the import cannot place is flagged,
+ *   never silent: an unknown or under-qualified object, a table/view kind mismatch, a view
+ *   output column, or text carrying NUL. A comment on a PG18 named not-null constraint is
+ *   flagged with its own wording (the model has no not-null entity); comments on unmodeled
+ *   families stay skipped and named.
+ * - Everything outside the imported subset (schemas, functions, grants, settings, …) is skipped
+ *   and named.
  *
  * Boundary for `CREATE TABLE` extras: what the model cannot represent becomes a flag on the
  * imported table — inheritance, partitioning clauses, typed-table definitions, `ON COMMIT`
- * behaviour, tablespace, access method, storage parameters, unlogged or temporary
- * persistence, and column-level EXCLUDE, GENERATED, COLLATE, compression, and storage. A
- * unique or check constraint carrying an attribute outside the model (`NULLS NOT DISTINCT`,
- * `INCLUDE (…)`, `NO INHERIT`, `NOT VALID`, deferrability) is still imported, and each
- * unrepresentable attribute is flagged and dropped, following the foreign-key precedent;
- * `NOT ENFORCED` is flagged under the `NOT VALID` wording, because the parser delivers it
- * through the same `skip_validation` channel — the foreign-key path behaves the same. The one
- * statement-level exception is a partition (`partbound`): a
+ * behaviour, tablespace, access method, storage parameters, and temporary persistence. What
+ * the model does carry reads instead: a column's `COLLATE` as the written,
+ * whitespace-normalized name, its inline `STORAGE` and `COMPRESSION` qualifiers as the
+ * model's words, and `CREATE UNLOGGED TABLE` as the table's persistence. A constraint
+ * carrying an attribute outside the model — `NULLS NOT DISTINCT`, `INCLUDE (…)`, or
+ * `NO INHERIT` on a unique or check constraint, `WITHOUT OVERLAPS` on a primary key or
+ * unique constraint, `PERIOD` on a foreign key (one flag per key, whichever side states it),
+ * or `NO INHERIT` on a not-null constraint — is still imported, and each unrepresentable
+ * attribute is flagged and dropped, following the foreign-key precedent; a check
+ * constraint's misplaced deferrability is flagged the same way. Enforcement and deferrability
+ * the model carries are read instead: on a foreign key or check constraint the parser's one
+ * `skip_validation` channel decodes to `NOT VALID` when `is_enforced` is true beside it and
+ * to `NOT ENFORCED` otherwise, and a deferrable primary key, unique constraint, or foreign
+ * key keeps `DEFERRABLE`/`INITIALLY DEFERRED`. A not-null constraint in any shape — inline,
+ * table-level, or `ALTER TABLE … ADD`, named or unnamed — sets the column's `notNull`, with a
+ * stated name on `notNullName`; the duplicate-declaration merge and the generated-name strip
+ * below keep the model's one-fact-per-column shape. A not-null `NOT VALID` keeps its enforced
+ * not-null fact and flags the validation state the model cannot carry. The one statement-level
+ * exception is a partition (`partbound`): a
  * plain-table representation would be a different object, so the whole statement is skipped
  * and named. `ALTER TABLE` on anything but a plain table is skipped the same way.
  *
@@ -59,7 +139,8 @@
  * `model.ts`: tables by schema then name, columns in source order, foreign keys by
  * referencing columns, then referenced table, then constraint name (unnamed first), unique
  * constraints by ordered columns then name (unnamed first), check constraints by expression
- * then name (unnamed first), and indexes by name (unnamed first).
+ * then name (unnamed first), indexes by name (unnamed first), views by schema then name, and
+ * extensions by name.
  *
  * This module is internal to the package; `index.ts` re-exports `importDump` and
  * `ddlImporter` as the seam binding.
@@ -68,8 +149,12 @@
 import type {
   CheckConstraint,
   Column,
+  ColumnCompression,
+  ColumnStorage,
+  ConstraintEnforcement,
   DdlImporter,
   Diagnostic,
+  Extension,
   ForeignKey,
   Identity,
   IdentityGeneration,
@@ -86,9 +171,13 @@ import type {
   SequenceOptions,
   SequenceOwner,
   SkipDiagnosticCode,
+  SourcePosition,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
 } from '@schemamill/core';
 import {
   canonicalIntType,
@@ -103,18 +192,31 @@ import type {
   AlterSeqStmt,
   AlterTableCmd,
   AlterTableStmt,
+  CollateClause,
   ColumnDef,
+  CommentStmt,
   Constraint,
+  CreateExtensionStmt,
   CreateSeqStmt,
   CreateStmt,
+  CreateTableAsStmt,
   DefElem,
   IndexElem,
   IndexStmt,
   Node,
   RangeVar,
   SelectStmt,
+  ViewStmt,
 } from 'libpg-query';
 
+import {
+  synthesizedCheckConstraintName,
+  synthesizedForeignKeyName,
+  synthesizedIndexName,
+  synthesizedNotNullName,
+  synthesizedPrimaryKeyName,
+  synthesizedUniqueConstraintName,
+} from './names.ts';
 import { parseDump, type ParseFailure, type ParsedStatement } from './parse.ts';
 import type { PreprocessDiagnostic } from './preprocess.ts';
 
@@ -125,16 +227,29 @@ type Mutable<Payload> = { -readonly [Key in keyof Payload]: Payload[Key] };
 interface TableDraft {
   readonly schema: string;
   readonly name: string;
-  columns: readonly Column[];
+  columns: Column[];
   primaryKey?: PrimaryKey;
   readonly foreignKeys: ForeignKey[];
   readonly uniqueConstraints: UniqueConstraint[];
   readonly checkConstraints: CheckConstraint[];
   readonly indexes: Index[];
+  /** `unlogged` while the source says so; `undefined` is `LOGGED`, the default. */
+  persistence?: TablePersistence;
+  /** The table's comment; a repeated `CREATE TABLE` replaces it wholesale. */
+  comment?: string;
 }
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
 type SequenceDraft = Mutable<Sequence>;
+
+/**
+ * A view being assembled. Views need no incremental mutation: a repeated definition of one
+ * identity replaces the draft wholesale, so the last definition wins.
+ */
+type ViewDraft = Mutable<View>;
+
+/** An extension being assembled; a repeated definition replaces it wholesale. */
+type ExtensionDraft = Mutable<Extension>;
 
 interface PositionedDiagnostic {
   readonly offset: number;
@@ -184,9 +299,35 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
 
   const tables = new Map<string, TableDraft>();
   const sequences = new Map<string, SequenceDraft>();
+  const views = new Map<string, ViewDraft>();
+  const extensions = new Map<string, ExtensionDraft>();
+  // Sequence-keyed side state for the owner post-pass: where the latest `OWNED BY` was set, the
+  // create-time findings that wait for the pass, and every table created with a partition spec.
+  const ownerPositions = new Map<string, SourcePosition>();
+  const sequenceFindings = new Map<string, PositionedDiagnostic[]>();
+  const partitionedTables = new Set<string>();
   for (const statement of parsed.statements) {
-    translateStatement(statement, tables, sequences, diagnostics);
+    translateStatement(
+      statement,
+      tables,
+      sequences,
+      views,
+      extensions,
+      diagnostics,
+      ownerPositions,
+      sequenceFindings,
+      partitionedTables,
+    );
   }
+
+  reconcileSequenceOwners(
+    sequences,
+    tables,
+    partitionedTables,
+    ownerPositions,
+    sequenceFindings,
+    diagnostics,
+  );
 
   diagnostics.sort((left, right) => left.offset - right.offset);
 
@@ -194,9 +335,73 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
+      views: [...views.values()].sort(compareViews),
+      extensions: [...extensions.values()].sort(compareExtensions),
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
+}
+
+/**
+ * Drops every sequence whose `OWNED BY` owner is not in the imported model, naming the skip.
+ *
+ * The pass judges the final drafts, not each statement: a forward reference to a table or
+ * column created later is kept, and a later `OWNED BY NONE` clears an earlier owner. An owner
+ * relation is unread when absent — a partition child, view, foreign table, or skipped
+ * `CREATE TABLE AS` never enters `tables` — or when it is a partitioned parent, which imports
+ * as a table draft but is `relkind 'p'` to the catalog. A present table with a missing column is
+ * an unread column. Either way the whole sequence is omitted, matching the catalog reader, so
+ * no dangling owner can reach the model or `plan()`.
+ */
+function reconcileSequenceOwners(
+  sequences: Map<string, SequenceDraft>,
+  tables: Map<string, TableDraft>,
+  partitionedTables: ReadonlySet<string>,
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  for (const [key, sequence] of sequences) {
+    const owner = sequence.ownedBy;
+    if (owner === undefined) continue;
+
+    const ownerKey = tableKey(owner.table.schema, owner.table.name);
+    const table = tables.get(ownerKey);
+    const unreadRelation = table === undefined || partitionedTables.has(ownerKey);
+    const unreadColumn =
+      table !== undefined && !table.columns.some((column) => column.name === owner.column);
+    if (!unreadRelation && !unreadColumn) continue;
+
+    const position = ownerPositions.get(key);
+    if (position === undefined) {
+      throw new Error(
+        `sequence ${tableIdentityName(sequence)} has an owner but no recorded owner position`,
+      );
+    }
+
+    sequences.delete(key);
+    sequenceFindings.delete(key);
+    const identity = tableIdentityName(sequence);
+    const place = `${owner.table.schema}.${owner.table.name}`;
+    diagnostics.push({
+      offset: position.offset,
+      diagnostic: {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: identity,
+        message: unreadRelation
+          ? `skipped sequence ${identity} belongs to unread relation ${place}; it is not represented`
+          : `skipped sequence ${identity} belongs to unread column ${place}.${owner.column}; it is not represented`,
+        position,
+      },
+    });
+  }
+
+  // Create-time persistence findings wait for the pass so a dropped sequence yields exactly one
+  // diagnostic, like the catalog reader.
+  for (const [key, findings] of sequenceFindings) {
+    if (sequences.has(key)) diagnostics.push(...findings);
+  }
 }
 
 /** The seam binding: a structurally checked `DdlImporter`. */
@@ -227,7 +432,12 @@ function translateStatement(
   statement: ParsedStatement,
   tables: Map<string, TableDraft>,
   sequences: Map<string, SequenceDraft>,
+  views: Map<string, ViewDraft>,
+  extensions: Map<string, ExtensionDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
+  partitionedTables: Set<string>,
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
   if (node === undefined) {
@@ -244,7 +454,7 @@ function translateStatement(
   }
 
   if ('CreateStmt' in node) {
-    translateCreateTable(statement, node.CreateStmt, tables, diagnostics);
+    translateCreateTable(statement, node.CreateStmt, tables, diagnostics, partitionedTables);
     return;
   }
   if ('AlterTableStmt' in node) {
@@ -252,15 +462,46 @@ function translateStatement(
     return;
   }
   if ('CreateSeqStmt' in node) {
-    translateCreateSequence(statement, node.CreateSeqStmt, sequences, diagnostics);
+    translateCreateSequence(
+      statement,
+      node.CreateSeqStmt,
+      sequences,
+      diagnostics,
+      ownerPositions,
+      sequenceFindings,
+    );
     return;
   }
   if ('AlterSeqStmt' in node) {
-    translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics);
+    translateAlterSequence(statement, node.AlterSeqStmt, sequences, diagnostics, ownerPositions);
     return;
   }
   if ('IndexStmt' in node) {
     translateCreateIndex(statement, node.IndexStmt, tables, diagnostics);
+    return;
+  }
+  if ('ViewStmt' in node) {
+    translateCreateView(statement, node.ViewStmt, views, diagnostics);
+    return;
+  }
+  if ('CreateTableAsStmt' in node && node.CreateTableAsStmt.objtype === 'OBJECT_MATVIEW') {
+    translateCreateMaterializedView(statement, node.CreateTableAsStmt, views, diagnostics);
+    return;
+  }
+  if ('CreateExtensionStmt' in node) {
+    translateCreateExtension(statement, node.CreateExtensionStmt, extensions, diagnostics);
+    return;
+  }
+  if ('CommentStmt' in node && MODELED_COMMENT_OBJECTS.has(node.CommentStmt.objtype ?? '')) {
+    translateCommentStatement(
+      statement,
+      node.CommentStmt,
+      tables,
+      sequences,
+      views,
+      extensions,
+      diagnostics,
+    );
     return;
   }
 
@@ -273,6 +514,7 @@ function translateCreateTable(
   create: CreateStmt,
   tables: Map<string, TableDraft>,
   diagnostics: PositionedDiagnostic[],
+  partitionedTables: Set<string>,
 ): void {
   const schema = create.relation?.schemaname ?? 'public';
   const name = create.relation?.relname ?? '';
@@ -290,17 +532,29 @@ function translateCreateTable(
     return;
   }
 
+  // The owner post-pass treats a partitioned parent as unread, like the catalog reader; a
+  // repeated CREATE TABLE replaces the draft, so a table that stops being partitioned must
+  // lose its stale membership.
+  const key = tableKey(schema, name);
+  if (create.partspec !== undefined) partitionedTables.add(key);
+  else partitionedTables.delete(key);
+
   const draft = getOrCreateTable(tables, schema, name);
   const elements = create.tableElts ?? [];
 
   const columns: Column[] = [];
   // A repeated CREATE TABLE replaces the table wholesale: columns, primary key, foreign keys,
-  // unique constraints, check constraints, and indexes.
+  // unique constraints, check constraints, indexes, persistence, and the comment.
   draft.primaryKey = undefined;
   draft.foreignKeys.length = 0;
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
   draft.indexes.length = 0;
+  draft.persistence = undefined;
+  delete draft.comment;
+  // The draft sees the columns as they are collected, so a table-level not-null constraint —
+  // which always follows the column definitions — can attach to its column.
+  draft.columns = columns;
 
   for (const element of elements) {
     const boundaries = clauseBoundaries(element);
@@ -309,8 +563,7 @@ function translateCreateTable(
         statement,
         element.ColumnDef,
         boundaries,
-        schema,
-        identity,
+        { schema, name },
         diagnostics,
       );
       columns.push(translated.column);
@@ -341,24 +594,41 @@ function translateCreateTable(
     );
   }
 
-  draft.columns = columns;
-  translateCreateTableExtras(statement, create, identity, diagnostics);
+  translateCreateTableExtras(statement, create, identity, draft, diagnostics);
+
+  // The model has no create-time idempotence and the plan renders a plain create, so the
+  // clause is flagged and dropped; the table itself still imports. A repeated CREATE TABLE
+  // flags per statement even though the draft is replaced.
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
+  }
 }
+
+/** A column and its constraints while `translateColumn` assembles them. */
+interface TranslatedColumn {
+  column: Column;
+  primaryKey?: PrimaryKey;
+  foreignKeys: ForeignKey[];
+  uniqueConstraints: UniqueConstraint[];
+  checkConstraints: CheckConstraint[];
+}
+
+/** The constraint an inline `CONSTR_ATTR_*` sibling can fold into. */
+type InlineAttributeTarget =
+  | { readonly kind: 'primary'; readonly value: Mutable<PrimaryKey> }
+  | { readonly kind: 'unique'; readonly value: Mutable<UniqueConstraint> }
+  | { readonly kind: 'foreign'; readonly value: Mutable<ForeignKey> }
+  | { readonly kind: 'check'; readonly value: Mutable<CheckConstraint> };
 
 function translateColumn(
   statement: ParsedStatement,
   column: ColumnDef,
   boundaries: readonly number[],
-  schema: string,
-  identity: string,
+  table: TableIdentity,
   diagnostics: PositionedDiagnostic[],
-): {
-  column: Column;
-  primaryKey?: PrimaryKey;
-  foreignKeys: readonly ForeignKey[];
-  uniqueConstraints: readonly UniqueConstraint[];
-  checkConstraints: readonly CheckConstraint[];
-} {
+): TranslatedColumn {
+  const schema = table.schema;
+  const identity = tableIdentityName(table);
   const name = column.colname ?? '';
   const place = `${identity}.${name}`;
   const constraints = (column.constraints ?? [])
@@ -394,13 +664,7 @@ function translateColumn(
         constraint.contype === 'CONSTR_NOTNULL' || constraint.contype === 'CONSTR_IDENTITY',
     );
 
-  const translated: {
-    column: Column;
-    primaryKey?: PrimaryKey;
-    foreignKeys: ForeignKey[];
-    uniqueConstraints: UniqueConstraint[];
-    checkConstraints: CheckConstraint[];
-  } = {
+  const translated: TranslatedColumn = {
     column: { name, type, notNull },
     foreignKeys: [],
     uniqueConstraints: [],
@@ -419,21 +683,48 @@ function translateColumn(
     }
   }
 
+  // The last non-attribute constraint of the list: consecutive `CONSTR_ATTR_*` siblings fold
+  // into it, in source order.
+  let fold: InlineAttributeTarget | undefined;
+
   for (const constraint of constraints) {
     switch (constraint.contype) {
-      case 'CONSTR_PRIMARY':
-        translated.primaryKey = primaryKeyFromConstraint(constraint, [name]);
+      case 'CONSTR_PRIMARY': {
+        const primaryKey = primaryKeyFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<PrimaryKey>;
+        translated.primaryKey = primaryKey;
+        fold = { kind: 'primary', value: primaryKey };
         break;
-      case 'CONSTR_FOREIGN':
-        translated.foreignKeys.push(
-          foreignKeyFromConstraint(statement, constraint, [name], identity, diagnostics),
-        );
+      }
+      case 'CONSTR_FOREIGN': {
+        const foreignKey = foreignKeyFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<ForeignKey>;
+        translated.foreignKeys.push(foreignKey);
+        fold = { kind: 'foreign', value: foreignKey };
         break;
-      case 'CONSTR_UNIQUE':
-        translated.uniqueConstraints.push(
-          uniqueConstraintFromConstraint(statement, constraint, [name], identity, diagnostics),
-        );
+      }
+      case 'CONSTR_UNIQUE': {
+        const uniqueConstraint = uniqueConstraintFromConstraint(
+          statement,
+          constraint,
+          [name],
+          identity,
+          diagnostics,
+        ) as Mutable<UniqueConstraint>;
+        translated.uniqueConstraints.push(uniqueConstraint);
+        fold = { kind: 'unique', value: uniqueConstraint };
         break;
+      }
       case 'CONSTR_CHECK': {
         const checkConstraint = checkConstraintFromConstraint(
           statement,
@@ -441,15 +732,39 @@ function translateColumn(
           identity,
           diagnostics,
         );
-        if (checkConstraint !== undefined) translated.checkConstraints.push(checkConstraint);
+        if (checkConstraint === undefined) {
+          fold = undefined;
+        } else {
+          translated.checkConstraints.push(checkConstraint);
+          fold = { kind: 'check', value: checkConstraint };
+        }
+        break;
+      }
+      case 'CONSTR_NOTNULL': {
+        fold = undefined;
+        const merged = mergeNotNullDeclaration(translated.column, table.name, constraint.conname);
+        if (merged.conflict) {
+          diagnostics.push(
+            flagAttribute(statement, identity, `additional not-null constraint on ${place}`),
+          );
+        } else {
+          translated.column = merged.column;
+        }
+        if (constraint.is_no_inherit === true) {
+          diagnostics.push(
+            flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
+          );
+        }
         break;
       }
       case 'CONSTR_EXCLUSION':
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
         break;
       case 'CONSTR_IDENTITY':
+        fold = undefined;
         translated.column = columnWithIdentity(
           statement,
           constraint,
@@ -461,16 +776,26 @@ function translateColumn(
         );
         break;
       case 'CONSTR_GENERATED':
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
         break;
-      case 'CONSTR_NOTNULL':
       case 'CONSTR_DEFAULT':
       case 'CONSTR_NULL':
       case undefined:
+        fold = undefined;
+        break;
+      case 'CONSTR_ATTR_DEFERRABLE':
+      case 'CONSTR_ATTR_NOT_DEFERRABLE':
+      case 'CONSTR_ATTR_DEFERRED':
+      case 'CONSTR_ATTR_IMMEDIATE':
+      case 'CONSTR_ATTR_ENFORCED':
+      case 'CONSTR_ATTR_NOT_ENFORCED':
+        applyInlineAttribute(statement, identity, place, fold, constraint, diagnostics);
         break;
       default:
+        fold = undefined;
         diagnostics.push(
           flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
         );
@@ -478,16 +803,246 @@ function translateColumn(
   }
 
   if (column.collClause !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `COLLATE on ${place}`));
+    const collation = extractCollationText(statement.sql, column.collClause, spanBoundaries);
+    if (collation === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `COLLATE on ${place}`));
+    } else {
+      translated.column = { ...translated.column, collation };
+    }
   }
+
+  if (column.storage_name !== undefined) {
+    const storage = storageWord(column.storage_name);
+    if (storage === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+    } else {
+      translated.column = withColumnStorage(translated.column, storage ?? undefined);
+    }
+  }
+
   if (column.compression !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
-  }
-  if (column.storage !== undefined) {
-    diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+    const compression = compressionWord(column.compression);
+    if (compression === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
+    } else {
+      translated.column = withColumnCompression(translated.column, compression ?? undefined);
+    }
   }
 
   return translated;
+}
+
+/** PostgreSQL's storage words, as the model spells them. */
+const COLUMN_STORAGE_WORDS: Readonly<Record<string, ColumnStorage>> = {
+  plain: 'plain',
+  external: 'external',
+  extended: 'extended',
+  main: 'main',
+};
+
+/** PostgreSQL's compression methods, as the model spells them. */
+const COLUMN_COMPRESSION_WORDS: Readonly<Record<string, ColumnCompression>> = {
+  pglz: 'pglz',
+  lz4: 'lz4',
+};
+
+/**
+ * The modeled storage a qualifier names: the word, `null` for `DEFAULT` (the type's default,
+ * the model's absent), or `undefined` when the source states a word the model cannot carry.
+ * PostgreSQL matches the words case-insensitively.
+ */
+function storageWord(value: string | undefined): ColumnStorage | null | undefined {
+  if (value === undefined) return undefined;
+  const word = value.toLowerCase();
+  if (word === 'default') return null;
+  return COLUMN_STORAGE_WORDS[word];
+}
+
+/**
+ * The modeled compression method a qualifier names: the method, `null` for `default` (the
+ * model's absent), or `undefined` when the source states a method the model cannot carry.
+ */
+function compressionWord(value: string | undefined): ColumnCompression | null | undefined {
+  if (value === undefined) return undefined;
+  const word = value.toLowerCase();
+  if (word === 'default') return null;
+  return COLUMN_COMPRESSION_WORDS[word];
+}
+
+/** A copy of `column` with `storage` set, or cleared when the word is absent. */
+function withColumnStorage(column: Column, storage: ColumnStorage | undefined): Column {
+  const copy: Mutable<Column> = { ...column };
+  if (storage === undefined) delete copy.storage;
+  else copy.storage = storage;
+  return copy;
+}
+
+/** A copy of `column` with `compression` set, or cleared when the word is absent. */
+function withColumnCompression(column: Column, compression: ColumnCompression | undefined): Column {
+  const copy: Mutable<Column> = { ...column };
+  if (compression === undefined) delete copy.compression;
+  else copy.compression = compression;
+  return copy;
+}
+
+const COLLATE_KEYWORD = 'COLLATE';
+
+/**
+ * Slices a column's inline `COLLATE` name from the source text — as written,
+ * whitespace-normalized — or, when the parser reports no location, reconstructs it from the
+ * parsed name parts, quoting each part that could not have been written bare. The source-text
+ * pattern is `extractDefaultText`'s; exported for the unit test of the location-less path,
+ * deliberately not re-exported from `index.ts`.
+ */
+export function extractCollationText(
+  sql: string,
+  collClause: CollateClause,
+  boundaries: readonly number[],
+): string | undefined {
+  const location = collClause.location;
+  if (location !== undefined && location >= 0) {
+    const startIndex = skipTrivia(sql, byteOffsetToUtf16(sql, location + COLLATE_KEYWORD.length));
+    const text = extractSourceText(sql, startIndex, boundaries);
+    return text.length > 0 ? text : undefined;
+  }
+  return reconstructCollationName(collClause.collname);
+}
+
+/** Rebuilds a collation's dotted name from string parts, preserving each part's spelling. */
+function reconstructCollationName(parts: readonly Node[] | undefined): string | undefined {
+  const names = stringList(parts);
+  if (names.length === 0) return undefined;
+  return names.map(quoteIdentifierAsWritten).join('.');
+}
+
+/**
+ * A name part as written: bare when it is a lowercase identifier, quoted otherwise — an
+ * uppercase letter or any other character can only come from a quoted spelling.
+ */
+function quoteIdentifierAsWritten(name: string): string {
+  return /^[a-z_][a-z0-9_$]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Folds an inline constraint attribute into the constraint it follows, or flags it by its raw
+ * parser label when there is no target or the target's kind cannot carry the attribute. The
+ * server rejects those placements — `NOT NULL DEFERRABLE`, `CHECK DEFERRABLE`, `UNIQUE NOT
+ * ENFORCED` — but the raw parser accepts them, so they stay diagnosed rather than silent.
+ */
+function applyInlineAttribute(
+  statement: ParsedStatement,
+  identity: string,
+  place: string,
+  target: InlineAttributeTarget | undefined,
+  attribute: Constraint,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const handled = target !== undefined && applyAttributeToTarget(target, attribute);
+  if (!handled) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${constraintLabel(attribute)} on ${place}`),
+    );
+  }
+}
+
+/** Applies one attribute to one target; `false` when the target's kind cannot carry it. */
+function applyAttributeToTarget(target: InlineAttributeTarget, attribute: Constraint): boolean {
+  switch (target.kind) {
+    case 'primary':
+    case 'unique':
+      return applyDeferrabilityAttribute(target.value, attribute);
+    case 'foreign':
+      return (
+        applyDeferrabilityAttribute(target.value, attribute) ||
+        applyEnforcementAttribute(target.value, attribute)
+      );
+    case 'check':
+      return applyEnforcementAttribute(target.value, attribute);
+  }
+}
+
+/** Applies a deferrability attribute; `false` for any other attribute. */
+function applyDeferrabilityAttribute(
+  target: Mutable<PrimaryKey | UniqueConstraint | ForeignKey>,
+  attribute: Constraint,
+): boolean {
+  const contype = attribute.contype;
+  if (contype === 'CONSTR_ATTR_DEFERRABLE') {
+    target.deferrable = true;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_DEFERRED') {
+    // `INITIALLY DEFERRED` implies `DEFERRABLE`; the model normalizes the pair.
+    target.deferrable = true;
+    target.initiallyDeferred = true;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_NOT_DEFERRABLE') {
+    // An explicit default: consumed, and it resets a preceding `DEFERRABLE`/`INITIALLY
+    // DEFERRED` in source order.
+    delete target.deferrable;
+    delete target.initiallyDeferred;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_IMMEDIATE') {
+    delete target.initiallyDeferred;
+    return true;
+  }
+  return false;
+}
+
+/** Applies an enforcement attribute; `false` for any other attribute. */
+function applyEnforcementAttribute(
+  target: Mutable<ForeignKey | CheckConstraint>,
+  attribute: Constraint,
+): boolean {
+  const contype = attribute.contype;
+  if (contype === 'CONSTR_ATTR_ENFORCED') {
+    delete target.enforcement;
+    return true;
+  }
+  if (contype === 'CONSTR_ATTR_NOT_ENFORCED') {
+    target.enforcement = 'not-enforced';
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Merges a not-null declaration into a column's not-null fact. PostgreSQL allows one not-null
+ * constraint per column, so declarations for the same column collapse: a name equal to the
+ * generated `<table>_<column>_not_null` formula reads as unnamed for the comparison, identical
+ * facts are ignored, an unnamed and a named declaration become the named one whatever the
+ * order, and two different real names keep the first and report a conflict — legal input the
+ * model collapses by design, never silently.
+ */
+function mergeNotNullDeclaration(
+  column: Column,
+  table: string,
+  incomingName: string | undefined,
+): { readonly column: Column; readonly conflict: boolean } {
+  const incoming = normalizedNotNullName(table, column.name, incomingName);
+  if (!column.notNull) {
+    const copy: Mutable<Column> = { ...column, notNull: true };
+    if (incoming !== undefined) copy.notNullName = incoming;
+    return { column: copy, conflict: false };
+  }
+  const existing = normalizedNotNullName(table, column.name, column.notNullName);
+  if (existing === incoming) return { column, conflict: false };
+  if (existing === undefined)
+    return { column: { ...column, notNullName: incoming }, conflict: false };
+  if (incoming === undefined) return { column, conflict: false };
+  return { column, conflict: true };
+}
+
+/** A not-null name normalized for the one-fact comparison: the generated formula reads unnamed. */
+function normalizedNotNullName(
+  table: string,
+  column: string,
+  name: string | undefined,
+): string | undefined {
+  if (name === undefined) return undefined;
+  return name === synthesizedNotNullName(table, column) ? undefined : name;
 }
 
 function translateTableConstraint(
@@ -499,10 +1054,20 @@ function translateTableConstraint(
 ): void {
   switch (constraint.contype) {
     case 'CONSTR_PRIMARY':
+      if (constraint.indexname !== undefined) {
+        diagnostics.push(
+          flagAttribute(
+            statement,
+            identity,
+            `${constraintLabel(constraint)} (USING INDEX ${constraint.indexname}; cannot use an existing index in CREATE TABLE)`,
+          ),
+        );
+        return;
+      }
       attachPrimaryKey(
         statement,
         draft,
-        primaryKeyFromConstraint(constraint, []),
+        primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
         identity,
         diagnostics,
       );
@@ -520,6 +1085,16 @@ function translateTableConstraint(
       );
       return;
     case 'CONSTR_UNIQUE':
+      if (constraint.indexname !== undefined) {
+        diagnostics.push(
+          flagAttribute(
+            statement,
+            identity,
+            `${constraintLabel(constraint)} (USING INDEX ${constraint.indexname}; cannot use an existing index in CREATE TABLE)`,
+          ),
+        );
+        return;
+      }
       attachUniqueConstraint(
         draft,
         uniqueConstraintFromConstraint(statement, constraint, [], identity, diagnostics),
@@ -535,8 +1110,78 @@ function translateTableConstraint(
       if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
       return;
     }
+    case 'CONSTR_NOTNULL':
+      attachNotNullConstraint(
+        statement,
+        constraint,
+        identity,
+        draft.name,
+        draft.columns,
+        diagnostics,
+      );
+      return;
+    case undefined:
+    case 'CONSTR_NULL':
+    case 'CONSTR_DEFAULT':
+    case 'CONSTR_IDENTITY':
+    case 'CONSTR_GENERATED':
+    case 'CONSTR_EXCLUSION':
+    case 'CONSTR_ATTR_DEFERRABLE':
+    case 'CONSTR_ATTR_NOT_DEFERRABLE':
+    case 'CONSTR_ATTR_DEFERRED':
+    case 'CONSTR_ATTR_IMMEDIATE':
+    case 'CONSTR_ATTR_ENFORCED':
+    case 'CONSTR_ATTR_NOT_ENFORCED':
     default:
       diagnostics.push(flagAttribute(statement, identity, `${constraintLabel(constraint)}`));
+  }
+}
+
+/**
+ * Attaches a table-level or `ALTER TABLE … ADD` not-null declaration to its column: the
+ * column gains `notNull`, and a stated name travels on `notNullName` (merged with any earlier
+ * declaration, see `mergeNotNullDeclaration`). A declaration whose column is not in the draft
+ * is skipped and named; a `NOT VALID` one keeps its enforced not-null fact and flags the
+ * validation state the model cannot carry.
+ */
+function attachNotNullConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  table: string,
+  columns: Column[],
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const key = stringList(constraint.keys)[0];
+  const place = key === undefined ? identity : `${identity}.${key}`;
+  const index = key === undefined ? -1 : columns.findIndex((column) => column.name === key);
+  if (index === -1) {
+    diagnostics.push(
+      skipStatement(statement, `not-null constraint on unknown column ${place}`, place),
+    );
+    return;
+  }
+
+  const column = columns[index]!;
+  const merged = mergeNotNullDeclaration(column, table, constraint.conname);
+  if (merged.conflict) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `additional not-null constraint on ${place}`),
+    );
+  } else {
+    columns[index] = merged.column;
+  }
+
+  if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `NOT VALID on ${constraintLabel(constraint)}`),
+    );
+  }
+
+  if (constraint.is_no_inherit === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `NO INHERIT on ${constraintLabel(constraint)}`),
+    );
   }
 }
 
@@ -544,6 +1189,7 @@ function translateCreateTableExtras(
   statement: ParsedStatement,
   create: CreateStmt,
   identity: string,
+  draft: TableDraft,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const flag = (description: string): void => {
@@ -558,8 +1204,460 @@ function translateCreateTableExtras(
   if (create.tablespacename !== undefined) flag('tablespace');
   if (create.accessMethod !== undefined) flag('access method');
   if ((create.options ?? []).length > 0) flag('storage parameters');
-  if (create.relation?.relpersistence === 'u') flag('unlogged-table persistence');
+  if (create.relation?.relpersistence === 'u') draft.persistence = 'unlogged';
   if (create.relation?.relpersistence === 't') flag('temporary-table persistence');
+}
+
+/**
+ * Translates a `CREATE EXTENSION` into its draft. `IF NOT EXISTS` is ignored — pg_dump restore
+ * noise with no model meaning. The install schema is required: a definition without `WITH
+ * SCHEMA` is skipped and named, and a skipped definition never replaces an existing draft. A
+ * repeated definition replaces the extension wholesale, clearing its comment.
+ */
+function translateCreateExtension(
+  statement: ParsedStatement,
+  create: CreateExtensionStmt,
+  extensions: Map<string, ExtensionDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const name = create.extname ?? '';
+  const schema = readCreateExtensionOptions(statement, name, create.options ?? [], diagnostics);
+  if (schema === undefined) {
+    diagnostics.push(skipStatement(statement, `CREATE EXTENSION ${name} (no WITH SCHEMA)`, name));
+    return;
+  }
+  extensions.set(name, { name, schema });
+}
+
+/**
+ * Reads a `CREATE EXTENSION`'s options into the install schema, flagging every option the model
+ * cannot carry: the version, install-time `CASCADE`, and anything else. A repeated `schema`
+ * option takes its last value. Exported for the unit test: the grammar admits no option this
+ * switch does not know, so the unknown-option guard is pinned on a fabricated option list.
+ */
+export function readCreateExtensionOptions(
+  statement: ParsedStatement,
+  name: string,
+  options: readonly Node[],
+  diagnostics: PositionedDiagnostic[],
+): string | undefined {
+  let schema: string | undefined;
+  for (const option of options) {
+    if (!('DefElem' in option)) continue;
+    const def = option.DefElem;
+    const defname = def.defname ?? 'option';
+    if (defname === 'schema') {
+      const value = extensionOptionString(def);
+      if (value !== undefined) schema = value;
+      continue;
+    }
+    if (defname === 'new_version') {
+      diagnostics.push(extensionFlag(statement, name, 'VERSION'));
+      continue;
+    }
+    if (defname === 'cascade') {
+      diagnostics.push(extensionFlag(statement, name, 'CASCADE'));
+      continue;
+    }
+    diagnostics.push(extensionFlag(statement, name, defname));
+  }
+  return schema;
+}
+
+/** The string argument of a `CREATE EXTENSION` option, when it carries one. */
+function extensionOptionString(option: DefElem): string | undefined {
+  return option.arg !== undefined && 'String' in option.arg ? option.arg.String.sval : undefined;
+}
+
+/**
+ * A flag for one dropped extension option, reading `dropped <description> from extension
+ * <name>`. The shared `flagAttribute` is not reused: its `from <identity>` tail assumes a
+ * schema-qualified object, while an extension is named by its bare, database-unique name.
+ */
+function extensionFlag(
+  statement: ParsedStatement,
+  name: string,
+  description: string,
+): PositionedDiagnostic {
+  return {
+    offset: statement.start.offset,
+    diagnostic: {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: name,
+      message: `dropped ${description} from extension ${name}`,
+      position: statement.start,
+    },
+  };
+}
+
+/** The `COMMENT ON` object kinds whose target the model carries. */
+const MODELED_COMMENT_OBJECTS: ReadonlySet<string> = new Set([
+  'OBJECT_TABLE',
+  'OBJECT_COLUMN',
+  'OBJECT_SEQUENCE',
+  'OBJECT_VIEW',
+  'OBJECT_MATVIEW',
+  'OBJECT_INDEX',
+  'OBJECT_TABCONSTRAINT',
+  'OBJECT_EXTENSION',
+]);
+
+/**
+ * Applies one parsed `COMMENT ON` to the draft it names. Resolution is by the stored server
+ * name — every draft still carries it, because finalization canonicalizes after all statements
+ * — or, for a node the source declared unnamed, the conventional name PostgreSQL would have
+ * synthesized, so a comment stays attached to the node after the name strip. `IS NULL` and
+ * `IS ''` arrive as an absent comment and clear the field; a repeated comment replaces the
+ * earlier one. A target the import cannot resolve, and text carrying NUL, is flagged and
+ * dropped. A comment on a not-null constraint takes the named deferral's flag wording.
+ */
+function translateCommentStatement(
+  statement: ParsedStatement,
+  comment: CommentStmt,
+  tables: Map<string, TableDraft>,
+  sequences: Map<string, SequenceDraft>,
+  views: Map<string, ViewDraft>,
+  extensions: Map<string, ExtensionDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const parts = commentObjectParts(comment.object);
+  const object = parts.length > 0 ? parts.join('.') : (commentObject(comment.object) ?? 'object');
+  // Widened to `string`: the parser's enum carries every object kind, while this switch owns
+  // only the modeled families and keeps the default as the total guard.
+  const objtype: string = comment.objtype ?? '';
+  const flag = (description = 'comment'): void => {
+    diagnostics.push(flagAttribute(statement, object, description));
+  };
+
+  switch (objtype) {
+    case 'OBJECT_TABLE': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.name));
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_COLUMN': {
+      const target =
+        parts.length === 3
+          ? { schema: parts[0]!, table: parts[1]!, column: parts[2]! }
+          : parts.length === 2
+            ? { schema: 'public', table: parts[0]!, column: parts[1]! }
+            : undefined;
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.table));
+      const column = draft?.columns.find((candidate) => candidate.name === target?.column);
+      if (draft === undefined || column === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          const position = draft.columns.indexOf(column);
+          draft.columns[position] = withComment(column, text);
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_SEQUENCE': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : sequences.get(tableKey(target.schema, target.name));
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_VIEW':
+    case 'OBJECT_MATVIEW': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const draft =
+        target === undefined ? undefined : views.get(tableKey(target.schema, target.name));
+      const materialized = objtype === 'OBJECT_MATVIEW';
+      if (draft === undefined || draft.materialized !== materialized) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_INDEX': {
+      const target = schemaQualifiedCommentTarget(parts);
+      const found = target === undefined ? undefined : findCommentedIndex(tables, target);
+      if (found === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          const position = found.draft.indexes.indexOf(found.index);
+          found.draft.indexes[position] = withComment(found.index, text);
+        },
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_TABCONSTRAINT': {
+      const target =
+        parts.length === 3
+          ? { schema: parts[0]!, table: parts[1]!, constraint: parts[2]! }
+          : parts.length === 2
+            ? { schema: 'public', table: parts[0]!, constraint: parts[1]! }
+            : undefined;
+      const draft =
+        target === undefined ? undefined : tables.get(tableKey(target.schema, target.table));
+      if (draft === undefined || target === undefined) {
+        flag();
+        return;
+      }
+      applyConstraintComment(
+        statement,
+        object,
+        target.constraint,
+        comment.comment,
+        draft,
+        diagnostics,
+      );
+      return;
+    }
+    case 'OBJECT_EXTENSION': {
+      // An extension's object is a bare `String`, never a schema-qualified name list, and its
+      // name is database-unique: resolve it directly.
+      const name = commentObject(comment.object);
+      const draft = name === undefined ? undefined : extensions.get(name);
+      if (draft === undefined) {
+        flag();
+        return;
+      }
+      storeComment(
+        statement,
+        object,
+        comment.comment,
+        (text) => {
+          if (text === undefined) delete draft.comment;
+          else draft.comment = text;
+        },
+        diagnostics,
+      );
+      return;
+    }
+    default:
+      // The dispatch only routes modeled objtypes here; keep the guard total.
+      flag();
+  }
+}
+
+/**
+ * Stores a comment text on one draft target, or flags it when the text carries NUL: no
+ * PostgreSQL text value can hold one, so the model's "a comment never contains NUL" invariant
+ * holds at this door too. Exported for the unit test — libpg-query rejects a NUL byte in a
+ * string literal at parse time, so the guard cannot be reached through DDL, but a future
+ * non-DDL producer must not store one either.
+ */
+export function storeComment(
+  statement: ParsedStatement,
+  object: string,
+  text: string | undefined,
+  store: (text: string | undefined) => void,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const refusal = nonStorableCommentFlag(statement, object, text);
+  if (refusal !== undefined) {
+    diagnostics.push(refusal);
+    return;
+  }
+  store(text);
+}
+
+/** The flag a comment whose text cannot be stored produces: text carrying U+0000. */
+function nonStorableCommentFlag(
+  statement: ParsedStatement,
+  object: string,
+  text: string | undefined,
+): PositionedDiagnostic | undefined {
+  if (text === undefined || !text.includes('\u0000')) return undefined;
+  return flagAttribute(statement, object, 'comment');
+}
+
+/** The schema-qualified target of a `[schema, name]` list; an unqualified name is `public`. */
+function schemaQualifiedCommentTarget(
+  parts: readonly string[],
+): { readonly schema: string; readonly name: string } | undefined {
+  if (parts.length === 2) return { schema: parts[0]!, name: parts[1]! };
+  if (parts.length === 1) return { schema: 'public', name: parts[0]! };
+  return undefined;
+}
+
+/** The identifier parts of a `CommentStmt.object` list, or an empty list for another shape. */
+function commentObjectParts(node: Node | undefined): string[] {
+  return node !== undefined && 'List' in node ? stringList(node.List.items) : [];
+}
+
+/** A copy of `node` carrying `text`, or without a comment when `text` is absent. */
+function withComment<Node extends { readonly comment?: string }>(
+  node: Node,
+  text: string | undefined,
+): Node {
+  const copy: Mutable<Node> = { ...node };
+  if (text === undefined) delete copy.comment;
+  else copy.comment = text;
+  return copy;
+}
+
+/** The draft index a `COMMENT ON INDEX` names, in its schema, by stored or synthesized name. */
+function findCommentedIndex(
+  tables: Map<string, TableDraft>,
+  target: { readonly schema: string; readonly name: string },
+): { readonly draft: TableDraft; readonly index: Index } | undefined {
+  for (const draft of tables.values()) {
+    if (draft.schema !== target.schema) continue;
+    const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+    const index = draft.indexes.find(
+      (candidate) =>
+        candidate.name === target.name ||
+        (candidate.name === undefined && synthesizedIndexName(identity, candidate) === target.name),
+    );
+    if (index !== undefined) return { draft, index };
+  }
+  return undefined;
+}
+
+/**
+ * Resolves a constraint comment by the fixed slot order: primary key, unique constraints,
+ * check constraints, foreign keys — each by stored name, or by the conventional synthesized
+ * name for a node the source left unnamed — then the columns' not-null facts, flagged with the
+ * PG18 deferral's wording, then the generic flag. PostgreSQL keeps constraint names unique per
+ * table, so the order is observable only for an invalid model.
+ */
+function applyConstraintComment(
+  statement: ParsedStatement,
+  object: string,
+  name: string,
+  text: string | undefined,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const matches = (stored: string | undefined, synthesized: string): boolean =>
+    stored === name || (stored === undefined && synthesized === name);
+
+  const primaryKey = draft.primaryKey;
+  if (primaryKey !== undefined && matches(primaryKey.name, synthesizedPrimaryKeyName(identity))) {
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.primaryKey = withComment(primaryKey, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const uniquePosition = draft.uniqueConstraints.findIndex((uniqueConstraint) =>
+    matches(uniqueConstraint.name, synthesizedUniqueConstraintName(identity, uniqueConstraint)),
+  );
+  if (uniquePosition !== -1) {
+    const uniqueConstraint = draft.uniqueConstraints[uniquePosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.uniqueConstraints[uniquePosition] = withComment(uniqueConstraint, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const checkPosition = draft.checkConstraints.findIndex((checkConstraint) =>
+    matches(checkConstraint.name, synthesizedCheckConstraintName(identity, checkConstraint)),
+  );
+  if (checkPosition !== -1) {
+    const checkConstraint = draft.checkConstraints[checkPosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.checkConstraints[checkPosition] = withComment(checkConstraint, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const foreignPosition = draft.foreignKeys.findIndex((foreignKey) =>
+    matches(foreignKey.name, synthesizedForeignKeyName(identity, foreignKey)),
+  );
+  if (foreignPosition !== -1) {
+    const foreignKey = draft.foreignKeys[foreignPosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.foreignKeys[foreignPosition] = withComment(foreignKey, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const notNull = draft.columns.find(
+    (column) =>
+      column.notNull &&
+      matches(column.notNullName, synthesizedNotNullName(draft.name, column.name)),
+  );
+  if (notNull !== undefined) {
+    diagnostics.push(flagAttribute(statement, object, 'comment on a not-null constraint'));
+    return;
+  }
+
+  diagnostics.push(flagAttribute(statement, object, 'comment'));
 }
 
 /** Maps PostgreSQL's normalized sequence type names onto the model's data types. */
@@ -589,24 +1687,46 @@ function translateCreateSequence(
   create: CreateSeqStmt,
   sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
+  sequenceFindings: Map<string, PositionedDiagnostic[]>,
 ): void {
   const schema = create.sequence?.schemaname ?? 'public';
   const name = create.sequence?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
-  const options = readCreateSequenceOptions(statement, create.options ?? [], identity, diagnostics);
+  const key = tableKey(schema, name);
+  const options = readCreateSequenceOptions(
+    statement,
+    create.options ?? [],
+    identity,
+    diagnostics,
+    key,
+    ownerPositions,
+  );
   if (options === undefined) return;
 
-  // Persistence is not modeled; the re-render is a plain sequence, so flag the loss, exactly
-  // as the table path flags unlogged and temporary tables.
+  // Sequence persistence is not modeled; the re-render is a plain sequence, so flag the loss,
+  // exactly as the table path flags temporary tables (unlogged table persistence is read). The
+  // findings wait for owner reconciliation: a sequence dropped for an unread owner yields only
+  // its skip, like the catalog reader.
+  const findings: PositionedDiagnostic[] = [];
   if (create.sequence?.relpersistence === 'u') {
-    diagnostics.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
+    findings.push(flagAttribute(statement, identity, 'unlogged-sequence persistence'));
   }
   if (create.sequence?.relpersistence === 't') {
-    diagnostics.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+    findings.push(flagAttribute(statement, identity, 'temporary-sequence persistence'));
+  }
+  // Like table persistence, the clause is flagged and dropped; it rides the findings buffer so
+  // a skipped or owner-dropped sequence reports only its skip.
+  if (create.if_not_exists === true) {
+    findings.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
   }
 
-  // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE.
-  sequences.set(tableKey(schema, name), effectiveSequence({ schema, name, ...options }));
+  // A repeated CREATE SEQUENCE replaces the sequence wholesale, like a repeated CREATE TABLE:
+  // only an inline owner on this definition keeps an owner position.
+  if (options.ownedBy === undefined) ownerPositions.delete(key);
+  sequenceFindings.set(key, findings);
+
+  sequences.set(key, effectiveSequence({ schema, name, ...options }));
 }
 
 /**
@@ -619,6 +1739,8 @@ function readCreateSequenceOptions(
   elements: readonly Node[],
   identity: string,
   diagnostics: PositionedDiagnostic[],
+  key: string,
+  ownerPositions: Map<string, SourcePosition>,
 ): SequenceOptions | undefined {
   const defs = sequenceOptionDefs(elements);
   for (const defname of defs.keys()) {
@@ -669,7 +1791,10 @@ function readCreateSequenceOptions(
   if (ownedBy !== undefined) {
     const owner = parseSequenceOwner(ownedBy);
     if (owner.kind === 'invalid') return unsupported('invalid OWNED BY');
-    if (owner.kind === 'owner') options.ownedBy = owner.owner;
+    if (owner.kind === 'owner') {
+      options.ownedBy = owner.owner;
+      ownerPositions.set(key, statement.start);
+    }
   }
 
   return options;
@@ -680,12 +1805,14 @@ function translateAlterSequence(
   alter: AlterSeqStmt,
   sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
+  ownerPositions: Map<string, SourcePosition>,
 ): void {
   const schema = alter.sequence?.schemaname ?? 'public';
   const name = alter.sequence?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
+  const key = tableKey(schema, name);
 
-  const draft = sequences.get(tableKey(schema, name));
+  const draft = sequences.get(key);
   if (draft === undefined) {
     diagnostics.push(
       skipStatement(statement, `ALTER SEQUENCE ${identity} (sequence not imported)`, identity),
@@ -778,8 +1905,13 @@ function translateAlterSequence(
   if (ownedBy !== undefined) {
     const owner = parseSequenceOwner(ownedBy);
     if (owner.kind === 'invalid') skip('invalid OWNED BY');
-    else if (owner.kind === 'none') delete draft.ownedBy;
-    else draft.ownedBy = owner.owner;
+    else if (owner.kind === 'none') {
+      delete draft.ownedBy;
+      ownerPositions.delete(key);
+    } else {
+      draft.ownedBy = owner.owner;
+      ownerPositions.set(key, statement.start);
+    }
   }
 
   for (const defname of defs.keys()) {
@@ -1111,6 +2243,24 @@ function alterObjectKind(objtype: string): string {
   return ALTER_OBJECT_KINDS[objtype] ?? objtype.replace(/^OBJECT_/, '');
 }
 
+/** The SQL phrase an `AlterTableCmd.subtype` names, where it reads as SQL rather than a node. */
+const ALTER_TABLE_ACTION_PHRASES: Readonly<Record<string, string>> = {
+  AT_EnableRowSecurity: 'ENABLE ROW LEVEL SECURITY',
+  AT_DisableRowSecurity: 'DISABLE ROW LEVEL SECURITY',
+  AT_ForceRowSecurity: 'FORCE ROW LEVEL SECURITY',
+  AT_NoForceRowSecurity: 'NO FORCE ROW LEVEL SECURITY',
+};
+
+/**
+ * Describes an unhandled `ALTER TABLE` command: the row-security phrases read as SQL, and every
+ * other subtype keeps the node-named `action <subtype>` wording.
+ */
+function alterTableActionDescription(subtype: string | undefined, identity: string): string {
+  const phrase = subtype === undefined ? undefined : ALTER_TABLE_ACTION_PHRASES[subtype];
+  if (phrase !== undefined) return `ALTER TABLE ${identity} ${phrase}`;
+  return `ALTER TABLE action ${subtype ?? 'unknown'} on ${identity}`;
+}
+
 function translateAlterTable(
   statement: ParsedStatement,
   alter: AlterTableStmt,
@@ -1183,13 +2333,7 @@ function translateAlterTableCommand(
       return;
     }
     if (constraint.contype === 'CONSTR_PRIMARY') {
-      attachPrimaryKey(
-        statement,
-        draft,
-        primaryKeyFromConstraint(constraint, []),
-        identity,
-        diagnostics,
-      );
+      attachAlteredPrimaryKey(statement, constraint, identity, draft, diagnostics);
       return;
     }
     if (constraint.contype === 'CONSTR_UNIQUE') {
@@ -1204,6 +2348,17 @@ function translateAlterTableCommand(
         diagnostics,
       );
       if (checkConstraint !== undefined) attachCheckConstraint(draft, checkConstraint);
+      return;
+    }
+    if (constraint.contype === 'CONSTR_NOTNULL') {
+      attachNotNullConstraint(
+        statement,
+        constraint,
+        identity,
+        draft.name,
+        draft.columns,
+        diagnostics,
+      );
       return;
     }
     diagnostics.push(
@@ -1245,22 +2400,30 @@ function translateAlterTableCommand(
     return;
   }
 
+  if (command.subtype === 'AT_SetLogged') {
+    draft.persistence = undefined;
+    return;
+  }
+
+  if (command.subtype === 'AT_SetUnLogged') {
+    draft.persistence = 'unlogged';
+    return;
+  }
+
+  if (command.subtype === 'AT_SetStorage' || command.subtype === 'AT_SetCompression') {
+    applyColumnMethod(statement, command, identity, draft, diagnostics);
+    return;
+  }
+
   diagnostics.push(
-    skipStatement(
-      statement,
-      `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
-      identity,
-    ),
+    skipStatement(statement, alterTableActionDescription(command.subtype, identity), identity),
   );
 }
 
 /**
  * Imports a standalone `CREATE [UNIQUE] INDEX` onto an already imported table, or skips and
- * names the whole statement when any part of it falls outside the minimal envelope. The
- * envelope is a plain btree column list: no expression element, partial `WHERE`, `INCLUDE`,
- * tablespace, storage parameters, `NULLS NOT DISTINCT`, non-btree access method, or
- * non-default ordering, operator class, collation, or NULLS ordering. An index is never
- * partially imported.
+ * names the whole statement when any part of it falls outside the minimal envelope. An index
+ * is never partially imported.
  */
 function translateCreateIndex(
   statement: ParsedStatement,
@@ -1281,61 +2444,81 @@ function translateCreateIndex(
     return;
   }
 
-  const skip = (description: string): void => {
-    diagnostics.push(skipStatement(statement, `CREATE INDEX ${object} (${description})`, object));
-  };
-
-  if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
-    skip(`access method ${create.accessMethod}`);
+  const envelope = classifyIndexEnvelope(create);
+  if (envelope.kind === 'skip') {
+    diagnostics.push(
+      skipStatement(statement, `CREATE INDEX ${object} (${envelope.reason})`, object),
+    );
     return;
+  }
+
+  const index: Mutable<Index> = { unique: envelope.unique, columns: envelope.columns };
+  if (create.idxname !== undefined) index.name = create.idxname;
+  if (create.concurrent === true) index.concurrently = true;
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, object, 'IF NOT EXISTS'));
+  }
+  attachIndex(draft, index);
+}
+
+/**
+ * The envelope classification of a parsed `CREATE [UNIQUE] INDEX`: the model index's
+ * structure — `unique` and the ordered columns, never the name or `concurrently`, which the
+ * callers own — or the reason the statement falls outside the minimal envelope.
+ */
+export type IndexEnvelope =
+  | { readonly kind: 'index'; readonly unique: boolean; readonly columns: string[] }
+  | { readonly kind: 'skip'; readonly reason: string };
+
+/**
+ * Classifies a parsed `CREATE [UNIQUE] INDEX` against the minimal envelope: a plain btree
+ * column list, with no expression element, partial `WHERE`, `INCLUDE`, tablespace, storage
+ * parameters, `NULLS NOT DISTINCT`, exclusion operators, non-btree access method, or
+ * non-default ordering, operator class, collation, or NULLS ordering. The single
+ * acceptance-rule source for both inbound paths: the dump importer's `translateCreateIndex`
+ * and the live-catalog mapper classify through this function, so a definition the importer
+ * rejects is never modeled from a catalog. Exported for `catalog.ts`; deliberately not
+ * re-exported from `index.ts`.
+ */
+export function classifyIndexEnvelope(create: IndexStmt): IndexEnvelope {
+  if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
+    return { kind: 'skip', reason: `access method ${create.accessMethod}` };
   }
   if ((create.indexIncludingParams ?? []).length > 0) {
-    skip('INCLUDE');
-    return;
+    return { kind: 'skip', reason: 'INCLUDE' };
   }
   if (create.whereClause !== undefined) {
-    skip('partial WHERE');
-    return;
+    return { kind: 'skip', reason: 'partial WHERE' };
   }
   if ((create.options ?? []).length > 0) {
-    skip('storage parameters');
-    return;
+    return { kind: 'skip', reason: 'storage parameters' };
   }
   if (create.tableSpace !== undefined) {
-    skip('tablespace');
-    return;
+    return { kind: 'skip', reason: 'tablespace' };
   }
   if (create.nulls_not_distinct === true) {
-    skip('NULLS NOT DISTINCT');
-    return;
+    return { kind: 'skip', reason: 'NULLS NOT DISTINCT' };
   }
   if ((create.excludeOpNames ?? []).length > 0) {
-    skip('exclusion operators');
-    return;
+    return { kind: 'skip', reason: 'exclusion operators' };
   }
 
   const columns: string[] = [];
   for (const element of create.indexParams ?? []) {
     if (!('IndexElem' in element)) {
-      skip('unrecognized index element');
-      return;
+      return { kind: 'skip', reason: 'unrecognized index element' };
     }
     const column = indexColumn(element.IndexElem);
     if (column === undefined) {
-      skip(indexElementDescription(element.IndexElem));
-      return;
+      return { kind: 'skip', reason: indexElementDescription(element.IndexElem) };
     }
     columns.push(column);
   }
   if (columns.length === 0) {
-    skip('no index columns');
-    return;
+    return { kind: 'skip', reason: 'no index columns' };
   }
 
-  const index: Mutable<Index> = { unique: create.unique === true, columns };
-  if (create.idxname !== undefined) index.name = create.idxname;
-  if (create.concurrent === true) index.concurrently = true;
-  attachIndex(draft, index);
+  return { kind: 'index', unique: create.unique === true, columns };
 }
 
 /**
@@ -1367,6 +2550,451 @@ function indexElementDescription(element: IndexElem): string {
   return 'non-default NULLS ordering';
 }
 
+/** What a materialized view's source states about its populated state after the body. */
+type MaterializedViewDataClause = 'no-data' | 'data' | 'none';
+
+/**
+ * A view statement's extracted source: the recursive form, which cannot be modeled, or the
+ * definition text and (for materialized views) the stated data clause. `undefined` when the
+ * statement yields no top-level `AS` or an empty body.
+ */
+type ViewDefinitionText =
+  | { readonly recursive: true }
+  | {
+      readonly definition: string;
+      readonly dataClause: MaterializedViewDataClause;
+    };
+
+/**
+ * Imports a plain view: the definition text, the check option, and a named flag for every inline
+ * attribute the model cannot carry. A recursive view is skipped whole and named; see
+ * `viewDefinitionText`.
+ */
+function translateCreateView(
+  statement: ParsedStatement,
+  create: ViewStmt,
+  views: Map<string, ViewDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const schema = create.view?.schemaname ?? 'public';
+  const name = create.view?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const clauseCheckOption = viewCheckOption(create.withCheckOption);
+  const extracted = viewDefinitionText(statement, create.view, 'VIEW', clauseCheckOption);
+  if (extracted === undefined) {
+    diagnostics.push(
+      skipStatement(statement, `CREATE VIEW ${identity} (definition text not found)`, identity),
+    );
+    return;
+  }
+  if ('recursive' in extracted) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE RECURSIVE VIEW ${identity} (recursive views are not represented yet)`,
+        identity,
+      ),
+    );
+    return;
+  }
+
+  // Persistence and the column list are not modeled; the view still imports with its body and
+  // check option. `CREATE OR REPLACE` is accepted: a repeat replaces the earlier definition.
+  if (create.view?.relpersistence === 't') {
+    diagnostics.push(flagAttribute(statement, identity, 'temporary-view persistence'));
+  }
+  if (create.view?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-view persistence'));
+  }
+  if ((create.aliases ?? []).length > 0) {
+    diagnostics.push(flagAttribute(statement, identity, 'view column list'));
+  }
+  const checkOption = readViewOptions(
+    statement,
+    create.options ?? [],
+    identity,
+    clauseCheckOption,
+    true,
+    diagnostics,
+  );
+
+  const draft: ViewDraft = {
+    schema,
+    name,
+    materialized: false,
+    definition: extracted.definition,
+  };
+  if (checkOption !== undefined) draft.checkOption = checkOption;
+  views.set(tableKey(schema, name), draft);
+}
+
+/**
+ * Imports a materialized view: the definition text and a named flag for the populated state and
+ * every inline attribute the model cannot carry. A check-option reloption is impossible on a
+ * materialized view and is flagged like any other option.
+ */
+function translateCreateMaterializedView(
+  statement: ParsedStatement,
+  create: CreateTableAsStmt,
+  views: Map<string, ViewDraft>,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const into = create.into;
+  const schema = into?.rel?.schemaname ?? 'public';
+  const name = into?.rel?.relname ?? '';
+  const identity = tableIdentityName({ schema, name });
+  const extracted = viewDefinitionText(statement, into?.rel, 'MATERIALIZED VIEW', undefined);
+  if (extracted === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE MATERIALIZED VIEW ${identity} (definition text not found)`,
+        identity,
+      ),
+    );
+    return;
+  }
+  if ('recursive' in extracted) {
+    // The grammar does not accept a recursive materialized view; keep the guard total.
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE MATERIALIZED VIEW ${identity} (recursive views are not represented yet)`,
+        identity,
+      ),
+    );
+    return;
+  }
+
+  if (create.if_not_exists === true) {
+    diagnostics.push(flagAttribute(statement, identity, 'IF NOT EXISTS'));
+  }
+  if (into?.rel?.relpersistence === 'u') {
+    diagnostics.push(flagAttribute(statement, identity, 'unlogged-materialized-view persistence'));
+  }
+  if ((into?.colNames ?? []).length > 0) {
+    diagnostics.push(flagAttribute(statement, identity, 'materialized view column list'));
+  }
+  if (into?.accessMethod !== undefined) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `materialized view access method ${into.accessMethod}`),
+    );
+  }
+  // A materialized view never carries a check option, so no option maps here.
+  readViewOptions(statement, into?.options ?? [], identity, undefined, false, diagnostics);
+  if (into?.tableSpaceName !== undefined) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `materialized view tablespace ${into.tableSpaceName}`),
+    );
+  }
+  // The model has no populated state and render always writes WITH NO DATA. The flag is keyed
+  // off the source clause, not `skipData`: an explicit WITH DATA and a clause-less statement
+  // (populated by default on the server) are distinct losses with distinct names.
+  if (extracted.dataClause === 'data') {
+    diagnostics.push(flagAttribute(statement, identity, 'WITH DATA'));
+  } else if (extracted.dataClause === 'none') {
+    diagnostics.push(flagAttribute(statement, identity, 'implicit populated state'));
+  }
+
+  views.set(tableKey(schema, name), {
+    schema,
+    name,
+    materialized: true,
+    definition: extracted.definition,
+  });
+}
+
+/**
+ * Reads a view statement's `WITH (...)` options. A `check_option` value maps to the model's
+ * check option when the statement carries no check-option clause and the kind can hold one;
+ * every other option — and a check option the clause overrides — is flagged by name. The
+ * statement's clause, when present, always wins.
+ */
+function readViewOptions(
+  statement: ParsedStatement,
+  elements: readonly Node[],
+  identity: string,
+  clauseCheckOption: ViewCheckOption | undefined,
+  canCarryCheckOption: boolean,
+  diagnostics: PositionedDiagnostic[],
+): ViewCheckOption | undefined {
+  let mapped: ViewCheckOption | undefined;
+  for (const element of elements) {
+    if (!('DefElem' in element) || element.DefElem.defname === undefined) continue;
+    const option = element.DefElem;
+    if (
+      canCarryCheckOption &&
+      clauseCheckOption === undefined &&
+      mapped === undefined &&
+      option.defname === 'check_option'
+    ) {
+      const value = checkOptionValue(option.arg);
+      if (value !== undefined) {
+        mapped = value;
+        continue;
+      }
+    }
+    diagnostics.push(flagAttribute(statement, identity, `view option ${viewOptionText(option)}`));
+  }
+  return clauseCheckOption ?? mapped;
+}
+
+/** Maps the parser's check-option code onto the model's spelling. */
+function viewCheckOption(code: string | undefined): ViewCheckOption | undefined {
+  if (code === 'LOCAL_CHECK_OPTION') return 'local';
+  if (code === 'CASCADED_CHECK_OPTION') return 'cascaded';
+  return undefined;
+}
+
+/** The modeled check option a `check_option` reloption states, when it is one PostgreSQL accepts. */
+function checkOptionValue(argument: Node | undefined): ViewCheckOption | undefined {
+  if (argument === undefined || !('String' in argument)) return undefined;
+  const value = argument.String.sval;
+  return value === 'local' || value === 'cascaded' ? value : undefined;
+}
+
+/** A reloption's `name[=value]` spelling for a flag, namespace included (`toast.fillfactor`). */
+function viewOptionText(option: DefElem): string {
+  const name =
+    option.defnamespace === undefined
+      ? (option.defname ?? 'option')
+      : `${option.defnamespace}.${option.defname ?? 'option'}`;
+  const value = defElemValueText(option.arg);
+  return value === undefined ? name : `${name}=${value}`;
+}
+
+/** A reloption argument as written, when the AST carries a printable scalar. */
+function defElemValueText(argument: Node | undefined): string | undefined {
+  if (argument === undefined) return undefined;
+  if ('String' in argument) return argument.String.sval ?? '';
+  if ('Integer' in argument) return BigInt(argument.Integer.ival ?? 0).toString();
+  if ('Float' in argument) return argument.Float.fval;
+  if ('Boolean' in argument) return argument.Boolean.boolval === true ? 'true' : 'false';
+  return undefined;
+}
+
+/**
+ * Extracts a view statement's body from its source: `ViewStmt.query` carries no location and a
+ * materialized view's `IntoClause` has no span for the body, so the text between the top-level
+ * `AS` after the name (and its options) and the statement terminator is sliced out, minus a
+ * trailing check-option or data clause, and normalized. A recursive view yields the recursive
+ * marker before extraction; `undefined` means the caller skips and names the statement.
+ */
+function viewDefinitionText(
+  statement: ParsedStatement,
+  anchor: RangeVar | undefined,
+  kind: 'VIEW' | 'MATERIALIZED VIEW',
+  checkOption: ViewCheckOption | undefined,
+): ViewDefinitionText | undefined {
+  const sql = statement.sql;
+  const location = anchor?.location ?? -1;
+  if (location < 0) return undefined;
+  const anchorIndex = byteOffsetToUtf16(sql, location);
+
+  // The parser rewrites `CREATE RECURSIVE VIEW` into a view-named recursive CTE with synthetic
+  // locations; the raw body after AS omits the CTE, so the stored definition could not be
+  // re-rendered. RECURSIVE is a keyword only between CREATE and VIEW, where quoted spans and
+  // comments are scanned out.
+  if (findKeyword(sql, 0, anchorIndex, 'RECURSIVE') !== null) return { recursive: true };
+
+  const asIndex = findTopLevelKeyword(sql, anchorIndex, sql.length, 'AS');
+  if (asIndex === null) return undefined;
+  const bodyStart = skipTrivia(sql, asIndex + 'AS'.length);
+  const end = statementTextEnd(sql, bodyStart);
+  if (end <= bodyStart) return undefined;
+
+  let bodyEnd = end;
+  let dataClause: MaterializedViewDataClause = 'none';
+  const withIndex = findLastTopLevelKeyword(sql, bodyStart, end, 'WITH');
+  if (withIndex !== null) {
+    if (kind === 'MATERIALIZED VIEW') {
+      const clause = readDataClause(sql, withIndex, end);
+      if (clause !== undefined) {
+        bodyEnd = withIndex;
+        dataClause = clause;
+      }
+    } else if (checkOption !== undefined && isCheckOptionClause(sql, withIndex, end)) {
+      bodyEnd = withIndex;
+    }
+  }
+
+  const definition = normalizeSourceText(sql.slice(bodyStart, bodyEnd));
+  if (definition === '') return undefined;
+  return { definition, dataClause };
+}
+
+/** Index just past a statement's text: trailing whitespace and one statement semicolon drop. */
+function statementTextEnd(sql: string, floor: number): number {
+  let end = sql.length;
+  while (end > floor && isWhitespaceCharacter(sql[end - 1]!)) end -= 1;
+  if (end > floor && sql[end - 1] === ';') {
+    end -= 1;
+    while (end > floor && isWhitespaceCharacter(sql[end - 1]!)) end -= 1;
+  }
+  return end;
+}
+
+/** The data clause a materialized view's trailing source states, or `undefined` when none. */
+function readDataClause(
+  sql: string,
+  withIndex: number,
+  end: number,
+): MaterializedViewDataClause | undefined {
+  const after = skipTrivia(sql, withIndex + 'WITH'.length);
+  if (isKeywordAt(sql, after, 'NO')) {
+    const data = skipTrivia(sql, after + 'NO'.length);
+    if (isKeywordAt(sql, data, 'DATA') && isTriviaOnly(sql, data + 'DATA'.length, end)) {
+      return 'no-data';
+    }
+    return undefined;
+  }
+  if (isKeywordAt(sql, after, 'DATA') && isTriviaOnly(sql, after + 'DATA'.length, end)) {
+    return 'data';
+  }
+  return undefined;
+}
+
+/**
+ * Whether the trailing top-level `WITH` begins a `WITH [LOCAL|CASCADED] CHECK OPTION` clause.
+ * The bare form is accepted and means `CASCADED`; extraction strips it the same way.
+ */
+function isCheckOptionClause(sql: string, withIndex: number, end: number): boolean {
+  const after = skipTrivia(sql, withIndex + 'WITH'.length);
+  const level = isKeywordAt(sql, after, 'LOCAL')
+    ? 'LOCAL'
+    : isKeywordAt(sql, after, 'CASCADED')
+      ? 'CASCADED'
+      : undefined;
+  const check = skipTrivia(sql, level === undefined ? after : after + level.length);
+  if (!isKeywordAt(sql, check, 'CHECK')) return false;
+  const option = skipTrivia(sql, check + 'CHECK'.length);
+  return isKeywordAt(sql, option, 'OPTION') && isTriviaOnly(sql, option + 'OPTION'.length, end);
+}
+
+/** Whether only whitespace and comments remain between `from` and `end`. */
+function isTriviaOnly(sql: string, from: number, end: number): boolean {
+  return skipTrivia(sql, from) >= end;
+}
+
+/** Index of the first `keyword` in `[from, to)`, skipping quoted spans and comments, or null. */
+function findKeyword(text: string, from: number, to: number, keyword: string): number | null {
+  let index = from;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (isKeywordAt(text, index, keyword)) return index;
+    index += 1;
+  }
+  return null;
+}
+
+/**
+ * Index of the first top-level `keyword` in `[from, to)`: one outside parentheses, brackets,
+ * quoted spans, dollar-quoted strings, and comments. A view's first such `AS` separates the
+ * name (plus options or column list) from the query.
+ */
+function findTopLevelKeyword(
+  text: string,
+  from: number,
+  to: number,
+  keyword: string,
+): number | null {
+  let index = from;
+  let depth = 0;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (character === '(' || character === '[') {
+      depth += 1;
+    } else if (character === ')' || character === ']') {
+      if (depth > 0) depth -= 1;
+    } else if (depth === 0 && isKeywordAt(text, index, keyword)) {
+      return index;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+/** Index of the last top-level `keyword` in `[from, to)`, or null when there is none. */
+function findLastTopLevelKeyword(
+  text: string,
+  from: number,
+  to: number,
+  keyword: string,
+): number | null {
+  let index = from;
+  let depth = 0;
+  let found: number | null = null;
+  while (index < to) {
+    const character = text[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(text, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[index + 1] === '-') {
+      index = lineCommentEnd(text, index);
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      index = blockCommentEnd(text, index);
+      continue;
+    }
+    if (character === '(' || character === '[') {
+      depth += 1;
+    } else if (character === ')' || character === ']') {
+      if (depth > 0) depth -= 1;
+    } else if (depth === 0 && isKeywordAt(text, index, keyword)) {
+      found = index;
+    }
+    index += 1;
+  }
+  return found;
+}
+
 /**
  * Attaches `ALTER COLUMN … SET DEFAULT` to an imported column — the form pg_dump uses for
  * sequence-backed defaults. `DROP DEFAULT` carries no expression and stays a skip; a different
@@ -1382,11 +3010,7 @@ function attachColumnDefault(
 ): void {
   if (command.def === undefined) {
     diagnostics.push(
-      skipStatement(
-        statement,
-        `ALTER TABLE action ${command.subtype ?? 'unknown'} on ${identity}`,
-        identity,
-      ),
+      skipStatement(statement, alterTableActionDescription(command.subtype, identity), identity),
     );
     return;
   }
@@ -1432,6 +3056,55 @@ function attachColumnDefault(
 }
 
 /**
+ * Applies one post-data `ALTER COLUMN … SET STORAGE`/`SET COMPRESSION` to its column: the
+ * word replaces the column's explicit value, `DEFAULT` clears it (the type's default, the
+ * model's absent), and a column or word the model cannot carry is skipped or flagged — never
+ * silent.
+ */
+function applyColumnMethod(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const isStorage = command.subtype === 'AT_SetStorage';
+  const action = isStorage ? 'SET STORAGE' : 'SET COMPRESSION';
+  const name = command.name;
+  const column =
+    name === undefined ? undefined : draft.columns.find((candidate) => candidate.name === name);
+  if (name === undefined || column === undefined) {
+    const place = name === undefined ? identity : `${identity}.${name}`;
+    diagnostics.push(skipStatement(statement, `${action} for unknown column ${place}`, place));
+    return;
+  }
+  const place = `${identity}.${name}`;
+
+  const value =
+    command.def !== undefined && 'String' in command.def ? command.def.String.sval : undefined;
+  if (isStorage) {
+    const storage = storageWord(value);
+    if (storage === undefined) {
+      diagnostics.push(flagAttribute(statement, identity, `storage on ${place}`));
+      return;
+    }
+    draft.columns = draft.columns.map((candidate) =>
+      candidate === column ? withColumnStorage(candidate, storage ?? undefined) : candidate,
+    );
+    return;
+  }
+
+  const compression = compressionWord(value);
+  if (compression === undefined) {
+    diagnostics.push(flagAttribute(statement, identity, `compression on ${place}`));
+    return;
+  }
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? withColumnCompression(candidate, compression ?? undefined) : candidate,
+  );
+}
+
+/**
  * Appends an `ALTER TABLE … ADD COLUMN` column to the draft, with inline primary key and
  * foreign keys, exactly as a `CREATE TABLE` column (including inline identity).
  */
@@ -1452,8 +3125,7 @@ function attachColumn(
     statement,
     element.ColumnDef,
     clauseBoundaries(element),
-    draft.schema,
-    identity,
+    { schema: draft.schema, name: draft.name },
     diagnostics,
   );
   draft.columns = [...draft.columns, translated.column];
@@ -1625,24 +3297,29 @@ function findColumnTarget(
 
 /** A copy of `column` without its identity descriptor. */
 function withoutIdentity(column: Column): Column {
-  const copy: Mutable<Column> = { name: column.name, type: column.type, notNull: column.notNull };
-  if (column.default !== undefined) copy.default = column.default;
+  const copy: Mutable<Column> = { ...column };
+  delete copy.identity;
   return copy;
 }
 
+/**
+ * Attaches the table's one primary key. Returns the retained key when the incoming one is
+ * deduped or rejected as an additional primary key, `undefined` when it attaches.
+ */
 function attachPrimaryKey(
   statement: ParsedStatement,
   draft: TableDraft,
   primaryKey: PrimaryKey,
   identity: string,
   diagnostics: PositionedDiagnostic[],
-): void {
+): PrimaryKey | undefined {
   if (draft.primaryKey === undefined) {
     draft.primaryKey = primaryKey;
-    return;
+    return undefined;
   }
-  if (samePrimaryKey(draft.primaryKey, primaryKey)) return;
+  if (samePrimaryKey(draft.primaryKey, primaryKey)) return draft.primaryKey;
   diagnostics.push(flagAttribute(statement, identity, 'additional primary key'));
+  return draft.primaryKey;
 }
 
 function attachForeignKey(draft: TableDraft, foreignKey: ForeignKey): void {
@@ -1650,13 +3327,20 @@ function attachForeignKey(draft: TableDraft, foreignKey: ForeignKey): void {
   draft.foreignKeys.push(foreignKey);
 }
 
-function attachUniqueConstraint(draft: TableDraft, uniqueConstraint: UniqueConstraint): void {
-  if (
-    draft.uniqueConstraints.some((existing) => sameUniqueConstraint(existing, uniqueConstraint))
-  ) {
-    return;
-  }
+/**
+ * Attaches a unique constraint unless an equal one is present. Returns the retained constraint
+ * when the incoming one is deduped, `undefined` when it attaches.
+ */
+function attachUniqueConstraint(
+  draft: TableDraft,
+  uniqueConstraint: UniqueConstraint,
+): UniqueConstraint | undefined {
+  const existing = draft.uniqueConstraints.find((candidate) =>
+    sameUniqueConstraint(candidate, uniqueConstraint),
+  );
+  if (existing !== undefined) return existing;
   draft.uniqueConstraints.push(uniqueConstraint);
+  return undefined;
 }
 
 function attachCheckConstraint(draft: TableDraft, checkConstraint: CheckConstraint): void {
@@ -1672,13 +3356,51 @@ function attachIndex(draft: TableDraft, index: Index): void {
 }
 
 function primaryKeyFromConstraint(
+  statement: ParsedStatement,
   constraint: Constraint,
   fallbackColumns: readonly string[],
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
 ): PrimaryKey {
   const keys = stringList(constraint.keys);
   const primaryKey: Mutable<PrimaryKey> = { columns: keys.length > 0 ? keys : fallbackColumns };
   if (constraint.conname !== undefined) primaryKey.name = constraint.conname;
+  applyConstraintDeferrability(constraint, primaryKey);
+  if (constraint.without_overlaps === true) {
+    diagnostics.push(
+      flagAttribute(statement, identity, `WITHOUT OVERLAPS on ${constraintLabel(constraint)}`),
+    );
+  }
+  flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
   return primaryKey;
+}
+
+/**
+ * Reads the deferrability a constraint node states: `DEFERRABLE` and `INITIALLY DEFERRED`
+ * arrive as present-true flags, and `INITIALLY DEFERRED` implies `DEFERRABLE` — the model's
+ * normalization. An explicit `NOT DEFERRABLE` is the absent default and never surfaces on the
+ * node, so nothing is written for it.
+ */
+function applyConstraintDeferrability(
+  constraint: Constraint,
+  target: Mutable<PrimaryKey | UniqueConstraint | ForeignKey>,
+): void {
+  if (constraint.deferrable === true || constraint.initdeferred === true) {
+    target.deferrable = true;
+  }
+  if (constraint.initdeferred === true) target.initiallyDeferred = true;
+}
+
+/**
+ * The enforcement a constraint node states, decoded from the parser's single `skip_validation`
+ * channel: `NOT VALID` carries `is_enforced: true` beside it, while `NOT ENFORCED` — and the
+ * combined `NOT VALID NOT ENFORCED`, which collapses to it — omits `is_enforced`; the
+ * serializer never writes a false boolean. Absent when the node states neither.
+ */
+function constraintEnforcement(constraint: Constraint): ConstraintEnforcement | undefined {
+  const flagged = constraint.skip_validation === true || constraint.initially_valid === false;
+  if (!flagged) return undefined;
+  return constraint.is_enforced === true ? 'not-valid' : 'not-enforced';
 }
 
 function foreignKeyFromConstraint(
@@ -1711,11 +3433,12 @@ function foreignKeyFromConstraint(
   if (constraint.fk_matchtype === 'f' || constraint.fk_matchtype === 'p') {
     flag(`MATCH ${constraint.fk_matchtype === 'f' ? 'FULL' : 'PARTIAL'}`);
   }
-  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
-  if (constraint.skip_validation === true || constraint.initially_valid === false)
-    flag('NOT VALID');
   if ((constraint.fk_del_set_cols ?? []).length > 0) flag('column list');
-  if (constraint.is_enforced === false) flag('NOT ENFORCED');
+  if (constraint.fk_with_period === true || constraint.pk_with_period === true) flag('PERIOD');
+
+  const enforcement = constraintEnforcement(constraint);
+  if (enforcement !== undefined) foreignKey.enforcement = enforcement;
+  applyConstraintDeferrability(constraint, foreignKey);
 
   return foreignKey;
 }
@@ -1732,7 +3455,8 @@ function uniqueConstraintFromConstraint(
     columns: keys.length > 0 ? keys : fallbackColumns,
   };
   if (constraint.conname !== undefined) uniqueConstraint.name = constraint.conname;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  applyConstraintDeferrability(constraint, uniqueConstraint);
+  flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   return uniqueConstraint;
 }
 
@@ -1757,7 +3481,9 @@ function checkConstraintFromConstraint(
   }
   const checkConstraint: Mutable<CheckConstraint> = { expression };
   if (constraint.conname !== undefined) checkConstraint.name = constraint.conname;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
+  const enforcement = constraintEnforcement(constraint);
+  if (enforcement !== undefined) checkConstraint.enforcement = enforcement;
+  flagCheckConstraintAttributes(statement, constraint, identity, diagnostics);
   return checkConstraint;
 }
 
@@ -1814,11 +3540,13 @@ function findCheckExpressionStart(sql: string, from: number): number | null {
 }
 
 /**
- * Flags every attribute of a unique or check constraint that the model cannot carry, following
- * the foreign-key precedent: the constraint still imports with its representable identity, and
- * each dropped attribute is named.
+ * Flags every attribute of a unique constraint that the model cannot carry, following the
+ * foreign-key precedent: the constraint still imports with its representable identity, and
+ * each dropped attribute is named. Deferrability is read into the model, so it is absent here;
+ * `NOT VALID`/`NOT ENFORCED` cannot appear on a unique constraint (the server rejects them),
+ * so the enforcement flag is defensive only.
  */
-function flagConstraintAttributes(
+function flagUniqueConstraintAttributes(
   statement: ParsedStatement,
   constraint: Constraint,
   identity: string,
@@ -1831,20 +3559,107 @@ function flagConstraintAttributes(
   };
   if (constraint.nulls_not_distinct === true) flag('NULLS NOT DISTINCT');
   if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.without_overlaps === true) flag('WITHOUT OVERLAPS');
   if (constraint.is_no_inherit === true) flag('NO INHERIT');
-  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
   if (constraint.skip_validation === true || constraint.initially_valid === false) {
-    // `NOT ENFORCED` arrives through the parser's same `skip_validation` channel as
-    // `NOT VALID`, with `is_enforced` omitted rather than false, so it is flagged under the
-    // `NOT VALID` wording — exactly as the pre-existing foreign-key path does.
     flag('NOT VALID');
   }
 }
 
 /**
+ * Flags every attribute of a primary key that the model cannot carry, mirroring
+ * `flagUniqueConstraintAttributes`: the key still imports with its representable identity, and
+ * each dropped attribute is named. Deferrability is read into the model, so it is absent here;
+ * `NO INHERIT` and `NOT VALID` cannot appear on a primary key (the server rejects them), so
+ * those flags are defensive only.
+ */
+function flagPrimaryKeyAttributes(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const flag = (description: string): void => {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${description} on ${constraintLabel(constraint)}`),
+    );
+  };
+  if ((constraint.including ?? []).length > 0) flag('INCLUDE');
+  if (constraint.is_no_inherit === true) flag('NO INHERIT');
+  if (constraint.skip_validation === true || constraint.initially_valid === false) {
+    flag('NOT VALID');
+  }
+}
+
+/**
+ * Flags every attribute of a check constraint that the model cannot carry: `NO INHERIT`, and
+ * deferrability, which the server rejects on a check constraint — only a misplaced inline
+ * attribute node could carry it here, so the flag is defensive. Enforcement is read into the
+ * model and never flagged.
+ */
+function flagCheckConstraintAttributes(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const flag = (description: string): void => {
+    diagnostics.push(
+      flagAttribute(statement, identity, `${description} on ${constraintLabel(constraint)}`),
+    );
+  };
+  if (constraint.is_no_inherit === true) flag('NO INHERIT');
+  if (constraint.deferrable === true || constraint.initdeferred === true) flag('deferrability');
+}
+
+/**
+ * Flags the one fact a consumed index cannot hand to the constraint it becomes: a constraint
+ * carries no `CONCURRENTLY` apply metadata. The index's comment, by contrast, travels onto the
+ * constraint in both splice functions.
+ */
+function flagConsumedIndexConcurrently(
+  statement: ParsedStatement,
+  index: Index,
+  constraint: Constraint,
+  identity: string,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  if (index.concurrently !== true || index.name === undefined) return;
+  diagnostics.push(
+    flagAttribute(
+      statement,
+      identity,
+      `CONCURRENTLY on ${constraintLabel(constraint)} (index ${index.name}; a constraint cannot carry it)`,
+    ),
+  );
+}
+
+/**
+ * Flags a consumed index's comment when the constraint it becomes is deduplicated or rejected:
+ * the comment travelled onto the built constraint, but the retained constraint keeps its own, so
+ * the consumed declaration's comment is dropped. An equal retained comment loses no fact.
+ */
+function flagDroppedConsumedComment(
+  statement: ParsedStatement,
+  schema: string,
+  indexname: string,
+  comment: string | undefined,
+  retained: { readonly comment?: string } | undefined,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  if (retained === undefined) return;
+  if (comment === undefined || retained.comment === comment) return;
+  diagnostics.push(
+    flagAttribute(statement, tableIdentityName({ schema, name: indexname }), 'comment'),
+  );
+}
+
+/**
  * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
  * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
- * column-list unique index; otherwise the whole constraint is skipped and named.
+ * column-list unique index; otherwise the whole constraint is skipped and named. The consumed
+ * index's comment travels onto the constraint, its `CONCURRENTLY` apply metadata is flagged
+ * because the constraint cannot carry it, and a dedupe flags the comment it cannot place.
  */
 function attachAlteredUniqueConstraint(
   statement: ParsedStatement,
@@ -1875,16 +3690,78 @@ function attachAlteredUniqueConstraint(
     return;
   }
 
+  const comment = index.comment;
   draft.indexes.splice(position, 1);
   const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
+  if (comment !== undefined) uniqueConstraint.comment = comment;
   const name = constraint.conname ?? index.name;
   if (name !== undefined) uniqueConstraint.name = name;
-  flagConstraintAttributes(statement, constraint, identity, diagnostics);
-  attachUniqueConstraint(draft, uniqueConstraint);
+  applyConstraintDeferrability(constraint, uniqueConstraint);
+  flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
+  flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
+  const retained = attachUniqueConstraint(draft, uniqueConstraint);
+  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
 }
 
-/** Maps PostgreSQL's single-letter action codes; `NO ACTION` (the default) is absent. */
-function referentialAction(code: string | undefined): ReferentialAction | undefined {
+/**
+ * Attaches an `ADD CONSTRAINT … PRIMARY KEY`: a plain key list attaches directly through
+ * `primaryKeyFromConstraint` — which owns the primary-key attribute flags — while a constraint
+ * stated `USING INDEX` consumes the named standalone index when it is a plain column-list
+ * unique index; otherwise the whole constraint is skipped and named. The consumed index's
+ * comment travels onto the key, its `CONCURRENTLY` apply metadata is flagged because the
+ * constraint cannot carry it, and a rejection flags the comment it cannot place.
+ */
+function attachAlteredPrimaryKey(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const indexname = constraint.indexname;
+  if (indexname === undefined) {
+    attachPrimaryKey(
+      statement,
+      draft,
+      primaryKeyFromConstraint(statement, constraint, [], identity, diagnostics),
+      identity,
+      diagnostics,
+    );
+    return;
+  }
+
+  const position = draft.indexes.findIndex((index) => index.name === indexname && index.unique);
+  const index = position === -1 ? undefined : draft.indexes[position]!;
+  if (index === undefined) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `${constraintLabel(constraint)} on ${identity} (USING INDEX ${indexname})`,
+        constraint.conname ?? indexname,
+      ),
+    );
+    return;
+  }
+
+  const comment = index.comment;
+  draft.indexes.splice(position, 1);
+  const primaryKey: Mutable<PrimaryKey> = { columns: [...index.columns] };
+  if (comment !== undefined) primaryKey.comment = comment;
+  const name = constraint.conname ?? index.name;
+  if (name !== undefined) primaryKey.name = name;
+  applyConstraintDeferrability(constraint, primaryKey);
+  flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
+  flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
+  const retained = attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
+  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
+}
+
+/**
+ * Maps PostgreSQL's single-letter action codes; `NO ACTION` (the default) is absent. Shared
+ * with the live-catalog mapper; exported for `catalog.ts`, deliberately not re-exported from
+ * `index.ts`.
+ */
+export function referentialAction(code: string | undefined): ReferentialAction | undefined {
   switch (code) {
     case 'r':
       return 'RESTRICT';
@@ -1894,6 +3771,7 @@ function referentialAction(code: string | undefined): ReferentialAction | undefi
       return 'SET NULL';
     case 'd':
       return 'SET DEFAULT';
+    case undefined:
     default:
       return undefined;
   }
@@ -1905,7 +3783,12 @@ interface StatementDescription {
   readonly object: string;
 }
 
-function describeStatement(node: Node): StatementDescription {
+/**
+ * The description and object of a statement outside the imported subset. Exported for the unit
+ * test: PostgreSQL has no `ALTER EXTENSION … RENAME` statement, so the defensive `RenameStmt`
+ * branch cannot be reached through `importDump`.
+ */
+export function describeStatement(node: Node): StatementDescription {
   if ('CreateSchemaStmt' in node) {
     const object = node.CreateSchemaStmt.schemaname ?? 'schema';
     return { description: `CREATE SCHEMA ${object}`, object };
@@ -1914,9 +3797,17 @@ function describeStatement(node: Node): StatementDescription {
     const object = listObjectName(node.DropStmt.objects?.[0]) ?? 'sequence';
     return { description: `DROP SEQUENCE ${object}`, object };
   }
+  if ('DropStmt' in node && node.DropStmt.removeType === 'OBJECT_EXTENSION') {
+    const object = commentObject(node.DropStmt.objects?.[0]) ?? 'extension';
+    return { description: `DROP EXTENSION ${object}`, object };
+  }
   if ('RenameStmt' in node && node.RenameStmt.renameType === 'OBJECT_SEQUENCE') {
     const object = rangeVarName(node.RenameStmt.relation) ?? 'sequence';
     return { description: `ALTER SEQUENCE ${object} RENAME`, object };
+  }
+  if ('RenameStmt' in node && node.RenameStmt.renameType === 'OBJECT_EXTENSION') {
+    const object = commentObject(node.RenameStmt.object) ?? 'extension';
+    return { description: `ALTER EXTENSION ${object} RENAME`, object };
   }
   if (
     'AlterObjectSchemaStmt' in node &&
@@ -1925,9 +3816,26 @@ function describeStatement(node: Node): StatementDescription {
     const object = rangeVarName(node.AlterObjectSchemaStmt.relation) ?? 'sequence';
     return { description: `ALTER SEQUENCE ${object} SET SCHEMA`, object };
   }
-  if ('ViewStmt' in node) {
-    const object = rangeVarName(node.ViewStmt.view) ?? 'view';
-    return { description: `CREATE VIEW ${object}`, object };
+  if (
+    'AlterObjectSchemaStmt' in node &&
+    node.AlterObjectSchemaStmt.objectType === 'OBJECT_EXTENSION'
+  ) {
+    const object = commentObject(node.AlterObjectSchemaStmt.object) ?? 'extension';
+    const schema = node.AlterObjectSchemaStmt.newschema ?? '';
+    return { description: `ALTER EXTENSION ${object} SET SCHEMA ${schema}`, object };
+  }
+  if ('AlterExtensionStmt' in node) {
+    const object = node.AlterExtensionStmt.extname ?? 'extension';
+    return { description: `ALTER EXTENSION ${object} UPDATE`, object };
+  }
+  if ('AlterExtensionContentsStmt' in node) {
+    const contents = node.AlterExtensionContentsStmt;
+    const object = contents.extname ?? 'extension';
+    const action = contents.action === -1 ? 'DROP' : 'ADD';
+    return {
+      description: `ALTER EXTENSION ${object} ${action} ${alterObjectKind(contents.objtype ?? 'OBJECT')}`,
+      object,
+    };
   }
   if ('CreateFunctionStmt' in node) {
     const object = stringList(node.CreateFunctionStmt.funcname).join('.') || 'function';
@@ -1946,11 +3854,34 @@ function describeStatement(node: Node): StatementDescription {
   }
   if ('CreateTableAsStmt' in node) {
     const object = rangeVarName(node.CreateTableAsStmt.into?.rel) ?? 'table';
-    return { description: `CREATE TABLE AS ${object}`, object };
+    const kind =
+      node.CreateTableAsStmt.objtype === 'OBJECT_MATVIEW'
+        ? 'CREATE MATERIALIZED VIEW'
+        : 'CREATE TABLE AS';
+    return { description: `${kind} ${object}`, object };
+  }
+  if ('RefreshMatViewStmt' in node) {
+    const object = rangeVarName(node.RefreshMatViewStmt.relation) ?? 'materialized view';
+    return { description: `REFRESH MATERIALIZED VIEW ${object}`, object };
+  }
+  if ('RuleStmt' in node) {
+    const object = node.RuleStmt.rulename ?? 'rule';
+    const table = rangeVarName(node.RuleStmt.relation) ?? 'table';
+    return { description: `CREATE RULE ${object} ON ${table}`, object };
+  }
+  if ('CreatePolicyStmt' in node) {
+    const object = node.CreatePolicyStmt.policy_name ?? 'policy';
+    const table = rangeVarName(node.CreatePolicyStmt.table) ?? 'table';
+    return { description: `CREATE POLICY ${object} ON ${table}`, object };
+  }
+  if ('AlterPolicyStmt' in node) {
+    const object = node.AlterPolicyStmt.policy_name ?? 'policy';
+    const table = rangeVarName(node.AlterPolicyStmt.table) ?? 'table';
+    return { description: `ALTER POLICY ${object} ON ${table}`, object };
   }
   if ('CommentStmt' in node) {
     const object = commentObject(node.CommentStmt.object) ?? 'object';
-    const kind = (node.CommentStmt.objtype ?? 'OBJECT').replace(/^OBJECT_/, '');
+    const kind = alterObjectKind(node.CommentStmt.objtype ?? 'OBJECT');
     return { description: `COMMENT ON ${kind} ${object}`, object };
   }
   if ('VariableSetStmt' in node) {
@@ -1961,7 +3892,11 @@ function describeStatement(node: Node): StatementDescription {
     const setval = describeSetval(node.SelectStmt);
     return setval ?? { description: 'SELECT statement', object: 'SELECT' };
   }
-  if ('GrantStmt' in node) return { description: 'GRANT statement', object: 'GRANT' };
+  if ('GrantStmt' in node) {
+    return node.GrantStmt.is_grant === true
+      ? { description: 'GRANT statement', object: 'GRANT' }
+      : { description: 'REVOKE statement', object: 'REVOKE' };
+  }
   if ('CreateExtensionStmt' in node) {
     const object = node.CreateExtensionStmt.extname ?? 'extension';
     return { description: `CREATE EXTENSION ${object}`, object };
@@ -2088,7 +4023,163 @@ function getOrCreateTable(
   return draft;
 }
 
+/**
+ * The duplicate guard's key: `unique` and the ordered columns, the name excluded. Shared with
+ * the live-catalog mapper's name canonicalization, so both inbound paths guard on the same
+ * structure; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
+ */
+export function indexStructureKey(index: Index): string {
+  return JSON.stringify([index.unique, index.columns]);
+}
+
+/**
+ * The duplicate guard's key for a unique constraint: the ordered columns and the attributes.
+ * Shared with the live-catalog mapper's name canonicalization, so both inbound paths guard on
+ * the same structure; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
+ */
+export function uniqueConstraintStructureKey(uniqueConstraint: UniqueConstraint): string {
+  return JSON.stringify([
+    uniqueConstraint.columns,
+    uniqueConstraint.deferrable ?? false,
+    uniqueConstraint.initiallyDeferred ?? false,
+  ]);
+}
+
+/**
+ * The duplicate guard's key for a check constraint: the expression and the enforcement. Shared
+ * with the live-catalog mapper's name canonicalization; exported for `catalog.ts` and
+ * deliberately not re-exported from `index.ts`.
+ */
+export function checkConstraintStructureKey(checkConstraint: CheckConstraint): string {
+  return JSON.stringify([checkConstraint.expression, checkConstraint.enforcement ?? null]);
+}
+
+/**
+ * The duplicate guard's key for a foreign key: every modeled field but the name — the
+ * referencing columns, the target, the referenced columns, both actions, the enforcement, and
+ * the deferrability, with an absent value distinct from a stated one. The key is
+ * equality-minus-name: a name is kept only beside a twin identical modulo name; a twin
+ * differing in referenced columns, actions, or attributes has a different key, the guard does
+ * not fire, and the name is stripped. The core diff matches foreign keys more narrowly
+ * (`foreignKeyIdentity`: columns and target only). Shared with the live-catalog mapper's name
+ * canonicalization; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
+ */
+export function foreignKeyStructureKey(foreignKey: ForeignKey): string {
+  return JSON.stringify([
+    foreignKey.columns,
+    foreignKey.referencedTable.schema,
+    foreignKey.referencedTable.name,
+    foreignKey.referencedColumns,
+    foreignKey.onUpdate ?? null,
+    foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? false,
+    foreignKey.initiallyDeferred ?? false,
+  ]);
+}
+
+/**
+ * Canonicalizes server-generated index names back to unnamed: a `CREATE INDEX ON t (c)`
+ * applies unnamed and PostgreSQL names the index `t_c_idx`, so a dump import would otherwise
+ * store the generated name and diff as remove + add against the model's unnamed declaration.
+ * An index whose name equals `synthesizedIndexName` — the server form, PostgreSQL's 63-byte
+ * truncation included — is stripped, unless its structural key is already covered by an
+ * unnamed entry — present in the draft or stripped earlier — in which case the name is kept;
+ * the guard keeps the pass from manufacturing a duplicate unnamed entry in either statement
+ * order. Runs in import order before the canonical sort, and names outside the server form
+ * stay named: collision suffixes are not predictable offline.
+ */
+function canonicalizeIndexNames(draft: TableDraft): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const seen = new Set<string>();
+  for (const index of draft.indexes) {
+    if (index.name === undefined) seen.add(indexStructureKey(index));
+  }
+  for (const index of draft.indexes) {
+    const name = index.name;
+    if (name === undefined || name !== synthesizedIndexName(identity, index)) continue;
+    const key = indexStructureKey(index);
+    if (seen.has(key)) continue;
+    delete (index as Mutable<Index>).name;
+    seen.add(key);
+  }
+}
+
+/**
+ * Canonicalizes server-generated primary-key, unique, foreign-key, and check-constraint names
+ * back to unnamed, mirroring `canonicalizeIndexNames`: a constraint whose name equals the
+ * prediction's server form for its structure is stripped, unless an unnamed constraint with
+ * the same key — the same columns, expression, or foreign-key target and actions — already
+ * exists in the draft or was stripped earlier, in which case the name is kept, so neither
+ * statement order manufactures a duplicate unnamed entry. The primary key has no twin guard:
+ * PostgreSQL allows one per table. Runs in import order before the canonical sort, and names
+ * outside the server form stay named: collision suffixes are not predictable offline, and a
+ * check expression the best-effort formula does not predict keeps its server name.
+ */
+function canonicalizeConstraintNames(draft: TableDraft): void {
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const seenUnique = new Set<string>();
+  const seenForeign = new Set<string>();
+  const seenCheck = new Set<string>();
+
+  // Pre-scan the unnamed entries of each kind, then strip in a second, position-independent pass.
+  for (const uniqueConstraint of draft.uniqueConstraints) {
+    if (uniqueConstraint.name === undefined) {
+      seenUnique.add(uniqueConstraintStructureKey(uniqueConstraint));
+    }
+  }
+  for (const foreignKey of draft.foreignKeys) {
+    if (foreignKey.name === undefined) seenForeign.add(foreignKeyStructureKey(foreignKey));
+  }
+  for (const checkConstraint of draft.checkConstraints) {
+    if (checkConstraint.name === undefined) {
+      seenCheck.add(checkConstraintStructureKey(checkConstraint));
+    }
+  }
+
+  const primaryKey = draft.primaryKey;
+  if (primaryKey !== undefined && primaryKey.name === synthesizedPrimaryKeyName(identity)) {
+    delete (primaryKey as Mutable<PrimaryKey>).name;
+  }
+
+  for (const uniqueConstraint of draft.uniqueConstraints) {
+    const name = uniqueConstraint.name;
+    if (
+      name === undefined ||
+      name !== synthesizedUniqueConstraintName(identity, uniqueConstraint)
+    ) {
+      continue;
+    }
+    const key = uniqueConstraintStructureKey(uniqueConstraint);
+    if (seenUnique.has(key)) continue;
+    delete (uniqueConstraint as Mutable<UniqueConstraint>).name;
+    seenUnique.add(key);
+  }
+  for (const foreignKey of draft.foreignKeys) {
+    const name = foreignKey.name;
+    if (name === undefined || name !== synthesizedForeignKeyName(identity, foreignKey)) continue;
+    const key = foreignKeyStructureKey(foreignKey);
+    if (seenForeign.has(key)) continue;
+    delete (foreignKey as Mutable<ForeignKey>).name;
+    seenForeign.add(key);
+  }
+  for (const checkConstraint of draft.checkConstraints) {
+    const name = checkConstraint.name;
+    if (name === undefined || name !== synthesizedCheckConstraintName(identity, checkConstraint)) {
+      continue;
+    }
+    const key = checkConstraintStructureKey(checkConstraint);
+    if (seenCheck.has(key)) continue;
+    delete (checkConstraint as Mutable<CheckConstraint>).name;
+    seenCheck.add(key);
+  }
+}
+
 function finalizeTable(draft: TableDraft): Table {
+  canonicalizeConstraintNames(draft);
+  canonicalizeIndexNames(draft);
+  canonicalizeNotNullNames(draft);
+  reconcilePrimaryKeyNullability(draft);
   const table: Mutable<Table> = {
     schema: draft.schema,
     name: draft.name,
@@ -2099,7 +4190,53 @@ function finalizeTable(draft: TableDraft): Table {
     indexes: [...draft.indexes].sort(compareIndexes),
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
+  if (draft.persistence !== undefined) table.persistence = draft.persistence;
+  if (draft.comment !== undefined) table.comment = draft.comment;
   return table;
+}
+
+/**
+ * Applies the not-null fact PostgreSQL gives every primary-key key column, whichever statement
+ * form created the key. The fact is implied and therefore unnamed: `mergeNotNullDeclaration`
+ * leaves an already-not-null column untouched, so an explicit named NOT NULL keeps its name. A
+ * key column the model never saw is skipped silently, matching `attachPrimaryKey`.
+ */
+function reconcilePrimaryKeyNullability(draft: TableDraft): void {
+  if (draft.primaryKey === undefined) return;
+  for (const name of draft.primaryKey.columns) {
+    const position = draft.columns.findIndex((column) => column.name === name);
+    if (position === -1) continue;
+    draft.columns[position] = mergeNotNullDeclaration(
+      draft.columns[position]!,
+      draft.name,
+      undefined,
+    ).column;
+  }
+}
+
+/**
+ * Canonicalizes PostgreSQL's generated not-null-constraint name back to unnamed: a dump of a
+ * declaration the model makes unnamed carries `<table>_<column>_not_null`, and the model's
+ * unnamed not-null fact must round-trip. The strip is the server form of the formula and
+ * nothing else — a name PostgreSQL truncated at 63 bytes strips, a collision-suffixed name
+ * stays named — and it has no twin guard, because one not-null fact per column is the only
+ * shape the model carries: the duplicate declaration is already collapsed by
+ * `mergeNotNullDeclaration` in either statement order. That comparison normalizes both sides
+ * through `normalizedNotNullName`, so no DDL-import path stores the generated formula name; this
+ * strip stays as defense-in-depth for a direct or future path that stores one.
+ */
+function canonicalizeNotNullNames(draft: TableDraft): void {
+  draft.columns = draft.columns.map((column) => {
+    if (
+      column.notNullName === undefined ||
+      column.notNullName !== synthesizedNotNullName(draft.name, column.name)
+    ) {
+      return column;
+    }
+    const copy: Mutable<Column> = { ...column };
+    delete copy.notNullName;
+    return copy;
+  });
 }
 
 /**
@@ -2175,27 +4312,30 @@ function commentObject(node: Node | undefined): string | undefined {
 }
 
 function samePrimaryKey(left: PrimaryKey, right: PrimaryKey): boolean {
-  return left.name === right.name && sameStringArray(left.columns, right.columns);
-}
-
-function sameForeignKey(left: ForeignKey, right: ForeignKey): boolean {
   return (
     left.name === right.name &&
     sameStringArray(left.columns, right.columns) &&
-    left.referencedTable.schema === right.referencedTable.schema &&
-    left.referencedTable.name === right.referencedTable.name &&
-    sameStringArray(left.referencedColumns, right.referencedColumns) &&
-    left.onUpdate === right.onUpdate &&
-    left.onDelete === right.onDelete
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
   );
 }
 
+function sameForeignKey(left: ForeignKey, right: ForeignKey): boolean {
+  return left.name === right.name && foreignKeyStructureKey(left) === foreignKeyStructureKey(right);
+}
+
 function sameUniqueConstraint(left: UniqueConstraint, right: UniqueConstraint): boolean {
-  return left.name === right.name && sameStringArray(left.columns, right.columns);
+  return (
+    left.name === right.name &&
+    uniqueConstraintStructureKey(left) === uniqueConstraintStructureKey(right)
+  );
 }
 
 function sameCheckConstraint(left: CheckConstraint, right: CheckConstraint): boolean {
-  return left.name === right.name && left.expression === right.expression;
+  return (
+    left.name === right.name &&
+    checkConstraintStructureKey(left) === checkConstraintStructureKey(right)
+  );
 }
 
 /** Whether two indexes are structurally equal; `concurrently` is apply metadata, excluded. */
@@ -2217,6 +4357,14 @@ function compareTables(left: Table, right: Table): number {
 
 function compareSequences(left: Sequence, right: Sequence): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareViews(left: View, right: View): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareExtensions(left: Extension, right: Extension): number {
+  return compareStrings(left.name, right.name);
 }
 
 function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {
@@ -2293,8 +4441,14 @@ function extractDefaultText(
   return extractSourceText(sql, startIndex, boundaries);
 }
 
-/** Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads `numeric(12,2)`. */
-function normalizeSourceText(text: string): string {
+/**
+ * Drops comments outside quoted spans and whitespace-normalizes; `numeric(12, 2)` reads
+ * `numeric(12,2)`. The default-expression and `COLLATE` readers share it, and the catalog
+ * mapper imports it for the default expressions `pg_get_expr` renders, so both sides of the
+ * dump-import congruence bar normalize identically. Exported for that sharing, deliberately
+ * not re-exported from `index.ts`.
+ */
+export function normalizeSourceText(text: string): string {
   let normalized = '';
   let pendingSpace = false;
   let index = 0;

@@ -20,15 +20,27 @@ const execFileAsync = promisify(execFile);
 /** The built entry point; the package's test script builds first. */
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
+/** One golden scene: the fixture base name and any extra arguments only `plan` receives. */
+interface GoldenScene {
+  readonly name: string;
+  readonly planArgs?: readonly string[];
+}
+
 /** Every golden scene, by fixture base name. */
-const SCENES = [
-  'all-changes',
-  'constraints-indexes',
-  'hazards',
-  'identity',
-  'schema-edges',
-  'sequences',
-] as const;
+const SCENES: readonly GoldenScene[] = [
+  { name: 'all-changes' },
+  { name: 'column-attributes', planArgs: ['--target-version', '16'] },
+  { name: 'comments' },
+  { name: 'constraint-attributes' },
+  { name: 'constraint-enforcement', planArgs: ['--target-version', '18'] },
+  { name: 'constraints-indexes' },
+  { name: 'extensions' },
+  { name: 'hazards' },
+  { name: 'identity' },
+  { name: 'schema-edges' },
+  { name: 'sequences' },
+  { name: 'views' },
+];
 
 /** Every command whose stdout a golden pins. */
 const COMMANDS = ['compare', 'plan'] as const;
@@ -60,20 +72,55 @@ const readText = (relativeUrl: string): string =>
 const fixturePath = (relativeUrl: string): string =>
   fileURLToPath(new URL(relativeUrl, import.meta.url));
 
+/** A golden's `Hazards:` block — the header and its `  step ` lines — or `null` when absent. */
+function hazardsBlock(golden: string): string | null {
+  const lines = golden.split('\n');
+  const start = lines.indexOf('Hazards:');
+  if (start === -1) return null;
+  const block = [lines[start]!];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (!lines[index]!.startsWith('  step ')) break;
+    block.push(lines[index]!);
+  }
+  return `${block.join('\n')}\n`;
+}
+
 for (const scene of SCENES) {
   for (const command of COMMANDS) {
-    test(`${command} prints exactly the ${scene} golden`, async () => {
-      const baseline = fixturePath(`../test/fixtures/${scene}.baseline.sql`);
-      const target = fixturePath(`../test/fixtures/${scene}.target.sql`);
+    test(`${command} prints exactly the ${scene.name} golden`, async () => {
+      const baseline = fixturePath(`../test/fixtures/${scene.name}.baseline.sql`);
+      const target = fixturePath(`../test/fixtures/${scene.name}.target.sql`);
 
-      const result = await runCli(command, baseline, target);
+      const result = await runCli(
+        command,
+        baseline,
+        target,
+        ...(command === 'plan' ? (scene.planArgs ?? []) : []),
+      );
 
       assert.equal(
         result.code,
         0,
         `schemamill ${command} exited ${String(result.code)}; stderr:\n${result.stderr}`,
       );
-      assert.equal(result.stdout, readText(`../test/goldens/${scene}.${command}.txt`));
+      assert.equal(result.stdout, readText(`../test/goldens/${scene.name}.${command}.txt`));
     });
   }
 }
+
+test('compare and plan pin the same hazards block for the hazards and identity scenes', () => {
+  for (const scene of ['hazards', 'identity'] as const) {
+    const compareBlock = hazardsBlock(readText(`../test/goldens/${scene}.compare.txt`));
+    const planBlock = hazardsBlock(readText(`../test/goldens/${scene}.plan.txt`));
+
+    assert.ok(
+      compareBlock !== null && compareBlock.includes('\n  step '),
+      `${scene}.compare.txt carries no hazards`,
+    );
+    assert.ok(
+      planBlock !== null && planBlock.includes('\n  step '),
+      `${scene}.plan.txt carries no hazards`,
+    );
+    assert.equal(compareBlock, planBlock, `${scene}: compare and plan hazards blocks differ`);
+  }
+});

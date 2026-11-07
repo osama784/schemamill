@@ -23,19 +23,19 @@ A table's attribute, named as PostgreSQL names it. Tables have columns.
 _Avoid_: field, attribute
 
 **Primary key**:
-A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one.
+A table's row identifier: an ordered list of its columns, named in the source or left unnamed. A table has at most one. On import, a primary key whose name is exactly PostgreSQL's generated name for it (`<table>_pkey`) is canonicalized back to unnamed, so a dump of a model-declared unnamed primary key round-trips.
 _Avoid_: pk, key
 
 **Unique constraint**:
-A table constraint requiring an ordered list of its columns to be unique together, named in the source or left unnamed. A unique constraint is never modeled as, or accompanied by, an index.
+A table constraint requiring an ordered list of its columns to be unique together, named in the source or left unnamed. A unique constraint is never modeled as, or accompanied by, an index. On import, a unique constraint whose name is exactly PostgreSQL's generated name for it (`<table>_<cols>_key`) is canonicalized back to unnamed, so a dump of a model-declared unnamed unique constraint round-trips.
 _Avoid_: unique index, key
 
 **Check constraint**:
-A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed.
+A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed. On import, a check constraint whose name is exactly PostgreSQL's generated name for it (`<table>_<column>_check`, or `<table>_check` when the expression does not single out one column) is canonicalized back to unnamed, so a dump of a model-declared unnamed check constraint round-trips.
 _Avoid_: validation rule, predicate
 
 **Index**:
-A standalone access path over a table's columns, identified by its name. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own.
+A standalone access path over a table's columns. A named index is identified by its name; an unnamed index by its structure — `unique` and ordered columns, with a missing name itself distinct in a diff. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
 _Avoid_: key, access method
 
 **Concurrent index**:
@@ -47,8 +47,40 @@ A link between two tables in the model — what the canvas draws and the plan cr
 _Avoid_: connection, edge, link
 
 **Foreign key**:
-The PostgreSQL constraint behind a relationship. The same fact in the database's language.
+The PostgreSQL constraint behind a relationship. The same fact in the database's language. On import, a foreign key whose name is exactly PostgreSQL's generated name for it (`<table>_<cols>_fkey`) is canonicalized back to unnamed, so a dump of a model-declared unnamed foreign key round-trips.
 _Avoid_: connection, reference
+
+**Constraint enforcement**:
+How a check constraint or foreign key is enforced: absent means valid and enforced, `not-valid` means declared `NOT VALID` — existing rows unchecked, new rows checked — and `not-enforced` means declared `NOT ENFORCED`, which implies not-valid and is never checked. A combined `NOT VALID NOT ENFORCED` declaration collapses to `not-enforced`; the two wordings are never conflated on import.
+_Avoid_: enabled/disabled constraint, enforcement state
+
+**Constraint deferrability**:
+Whether a primary key, unique constraint, or foreign key is checked immediately or at transaction commit, declared `DEFERRABLE` and optionally `INITIALLY DEFERRED`; immediate is the default, and `INITIALLY DEFERRED` implies deferrable. Check constraints reject deferrability at parse time.
+_Avoid_: deferred constraint, deferment
+
+**Not-null constraint name**:
+A not-null constraint's name when PostgreSQL 18 names it, carried beside the column's not-null fact — the model has no separate not-null constraint object. On import, a name exactly matching PostgreSQL's generated `<table>_<column>_not_null` is canonicalized back to unnamed, so a dump of a model-declared named not-null constraint round-trips; a name outside the formula stays named.
+_Avoid_: column constraint name, NN name
+
+**Column collation**:
+A column's explicit collation, carried as opaque, whitespace-normalized text in the spelling a dump writes — qualified and quoted, e.g. `pg_catalog."C"` — so it is attribute text, never identity. Absent means the type's default collation. Import keeps the source's spelling as written and the catalog reproduces pg_dump's spelling, so a dump's forms round-trip; a hand-authored spelling that differs from them is a named residual.
+_Avoid_: charset, locale, sort order
+
+**Column storage**:
+A column's explicit storage method: `plain`, `external`, `extended`, or `main`. Absent means the type's default. A method equal to the type's default reads back as absent from a live catalog — `attstorage` carries no explicit bit — and a dump cannot carry the distinction either.
+_Avoid_: toast mode, storage class
+
+**Column compression**:
+A column's explicit compression method: `pglz` or `lz4`. Absent means the type's default. `attcompression` exists only from PostgreSQL 14: on the 13 floor the catalog reports no explicit method.
+_Avoid_: codec, encoding
+
+**Comment**:
+Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, index, or extension — carried verbatim as the entity's `comment`. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
+_Avoid_: description, annotation, docstring, metadata
+
+**Table persistence**:
+A table's persistence when it is not PostgreSQL's default: `unlogged`. Absent means `LOGGED`. Temporary persistence is not modeled and stays flagged.
+_Avoid_: logging, durability
 
 **Snapshot**:
 A frozen copy of the model at a point in time. Capture it, name it, list it, compare it.
@@ -90,6 +122,26 @@ _Avoid_: serial, sequence column
 The internal sequence attached to an identity column. Created with `ADD GENERATED`, dropped with `DROP IDENTITY` or with its column or table; it is never detached, re-owned, or dropped on its own, and never appears as a `Sequence` in `Model.sequences`. PostgreSQL records the link as a `pg_depend` dependency of type `i`.
 _Avoid_: owned sequence, serial sequence
 
+**View**:
+A named query stored in the model, identified by its schema and name, e.g. `public.active_accounts`. A view is a relation with a definition, not a table: it has no modeled columns, and a change is a `CREATE OR REPLACE` or a drop and recreate.
+_Avoid_: virtual table, query object
+
+**Materialized view**:
+A view whose query result is stored. It is the same `View` entity as a plain view, discriminated by `materialized`; PostgreSQL cannot replace one in place, so a change is a drop and recreate, and the model carries no populated state.
+_Avoid_: materialized query table, MV
+
+**View definition**:
+The SQL body after a view's `AS`, carried as opaque, whitespace-normalized canonical text in the server's deparsed spelling. The model never parses or reconstructs it, and the renderer emits it verbatim.
+_Avoid_: view query, view SQL
+
+**View check option**:
+A plain view's `WITH [LOCAL|CASCADED] CHECK OPTION`: `local` or `cascaded` in the model, absent meaning none. A materialized view never carries one.
+_Avoid_: check constraint, validation rule
+
+**Extension**:
+A PostgreSQL extension installed in the database, identified by its name alone: extension names are database-unique and never schema-qualified. Its install schema and comment are attributes, not identity, so moving the extension is an `ALTER EXTENSION … SET SCHEMA`, not a drop and create. The install schema is required because a dump always states it; a definition without one is skipped and named, never defaulted.
+_Avoid_: plugin, module, package
+
 ### Crossing the boundary
 
 **Import**:
@@ -99,6 +151,10 @@ _Avoid_: ingest, load, sync, reverse-engineer
 **Introspection**:
 Bringing a schema into the model by reading a live database's catalog, read-only. The verb is introspect.
 _Avoid_: import, scan, sync
+
+**Export**:
+Projecting the canonical model into a reviewable artifact — migration-style DDL or canonical JSON — without changing the workspace. Read-only: schemamill never applies the SQL it prints.
+_Avoid_: dump, save, serialize
 
 **DDL dump**:
 The textual source import reads: a file or paste of DDL statements.
@@ -111,7 +167,7 @@ _Avoid_: run, execute, deploy
 ### The change engine
 
 **Change**:
-One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, or index added, removed, or changed between a baseline and a target.
+One atom of a diff — a table, column, primary key, foreign key, unique constraint, check constraint, index, sequence, view, extension, or comment added, removed, or changed between a baseline and a target.
 _Avoid_: edit, modification, alteration
 
 **Migration plan**:
@@ -122,6 +178,10 @@ _Avoid_: changeset, script
 The SQL rendering of a migration plan — deterministic and reviewable, for the user to apply.
 _Avoid_: script, patch, changeset
 
+**Target version**:
+The PostgreSQL major a migration plan's SQL is generated for, declared offline — `plan --target-version <major>`, default 13, the documented floor. The renderer synthesizes nothing above it: a synthesized statement whose form postdates the target is refused by name, while a declaration the model carries still renders as declared. A form with an equivalent fallback renders the fallback below its floor — the in-place foreign-key enforcement flip does exactly that — which is distinct from a declaration (rendered as declared) and from a synthesized reset (refused). Distinct from the diff's **Target** side, which is a model, not a server major.
+_Avoid_: server version, PG version, dialect, version
+
 **Transaction group**:
 A run of consecutive migration-plan steps that applies as one unit. Transaction-safe steps coalesce into one group; a step PostgreSQL cannot run inside a transaction stands alone. Boundaries are derived from step semantics, never configured by the user. A plan with more than one group displays the group count with one section per group, and its SQL separates the groups with a blank line.
 _Avoid_: batch, transaction block, commit point
@@ -131,7 +191,7 @@ A migration-plan step whose statement PostgreSQL refuses to run inside a transac
 _Avoid_: unsafe step, autocommit step
 
 **Hazard**:
-A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled.
+A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled. A certain-cost hazard — a persistence flip — rewrites the table under an ACCESS EXCLUSIVE lock at apply.
 _Avoid_: warning, danger
 
 **Expand/contract**:

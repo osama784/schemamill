@@ -1,0 +1,19 @@
+~ view public.account_totals
+    definition SELECT count(*) AS n FROM public.accounts → SELECT count(*) AS n FROM public.accounts WHERE active
+
+~ view public.active_accounts
+    definition SELECT id,email FROM public.accounts WHERE active → SELECT id,email,active FROM public.accounts WHERE active AND email IS NOT NULL
+
+~ view public.checked_accounts
+    checkOption local → cascaded
+
+- view public.obsolete_accounts
+
+- view public.obsolete_totals
+
++ view public.positive_accounts
+
+~ view public.promote_me
+    materialized false → true
+
++ view public.recent_accounts

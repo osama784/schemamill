@@ -3,6 +3,11 @@ import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  ColumnCompression,
+  ColumnStorage,
+  Extension,
+  ExtensionIdentity,
   ForeignKey,
   Index,
   Model,
@@ -13,15 +18,22 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
+  ViewCheckOption,
+  ViewIdentity,
 } from './model.ts';
+import type { CommentTarget } from './plan.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
 /**
  * The diff: what changed between a baseline model and a target model.
  *
  * `diff` compares two models and reports one change per added, removed, or changed table,
- * column, primary key, foreign key, unique constraint, check constraint, index, or sequence.
+ * column, primary key, foreign key, unique constraint, check constraint, index, sequence, view,
+ * or extension, plus one `comment-changed` per target entity whose comment text differs (or
+ * that the baseline lacks while it states one).
  * It never guesses a rename: a table or column under a new name is a removal and an addition,
  * a primary key with a different column list is a primary-key change, a foreign key pointing
  * at a different table is a removal and an addition, and so are a unique constraint with a
@@ -29,14 +41,31 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * different name.
  *
  * Identity is the model's identity. A table is its schema and name; a column is its name
- * within its table; a table has at most one primary key, compared by its name and its column
- * list; two foreign keys belong together when their referencing columns (order-sensitive) and
- * their referenced table are the same, and any other difference — name, referenced columns,
- * actions — reads as a change to that pair; two unique constraints belong together when their
- * ordered column lists are the same and two check constraints when their expressions are the
- * same, with any other difference — a name, for either — reading as a change to that pair; an
- * index is its name, so a renamed index is a removal and an addition; a sequence is its schema
- * and name, like a table.
+ * within its table; a table has at most one primary key, compared by its name, its column
+ * list, and its deferrability; two foreign keys belong together when their referencing columns
+ * (order-sensitive) and their referenced table are the same, and any other difference — name,
+ * actions, enforcement, deferrability — reads as a change to that pair. Their referenced
+ * columns compare equivalent when both sides omit them, when one side omits them and the other
+ * lists exactly the omitting side's own model's referenced-table primary key in primary-key
+ * order, or element-wise when both state a list; an absent referenced table or primary key
+ * leaves an omission unequal to every explicit list, and a resolved list is comparison-only —
+ * it never enters a payload;
+ * two unique constraints belong together when their ordered column lists are the same and two
+ * check constraints when their expressions are the same, with any other difference — a name or
+ * an attribute, for either — reading as a change to that pair; a named index is identified by
+ * its name, so a rename is a removal and an addition, and an unnamed index by its structure —
+ * `unique` and ordered columns — with a missing name itself distinct in a diff; a sequence is
+ * its schema and name, like a table.
+ *
+ * A view is identified by its schema and name, like a sequence, and one identity names either
+ * a view or a materialized view: a change between the two kinds is a `view-changed` carrying
+ * the `materialized` field, never a removal and an addition. The definition is compared
+ * exactly as stored, like any other opaque text, and the check option compares as an optional
+ * enum whose absent side is reported by omission.
+ *
+ * An extension is identified by its name alone — database-unique, never schema-qualified —
+ * and its install schema is a mutable attribute, not identity: a schema difference is an
+ * `extension-changed` carrying one value-carrying field, never a removal and an addition.
  *
  * `Index.concurrently` is apply metadata, not structure: it never makes a difference. An index
  * whose only stated difference is its flag is not a change, and an added or removed index
@@ -54,16 +83,18 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *
  * A column's identity — its `GENERATED … AS IDENTITY` descriptor — is a column property, not
  * a sequence entity, and compares as the `identity` part of the column's change, alongside
- * the scalar fields `type`, `notNull`, and `default`. One identity against a column without
- * one is an addition or a removal carrying that descriptor; two identities compare as a
- * change with only their differing options, in the fixed order `generated`, `increment`,
- * `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is deliberately not an
- * option: it compares only when both sides state one, a stated mismatch is a recreation
- * carrying the target descriptor (the plan drops the baseline identity and adds the target's),
- * and a name absent on either side is a don't-care. When the column's type change crosses
- * canonical integer types (`canonicalIntType`), the identity's `minValue`/`maxValue` compare
- * against the bounds the engine's `AS` conversion would leave, exactly like a sequence's, so
- * the conversion never churns a bound and any bound it would move is restated.
+ * the scalar fields `type`, `notNull`, `notNullName`, `default`, `collation`, `storage`,
+ * and `compression`. One identity against a column without one is an addition or a removal
+ * carrying that descriptor; two identities
+ * compare as a change with only their differing options, in the fixed order `generated`,
+ * `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`. The sequence name is
+ * deliberately not an option: it compares only when both sides state one, a stated mismatch is
+ * a recreation carrying the target descriptor (the plan drops the baseline identity and adds
+ * the target's), and a name absent on either side is a don't-care. When the column's type
+ * change crosses canonical integer types (`canonicalIntType`), the identity's
+ * `minValue`/`maxValue` compare against the bounds the engine's `AS` conversion would leave,
+ * exactly like a sequence's, so the conversion never churns a bound and any bound it would
+ * move is restated.
  *
  * A column is identified by name alone: the ordinal position of an existing column is not
  * part of the diff. The model stores `columns` in source order for fidelity, and column
@@ -83,17 +114,20 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * 2. A changed table reports its members in this exact order: columns removed (baseline
  *    column order), columns added (target column order), columns changed (target column
  *    order, with only the scalar fields that differ, in the fixed order `type`, `notNull`,
- *    `default`, plus the column's identity change when it has one); then at most one
- *    primary-key addition, removal, or change; then foreign keys removed, added, and changed,
- *    each sorted in the model's foreign-key order (referencing columns element-wise, referenced
- *    table schema then name, then name, absent first — an absent name sorts before any present
- *    one, including the empty string, which remains a distinct, later entry); then unique
- *    constraints removed, added, and changed, each sorted in the model's unique-constraint
- *    order (columns element-wise, then name, absent first the same way); then check constraints
- *    removed, added, and changed, each sorted in the model's check-constraint order
- *    (expression, then name, absent first); then indexes removed, added, and changed, each
- *    sorted by name, absent first. Changed pairs are ordered by their baseline member in that
- *    member's order, then by their target member the same way.
+ *    `notNullName`, `default`, `collation`, `storage`, `compression`, plus the column's
+ *    identity change when it has one); then at most one primary-key addition, removal, or
+ *    change; then foreign keys removed, added, and
+ *    changed, each sorted in the model's foreign-key order (referencing columns element-wise,
+ *    referenced table schema then name, then name, absent first — an absent name sorts before
+ *    any present one, including the empty string, which remains a distinct, later entry); then
+ *    unique constraints removed, added, and changed, each sorted in the model's
+ *    unique-constraint order (columns element-wise, then name, absent first the same way);
+ *    then check constraints removed, added, and changed, each sorted in the model's
+ *    check-constraint order (expression, then name, absent first); then indexes removed,
+ *    added, and changed, each sorted by name, absent first; then the table's
+ *    `persistence-changed` entry when the two sides' persistence differs. Changed pairs are
+ *    ordered by their baseline member in that member's order, then by their target member the
+ *    same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
  *    come from, as point 2 describes, and no entry states a column's position. A table with no
  *    reported changes is therefore not necessarily structurally identical to its counterpart:
@@ -106,6 +140,24 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    `dataType` change, `minValue`/`maxValue` compare the bounds the engine's `AS` conversion
  *    would leave, so a bound that only differs from the target after the conversion is still
  *    reported.
+ * 5. View identities are merge-walked the same way, after every sequence change, and reported
+ *    as a group in identity order: a baseline-only identity is `view-removed`, a target-only
+ *    identity `view-added`, and a shared identity is compared on `materialized`, `definition`,
+ *    and `checkOption`, in that fixed order. A changed view carries both stored sides —
+ *    `before` and `after` — because the plan recreates a materialized view from its target
+ *    payload; an absent check option is reported by omission.
+ * 6. Extension identities are merge-walked the same way, after every view change, and reported
+ *    as a group in name order: a baseline-only identity is `extension-removed`, a target-only
+ *    identity `extension-added`, and a shared identity is compared on `schema`, its one mutable
+ *    field, reported value-carrying as `before` and `after`. The added and changed entries keep
+ *    target name order and the removed entries baseline name order, so a model's array order
+ *    never leaks into the result.
+ * 7. Comment changes are walked over the target model, after every extension change, and
+ *    reported as a group in target identity order: the schema-qualified relation, then the
+ *    target kind, then the member's name or identity. An entity the target removes contributes
+ *    nothing — dropping it drops its comment — and an entity whose identity fields changed reads
+ *    as absent from the baseline, so its comment is an addition. The payload is a copy without
+ *    the carried node's own `comment`: `before` and `after` are the only text.
  *
  * Duplicate identities — several foreign keys with the same referencing columns and referenced
  * table, unique constraints with the same columns, check constraints with the same expression,
@@ -139,7 +191,45 @@ export type Change =
       kind: 'sequence-changed';
       sequence: SequenceIdentity;
       changes: readonly SequenceFieldChange[];
-    };
+    }
+  /** The target has a view or materialized view the baseline does not. */
+  | { kind: 'view-added'; view: View }
+  /** The baseline has a view or materialized view the target does not. */
+  | { kind: 'view-removed'; view: View }
+  /**
+   * Both sides have the view identity, and at least one field differs. `before` and `after`
+   * carry the stored views — the plan recreates a materialized view or a kind change from
+   * them — while `changes` reports only the differing fields.
+   */
+  | {
+      kind: 'view-changed';
+      view: ViewIdentity;
+      changes: readonly ViewFieldChange[];
+      before: View;
+      after: View;
+    }
+  /** The target has an extension the baseline does not. */
+  | { kind: 'extension-added'; extension: Extension }
+  /** The baseline has an extension the target does not. */
+  | { kind: 'extension-removed'; extension: Extension }
+  /**
+   * Both sides have the extension identity, and at least one of its fields differs. The fields
+   * are value-carrying — today `schema` alone — so the plan needs no baseline lookup.
+   */
+  | {
+      kind: 'extension-changed';
+      extension: ExtensionIdentity;
+      changes: readonly ExtensionFieldChange[];
+    }
+  /**
+   * A comment differs, or the entity is new: `before`/`after` are the stored texts, a side
+   * that states none omitted (a removal is `COMMENT … IS NULL`). Comment changes come last, in
+   * target identity order, and the target is a copy without any carried node's own `comment`.
+   * An entity the target removes emits nothing — dropping it drops its comment — and a
+   * constraint or index whose identity fields changed reads as absent from the baseline, so
+   * its comment is reported as an addition even when the model held one before.
+   */
+  | { kind: 'comment-changed'; target: CommentTarget; before?: string; after?: string };
 
 /** One difference within a changed table. */
 export type TableChange =
@@ -149,13 +239,15 @@ export type TableChange =
   | { kind: 'column-removed'; column: Column }
   /**
    * A column both sides have with differing fields: the scalar fields, plus the identity
-   * difference when the column's identity differs.
+   * difference when the column's identity differs, plus the target-side attribute carrier
+   * when any of `type`, `collation`, `storage`, or `compression` differs.
    */
   | {
       kind: 'column-changed';
       name: string;
       fields: readonly ColumnFieldChange[];
       identity?: IdentityChange;
+      attributes?: ColumnAttributes;
     }
   /** The target has a primary key the baseline does not. */
   | { kind: 'primary-key-added'; primaryKey: PrimaryKey }
@@ -190,18 +282,28 @@ export type TableChange =
   /** An index only the baseline has. */
   | { kind: 'index-removed'; index: Index }
   /** A matched index pair with any structural difference. */
-  | { kind: 'index-changed'; before: Index; after: Index };
+  | { kind: 'index-changed'; before: Index; after: Index }
+  /**
+   * A table both sides have whose persistence differs; a side that states none is `LOGGED`,
+   * the default, and is omitted.
+   */
+  | { kind: 'persistence-changed'; before?: TablePersistence; after?: TablePersistence };
 
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
- * the fixed order `type`, `notNull`, `default`. A `default` change omits the side that has no
- * `DEFAULT`. A column's identity is not a scalar field: it travels as the `identity` part of
- * the `column-changed` entry.
+ * the fixed order `type`, `notNull`, `notNullName`, `default`, `collation`, `storage`,
+ * `compression`. A `default`, `notNullName`, `collation`, `storage`, or `compression` change
+ * omits the side that states none. A column's identity is not a scalar field: it travels as
+ * the `identity` part of the `column-changed` entry.
  */
 export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
   | { field: 'notNull'; before: boolean; after: boolean }
-  | { field: 'default'; before?: string; after?: string };
+  | { field: 'notNullName'; before?: string; after?: string }
+  | { field: 'default'; before?: string; after?: string }
+  | { field: 'collation'; before?: string; after?: string }
+  | { field: 'storage'; before?: ColumnStorage; after?: ColumnStorage }
+  | { field: 'compression'; before?: ColumnCompression; after?: ColumnCompression };
 
 /**
  * One differing option of a changed identity; only options that differ are reported, in the
@@ -253,6 +355,23 @@ export type SequenceFieldChange =
   | { field: 'ownedBy'; before?: SequenceOwner; after?: SequenceOwner };
 
 /**
+ * One differing field of a changed view; only fields that differ are reported, in the fixed
+ * order `materialized`, `definition`, `checkOption`. A `checkOption` change omits the side
+ * that states none.
+ */
+export type ViewFieldChange =
+  | { field: 'materialized'; before: boolean; after: boolean }
+  | { field: 'definition'; before: string; after: string }
+  | { field: 'checkOption'; before?: ViewCheckOption; after?: ViewCheckOption };
+
+/**
+ * One differing field of a changed extension; only fields that differ are reported. The union
+ * holds one member today — the install schema — so the plan's `assertNever` default is real
+ * from day one, and every value the destination needs travels in `after`.
+ */
+export type ExtensionFieldChange = { field: 'schema'; before: string; after: string };
+
+/**
  * The changes from `baseline` to `target`, in the module's deterministic order. Returned
  * payloads are independent copies: mutating them never affects the caller's models, and
  * neither input is mutated.
@@ -260,6 +379,8 @@ export type SequenceFieldChange =
 export function diff(baseline: Model, target: Model): readonly Change[] {
   const baselineTables = [...baseline.tables].sort(compareTables);
   const targetTables = [...target.tables].sort(compareTables);
+  const baselinePrimaryKeys = primaryKeyMap(baseline);
+  const targetPrimaryKeys = primaryKeyMap(target);
 
   const changes: Change[] = [];
   let baselineIndex = 0;
@@ -276,7 +397,12 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
       changes.push({ kind: 'table-added', table: copyTable(targetTable) });
       targetIndex += 1;
     } else {
-      const tableChanges = diffTable(baselineTable, targetTable);
+      const tableChanges = diffTable(
+        baselineTable,
+        targetTable,
+        baselinePrimaryKeys,
+        targetPrimaryKeys,
+      );
       if (tableChanges.length > 0) {
         changes.push({
           kind: 'table-changed',
@@ -296,7 +422,13 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     changes.push({ kind: 'table-added', table: copyTable(targetTables[targetIndex]!) });
   }
 
-  return [...changes, ...diffSequences(baseline, target)];
+  return [
+    ...changes,
+    ...diffSequences(baseline, target),
+    ...diffViews(baseline, target),
+    ...diffExtensions(baseline, target),
+    ...diffComments(baseline, target),
+  ];
 }
 
 /**
@@ -347,6 +479,420 @@ function diffSequences(baseline: Model, target: Model): readonly Change[] {
   }
 
   return changes;
+}
+
+/**
+ * The view group of the diff, in identity order. A changed view reports the fields that differ
+ * in the fixed order `materialized`, `definition`, `checkOption`, and carries both stored sides
+ * for the plan's recreate.
+ */
+function diffViews(baseline: Model, target: Model): readonly Change[] {
+  const baselineViews = [...baseline.views].sort(compareViews);
+  const targetViews = [...target.views].sort(compareViews);
+
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineViews.length && targetIndex < targetViews.length) {
+    const baselineView = baselineViews[baselineIndex]!;
+    const targetView = targetViews[targetIndex]!;
+    const comparison = compareViews(baselineView, targetView);
+    if (comparison < 0) {
+      changes.push({ kind: 'view-removed', view: copyView(baselineView) });
+      baselineIndex += 1;
+    } else if (comparison > 0) {
+      changes.push({ kind: 'view-added', view: copyView(targetView) });
+      targetIndex += 1;
+    } else {
+      const fields = diffViewFields(baselineView, targetView);
+      if (fields.length > 0) {
+        changes.push({
+          kind: 'view-changed',
+          view: { schema: baselineView.schema, name: baselineView.name },
+          changes: fields,
+          before: copyView(baselineView),
+          after: copyView(targetView),
+        });
+      }
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+
+  for (; baselineIndex < baselineViews.length; baselineIndex += 1) {
+    changes.push({ kind: 'view-removed', view: copyView(baselineViews[baselineIndex]!) });
+  }
+  for (; targetIndex < targetViews.length; targetIndex += 1) {
+    changes.push({ kind: 'view-added', view: copyView(targetViews[targetIndex]!) });
+  }
+
+  return changes;
+}
+
+function diffViewFields(baseline: View, target: View): ViewFieldChange[] {
+  const fields: ViewFieldChange[] = [];
+  if (baseline.materialized !== target.materialized) {
+    fields.push({
+      field: 'materialized',
+      before: baseline.materialized,
+      after: target.materialized,
+    });
+  }
+  if (baseline.definition !== target.definition) {
+    fields.push({ field: 'definition', before: baseline.definition, after: target.definition });
+  }
+  if (baseline.checkOption !== target.checkOption) {
+    fields.push({
+      field: 'checkOption',
+      ...(baseline.checkOption === undefined ? {} : { before: baseline.checkOption }),
+      ...(target.checkOption === undefined ? {} : { after: target.checkOption }),
+    });
+  }
+  return fields;
+}
+
+/**
+ * The extension group of the diff, in name order. Extensions identify by name alone, so a
+ * schema move is an `extension-changed` with its value-carrying field — never a removal and an
+ * addition.
+ */
+function diffExtensions(baseline: Model, target: Model): readonly Change[] {
+  const baselineExtensions = [...baseline.extensions].sort(compareExtensions);
+  const targetExtensions = [...target.extensions].sort(compareExtensions);
+
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineExtensions.length && targetIndex < targetExtensions.length) {
+    const baselineExtension = baselineExtensions[baselineIndex]!;
+    const targetExtension = targetExtensions[targetIndex]!;
+    const comparison = compareStrings(baselineExtension.name, targetExtension.name);
+    if (comparison < 0) {
+      changes.push({ kind: 'extension-removed', extension: copyExtension(baselineExtension) });
+      baselineIndex += 1;
+    } else if (comparison > 0) {
+      changes.push({ kind: 'extension-added', extension: copyExtension(targetExtension) });
+      targetIndex += 1;
+    } else {
+      const fields = diffExtensionFields(baselineExtension, targetExtension);
+      if (fields.length > 0) {
+        changes.push({
+          kind: 'extension-changed',
+          extension: { name: baselineExtension.name },
+          changes: fields,
+        });
+      }
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+
+  for (; baselineIndex < baselineExtensions.length; baselineIndex += 1) {
+    changes.push({
+      kind: 'extension-removed',
+      extension: copyExtension(baselineExtensions[baselineIndex]!),
+    });
+  }
+  for (; targetIndex < targetExtensions.length; targetIndex += 1) {
+    changes.push({
+      kind: 'extension-added',
+      extension: copyExtension(targetExtensions[targetIndex]!),
+    });
+  }
+
+  return changes;
+}
+
+function diffExtensionFields(baseline: Extension, target: Extension): ExtensionFieldChange[] {
+  const fields: ExtensionFieldChange[] = [];
+  if (baseline.schema !== target.schema) {
+    fields.push({ field: 'schema', before: baseline.schema, after: target.schema });
+  }
+  return fields;
+}
+
+/** A `comment-changed` entry, as the comment pass emits it. */
+type CommentChange = Extract<Change, { kind: 'comment-changed' }>;
+
+/**
+ * The comment group of the diff, in target identity order. The pass walks the target model only:
+ * a target entity whose comment differs from its baseline counterpart's, or that the baseline
+ * lacks while stating a comment, is an entry; a removed entity is not, because dropping it drops
+ * its comment.
+ *
+ * Counterparts match by the model's identity — table, sequence, view, or extension identity, a
+ * column's name, a primary key's or unique constraint's columns, a check constraint's
+ * expression, a foreign key's referencing columns and referenced table, and an index's name (an
+ * unnamed index by its structure) — so a name or attribute change still compares both sides'
+ * comments, while an identity change reads as absent from the baseline and reports an addition.
+ * Every differing entry is emitted; the plan's terminal phase keeps one step per target, the
+ * first in target order, mirroring its target key.
+ */
+function diffComments(baseline: Model, target: Model): readonly CommentChange[] {
+  const changes: CommentChange[] = [];
+  const baselineTables = new Map(baseline.tables.map((table) => [tableKey(table), table]));
+  const baselineSequences = new Map(
+    baseline.sequences.map((sequence) => [tableKey(sequence), sequence]),
+  );
+  const baselineViews = new Map(baseline.views.map((view) => [tableKey(view), view]));
+  const baselineExtensions = new Map(
+    baseline.extensions.map((extension) => [extension.name, extension]),
+  );
+
+  const emit = (
+    commentTarget: CommentTarget,
+    before: string | undefined,
+    after: string | undefined,
+  ): void => {
+    if (before === after) return;
+    changes.push({
+      kind: 'comment-changed',
+      target: copyTarget(commentTarget),
+      ...(before === undefined ? {} : { before }),
+      ...(after === undefined ? {} : { after }),
+    });
+  };
+
+  for (const table of target.tables) {
+    const before = baselineTables.get(tableKey(table));
+    emit({ kind: 'table', table }, before?.comment, table.comment);
+
+    const beforeColumns = new Map((before?.columns ?? []).map((entry) => [entry.name, entry]));
+    for (const column of table.columns) {
+      emit(
+        { kind: 'column', table, column: column.name },
+        beforeColumns.get(column.name)?.comment,
+        column.comment,
+      );
+    }
+
+    if (table.primaryKey !== undefined) {
+      const prior =
+        before?.primaryKey !== undefined &&
+        sameStrings(before.primaryKey.columns, table.primaryKey.columns)
+          ? before.primaryKey
+          : undefined;
+      emit(
+        { kind: 'primary-key', table, primaryKey: table.primaryKey },
+        prior?.comment,
+        table.primaryKey.comment,
+      );
+    }
+
+    const beforeForeignKeys = new Map(
+      (before?.foreignKeys ?? []).map((entry) => [foreignKeyIdentity(entry), entry]),
+    );
+    for (const foreignKey of table.foreignKeys) {
+      emit(
+        { kind: 'foreign-key', table, foreignKey },
+        beforeForeignKeys.get(foreignKeyIdentity(foreignKey))?.comment,
+        foreignKey.comment,
+      );
+    }
+
+    const beforeUniqueConstraints = new Map(
+      (before?.uniqueConstraints ?? []).map((entry) => [uniqueConstraintIdentity(entry), entry]),
+    );
+    for (const uniqueConstraint of table.uniqueConstraints) {
+      emit(
+        { kind: 'unique-constraint', table, uniqueConstraint },
+        beforeUniqueConstraints.get(uniqueConstraintIdentity(uniqueConstraint))?.comment,
+        uniqueConstraint.comment,
+      );
+    }
+
+    const beforeCheckConstraints = new Map(
+      (before?.checkConstraints ?? []).map((entry) => [checkConstraintIdentity(entry), entry]),
+    );
+    for (const checkConstraint of table.checkConstraints) {
+      emit(
+        { kind: 'check-constraint', table, checkConstraint },
+        beforeCheckConstraints.get(checkConstraintIdentity(checkConstraint))?.comment,
+        checkConstraint.comment,
+      );
+    }
+
+    const beforeIndexes = new Map(
+      (before?.indexes ?? []).map((entry) => [commentIndexIdentity(entry), entry]),
+    );
+    for (const index of table.indexes) {
+      emit(
+        { kind: 'index', table, index },
+        beforeIndexes.get(commentIndexIdentity(index))?.comment,
+        index.comment,
+      );
+    }
+  }
+
+  for (const sequence of target.sequences) {
+    emit(
+      { kind: 'sequence', sequence },
+      baselineSequences.get(tableKey(sequence))?.comment,
+      sequence.comment,
+    );
+  }
+
+  for (const view of target.views) {
+    emit(
+      { kind: 'view', view, materialized: view.materialized },
+      baselineViews.get(tableKey(view))?.comment,
+      view.comment,
+    );
+  }
+
+  for (const extension of target.extensions) {
+    emit(
+      { kind: 'extension', extension },
+      baselineExtensions.get(extension.name)?.comment,
+      extension.comment,
+    );
+  }
+
+  changes.sort((left, right) =>
+    compareStrings(commentTargetKey(left.target), commentTargetKey(right.target)),
+  );
+  return changes;
+}
+
+/** The identity key of an index for the comment pass: its name, or an unnamed index's structure. */
+function commentIndexIdentity(index: Index): string {
+  return index.name !== undefined
+    ? indexIdentity(index)
+    : JSON.stringify([null, index.unique, index.columns]);
+}
+
+/** A writable view of a model payload, for the one place a copy is stripped. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * A copy of `target` with every carried node stripped of its `comment` and reduced to what the
+ * variant needs: identities for the identity-carrying variants, whole node copies — less
+ * `comment` — for the constraint and index variants. The change's `before` and `after` are the
+ * single source of the comment text, like the plan's step target.
+ */
+function copyTarget(target: CommentTarget): CommentTarget {
+  switch (target.kind) {
+    case 'table':
+      return { kind: 'table', table: copyTargetIdentity(target.table) };
+    case 'column':
+      return {
+        kind: 'column',
+        table: copyTargetIdentity(target.table),
+        column: target.column,
+      };
+    case 'sequence':
+      return { kind: 'sequence', sequence: copyTargetIdentity(target.sequence) };
+    case 'view':
+      return {
+        kind: 'view',
+        view: copyTargetIdentity(target.view),
+        materialized: target.materialized,
+      };
+    case 'extension':
+      return { kind: 'extension', extension: { name: target.extension.name } };
+    case 'index': {
+      const index: Mutable<Index> = copyIndex(target.index);
+      delete index.comment;
+      return { kind: 'index', table: copyTargetIdentity(target.table), index };
+    }
+    case 'primary-key': {
+      const primaryKey: Mutable<PrimaryKey> = copyPrimaryKey(target.primaryKey);
+      delete primaryKey.comment;
+      return { kind: 'primary-key', table: copyTargetIdentity(target.table), primaryKey };
+    }
+    case 'unique-constraint': {
+      const uniqueConstraint: Mutable<UniqueConstraint> = copyUniqueConstraint(
+        target.uniqueConstraint,
+      );
+      delete uniqueConstraint.comment;
+      return {
+        kind: 'unique-constraint',
+        table: copyTargetIdentity(target.table),
+        uniqueConstraint,
+      };
+    }
+    case 'check-constraint': {
+      const checkConstraint: Mutable<CheckConstraint> = copyCheckConstraint(target.checkConstraint);
+      delete checkConstraint.comment;
+      return {
+        kind: 'check-constraint',
+        table: copyTargetIdentity(target.table),
+        checkConstraint,
+      };
+    }
+    case 'foreign-key': {
+      const foreignKey: Mutable<ForeignKey> = copyForeignKey(target.foreignKey);
+      delete foreignKey.comment;
+      return { kind: 'foreign-key', table: copyTargetIdentity(target.table), foreignKey };
+    }
+  }
+}
+
+/** A copy of a relation identity, independent of the target's node. */
+function copyTargetIdentity(identity: TableIdentity): TableIdentity {
+  return { schema: identity.schema, name: identity.name };
+}
+
+/**
+ * The identity key of a comment target: the relation identity — a schema-qualified relation or
+ * the name-only extension, whose empty schema slot sorts it before every qualified relation —
+ * the target kind, then the member's name or identity. It mirrors `plan.ts`'s private key so
+ * the diff's order and the plan's terminal phase agree, and it never reads a comment.
+ */
+function commentTargetKey(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
+    case 'column':
+      return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'sequence':
+      return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
+    case 'view':
+      return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'extension':
+      return JSON.stringify(['', target.extension.name, 'extension', '']);
+    case 'index':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'index',
+        target.index.name ?? [null, target.index.unique, target.index.columns],
+      ]);
+    case 'primary-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'primary-key',
+        target.primaryKey.columns,
+      ]);
+    case 'unique-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'unique-constraint',
+        target.uniqueConstraint.columns,
+      ]);
+    case 'check-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'check-constraint',
+        target.checkConstraint.expression,
+      ]);
+    case 'foreign-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'foreign-key',
+        [
+          target.foreignKey.columns,
+          target.foreignKey.referencedTable.schema,
+          target.foreignKey.referencedTable.name,
+        ],
+      ]);
+  }
 }
 
 function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceFieldChange[] {
@@ -418,6 +964,30 @@ function sameIdentity(left: TableIdentity, right: TableIdentity): boolean {
   return left.schema === right.schema && left.name === right.name;
 }
 
+/**
+ * The primary-key columns of every table in a model, keyed by table identity. The whole model is
+ * indexed once per `diff`, so a foreign key that omits its referenced columns can be resolved
+ * against its own side's tables.
+ */
+type PrimaryKeyMap = ReadonlyMap<string, readonly string[]>;
+
+function primaryKeyMap(model: Model): PrimaryKeyMap {
+  const primaryKeys = new Map<string, readonly string[]>();
+  for (const table of model.tables) {
+    if (table.primaryKey !== undefined) primaryKeys.set(tableKey(table), table.primaryKey.columns);
+  }
+  return primaryKeys;
+}
+
+/**
+ * The map key of a relation identity; JSON keeps names — which may contain any character —
+ * unambiguous. Tables, sequences, and views all identify by schema and name, so the one key
+ * serves all three.
+ */
+function tableKey(identity: TableIdentity): string {
+  return JSON.stringify([identity.schema, identity.name]);
+}
+
 /** A copy of `column`, independent of the caller's model, nested identity included. */
 function copyColumn(column: Column): Column {
   return {
@@ -469,6 +1039,16 @@ function copySequence(sequence: Sequence): Sequence {
   };
 }
 
+/** A copy of `view`, independent of the caller's model. */
+function copyView(view: View): View {
+  return { ...view };
+}
+
+/** A copy of `extension`, independent of the caller's model. */
+function copyExtension(extension: Extension): Extension {
+  return { ...extension };
+}
+
 /**
  * A copy of `table`, independent of the caller's model, whose foreign keys, unique
  * constraints, check constraints, and indexes are in canonical order: the model's order,
@@ -497,14 +1077,33 @@ interface ForeignKeyPair {
   readonly after: ForeignKey;
 }
 
-function diffTable(baseline: Table, target: Table): TableChange[] {
+function diffTable(
+  baseline: Table,
+  target: Table,
+  baselinePrimaryKeys: PrimaryKeyMap,
+  targetPrimaryKeys: PrimaryKeyMap,
+): TableChange[] {
   const changes = diffColumns(baseline.columns, target.columns);
   const primaryKey = diffPrimaryKey(baseline.primaryKey, target.primaryKey);
   if (primaryKey !== undefined) changes.push(primaryKey);
-  changes.push(...diffForeignKeys(baseline.foreignKeys, target.foreignKeys));
+  changes.push(
+    ...diffForeignKeys(
+      baseline.foreignKeys,
+      target.foreignKeys,
+      baselinePrimaryKeys,
+      targetPrimaryKeys,
+    ),
+  );
   changes.push(...diffUniqueConstraints(baseline.uniqueConstraints, target.uniqueConstraints));
   changes.push(...diffCheckConstraints(baseline.checkConstraints, target.checkConstraints));
   changes.push(...diffIndexes(baseline.indexes, target.indexes));
+  if (baseline.persistence !== target.persistence) {
+    changes.push({
+      kind: 'persistence-changed',
+      ...(baseline.persistence === undefined ? {} : { before: baseline.persistence }),
+      ...(target.persistence === undefined ? {} : { after: target.persistence }),
+    });
+  }
   return changes;
 }
 
@@ -529,16 +1128,42 @@ function diffColumns(baseline: readonly Column[], target: readonly Column[]): Ta
     const fields = diffColumnFields(before, column);
     const identity = diffIdentity(before, column);
     if (fields.length > 0 || identity !== undefined) {
+      const attributes = columnAttributes(before, column);
       changes.push({
         kind: 'column-changed',
         name: column.name,
         fields,
         ...(identity === undefined ? {} : { identity }),
+        ...(attributes === undefined ? {} : { attributes }),
       });
     }
   }
 
   return changes;
+}
+
+/**
+ * The target-side attribute carrier of a changed column, or `undefined` when the four
+ * render-relevant values compare equal. The carrier restates the target's explicit
+ * attributes even when only the type differed: the renderer merges a type and collation
+ * change into one `TYPE` statement, which resets storage and compression to the type's
+ * defaults.
+ */
+function columnAttributes(baseline: Column, target: Column): ColumnAttributes | undefined {
+  if (
+    baseline.type === target.type &&
+    baseline.collation === target.collation &&
+    baseline.storage === target.storage &&
+    baseline.compression === target.compression
+  ) {
+    return undefined;
+  }
+  return {
+    type: target.type,
+    ...(target.collation === undefined ? {} : { collation: target.collation }),
+    ...(target.storage === undefined ? {} : { storage: target.storage }),
+    ...(target.compression === undefined ? {} : { compression: target.compression }),
+  };
 }
 
 function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[] {
@@ -549,11 +1174,39 @@ function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[]
   if (baseline.notNull !== target.notNull) {
     fields.push({ field: 'notNull', before: baseline.notNull, after: target.notNull });
   }
+  if (baseline.notNullName !== target.notNullName) {
+    fields.push({
+      field: 'notNullName',
+      ...(baseline.notNullName === undefined ? {} : { before: baseline.notNullName }),
+      ...(target.notNullName === undefined ? {} : { after: target.notNullName }),
+    });
+  }
   if (baseline.default !== target.default) {
     fields.push({
       field: 'default',
       ...(baseline.default === undefined ? {} : { before: baseline.default }),
       ...(target.default === undefined ? {} : { after: target.default }),
+    });
+  }
+  if (baseline.collation !== target.collation) {
+    fields.push({
+      field: 'collation',
+      ...(baseline.collation === undefined ? {} : { before: baseline.collation }),
+      ...(target.collation === undefined ? {} : { after: target.collation }),
+    });
+  }
+  if (baseline.storage !== target.storage) {
+    fields.push({
+      field: 'storage',
+      ...(baseline.storage === undefined ? {} : { before: baseline.storage }),
+      ...(target.storage === undefined ? {} : { after: target.storage }),
+    });
+  }
+  if (baseline.compression !== target.compression) {
+    fields.push({
+      field: 'compression',
+      ...(baseline.compression === undefined ? {} : { before: baseline.compression }),
+      ...(target.compression === undefined ? {} : { after: target.compression }),
     });
   }
   return fields;
@@ -675,7 +1328,12 @@ function diffPrimaryKey(
   if (target === undefined) {
     return { kind: 'primary-key-removed', primaryKey: copyPrimaryKey(baseline) };
   }
-  if (baseline.name === target.name && sameStrings(baseline.columns, target.columns)) {
+  if (
+    baseline.name === target.name &&
+    sameStrings(baseline.columns, target.columns) &&
+    baseline.deferrable === target.deferrable &&
+    baseline.initiallyDeferred === target.initiallyDeferred
+  ) {
     return undefined;
   }
   return {
@@ -688,6 +1346,8 @@ function diffPrimaryKey(
 function diffForeignKeys(
   baseline: readonly ForeignKey[],
   target: readonly ForeignKey[],
+  baselinePrimaryKeys: PrimaryKeyMap,
+  targetPrimaryKeys: PrimaryKeyMap,
 ): TableChange[] {
   const baselineGroups = groupForeignKeys(baseline);
   const targetGroups = groupForeignKeys(target);
@@ -703,7 +1363,9 @@ function diffForeignKeys(
 
     // Structurally identical foreign keys cancel; only the rest is paired by order.
     for (const after of targetGroups.get(identity) ?? []) {
-      const match = remainingBaseline.findIndex((before) => foreignKeysEqual(before, after));
+      const match = remainingBaseline.findIndex((before) =>
+        foreignKeysEqual(before, after, baselinePrimaryKeys, targetPrimaryKeys),
+      );
       if (match === -1) remainingTarget.push(after);
       else remainingBaseline.splice(match, 1);
     }
@@ -880,9 +1542,10 @@ function diffCheckConstraints(
 }
 
 /**
- * Indexes pair like tables and sequences: identity is the name, so a rename is a removal and
- * an addition, and two indexes with the same name differ by `unique` or `columns`. `concurrently`
- * is apply metadata and never makes a difference.
+ * Indexes pair like tables and sequences: a named index's identity is its name, so a rename is
+ * a removal and an addition, and two indexes with the same name differ by `unique` or
+ * `columns`; every unnamed index groups by absence and pairs by structure (`unique`, then
+ * columns). `concurrently` is apply metadata and never makes a difference.
  */
 function diffIndexes(baseline: readonly Index[], target: readonly Index[]): TableChange[] {
   const baselineGroups = groupIndexes(baseline);
@@ -965,16 +1628,55 @@ function foreignKeyIdentity(foreignKey: ForeignKey): string {
   ]);
 }
 
-function foreignKeysEqual(left: ForeignKey, right: ForeignKey): boolean {
+/**
+ * Whether two foreign keys are equivalent. Every field other than `referencedColumns` — name,
+ * referencing columns, referenced table, referential actions, enforcement, deferrability — stays
+ * a conjunct; the referenced columns compare per `sameReferencedColumns`.
+ */
+function foreignKeysEqual(
+  left: ForeignKey,
+  right: ForeignKey,
+  leftPrimaryKeys: PrimaryKeyMap,
+  rightPrimaryKeys: PrimaryKeyMap,
+): boolean {
   return (
     left.name === right.name &&
     sameStrings(left.columns, right.columns) &&
     left.referencedTable.schema === right.referencedTable.schema &&
     left.referencedTable.name === right.referencedTable.name &&
-    sameStrings(left.referencedColumns, right.referencedColumns) &&
+    sameReferencedColumns(left, right, leftPrimaryKeys, rightPrimaryKeys) &&
     left.onUpdate === right.onUpdate &&
-    left.onDelete === right.onDelete
+    left.onDelete === right.onDelete &&
+    left.enforcement === right.enforcement &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
   );
+}
+
+/**
+ * Whether two foreign keys' referenced columns are equivalent. Both sides empty is equal
+ * regardless of any primary key — the dependent-foreign-key synthesis owns primary-key moves. One
+ * side empty is equal to an explicit list exactly when that list equals the empty side's own
+ * model's referenced-table primary key, in primary-key order; an absent referenced table or a
+ * table without a primary key leaves the two unequal. Two explicit lists compare element-wise.
+ * The resolved columns never enter a payload: the equivalence is comparison-only.
+ */
+function sameReferencedColumns(
+  left: ForeignKey,
+  right: ForeignKey,
+  leftPrimaryKeys: PrimaryKeyMap,
+  rightPrimaryKeys: PrimaryKeyMap,
+): boolean {
+  if (left.referencedColumns.length === 0 && right.referencedColumns.length === 0) return true;
+  if (left.referencedColumns.length === 0) {
+    const resolved = leftPrimaryKeys.get(tableKey(left.referencedTable));
+    return resolved !== undefined && sameStrings(resolved, right.referencedColumns);
+  }
+  if (right.referencedColumns.length === 0) {
+    const resolved = rightPrimaryKeys.get(tableKey(right.referencedTable));
+    return resolved !== undefined && sameStrings(resolved, left.referencedColumns);
+  }
+  return sameStrings(left.referencedColumns, right.referencedColumns);
 }
 
 function groupUniqueConstraints(
@@ -996,7 +1698,12 @@ function uniqueConstraintIdentity(uniqueConstraint: UniqueConstraint): string {
 }
 
 function uniqueConstraintsEqual(left: UniqueConstraint, right: UniqueConstraint): boolean {
-  return left.name === right.name && sameStrings(left.columns, right.columns);
+  return (
+    left.name === right.name &&
+    sameStrings(left.columns, right.columns) &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
+  );
 }
 
 function groupCheckConstraints(
@@ -1018,7 +1725,11 @@ function checkConstraintIdentity(checkConstraint: CheckConstraint): string {
 }
 
 function checkConstraintsEqual(left: CheckConstraint, right: CheckConstraint): boolean {
-  return left.name === right.name && left.expression === right.expression;
+  return (
+    left.name === right.name &&
+    left.expression === right.expression &&
+    left.enforcement === right.enforcement
+  );
 }
 
 function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {
@@ -1034,7 +1745,8 @@ function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {
 
 /**
  * The matching key of an index: its name, with absence distinct from the empty string. JSON
- * encodes the optional name so the two never collapse.
+ * encodes the optional name so the two never collapse; every unnamed index shares the absent
+ * key, and the positional pairing then separates them by structure.
  */
 function indexIdentity(index: Index): string {
   return JSON.stringify([index.name]);
@@ -1059,6 +1771,14 @@ function compareTables(left: TableIdentity, right: TableIdentity): number {
 
 function compareSequences(left: SequenceIdentity, right: SequenceIdentity): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareViews(left: ViewIdentity, right: ViewIdentity): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+function compareExtensions(left: ExtensionIdentity, right: ExtensionIdentity): number {
+  return compareStrings(left.name, right.name);
 }
 
 function compareForeignKeys(left: ForeignKey, right: ForeignKey): number {

@@ -1,9 +1,18 @@
 import { diff } from './diff.ts';
-import type { ColumnFieldChange, IdentityFieldChange, SequenceFieldChange } from './diff.ts';
+import type {
+  Change,
+  ColumnFieldChange,
+  ExtensionFieldChange,
+  IdentityFieldChange,
+  SequenceFieldChange,
+} from './diff.ts';
 import type { Identity } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  Extension,
+  ExtensionIdentity,
   ForeignKey,
   Index,
   Model,
@@ -13,7 +22,10 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
+  ViewIdentity,
 } from './model.ts';
 
 /**
@@ -22,12 +34,14 @@ import type {
  * `plan` runs the diff between a baseline model and a target model, expands every change into
  * executable steps, and reorders them so the dependencies the model can express are respected:
  * sequences before the tables that own them, referencing tables before the tables they
- * reference, and constraints before the primary keys and columns they depend on. It is the
- * change engine's ordering pass: the plan carries every payload a renderer needs and partitions
- * its steps into transaction groups, telling a renderer what applies as one unit; hazards are a
- * separate analysis.
+ * reference, constraints before the primary keys and columns they depend on, view drops before
+ * the table drops they could block, and view creates after the table work they may read. It is
+ * the change engine's ordering pass: the plan carries every payload a renderer needs and
+ * partitions its steps into transaction groups, telling a renderer what applies as one unit;
+ * hazards are a separate analysis.
  *
- * A step is one of twenty-three kinds. A table addition becomes a create-table step carrying
+ * A step is one of thirty-four kinds. A schema the target's objects use but the baseline's do
+ * not becomes a create-schema step. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
  * check constraint, and one create-index step per index — the create-table payload is always
@@ -35,18 +49,25 @@ import type {
  * with its own step and constraints attach only once every referenced table exists. A table
  * removal becomes a drop-table step. A changed table is mapped member by member: a removed
  * column becomes drop-column, an added column add-column, a changed column alter-column
- * carrying only its differing fields in the fixed order `type`, `notNull`, `default`, plus,
- * when the column's identity differs, identity steps — an identity addition becomes an
- * add-identity step carrying the target descriptor, a removal a drop-identity, a change an
- * alter-identity carrying only its differing fields, and a stated sequence-name mismatch a
- * drop-identity and an add-identity (a recreation); a removed, added, or changed primary key
- * becomes a drop-primary-key and/or add-primary-key step; a removed, added, or changed foreign
- * key becomes a drop-foreign-key and/or add-foreign-key step; a removed, added, or changed
- * unique constraint becomes a drop-unique-constraint and/or add-unique-constraint step; a
- * removed, added, or changed check constraint becomes a drop-check-constraint and/or
- * add-check-constraint step; and a removed, added, or changed index becomes a drop-index and/or
- * create-index step. A changed primary key, foreign key, unique constraint, check constraint,
- * or index decomposes into its drop half and its add half.
+ * carrying only its differing fields in the fixed order `type`, `notNull`, `notNullName`,
+ * `default`, `collation`, `storage`, `compression`, and, when any of `type`, `collation`,
+ * `storage`, or `compression` differs, the target-side `attributes` carrier the renderer
+ * restates from — except that a `notNullName` difference is name-involved: the plan consumes
+ * the `notNull` and `notNullName` fields into a drop-not-null and/or add-not-null step (a drop
+ * when the baseline column is NOT NULL, an add when the target is) and keeps only the
+ * remaining fields in an alter-column; a changed persistence becomes an alter-persistence
+ * step carrying the target state; plus, when the column's identity differs, identity steps:
+ * an identity addition becomes an add-identity step carrying the target descriptor, a
+ * removal a drop-identity, a change an alter-identity carrying only its differing fields, and
+ * a stated sequence-name mismatch a drop-identity and an add-identity (a recreation); a
+ * removed, added, or changed primary key becomes a drop-primary-key and/or add-primary-key
+ * step; a removed, added, or changed foreign key becomes a drop-foreign-key and/or
+ * add-foreign-key step; a removed, added, or changed unique constraint becomes a
+ * drop-unique-constraint and/or add-unique-constraint step; a removed, added, or changed check
+ * constraint becomes a drop-check-constraint and/or add-check-constraint step; and a removed,
+ * added, or changed index becomes a drop-index and/or create-index step. A changed primary key,
+ * foreign key, unique constraint, check constraint, or index decomposes into its drop half and
+ * its add half.
  *
  * The concurrent index kinds are the plan's only non-transactional steps. A create step is
  * `create-index-concurrently` exactly when the target index states `concurrently: true`; a
@@ -67,44 +88,90 @@ import type {
  * ownership phases, and every other changed field becomes an option alter-sequence step,
  * carrying only the fields that differ.
  *
- * The final sequence is the concatenation of eight global phases, in this exact order:
+ * A view addition becomes a create-view step carrying the view as stored; a view removal
+ * becomes a drop-view step carrying the baseline identity and whether it was materialized. A
+ * changed plain view becomes a replace-view step carrying the target view: `CREATE OR REPLACE
+ * VIEW` keeps grants, ownership, and dependent views, but PostgreSQL requires compatible output
+ * columns. A changed materialized view, or any change between plain and materialized, becomes a
+ * drop-view and a create-view; a materialized view cannot be replaced, and the recreate states
+ * `WITH NO DATA`. View steps carry no column or table payloads.
  *
- * 1. drop-identity — every removed identity whose column survives, in the diff's column and
- *    table order. It runs before everything else: it must precede the `DROP NOT NULL` /
+ * An extension addition becomes a create-extension step carrying the extension as stored,
+ * comment included; its comment still travels through the terminal comment phase as the single
+ * rendered source. A removal becomes a drop-extension step carrying the baseline identity. A
+ * changed extension maps field by field — today its install schema alone — into an
+ * alter-extension step carrying the identity and only the differing value-carrying fields, so
+ * the destination is `field.after` and the plan needs no baseline lookup.
+ *
+ * A comment addition, change, or removal becomes a comment step carrying a `CommentTarget` and
+ * the target's text, absent text meaning `COMMENT … IS NULL`. The target's copied nodes never
+ * carry their own `comment`: the step's `text` is the single source of the rendered value. A
+ * node a structural change recreates (an index, a primary key, a constraint, or a view) gets a
+ * comment step right after its create when the target node states a comment, because the drop
+ * took the old one away; the plan then keeps one step per target, first occurrence wins.
+ *
+ * The final sequence is the concatenation of thirteen global phases, in this exact order:
+ *
+ * 1. create-schema, then create-extension — every schema the target uses that no baseline
+ *    object uses, in name order, then every added extension, in name order, before everything
+ *    else: an object lives in a schema and may use an extension's type or function, so both
+ *    must exist first. The schema step renders `CREATE SCHEMA IF NOT EXISTS`: schemas are not
+ *    modeled, so an existing but unmodeled namespace is not a difference and must not fail the
+ *    migration;
+ * 2. drop-identity — every removed identity whose column survives, in the diff's column and
+ *    table order. It runs before every table step: it must precede the `DROP NOT NULL` /
  *    `SET DEFAULT` the table phases put on the same column, and it frees the default sequence
- *    name for the replacement sequence the identity→serial conversion creates in phase 2 (or
- *    for the replacement identity's sequence added in phase 8);
- * 2. create-sequence — one per added sequence, in sequence identity order;
- * 3. ownership detaches — an ownership alter-sequence step for every kept sequence whose
+ *    name for the replacement sequence the identity→serial conversion creates in phase 3 (or
+ *    for the replacement identity's sequence added in phase 11);
+ * 3. create-sequence — one per added sequence, in sequence identity order;
+ * 4. ownership detaches — an ownership alter-sequence step for every kept sequence whose
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 4. table operations — the fifteen table phases listed below, in their exact order;
- * 5. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
+ * 5. drop-view — every removed view and the drop half of every rewritten one, in view identity
+ *    order. View drops precede the table phases so a removed view cannot block a table or
+ *    column drop; a dependency between views is not modeled, so a dependent view may still
+ *    fail the drop at apply. Extension removal carries the same class: `DROP EXTENSION`
+ *    defaults to RESTRICT, so a kept object that depends on a removed extension fails at apply
+ *    (phase 13);
+ * 6. table operations — the eighteen table phases listed below, in their exact order;
+ * 7. create-view, then replace-view — every added view and the create half of every rewritten
+ *    one, then the changed plain views, each bucket in view identity order. Views come after
+ *    every table phase so a view can reference a newly created table or column; a kept view
+ *    whose definition references a dropped object still fails at apply;
+ * 8. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
- *    removed in phase 3: a new owner after a phase-3 detach, a new owner over a surviving
+ *    removed in phase 4: a new owner after a phase-4 detach, a new owner over a surviving
  *    baseline one, or a detach when the target drops ownership but keeps the owner;
- * 6. sequence option alters — one alter-sequence step per changed sequence, carrying its
+ * 9. sequence option alters — one alter-sequence step per changed sequence, carrying its
  *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
  *    statement without passing through an invalid intermediate state;
- * 7. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
+ * 10. drop-sequence — every removed sequence whose owner the plan does not remove, in sequence
  *    identity order. Drops come after the table phases, so a column `DROP DEFAULT` has already
  *    released the sequence by the time its drop runs; a surviving default that still
  *    references a dropped sequence is a broken target and fails at apply;
- * 8. add-identity, then alter-identity — the identity additions and option alters, in the
+ * 11. add-identity, then alter-identity — the identity additions and option alters, in the
  *    diff's column and table order, adds before alters. They run last because `ADD GENERATED`
  *    manufactures a fresh sequence: by then the table phases have produced the column, its
- *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 7 have freed the sequence names
+ *    `SET NOT NULL`, and its `DROP DEFAULT`, and phases 2 and 10 have freed the sequence names
  *    the added identities replace. This placement alone makes both conversions compositions of
- *    ordinary steps: serial→identity is a phase-4 `DROP DEFAULT`, a phase-7 sequence drop, and
- *    a phase-8 add-identity; identity→serial is a phase-1 drop-identity, a phase-2
- *    create-sequence, and a phase-4 `SET DEFAULT`.
+ *    ordinary steps: serial→identity is a phase-6 `DROP DEFAULT`, a phase-10 sequence drop, and
+ *    a phase-11 add-identity; identity→serial is a phase-2 drop-identity, a phase-3
+ *    create-sequence, and a phase-6 `SET DEFAULT`;
+ * 12. comment — every comment addition, change, and removal, in target identity order, before
+ *    the extension teardown. Every commented object exists by then (tables, columns,
+ *    constraints, and indexes from phase 6, views from phase 7, sequences from phases 3 and 9,
+ *    identities from phase 11, extensions from phase 1) and comments never affect structure. A
+ *    removed extension emits no comment step: the drop takes its comment with it;
+ * 13. alter-extension, then drop-extension — the schema moves in name order, then the removals
+ *    in name order, last (after every dependent object and comment; a dropped extension takes
+ *    its comment with it).
  *
  * A `drop-identity` needs no drop-suppression: an identity reaches the plan as its own removal
  * only when its column survives — a removed column or table carries its identity away in that
  * drop — so every collected drop-identity names an owner that still exists.
  *
- * The table phases inside phase 4 are numbered as before (and keep their documented semantics):
+ * The table phases inside phase 6 are numbered as before (and keep their documented semantics):
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -121,18 +188,27 @@ import type {
  * 7. drop-column;
  * 8. create-table;
  * 9. add-column;
- * 10. alter-column;
- * 11. add-primary-key — after its columns exist;
- * 12. add-unique-constraint — after its columns exist;
- * 13. add-check-constraint — after its columns exist;
- * 14. create-index — after its columns exist; the concurrent variant stands alone;
- * 15. add-foreign-key — last, once both the table and the referenced table exist, with the
+ * 10. drop-not-null — the name-involved not-null drops, before the column alterations they
+ *     bracket. Each carries the name the baseline column's not-null constraint had, or no
+ *     name when it was unnamed;
+ * 11. alter-column — after the not-null drops and before the not-null adds, so a
+ *     name-involved change never rides an alter-column;
+ * 12. add-not-null — the name-involved not-null adds, after the column alterations. Each
+ *     carries the target constraint's name, or no name when the target's not-null fact is
+ *     unnamed;
+ * 13. alter-persistence — the target-side persistence changes, after the column work and
+ *     before the keys: each carries the target's persistence, or nothing for `SET LOGGED`;
+ * 14. add-primary-key — after its columns exist;
+ * 15. add-unique-constraint — after its columns exist;
+ * 16. add-check-constraint — after its columns exist;
+ * 17. create-index — after its columns exist; the concurrent variant stands alone;
+ * 18. add-foreign-key — last, once both the table and the referenced table exist, with the
  *     synthesized primary-key dependents after the diff-derived adds.
  *
  * Within a phase, steps keep the relative order the diff produced: table and sequence changes
  * in identity order, and inside a changed table the diff's documented member order. A table
  * addition contributes its unique-constraint, check-constraint, and index steps to table phases
- * 12–14 and its foreign-key steps to table phase 15, each in the added table's canonical order.
+ * 15–17 and its foreign-key steps to table phase 18, each in the added table's canonical order.
  * The steps synthesized for primary-key changes are ordered as described below, and the
  * cycle-breaking drop-foreign-key steps close table phase 1.
  *
@@ -143,7 +219,7 @@ import type {
  * T's dropped primary-key columns — an empty `referencedColumns` resolves to T's baseline
  * primary key — and whose payload the target still carries unchanged (same owning table, same
  * identity, equal fields) gets a drop-foreign-key step with the baseline payload in table
- * phase 1 and an add-foreign-key step with the target payload in table phase 15. The diff's own
+ * phase 1 and an add-foreign-key step with the target payload in table phase 18. The diff's own
  * drops and adds are never duplicated: only the occurrences the diff's identical-pair
  * cancellation leaves in place are synthesized, so a foreign key the diff removes or replaces
  * needs nothing here, and a removed table's constraints are already gone when table phase 5
@@ -204,8 +280,46 @@ export interface TransactionGroup {
   readonly transactional: boolean;
 }
 
+/**
+ * The entity a `comment` step (or a `comment-changed` change) names: one variant per
+ * `COMMENT ON` object form the model carries. Each carries the node or identity the renderer
+ * needs, never the comment text itself — the step's `text` is the single source of the rendered
+ * value, and a copied target's nodes carry no `comment` of their own. The constraint and index
+ * variants carry the whole node because an unnamed node's server name is synthesized at render
+ * time, and `view` carries `materialized` because the rendered keyword differs and a
+ * `ViewIdentity` alone does not say which kind it names.
+ */
+export type CommentTarget =
+  | { readonly kind: 'table'; readonly table: TableIdentity }
+  | { readonly kind: 'column'; readonly table: TableIdentity; readonly column: string }
+  | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
+  | { readonly kind: 'view'; readonly view: ViewIdentity; readonly materialized: boolean }
+  | { readonly kind: 'extension'; readonly extension: ExtensionIdentity }
+  | { readonly kind: 'index'; readonly table: TableIdentity; readonly index: Index }
+  | { readonly kind: 'primary-key'; readonly table: TableIdentity; readonly primaryKey: PrimaryKey }
+  | {
+      readonly kind: 'unique-constraint';
+      readonly table: TableIdentity;
+      readonly uniqueConstraint: UniqueConstraint;
+    }
+  | {
+      readonly kind: 'check-constraint';
+      readonly table: TableIdentity;
+      readonly checkConstraint: CheckConstraint;
+    }
+  | {
+      readonly kind: 'foreign-key';
+      readonly table: TableIdentity;
+      readonly foreignKey: ForeignKey;
+    };
+
 /** One planned action. */
 export type Step =
+  /**
+   * The target uses a non-`public` schema that no baseline object uses; schemas are not modeled,
+   * so this is the only step that creates a namespace. Idempotent at apply.
+   */
+  | { kind: 'create-schema'; schema: string }
   /** The target has a table the baseline does not; a copy without its foreign keys. */
   | { kind: 'create-table'; table: Table }
   /** The baseline has a table the target does not. */
@@ -214,13 +328,36 @@ export type Step =
   | { kind: 'add-column'; table: TableIdentity; column: Column }
   /** The baseline has a column the target does not. */
   | { kind: 'drop-column'; table: TableIdentity; column: Column }
-  /** A column both sides have with differing fields, in the fixed order `type`, `notNull`, `default`. */
+  /**
+   * A column both sides have with differing fields, in the fixed order `type`, `notNull`,
+   * `notNullName`, `default`, `collation`, `storage`, `compression`. A name-involved change
+   * (a differing `notNullName`) consumes both not-null fields into
+   * `drop-not-null`/`add-not-null` steps and leaves only the other fields here. The
+   * `attributes` carrier is the target side, present exactly when the diff reports one of
+   * `type`, `collation`, `storage`, or `compression`.
+   */
   | {
       kind: 'alter-column';
       table: TableIdentity;
       name: string;
       fields: readonly ColumnFieldChange[];
+      attributes?: ColumnAttributes;
     }
+  /**
+   * The baseline has a not-null fact on a column the target does not keep: a named
+   * `drop-not-null` drops the constraint by name, an unnamed one drops the column's not-null.
+   */
+  | { kind: 'drop-not-null'; table: TableIdentity; column: string; name?: string }
+  /**
+   * The target has a not-null fact on a column the baseline does not: a named `add-not-null`
+   * adds the named constraint, an unnamed one sets the column's not-null.
+   */
+  | { kind: 'add-not-null'; table: TableIdentity; column: string; name?: string }
+  /**
+   * The target's table persistence: `unlogged` sets `SET UNLOGGED`, and an absent persistence
+   * states the `LOGGED` default (`SET LOGGED`).
+   */
+  | { kind: 'alter-persistence'; table: TableIdentity; persistence?: TablePersistence }
   /** The target has an identity on a column the baseline does not; the full effective descriptor. */
   | { kind: 'add-identity'; table: TableIdentity; name: string; identity: Identity }
   /** The baseline has an identity on a column the target does not. */
@@ -265,7 +402,51 @@ export type Step =
       kind: 'alter-sequence';
       sequence: SequenceIdentity;
       fields: readonly SequenceFieldChange[];
-    };
+    }
+  /** The target has an extension the baseline does not; the full entity, comment included. */
+  | { kind: 'create-extension'; extension: Extension }
+  /**
+   * An extension both sides have with differing fields, in the diff's fixed field order. The
+   * fields are value-carrying, so the destination is `field.after` and no baseline lookup is
+   * needed.
+   */
+  | {
+      kind: 'alter-extension';
+      extension: ExtensionIdentity;
+      fields: readonly ExtensionFieldChange[];
+    }
+  /** The baseline has an extension the target does not. */
+  | { kind: 'drop-extension'; extension: ExtensionIdentity }
+  /** The target has a view the baseline does not; `materialized` decides the rendered keyword. */
+  | { kind: 'create-view'; view: View }
+  /**
+   * The baseline has a view the target does not, or the drop half of a rewritten one;
+   * `materialized` decides the rendered keyword.
+   */
+  | { kind: 'drop-view'; view: ViewIdentity; materialized: boolean }
+  /**
+   * A plain view both sides have with a differing definition or check option:
+   * `CREATE OR REPLACE VIEW`. Never materialized: a materialized view is dropped and created.
+   */
+  | { kind: 'replace-view'; view: View }
+  /**
+   * The target's comment on `target`, or the comment's removal when `text` is absent
+   * (`COMMENT … IS NULL`). `text` is the single source of the rendered value: the copied
+   * target's nodes carry no `comment` of their own.
+   */
+  | { kind: 'comment'; target: CommentTarget; text?: string };
+
+/**
+ * The exhaustiveness guard for a union `switch`: every `switch` that must understand each member
+ * ends its `default` clause here, so a member with no case fails to typecheck. It throws with
+ * `context` and the offending `kind` or `field` when one is present, else the whole value.
+ */
+export function assertNever(value: never, context: string): never {
+  const { kind, field } = value as { kind?: unknown; field?: unknown };
+  const detail =
+    typeof kind === 'string' ? kind : typeof field === 'string' ? field : String(value);
+  throw new Error(`Unhandled ${context}: ${detail}`);
+}
 
 /**
  * Whether each step kind may run inside a transaction. Every kind but the two concurrent index
@@ -274,11 +455,15 @@ export type Step =
  * stand its step alone, outside any wrapper.
  */
 export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
+  'create-schema': true,
   'create-table': true,
   'drop-table': true,
   'add-column': true,
   'drop-column': true,
   'alter-column': true,
+  'drop-not-null': true,
+  'add-not-null': true,
+  'alter-persistence': true,
   'add-identity': true,
   'drop-identity': true,
   'alter-identity': true,
@@ -297,6 +482,13 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-sequence': true,
   'drop-sequence': true,
   'alter-sequence': true,
+  'create-view': true,
+  'drop-view': true,
+  'replace-view': true,
+  'create-extension': true,
+  'alter-extension': true,
+  'drop-extension': true,
+  comment: true,
 };
 
 /**
@@ -328,6 +520,39 @@ export function groupSteps(
 }
 
 /**
+ * Every schema a model's objects name: table, sequence, view, and extension schemas, plus the
+ * schemas of stated identity sequence names. `public` is excluded, and the result is deduped and
+ * in name order. A schema is not a modeled entity, so this inventory is the only offline view of
+ * which namespaces the objects need.
+ */
+function schemaInventory(model: Model): readonly string[] {
+  const schemas = new Set<string>();
+  for (const table of model.tables) {
+    schemas.add(table.schema);
+    for (const column of table.columns) {
+      const sequenceName = column.identity?.sequenceName;
+      if (sequenceName !== undefined) schemas.add(sequenceName.schema);
+    }
+  }
+  for (const sequence of model.sequences) schemas.add(sequence.schema);
+  for (const view of model.views) schemas.add(view.schema);
+  for (const extension of model.extensions) schemas.add(extension.schema);
+  schemas.delete('public');
+  return [...schemas].sort(compareStrings);
+}
+
+/**
+ * One `create-schema` step for every schema the target uses that no baseline object uses, in
+ * name order. A baseline-only schema emits nothing: schema drops are out of scope.
+ */
+function schemaSteps(baseline: Model, target: Model): readonly Step[] {
+  const baselineSchemas = new Set(schemaInventory(baseline));
+  return schemaInventory(target)
+    .filter((schema) => !baselineSchemas.has(schema))
+    .map((schema) => ({ kind: 'create-schema', schema }));
+}
+
+/**
  * The steps from `baseline` to `target`, in dependency-correct order. Returned payloads are
  * independent copies: mutating them never affects the caller's models, and neither input is
  * mutated.
@@ -335,357 +560,37 @@ export function groupSteps(
 export function plan(baseline: Model, target: Model): Plan {
   const changes = diff(baseline, target);
 
-  const foreignKeyDrops: Step[] = [];
-  const primaryKeyDrops: Step[] = [];
-  const columnDrops: Step[] = [];
-  const removedTables: RemovedTable[] = [];
-  const tableCreates: Step[] = [];
-  const columnAdds: Step[] = [];
-  const columnAlters: Step[] = [];
-  const primaryKeyAdds: Step[] = [];
-  const foreignKeyAdds: Step[] = [];
-  const uniqueConstraintDrops: Step[] = [];
-  const uniqueConstraintAdds: Step[] = [];
-  const checkConstraintDrops: Step[] = [];
-  const checkConstraintAdds: Step[] = [];
-  const indexDrops: Step[] = [];
-  const indexCreates: Step[] = [];
-  const identityDrops: Step[] = [];
-  const identityAdds: Step[] = [];
-  const identityAlters: Step[] = [];
-  const sequenceCreates: Step[] = [];
-  const optionAlters: Step[] = [];
-  const ownershipChanges: SequenceOwnershipChange[] = [];
-  const removedSequences: RemovedSequence[] = [];
-  const removedTableKeys = new Set<string>();
-  const removedColumnKeys = new Set<string>();
+  const application = emptyChangeApplication();
+  for (const change of changes) applyChange(application, change);
 
-  for (const change of changes) {
-    switch (change.kind) {
-      case 'table-removed': {
-        removedTables.push({
-          identity: copyIdentity(change.table),
-          table: copyTable(change.table),
-        });
-        removedTableKeys.add(keyOf(change.table));
-        break;
-      }
-      case 'table-added': {
-        tableCreates.push({
-          kind: 'create-table',
-          table: copyTableForCreate(change.table),
-        });
-        for (const foreignKey of change.table.foreignKeys) {
-          foreignKeyAdds.push({
-            kind: 'add-foreign-key',
-            table: copyIdentity(change.table),
-            foreignKey: copyForeignKey(foreignKey),
-          });
-        }
-        for (const uniqueConstraint of change.table.uniqueConstraints) {
-          uniqueConstraintAdds.push({
-            kind: 'add-unique-constraint',
-            table: copyIdentity(change.table),
-            uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
-          });
-        }
-        for (const checkConstraint of change.table.checkConstraints) {
-          checkConstraintAdds.push({
-            kind: 'add-check-constraint',
-            table: copyIdentity(change.table),
-            checkConstraint: copyCheckConstraint(checkConstraint),
-          });
-        }
-        for (const index of change.table.indexes) {
-          indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
-        }
-        for (const column of change.table.columns) {
-          if (column.identity === undefined) continue;
-          identityAdds.push({
-            kind: 'add-identity',
-            table: copyIdentity(change.table),
-            name: column.name,
-            identity: copyColumnIdentity(column.identity),
-          });
-        }
-        break;
-      }
-      case 'table-changed': {
-        for (const tableChange of change.changes) {
-          switch (tableChange.kind) {
-            case 'column-removed': {
-              columnDrops.push({
-                kind: 'drop-column',
-                table: copyIdentity(change.table),
-                column: copyColumn(tableChange.column),
-              });
-              removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
-              break;
-            }
-            case 'column-added': {
-              columnAdds.push({
-                kind: 'add-column',
-                table: copyIdentity(change.table),
-                column: copyColumn(tableChange.column),
-              });
-              if (tableChange.column.identity !== undefined) {
-                identityAdds.push({
-                  kind: 'add-identity',
-                  table: copyIdentity(change.table),
-                  name: tableChange.column.name,
-                  identity: copyColumnIdentity(tableChange.column.identity),
-                });
-              }
-              break;
-            }
-            case 'column-changed': {
-              if (tableChange.fields.length > 0) {
-                columnAlters.push({
-                  kind: 'alter-column',
-                  table: copyIdentity(change.table),
-                  name: tableChange.name,
-                  fields: tableChange.fields.map(copyFieldChange),
-                });
-              }
-              const identityChange = tableChange.identity;
-              if (identityChange !== undefined) {
-                switch (identityChange.kind) {
-                  case 'added':
-                    identityAdds.push({
-                      kind: 'add-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                      identity: copyColumnIdentity(identityChange.identity),
-                    });
-                    break;
-                  case 'removed':
-                    identityDrops.push({
-                      kind: 'drop-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                    });
-                    break;
-                  case 'recreated':
-                    identityDrops.push({
-                      kind: 'drop-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                    });
-                    identityAdds.push({
-                      kind: 'add-identity',
-                      table: copyIdentity(change.table),
-                      name: tableChange.name,
-                      identity: copyColumnIdentity(identityChange.identity),
-                    });
-                    break;
-                  case 'changed':
-                    if (identityChange.fields.length > 0) {
-                      identityAlters.push({
-                        kind: 'alter-identity',
-                        table: copyIdentity(change.table),
-                        name: tableChange.name,
-                        fields: identityChange.fields.map(copyIdentityFieldChange),
-                      });
-                    }
-                    break;
-                }
-              }
-              break;
-            }
-            case 'primary-key-removed': {
-              primaryKeyDrops.push({
-                kind: 'drop-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.primaryKey),
-              });
-              break;
-            }
-            case 'primary-key-added': {
-              primaryKeyAdds.push({
-                kind: 'add-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.primaryKey),
-              });
-              break;
-            }
-            case 'primary-key-changed': {
-              primaryKeyDrops.push({
-                kind: 'drop-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.before),
-              });
-              primaryKeyAdds.push({
-                kind: 'add-primary-key',
-                table: copyIdentity(change.table),
-                primaryKey: copyPrimaryKey(tableChange.after),
-              });
-              break;
-            }
-            case 'foreign-key-removed': {
-              foreignKeyDrops.push({
-                kind: 'drop-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.foreignKey),
-              });
-              break;
-            }
-            case 'foreign-key-added': {
-              foreignKeyAdds.push({
-                kind: 'add-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.foreignKey),
-              });
-              break;
-            }
-            case 'foreign-key-changed': {
-              foreignKeyDrops.push({
-                kind: 'drop-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.before),
-              });
-              foreignKeyAdds.push({
-                kind: 'add-foreign-key',
-                table: copyIdentity(change.table),
-                foreignKey: copyForeignKey(tableChange.after),
-              });
-              break;
-            }
-            case 'unique-constraint-removed': {
-              uniqueConstraintDrops.push({
-                kind: 'drop-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
-              });
-              break;
-            }
-            case 'unique-constraint-added': {
-              uniqueConstraintAdds.push({
-                kind: 'add-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
-              });
-              break;
-            }
-            case 'unique-constraint-changed': {
-              uniqueConstraintDrops.push({
-                kind: 'drop-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.before),
-              });
-              uniqueConstraintAdds.push({
-                kind: 'add-unique-constraint',
-                table: copyIdentity(change.table),
-                uniqueConstraint: copyUniqueConstraint(tableChange.after),
-              });
-              break;
-            }
-            case 'check-constraint-removed': {
-              checkConstraintDrops.push({
-                kind: 'drop-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
-              });
-              break;
-            }
-            case 'check-constraint-added': {
-              checkConstraintAdds.push({
-                kind: 'add-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
-              });
-              break;
-            }
-            case 'check-constraint-changed': {
-              checkConstraintDrops.push({
-                kind: 'drop-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.before),
-              });
-              checkConstraintAdds.push({
-                kind: 'add-check-constraint',
-                table: copyIdentity(change.table),
-                checkConstraint: copyCheckConstraint(tableChange.after),
-              });
-              break;
-            }
-            case 'index-removed': {
-              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.index));
-              break;
-            }
-            case 'index-added': {
-              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.index));
-              break;
-            }
-            case 'index-changed': {
-              indexDrops.push(indexDropStep(copyIdentity(change.table), tableChange.before));
-              indexCreates.push(indexCreateStep(copyIdentity(change.table), tableChange.after));
-              break;
-            }
-          }
-        }
-        break;
-      }
-      case 'sequence-added': {
-        sequenceCreates.push({
-          kind: 'create-sequence',
-          sequence: copySequenceWithoutOwner(change.sequence),
-        });
-        if (change.sequence.ownedBy !== undefined) {
-          ownershipChanges.push({
-            sequence: copySequenceIdentity(change.sequence),
-            after: copyOwner(change.sequence.ownedBy),
-          });
-        }
-        break;
-      }
-      case 'sequence-removed': {
-        removedSequences.push({
-          identity: copySequenceIdentity(change.sequence),
-          ...(change.sequence.ownedBy === undefined
-            ? {}
-            : { ownedBy: copyOwner(change.sequence.ownedBy) }),
-        });
-        break;
-      }
-      case 'sequence-changed': {
-        const identity = copySequenceIdentity(change.sequence);
-        const ownership = change.changes.filter((field) => field.field === 'ownedBy');
-        const options = change.changes.filter((field) => field.field !== 'ownedBy');
-        if (options.length > 0) {
-          optionAlters.push({
-            kind: 'alter-sequence',
-            sequence: identity,
-            fields: options.map(copySequenceFieldChange),
-          });
-        }
-        for (const field of ownership) {
-          if (field.field !== 'ownedBy') continue;
-          ownershipChanges.push({
-            sequence: copySequenceIdentity(identity),
-            ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-            ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
-          });
-        }
-        break;
-      }
-    }
-  }
-
-  const { drops: tableDrops, breaks } = orderTableDrops(removedTables);
+  const { drops: tableDrops, breaks } = orderTableDrops(application.removedTables);
   const { drops: dependentKeyDrops, adds: dependentKeyAdds } = dependentForeignKeySteps(
     baseline,
     target,
-    primaryKeyDrops,
+    application.primaryKeyDrops,
   );
 
+  // The seventh recreate site: a diff-equal foreign key is dropped and re-added when its
+  // table's primary key changes, so a comment on it must be asserted again after the add.
+  // Primary-key drops were walked in diff order, and each add carries the target payload.
+  for (const step of dependentKeyAdds) {
+    if (step.kind !== 'add-foreign-key') continue;
+    pushRecreateComment(
+      application,
+      { kind: 'foreign-key', table: step.table, foreignKey: step.foreignKey },
+      step.foreignKey.comment,
+    );
+  }
+
   const columnRemoved = (table: TableIdentity, column: string): boolean =>
-    removedTableKeys.has(keyOf(table)) || removedColumnKeys.has(columnKey(table, column));
+    application.removedTableKeys.has(keyOf(table)) ||
+    application.removedColumnKeys.has(columnKey(table, column));
 
   const ownerRemoved = (owner: SequenceOwner): boolean => columnRemoved(owner.table, owner.column);
 
   const ownershipDetaches: Step[] = [];
   const ownershipAttaches: Step[] = [];
-  for (const change of ownershipChanges) {
+  for (const change of application.ownershipChanges) {
     if (change.before !== undefined && ownerRemoved(change.before)) {
       ownershipDetaches.push({
         kind: 'alter-sequence',
@@ -715,64 +620,709 @@ export function plan(baseline: Model, target: Model): Plan {
   }
 
   const sequenceDrops: Step[] = [];
-  for (const removed of removedSequences) {
+  for (const removed of application.removedSequences) {
     if (removed.ownedBy !== undefined && ownerRemoved(removed.ownedBy)) continue;
     sequenceDrops.push({ kind: 'drop-sequence', sequence: removed.identity });
   }
 
+  const schemaCreates = schemaSteps(baseline, target);
+
   const steps: Step[] = [
-    ...identityDrops,
-    ...sequenceCreates,
+    ...schemaCreates,
+    ...application.extensionCreates,
+    ...application.identityDrops,
+    ...application.sequenceCreates,
     ...ownershipDetaches,
-    ...foreignKeyDrops,
+    ...application.viewDrops,
+    ...application.foreignKeyDrops,
     ...dependentKeyDrops,
     ...breaks,
-    ...indexDrops,
-    ...checkConstraintDrops,
-    ...uniqueConstraintDrops,
+    ...application.indexDrops,
+    ...application.checkConstraintDrops,
+    ...application.uniqueConstraintDrops,
     ...tableDrops,
-    ...primaryKeyDrops,
-    ...columnDrops,
-    ...tableCreates,
-    ...columnAdds,
-    ...columnAlters,
-    ...primaryKeyAdds,
-    ...uniqueConstraintAdds,
-    ...checkConstraintAdds,
-    ...indexCreates,
-    ...foreignKeyAdds,
+    ...application.primaryKeyDrops,
+    ...application.columnDrops,
+    ...application.tableCreates,
+    ...application.columnAdds,
+    ...application.notNullDrops,
+    ...application.columnAlters,
+    ...application.notNullAdds,
+    ...application.persistenceAlters,
+    ...application.primaryKeyAdds,
+    ...application.uniqueConstraintAdds,
+    ...application.checkConstraintAdds,
+    ...application.indexCreates,
+    ...application.foreignKeyAdds,
     ...dependentKeyAdds,
+    ...application.viewCreates,
+    ...application.viewReplaces,
     ...ownershipAttaches,
-    ...optionAlters,
+    ...application.optionAlters,
     ...sequenceDrops,
-    ...identityAdds,
-    ...identityAlters,
+    ...application.identityAdds,
+    ...application.identityAlters,
+    ...commentPhase(application.comments),
+    ...application.extensionAlters,
+    ...application.extensionDrops,
   ];
 
   return { steps, groups: groupSteps(steps) };
 }
 
+/**
+ * The buckets `plan` writes while expanding every `Change` into steps: the write side of the
+ * change application pass, exposed with `emptyChangeApplication` and `applyChange` as an
+ * internal test seam. `plan` builds one application, applies the whole diff through
+ * `applyChange`, then reads the buckets in the post-loop to order, suppress, and phase the
+ * steps. Not package API: the barrel never re-exports the values, and this seam validates
+ * nothing — `diff` never emits a kind or field outside the unions below, so unknown values
+ * here are fabricated detectors, not pipeline input. #50 extends this seam.
+ */
+export interface ChangeApplication {
+  readonly foreignKeyDrops: Step[];
+  readonly primaryKeyDrops: Step[];
+  readonly columnDrops: Step[];
+  /** Removed tables, held with their payload until table phase 5 orders the drops. */
+  readonly removedTables: RemovedTable[];
+  readonly tableCreates: Step[];
+  readonly columnAdds: Step[];
+  /** The name-involved not-null drops, bracketing the column alterations. */
+  readonly notNullDrops: Step[];
+  readonly columnAlters: Step[];
+  /** The name-involved not-null adds, bracketing the column alterations. */
+  readonly notNullAdds: Step[];
+  /** The persistence alters, after the not-null adds and before the primary-key adds. */
+  readonly persistenceAlters: Step[];
+  readonly primaryKeyAdds: Step[];
+  readonly foreignKeyAdds: Step[];
+  readonly uniqueConstraintDrops: Step[];
+  readonly uniqueConstraintAdds: Step[];
+  readonly checkConstraintDrops: Step[];
+  readonly checkConstraintAdds: Step[];
+  readonly indexDrops: Step[];
+  readonly indexCreates: Step[];
+  readonly identityDrops: Step[];
+  readonly identityAdds: Step[];
+  readonly identityAlters: Step[];
+  readonly sequenceCreates: Step[];
+  readonly optionAlters: Step[];
+  /** Added extensions, first in the plan. */
+  readonly extensionCreates: Step[];
+  /** Changed extensions, after every comment and before the removals. */
+  readonly extensionAlters: Step[];
+  /** Removed extensions, last in the plan. */
+  readonly extensionDrops: Step[];
+  /** Removed views and the drop half of rewritten ones, before the table phases. */
+  readonly viewDrops: Step[];
+  /** Added views and the create half of rewritten ones, after the table phases. */
+  readonly viewCreates: Step[];
+  /** Changed plain views, applied with `CREATE OR REPLACE VIEW` after the table phases. */
+  readonly viewReplaces: Step[];
+  /**
+   * Every comment step: the diff's `comment-changed` changes and the recreate re-assertions
+   * alike. `plan` keeps this bucket out of every other one, so the terminal phase owns every
+   * comment statement.
+   */
+  readonly comments: Step[];
+  /** A changed sequence's ownership, held until the plan knows which owners it removes. */
+  readonly ownershipChanges: SequenceOwnershipChange[];
+  /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
+  readonly removedSequences: RemovedSequence[];
+  /** The removed tables' keys, for the post-loop owner-removal test. */
+  readonly removedTableKeys: Set<string>;
+  /** The removed columns' keys, for the post-loop owner-removal test. */
+  readonly removedColumnKeys: Set<string>;
+}
+
+/**
+ * A fresh `ChangeApplication` with independent arrays and sets, so separate applications never
+ * share bucket state. Internal test seam, see `ChangeApplication`.
+ */
+export function emptyChangeApplication(): ChangeApplication {
+  return {
+    foreignKeyDrops: [],
+    primaryKeyDrops: [],
+    columnDrops: [],
+    removedTables: [],
+    tableCreates: [],
+    columnAdds: [],
+    notNullDrops: [],
+    columnAlters: [],
+    notNullAdds: [],
+    persistenceAlters: [],
+    primaryKeyAdds: [],
+    foreignKeyAdds: [],
+    uniqueConstraintDrops: [],
+    uniqueConstraintAdds: [],
+    checkConstraintDrops: [],
+    checkConstraintAdds: [],
+    indexDrops: [],
+    indexCreates: [],
+    identityDrops: [],
+    identityAdds: [],
+    identityAlters: [],
+    sequenceCreates: [],
+    optionAlters: [],
+    extensionCreates: [],
+    extensionAlters: [],
+    extensionDrops: [],
+    viewDrops: [],
+    viewCreates: [],
+    viewReplaces: [],
+    comments: [],
+    ownershipChanges: [],
+    removedSequences: [],
+    removedTableKeys: new Set<string>(),
+    removedColumnKeys: new Set<string>(),
+  };
+}
+
+/**
+ * Applies one `Change` to `application`: it writes exactly the buckets `plan` reads after the
+ * loop, with the same copies and in the same order. Internal test seam, see
+ * `ChangeApplication`.
+ */
+export function applyChange(application: ChangeApplication, change: Change): void {
+  switch (change.kind) {
+    case 'table-removed': {
+      application.removedTables.push({
+        identity: copyIdentity(change.table),
+        table: copyTable(change.table),
+      });
+      application.removedTableKeys.add(keyOf(change.table));
+      break;
+    }
+    case 'table-added': {
+      application.tableCreates.push({
+        kind: 'create-table',
+        table: copyTableForCreate(change.table),
+      });
+      for (const foreignKey of change.table.foreignKeys) {
+        application.foreignKeyAdds.push({
+          kind: 'add-foreign-key',
+          table: copyIdentity(change.table),
+          foreignKey: copyForeignKey(foreignKey),
+        });
+      }
+      for (const uniqueConstraint of change.table.uniqueConstraints) {
+        application.uniqueConstraintAdds.push({
+          kind: 'add-unique-constraint',
+          table: copyIdentity(change.table),
+          uniqueConstraint: copyUniqueConstraint(uniqueConstraint),
+        });
+      }
+      for (const checkConstraint of change.table.checkConstraints) {
+        application.checkConstraintAdds.push({
+          kind: 'add-check-constraint',
+          table: copyIdentity(change.table),
+          checkConstraint: copyCheckConstraint(checkConstraint),
+        });
+      }
+      for (const index of change.table.indexes) {
+        application.indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
+      }
+      for (const column of change.table.columns) {
+        if (column.identity === undefined) continue;
+        application.identityAdds.push({
+          kind: 'add-identity',
+          table: copyIdentity(change.table),
+          name: column.name,
+          identity: copyColumnIdentity(column.identity),
+        });
+      }
+      break;
+    }
+    case 'table-changed': {
+      for (const tableChange of change.changes) {
+        switch (tableChange.kind) {
+          case 'column-removed': {
+            application.columnDrops.push({
+              kind: 'drop-column',
+              table: copyIdentity(change.table),
+              column: copyColumn(tableChange.column),
+            });
+            application.removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
+            break;
+          }
+          case 'column-added': {
+            application.columnAdds.push({
+              kind: 'add-column',
+              table: copyIdentity(change.table),
+              column: copyColumn(tableChange.column),
+            });
+            if (tableChange.column.identity !== undefined) {
+              application.identityAdds.push({
+                kind: 'add-identity',
+                table: copyIdentity(change.table),
+                name: tableChange.column.name,
+                identity: copyColumnIdentity(tableChange.column.identity),
+              });
+            }
+            break;
+          }
+          case 'column-changed': {
+            const nameInvolved = tableChange.fields.some((field) => field.field === 'notNullName');
+            const remaining: ColumnFieldChange[] = [];
+            if (nameInvolved) {
+              // A name-involved change consumes both not-null fields: the names ride the new
+              // steps, and the not-null facts default to true when the `notNull` field is
+              // absent (a name-only change leaves the column's nullability alone).
+              let beforeNotNull = true;
+              let afterNotNull = true;
+              let beforeName: string | undefined;
+              let afterName: string | undefined;
+              for (const field of tableChange.fields) {
+                if (field.field === 'notNullName') {
+                  beforeName = field.before;
+                  afterName = field.after;
+                } else if (field.field === 'notNull') {
+                  beforeNotNull = field.before;
+                  afterNotNull = field.after;
+                } else {
+                  remaining.push(field);
+                }
+              }
+              if (beforeNotNull) {
+                application.notNullDrops.push({
+                  kind: 'drop-not-null',
+                  table: copyIdentity(change.table),
+                  column: tableChange.name,
+                  ...(beforeName === undefined ? {} : { name: beforeName }),
+                });
+              }
+              if (afterNotNull) {
+                application.notNullAdds.push({
+                  kind: 'add-not-null',
+                  table: copyIdentity(change.table),
+                  column: tableChange.name,
+                  ...(afterName === undefined ? {} : { name: afterName }),
+                });
+              }
+            } else {
+              remaining.push(...tableChange.fields);
+            }
+            if (remaining.length > 0) {
+              application.columnAlters.push({
+                kind: 'alter-column',
+                table: copyIdentity(change.table),
+                name: tableChange.name,
+                fields: remaining.map(copyFieldChange),
+                ...(tableChange.attributes === undefined
+                  ? {}
+                  : { attributes: copyStepPayload(tableChange.attributes) }),
+              });
+            }
+            const identityChange = tableChange.identity;
+            if (identityChange !== undefined) {
+              switch (identityChange.kind) {
+                case 'added':
+                  application.identityAdds.push({
+                    kind: 'add-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                    identity: copyColumnIdentity(identityChange.identity),
+                  });
+                  break;
+                case 'removed':
+                  application.identityDrops.push({
+                    kind: 'drop-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                  });
+                  break;
+                case 'recreated':
+                  application.identityDrops.push({
+                    kind: 'drop-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                  });
+                  application.identityAdds.push({
+                    kind: 'add-identity',
+                    table: copyIdentity(change.table),
+                    name: tableChange.name,
+                    identity: copyColumnIdentity(identityChange.identity),
+                  });
+                  break;
+                case 'changed':
+                  if (identityChange.fields.length > 0) {
+                    application.identityAlters.push({
+                      kind: 'alter-identity',
+                      table: copyIdentity(change.table),
+                      name: tableChange.name,
+                      fields: identityChange.fields.map(copyIdentityFieldChange),
+                    });
+                  }
+                  break;
+                default:
+                  assertNever(identityChange, 'identity change kind');
+              }
+            }
+            break;
+          }
+          case 'primary-key-removed': {
+            application.primaryKeyDrops.push({
+              kind: 'drop-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.primaryKey),
+            });
+            break;
+          }
+          case 'primary-key-added': {
+            application.primaryKeyAdds.push({
+              kind: 'add-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.primaryKey),
+            });
+            break;
+          }
+          case 'primary-key-changed': {
+            application.primaryKeyDrops.push({
+              kind: 'drop-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.before),
+            });
+            application.primaryKeyAdds.push({
+              kind: 'add-primary-key',
+              table: copyIdentity(change.table),
+              primaryKey: copyPrimaryKey(tableChange.after),
+            });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'primary-key',
+                table: change.table,
+                primaryKey: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'foreign-key-removed': {
+            application.foreignKeyDrops.push({
+              kind: 'drop-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.foreignKey),
+            });
+            break;
+          }
+          case 'foreign-key-added': {
+            application.foreignKeyAdds.push({
+              kind: 'add-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.foreignKey),
+            });
+            break;
+          }
+          case 'foreign-key-changed': {
+            application.foreignKeyDrops.push({
+              kind: 'drop-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.before),
+            });
+            application.foreignKeyAdds.push({
+              kind: 'add-foreign-key',
+              table: copyIdentity(change.table),
+              foreignKey: copyForeignKey(tableChange.after),
+            });
+            pushRecreateComment(
+              application,
+              { kind: 'foreign-key', table: change.table, foreignKey: tableChange.after },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'unique-constraint-removed': {
+            application.uniqueConstraintDrops.push({
+              kind: 'drop-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+            });
+            break;
+          }
+          case 'unique-constraint-added': {
+            application.uniqueConstraintAdds.push({
+              kind: 'add-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.uniqueConstraint),
+            });
+            break;
+          }
+          case 'unique-constraint-changed': {
+            application.uniqueConstraintDrops.push({
+              kind: 'drop-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.before),
+            });
+            application.uniqueConstraintAdds.push({
+              kind: 'add-unique-constraint',
+              table: copyIdentity(change.table),
+              uniqueConstraint: copyUniqueConstraint(tableChange.after),
+            });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'unique-constraint',
+                table: change.table,
+                uniqueConstraint: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'check-constraint-removed': {
+            application.checkConstraintDrops.push({
+              kind: 'drop-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+            });
+            break;
+          }
+          case 'check-constraint-added': {
+            application.checkConstraintAdds.push({
+              kind: 'add-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.checkConstraint),
+            });
+            break;
+          }
+          case 'check-constraint-changed': {
+            application.checkConstraintDrops.push({
+              kind: 'drop-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.before),
+            });
+            application.checkConstraintAdds.push({
+              kind: 'add-check-constraint',
+              table: copyIdentity(change.table),
+              checkConstraint: copyCheckConstraint(tableChange.after),
+            });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'check-constraint',
+                table: change.table,
+                checkConstraint: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'index-removed': {
+            application.indexDrops.push(
+              indexDropStep(copyIdentity(change.table), tableChange.index),
+            );
+            break;
+          }
+          case 'index-added': {
+            application.indexCreates.push(
+              indexCreateStep(copyIdentity(change.table), tableChange.index),
+            );
+            break;
+          }
+          case 'index-changed': {
+            application.indexDrops.push(
+              indexDropStep(copyIdentity(change.table), tableChange.before),
+            );
+            application.indexCreates.push(
+              indexCreateStep(copyIdentity(change.table), tableChange.after),
+            );
+            pushRecreateComment(
+              application,
+              { kind: 'index', table: change.table, index: tableChange.after },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'persistence-changed': {
+            application.persistenceAlters.push({
+              kind: 'alter-persistence',
+              table: copyIdentity(change.table),
+              ...(tableChange.after === undefined ? {} : { persistence: tableChange.after }),
+            });
+            break;
+          }
+          default:
+            assertNever(tableChange, 'table change kind');
+        }
+      }
+      break;
+    }
+    case 'sequence-added': {
+      application.sequenceCreates.push({
+        kind: 'create-sequence',
+        sequence: copySequenceWithoutOwner(change.sequence),
+      });
+      if (change.sequence.ownedBy !== undefined) {
+        application.ownershipChanges.push({
+          sequence: copySequenceIdentity(change.sequence),
+          after: copyOwner(change.sequence.ownedBy),
+        });
+      }
+      break;
+    }
+    case 'sequence-removed': {
+      application.removedSequences.push({
+        identity: copySequenceIdentity(change.sequence),
+        ...(change.sequence.ownedBy === undefined
+          ? {}
+          : { ownedBy: copyOwner(change.sequence.ownedBy) }),
+      });
+      break;
+    }
+    case 'sequence-changed': {
+      const identity = copySequenceIdentity(change.sequence);
+      const options: SequenceFieldChange[] = [];
+      for (const field of change.changes) {
+        switch (field.field) {
+          case 'ownedBy':
+            application.ownershipChanges.push({
+              sequence: copySequenceIdentity(identity),
+              ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
+              ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
+            });
+            break;
+          case 'dataType':
+          case 'increment':
+          case 'minValue':
+          case 'maxValue':
+          case 'start':
+          case 'cache':
+          case 'cycle':
+            options.push(copyStepPayload(field));
+            break;
+          default:
+            assertNever(field, 'sequence field');
+        }
+      }
+      if (options.length > 0) {
+        application.optionAlters.push({
+          kind: 'alter-sequence',
+          sequence: identity,
+          fields: options,
+        });
+      }
+      break;
+    }
+    case 'view-added': {
+      application.viewCreates.push({ kind: 'create-view', view: copyView(change.view) });
+      break;
+    }
+    case 'view-removed': {
+      application.viewDrops.push({
+        kind: 'drop-view',
+        view: copyViewIdentity(change.view),
+        materialized: change.view.materialized,
+      });
+      break;
+    }
+    case 'view-changed': {
+      // A plain view's definition or check-option change is an in-place replace: it keeps
+      // grants, ownership, and dependent views. A materialized view cannot be replaced, and a
+      // kind change is a different object, so both become a drop and a create — which leaves
+      // the recreated matview unpopulated and discards its indexes and dependents (named
+      // residual, ADR 0019).
+      if (change.before.materialized === false && change.after.materialized === false) {
+        application.viewReplaces.push({ kind: 'replace-view', view: copyView(change.after) });
+      } else {
+        application.viewDrops.push({
+          kind: 'drop-view',
+          view: copyViewIdentity(change.before),
+          materialized: change.before.materialized,
+        });
+        application.viewCreates.push({ kind: 'create-view', view: copyView(change.after) });
+        pushRecreateComment(
+          application,
+          {
+            kind: 'view',
+            view: change.after,
+            materialized: change.after.materialized,
+          },
+          change.after.comment,
+        );
+      }
+      break;
+    }
+    case 'extension-added': {
+      application.extensionCreates.push({
+        kind: 'create-extension',
+        extension: copyStepPayload(change.extension),
+      });
+      break;
+    }
+    case 'extension-removed': {
+      application.extensionDrops.push({
+        kind: 'drop-extension',
+        extension: copyExtensionIdentity(change.extension),
+      });
+      break;
+    }
+    case 'extension-changed': {
+      const fields: ExtensionFieldChange[] = [];
+      for (const field of change.changes) {
+        if (field.field === 'schema') {
+          fields.push(copyStepPayload(field));
+        } else {
+          // A one-member union's object type does not reduce to `never` in the else branch;
+          // the cast keeps the runtime detector real without narrowing the guard's contract
+          // for the multi-member unions elsewhere.
+          assertNever(field as never, 'extension field');
+        }
+      }
+      if (fields.length > 0) {
+        application.extensionAlters.push({
+          kind: 'alter-extension',
+          extension: copyExtensionIdentity(change.extension),
+          fields,
+        });
+      }
+      break;
+    }
+    case 'comment-changed': {
+      application.comments.push(commentStep(change.target, change.after));
+      break;
+    }
+    default:
+      assertNever(change, 'change kind');
+  }
+}
+
+/** A copy of `view`, independent of the diff's change. */
+function copyView(view: View): View {
+  return { ...view };
+}
+
+/** A copy of a view identity, independent of the diff's change. */
+function copyViewIdentity(identity: ViewIdentity): ViewIdentity {
+  return { schema: identity.schema, name: identity.name };
+}
+
+/** A copy of an extension identity, independent of the diff's change. */
+function copyExtensionIdentity(identity: ExtensionIdentity): ExtensionIdentity {
+  return { name: identity.name };
+}
+
 /** A changed sequence's ownership, held until the plan knows which owners it removes. */
-interface SequenceOwnershipChange {
+export interface SequenceOwnershipChange {
   readonly sequence: SequenceIdentity;
   readonly before?: SequenceOwner;
   readonly after?: SequenceOwner;
 }
 
 /** A removed sequence, held until the plan knows whether its owner's drop cascades it. */
-interface RemovedSequence {
+export interface RemovedSequence {
   readonly identity: SequenceIdentity;
   readonly ownedBy?: SequenceOwner;
 }
 
 /** A removed table, held with its canonical payload while table phase 5 orders the drops. */
-interface RemovedTable {
+export interface RemovedTable {
   readonly identity: TableIdentity;
   readonly table: Table;
 }
 
 /**
- * Phase 5: orders the removed tables' drops so a table is dropped only once no remaining
+ * Table phase 5: orders the removed tables' drops so a table is dropped only once no remaining
  * removed table references it, breaking reference cycles with explicit drop-foreign-key
  * steps aimed at the table about to be dropped. Returns the drops in execution order and the
  * cycle-breaking steps in discovery order.
@@ -889,14 +1439,25 @@ function copyUniqueConstraint(uniqueConstraint: UniqueConstraint): UniqueConstra
   return { ...uniqueConstraint, columns: [...uniqueConstraint.columns] };
 }
 
+/**
+ * A deep copy of a step-embedded payload, independent of the diff's `Change`. `structuredClone`
+ * preserves the payload's shape — undefined-valued keys and key order included — and throws
+ * loudly on a non-cloneable value (payloads are plain data). Every payload that reaches a step
+ * through a whole-object copy goes through here, so a future nested field cannot alias the
+ * diff's change.
+ */
+function copyStepPayload<T>(value: T): T {
+  return structuredClone(value);
+}
+
 /** A copy of `checkConstraint`, independent of the caller's model. */
 function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint {
-  return { ...checkConstraint };
+  return copyStepPayload(checkConstraint);
 }
 
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
-  return { ...index, columns: [...index.columns] };
+  return copyStepPayload(index);
 }
 
 /** The create step for `index`: concurrent exactly when the index states `concurrently`. */
@@ -917,14 +1478,182 @@ function indexDropStep(table: TableIdentity, index: Index): Step {
   };
 }
 
+/** A writable view of a model payload, for the one place a copy is stripped. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * The `comment` step for `target`: the target is copied without any carried node's `comment`,
+ * and `text` — absent for a removal — is the single source of the rendered value.
+ */
+function commentStep(target: CommentTarget, text: string | undefined): Step {
+  return {
+    kind: 'comment',
+    target: copyCommentTarget(target),
+    ...(text === undefined ? {} : { text }),
+  };
+}
+
+/**
+ * Re-asserts `comment` after a recreate, when the target node states one: the drop half took the
+ * old comment away. A target the diff also reports as `comment-changed` is deduped by the
+ * terminal phase, and both steps carry the target node's text, so one step survives.
+ */
+function pushRecreateComment(
+  application: ChangeApplication,
+  target: CommentTarget,
+  comment: string | undefined,
+): void {
+  if (comment === undefined) return;
+  application.comments.push(commentStep(target, comment));
+}
+
+/**
+ * A deep copy of `target` with every carried node stripped of its `comment`: a step's `text` is
+ * the single source of the rendered value, so a stale node field can never diverge from it.
+ */
+function copyCommentTarget(target: CommentTarget): CommentTarget {
+  switch (target.kind) {
+    case 'table':
+      return { kind: 'table', table: copyIdentity(target.table) };
+    case 'column':
+      return { kind: 'column', table: copyIdentity(target.table), column: target.column };
+    case 'sequence':
+      return { kind: 'sequence', sequence: copySequenceIdentity(target.sequence) };
+    case 'view':
+      return {
+        kind: 'view',
+        view: copyViewIdentity(target.view),
+        materialized: target.materialized,
+      };
+    case 'extension':
+      return { kind: 'extension', extension: copyExtensionIdentity(target.extension) };
+    case 'index': {
+      const index: Mutable<Index> = copyIndex(target.index);
+      delete index.comment;
+      return { kind: 'index', table: copyIdentity(target.table), index };
+    }
+    case 'primary-key': {
+      const primaryKey: Mutable<PrimaryKey> = copyPrimaryKey(target.primaryKey);
+      delete primaryKey.comment;
+      return { kind: 'primary-key', table: copyIdentity(target.table), primaryKey };
+    }
+    case 'unique-constraint': {
+      const uniqueConstraint: Mutable<UniqueConstraint> = copyUniqueConstraint(
+        target.uniqueConstraint,
+      );
+      delete uniqueConstraint.comment;
+      return { kind: 'unique-constraint', table: copyIdentity(target.table), uniqueConstraint };
+    }
+    case 'check-constraint': {
+      const checkConstraint: Mutable<CheckConstraint> = copyCheckConstraint(target.checkConstraint);
+      delete checkConstraint.comment;
+      return { kind: 'check-constraint', table: copyIdentity(target.table), checkConstraint };
+    }
+    case 'foreign-key': {
+      const foreignKey: Mutable<ForeignKey> = copyForeignKey(target.foreignKey);
+      delete foreignKey.comment;
+      return { kind: 'foreign-key', table: copyIdentity(target.table), foreignKey };
+    }
+  }
+}
+
+/**
+ * The identity key of a comment target: the relation identity — a schema-qualified relation or
+ * the name-only extension, whose empty schema slot sorts it before every qualified relation —
+ * the target kind, then the member's name or identity — a column's name, a constraint's columns
+ * or expression, a foreign key's referencing columns and referenced table, or an index's name
+ * (an unnamed index by its structure). It deliberately ignores `comment` and every other text
+ * value, so the diff's change and a recreate re-assertion for the same target agree on one key.
+ * Targets that share the model's identity share a key, and the terminal phase keeps the first
+ * step: a recreated node's re-assertion and the diff's change carry the same target text, while
+ * two structurally identical unnamed nodes are one server object the model cannot distinguish,
+ * so one step is the only coherent assertion.
+ */
+function commentTargetKey(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
+    case 'column':
+      return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'sequence':
+      return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
+    case 'view':
+      return JSON.stringify([target.view.schema, target.view.name, 'view', '']);
+    case 'extension':
+      return JSON.stringify(['', target.extension.name, 'extension', '']);
+    case 'index':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'index',
+        target.index.name ?? [null, target.index.unique, target.index.columns],
+      ]);
+    case 'primary-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'primary-key',
+        target.primaryKey.columns,
+      ]);
+    case 'unique-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'unique-constraint',
+        target.uniqueConstraint.columns,
+      ]);
+    case 'check-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'check-constraint',
+        target.checkConstraint.expression,
+      ]);
+    case 'foreign-key':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'foreign-key',
+        [
+          target.foreignKey.columns,
+          target.foreignKey.referencedTable.schema,
+          target.foreignKey.referencedTable.name,
+        ],
+      ]);
+  }
+}
+
+/**
+ * The terminal comment phase: the bucket sorted by target identity, one step per target. A
+ * target appears twice only when the diff also emitted a change for a node a structural change
+ * recreates; both steps carry the target node's text, so keeping the first is sound.
+ */
+function commentPhase(steps: readonly Step[]): Step[] {
+  const comments = steps.filter(
+    (step): step is Extract<Step, { kind: 'comment' }> => step.kind === 'comment',
+  );
+  comments.sort((left, right) =>
+    compareStrings(commentTargetKey(left.target), commentTargetKey(right.target)),
+  );
+  const seen = new Set<string>();
+  const kept: Step[] = [];
+  for (const step of comments) {
+    const key = commentTargetKey(step.target);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(step);
+  }
+  return kept;
+}
+
 /** A copy of one column field change, independent of the diff's payload. */
 function copyFieldChange(field: ColumnFieldChange): ColumnFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of one identity field change, independent of the diff's payload. */
 function copyIdentityFieldChange(field: IdentityFieldChange): IdentityFieldChange {
-  return { ...field };
+  return copyStepPayload(field);
 }
 
 /** A copy of a column's identity descriptor, independent of the caller's model. */
@@ -939,16 +1668,6 @@ function copyColumnIdentity(identity: Identity): Identity {
             name: identity.sequenceName.name,
           },
         }),
-  };
-}
-
-/** A copy of one sequence field change, independent of the diff's payload. */
-function copySequenceFieldChange(field: SequenceFieldChange): SequenceFieldChange {
-  if (field.field !== 'ownedBy') return { ...field };
-  return {
-    field: 'ownedBy',
-    ...(field.before === undefined ? {} : { before: copyOwner(field.before) }),
-    ...(field.after === undefined ? {} : { after: copyOwner(field.after) }),
   };
 }
 
@@ -974,6 +1693,7 @@ function copySequenceWithoutOwner(sequence: Sequence): Sequence {
     start: sequence.start,
     cache: sequence.cache,
     cycle: sequence.cycle,
+    ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
   };
 }
 
@@ -999,6 +1719,8 @@ function copyTableForCreate(table: Table): Table {
     name: table.name,
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
+    ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.comment === undefined ? {} : { comment: table.comment }),
     foreignKeys: [],
     uniqueConstraints: [],
     checkConstraints: [],
@@ -1010,7 +1732,7 @@ function copyTableForCreate(table: Table): Table {
  * The foreign-key steps synthesized for the primary-key drops: for every drop, the baseline
  * foreign keys on surviving tables that resolve to the dropped key's columns and that the
  * target still carries unchanged are set aside with a phase-1 drop and restored with a
- * phase-9 add. Returns the drops and adds in matching discovery order: primary-key drops in
+ * phase-18 add. Returns the drops and adds in matching discovery order: primary-key drops in
  * diff order, dependents per drop in owning-table identity order and canonical foreign-key
  * order.
  */
@@ -1095,6 +1817,9 @@ function foreignKeyKey(foreignKey: ForeignKey): string {
     foreignKey.referencedColumns,
     foreignKey.onUpdate ?? null,
     foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? null,
+    foreignKey.initiallyDeferred ?? null,
   ]);
 }
 

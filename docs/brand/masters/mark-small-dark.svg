@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" id="sm-mark-small-dark" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="schemamill">
+  <title>schemamill — small cut (2 in / 2 out)</title>
+  <rect class="sm-bg" width="64" height="64" fill="#1c1f23"/>
+  <g class="sm-mark-sm">
+    <g class="sm-raw" fill="#fbfaf6">
+      <path d="M7 22 H19.25 A3.25 3.25 0 0 1 19.25 28.5 H7 Z"/>
+      <path d="M12 35.5 H16.75 A3.25 3.25 0 0 1 16.75 42 H12 Z"/>
+    </g>
+    <g class="sm-gate" fill="#fbfaf6">
+      <path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/>
+    </g>
+    <g class="sm-canonical" fill="#fbfaf6">
+      <path d="M42.5 22.5h15v6.5h-15Z"/>
+    </g>
+    <g class="sm-accent" fill="#c96a3b">
+      <path d="M43 35h14.5v6.5h-14.5Z"/>
+    </g>
+  </g>
+</svg>

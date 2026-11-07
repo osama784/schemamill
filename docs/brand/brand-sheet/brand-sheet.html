@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>schemamill — brand sheet</title>
+<style>
+:root{--paper:#fbfaf6;--panel:#efece4;--ink:#1c1f23;--sec:#5f6469;--faint:#9b9fa4;--accent:#a9522b;--accent-dk:#c96a3b;
+  --hair:#e7e3d8;--rule:rgba(28,31,35,.16);--mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font:13px/1.5 var(--sans);-webkit-font-smoothing:antialiased}
+.sheet{max-width:1180px;margin:0 auto}
+.mono{font-family:var(--mono);font-size:11.5px}
+.fine{font-size:11px;line-height:1.55;color:var(--sec);margin:10px 0 0}
+.shead{padding:32px 44px 20px;border-bottom:1px solid var(--rule)}
+.kicker{font:600 9.5px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--sec)}
+h1{margin:12px 0 10px;font-size:25px;line-height:1.15;font-weight:600;letter-spacing:-.01em}
+.lead{margin:0;max-width:96ch;color:var(--sec);font-size:13px}
+.factline{margin:14px 0 0;font:11.5px var(--mono);color:var(--ink);letter-spacing:.01em}
+.section{display:grid;grid-template-columns:286px 1fr;gap:36px;padding:24px 44px;border-bottom:1px solid var(--hair)}
+.snum{font:600 9.5px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
+.stitle{margin:8px 0 10px;font-size:18px;font-weight:600;letter-spacing:-.005em}
+.slead{margin:0 0 10px;color:var(--sec);font-size:12.5px}
+.slead b{color:var(--ink)}
+.col-r{min-width:0}
+.figrow{display:flex;align-items:flex-end;gap:22px;flex-wrap:wrap}
+.fig{margin:0;border:1px solid var(--hair);border-radius:2px;padding:10px;line-height:0}
+.fig-dark{background:var(--ink);border-color:var(--ink)}
+.fig-svg{display:block;width:var(--px,144px);height:var(--px,144px)}
+.hatchrow{display:flex;gap:18px;flex-wrap:wrap}
+.fig figcaption{font:10px/1.45 var(--mono);color:var(--faint);padding-top:8px;max-width:22ch}
+.measures{line-height:0;display:inline-block;border:1px solid var(--hair);border-radius:2px;padding:8px}
+table.facts{width:100%;border-collapse:collapse;font-size:12px}
+table.facts caption{text-align:left;font:600 9.5px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--sec);padding:0 0 8px}
+table.facts th,table.facts td{text-align:left;padding:6px 8px 6px 0;border-bottom:1px solid var(--hair);vertical-align:middle}
+table.facts th{font:600 9.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--sec);border-bottom:1px solid var(--rule)}
+table.facts td.note,table.facts td:last-child{color:var(--sec);font-size:11.5px}
+.sw{display:inline-block;width:32px;height:20px;border:1px solid var(--rule);vertical-align:middle}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+.ladder{display:flex;align-items:flex-end;gap:16px;padding:12px 14px;background:var(--panel);border-radius:2px;line-height:0}
+.chipbox{margin:0;display:flex;flex-direction:column;align-items:center;gap:6px;line-height:1.4}
+.chipbox figcaption{font:9.5px var(--mono);color:var(--sec)}
+.chipnat,.chipmag{display:inline-block;background-image:var(--src);background-repeat:no-repeat;background-size:var(--px) var(--px);
+  width:calc(var(--px) * 1px);height:calc(var(--px) * 1px);image-rendering:pixelated;border:1px solid var(--rule)}
+.chipmag{width:calc(var(--px) * var(--mag) * 1px);height:calc(var(--px) * var(--mag) * 1px);background-size:calc(var(--px) * var(--mag) * 1px) calc(var(--px) * var(--mag) * 1px)}
+.dodont{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+.list h3{margin:0 0 8px;font:600 9.5px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--sec)}
+.list ul{margin:0;padding-left:16px}
+.list li{margin:0 0 7px;font-size:12px;color:var(--ink)}
+.list.dont li{color:var(--sec)}
+.sfoot{display:grid;grid-template-columns:1fr 1fr;gap:36px;padding:22px 44px 30px}
+@media (max-width:900px){.section{grid-template-columns:1fr}.grid2,.dodont,.sfoot{grid-template-columns:1fr}}</style>
+</head>
+<body>
+
+<div class="sheet">
+  <header class="shead">
+    <span class="kicker">schemamill · logo kit · brand sheet</span>
+    <h1>One mass, one material rule, one warm row.</h1>
+    <p class="lead">The mark is locked: <b>A3 “material language”</b> — The Chute's composition with mill-finish round leading ends on the raw bars.
+    Everything below is either the brief or a number this build measured; the source file is named in every case.</p>
+    <p class="factline">ground #fbfaf6 · ink #1c1f23 · accent #a9522b (light) / #c96a3b (dark) · one bar = 6.5 units of the 64-unit canvas</p>
+  </header>
+
+  <section class="section" id="mark">
+    <div class="col-l">
+      <span class="snum">01 · the mark</span>
+      <h2 class="stitle">The gate is one mass</h2>
+      <p class="slead">The chock, its converging throat and the die window are cut from a single closed outline
+      (24 → 43 × 6 → 58). It is never split, never outlined, never given an inner seam: at 16 px that mass is
+      what holds the composition together.</p>
+      <p class="slead">Material rule: <b>round rods in, square-cut stock out.</b> The raw bars arrive as
+      mill-finish stock — a 3.25-radius cap on the leading end, exactly half the bar — and leave as ruled rows,
+      square and flush at the exit face.</p>
+    </div>
+    <div class="col-r">
+      <div class="figrow"><figure class="fig fig-light" style="--px:160px"><svg xmlns="http://www.w3.org/2000/svg" id="sheet-mark-light--sm-mark-light" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="schemamill mark, light" class="fig-svg">
+  <title>schemamill</title>
+  <rect class="sm-bg" width="64" height="64" fill="#fbfaf6"/>
+  <g class="sm-mark">
+    <g class="sm-raw" fill="#1c1f23">
+      <path d="M8.5 15.75 H17 A3.25 3.25 0 0 1 17 22.25 H8.5 Z"/>
+      <path d="M12.5 28 H16.25 A3.25 3.25 0 0 1 16.25 34.5 H12.5 Z"/>
+      <path d="M7 41.75 H17.75 A3.25 3.25 0 0 1 17.75 48.25 H7 Z"/>
+    </g>
+    <g class="sm-gate" fill="#1c1f23">
+      <path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/>
+    </g>
+    <g class="sm-canonical" fill="#1c1f23">
+      <path d="M42.5 16.25h15v6.5h-15Z"/>
+      <path d="M42.5 41.25h15v6.5h-15Z"/>
+    </g>
+    <g class="sm-accent" fill="#a9522b">
+      <path d="M43 28.75h14.5v6.5h-14.5Z"/>
+    </g>
+  </g>
+</svg></figure><figure class="fig fig-dark" style="--px:160px"><svg xmlns="http://www.w3.org/2000/svg" id="sheet-mark-dark--sm-mark-dark" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="schemamill mark, dark" class="fig-svg">
+  <title>schemamill</title>
+  <rect class="sm-bg" width="64" height="64" fill="#1c1f23"/>
+  <g class="sm-mark">
+    <g class="sm-raw" fill="#fbfaf6">
+      <path d="M8.5 15.75 H17 A3.25 3.25 0 0 1 17 22.25 H8.5 Z"/>
+      <path d="M12.5 28 H16.25 A3.25 3.25 0 0 1 16.25 34.5 H12.5 Z"/>
+      <path d="M7 41.75 H17.75 A3.25 3.25 0 0 1 17.75 48.25 H7 Z"/>
+    </g>
+    <g class="sm-gate" fill="#fbfaf6">
+      <path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/>
+    </g>
+    <g class="sm-canonical" fill="#fbfaf6">
+      <path d="M42.5 16.25h15v6.5h-15Z"/>
+      <path d="M42.5 41.25h15v6.5h-15Z"/>
+    </g>
+    <g class="sm-accent" fill="#c96a3b">
+      <path d="M43 28.75h14.5v6.5h-14.5Z"/>
+    </g>
+  </g>
+</svg></figure></div>
+      <p class="fine">masters/mark-{light,dark}.svg — ink box 50.5 × 52 u on a 64 u canvas; accent = the middle
+      emitted row, 14.5 × 6.5 u ≈ 7.40 % of the mark's ink by geometry; 7.19–7.42 % by decoded
+      raster (64–512 px). Worst-case ink radius 29.97 u of 32 → the 512 px avatar
+      carries 239.1 px of 256 (93.4 %) — circle-safe, both tones.</p>
+    </div>
+  </section>
+
+  <section class="section" id="dual">
+    <div class="col-l">
+      <span class="snum">02 · the dual cut</span>
+      <h2 class="stitle">2+2 at ≤ 32 px, 3+3 at ≥ 40 px</h2>
+      <p class="slead">The master is 3 in / 3 out. At ≤ 32 px its six row strokes crowd the 16 px grid, so the kit
+      ships a second, dressed cut: <b>2 in / 2 out</b>, same gate, same rules, same canvas.</p>
+      <p class="slead">In the 2+2 cut the warm row is the <b>lower</b> emitted row — the one paired with the short
+      raw stub, exactly as the master pairs its short stub (raw 28.0 → accent 28.75; here raw 35.5 → accent 35.0).</p>
+      <p class="slead">Exactly <b>16 px</b> has a third, finer cut: the same 2 in / 2 out composition with the row
+      geometry snapped to the 16 px grid (one unit is 0.25 px there, so a row edge is crisp only on a multiple of 4 —
+      bar 8 = 2 px, tops 20 / 36 = 5 px / 9 px). The 2+2 cut's 6.5-unit rows are 1.625 px at 16 px and stripe
+      (partial / solid / partial rows); at that one size the kit ships <span class="mono">masters/mark-16-*.svg</span>.</p>
+    </div>
+    <div class="col-r">
+      <div class="figrow"><figure class="fig fig-light" style="--px:144px"><svg xmlns="http://www.w3.org/2000/svg" id="sheet-small-light--sm-mark-small-light" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="schemamill small cut, light" class="fig-svg">
+  <title>schemamill — small cut (2 in / 2 out)</title>
+  <rect class="sm-bg" width="64" height="64" fill="#fbfaf6"/>
+  <g class="sm-mark-sm">
+    <g class="sm-raw" fill="#1c1f23">
+      <path d="M7 22 H19.25 A3.25 3.25 0 0 1 19.25 28.5 H7 Z"/>
+      <path d="M12 35.5 H16.75 A3.25 3.25 0 0 1 16.75 42 H12 Z"/>
+    </g>
+    <g class="sm-gate" fill="#1c1f23">
+      <path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/>
+    </g>
+    <g class="sm-canonical" fill="#1c1f23">
+      <path d="M42.5 22.5h15v6.5h-15Z"/>
+    </g>
+    <g class="sm-accent" fill="#a9522b">
+      <path d="M43 35h14.5v6.5h-14.5Z"/>
+    </g>
+  </g>
+</svg></figure><figure class="fig fig-dark" style="--px:144px"><svg xmlns="http://www.w3.org/2000/svg" id="sheet-small-dark--sm-mark-small-dark" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="schemamill small cut, dark" class="fig-svg">
+  <title>schemamill — small cut (2 in / 2 out)</title>
+  <rect class="sm-bg" width="64" height="64" fill="#1c1f23"/>
+  <g class="sm-mark-sm">
+    <g class="sm-raw" fill="#fbfaf6">
+      <path d="M7 22 H19.25 A3.25 3.25 0 0 1 19.25 28.5 H7 Z"/>
+      <path d="M12 35.5 H16.75 A3.25 3.25 0 0 1 16.75 42 H12 Z"/>
+    </g>
+    <g class="sm-gate" fill="#fbfaf6">
+      <path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/>
+    </g>
+    <g class="sm-canonical" fill="#fbfaf6">
+      <path d="M42.5 22.5h15v6.5h-15Z"/>
+    </g>
+    <g class="sm-accent" fill="#c96a3b">
+      <path d="M43 35h14.5v6.5h-14.5Z"/>
+    </g>
+  </g>
+</svg></figure>
+        <div class="ladder"><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABBklEQVR4nKWSu2oCQRSGTx4jmiZFSCaQBHKF2PgCgqCNYCWoKHh5BrVQbLyAliIoCFoJWihYKz6AWPkOu2ChoP7jIOsqszr4wZ45Z1g+9p+du/VquaUbkAqK5Sqqgd12T16PG50ZqeDx6Q3V4O/3m1rNGjozUsH75z/puo5OoCwYDEcUjibQCSwF48mUfP4ARkE+m97nTWVyVKs3sEPE2DPNZnN0gkQsQsl41FqgaRp9fDmwc0GAWcrhMC0jYJWiJOAvv7IX6nXbmMgUwfXDyLlZoBMwbxBP6FzAs/a7HUxkOsSrBMco/UasZ/BP5xEOKAt4nGOUBYVSBdXgwW7b341TpIJr2QGrnJyxJt8XqgAAAABJRU5ErkJggg==);--px:16" role="img" aria-label="16 px"></span><figcaption>16 px</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABw0lEQVR4nO2VPUtCURiA35aEBl0Kog+koUyhTyqdKiKXpDTUSpCCgkIhDYKCCIdyMFz6gKIlCYz8DRm1ZjUEgRoNDWk/QKihhnqPh9DrvSft4kUKn+HwHLjqw7nnHCs+3t8+oYSUA34d0NTchuPPuBcdsORyouWnHPD3AuYdLgifX6KxkTQglUrByJgVkskXnAkjaQDhKnIDNvssmjCSBxA2vFsQOA6i8REdsL27Dzt7B2h8LGYj+H1eNAp5FVO4CrHYA864dHW2g0wmQ+OjblWBZ30VjVJwAOE0eAQ6bS8aJRqNg8FoRePSUF8HCcYe0fb1QOgkgEYpOECtVkEIA+RyOc4yCB1L0QGJRJL5QQ0G5P44QShAPzyUfl4IEmcxm9AonAAxCAWI3oRikCwgcn2LI4W8NxZCASvT4zCobkTjU1VTC8qBUTQKMyD7i3OPYDbZz33jMelA8XyHxqda0w39nkM0SkEBhKfHexy5sI5h0QP8vk1cBRNaBnIR2exzEI3FccZlbVIPqspXND4KZQt0zCyjUZgB+ZDkKi6Ukv4ZkaU3GCfSlxYLSQMWnG44C1+gsZE0IHtzsigH/O+AYlMO+AJNjypwzAfRSwAAAABJRU5ErkJggg==);--px:32" role="img" aria-label="32 px"></span><figcaption>32 px</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAC/klEQVR4nO2ZP2gTURzHf25SMVvAJlluUJOAOPQvOCnWwUKjNpUWI5qKlRZsnSqodbARWq1gFSou2qKTdUkholasoIONbkJScXBJ6p6Agw76+xUCbS5J7+XeveQuvw/k5XtL6H16736/996Ov39+/4MGhgWwABbAAlgAfluGtvcAjnL4+eMbjnJhASyABbAAFoDflsECGl3A0PAoLL9bwWSemgjIZLKQXf+FqTxeTzP4fF5MenK5HBzv6YNsdh2vzFETAfcfzMHsw0eYKhMM+OHu1CQEg3682srn1S8wEBnEZI7OjjYcxek92QPh3hOY9EgTQJCExNIiJj23YtPwdOE5JvWMXR6GK6MjmPRIFUB8XHldcjrQVOjHpyCd/o5XaqkLAUQqtQbdoT5MalEmIBDYD6+WXmIqj8jvyUKJALr5malYyZdgMf1norCa/IpJDaYEUBnMbFPCfF5P2ce+FPSbVBrz+TxeGaejvRVHccKnQtVXAat4Mv8MJm/fwWScmvQBViLaJTpOAJXGgy2HMBnDcQIIkcUSC6gHAcVl0eVyYY/eChPXxoUqQQERAcn4Ao7iNLn3wC63B5Me0wIK0M0n4i82hIggIuBey04cxQmEL+JnCJMeaQKIx3OzcKzrCCbjaE4SMHF9HAbPn8VkHM1JAhLxRUOt8GY0pwio1G9XQrObANrdoU8Bl2s3dLa3Cf/nC2h2EyAbTUBAMj4P1dDkbpZXBmUjIqAuGiHZNLSAhl8MXRoZg7fL7zEZw1ECbLEhIrJvF/Dvw5JobB1AW2LdodMbU0AE5QcjIi8ogtYBdDq0nQg6JdrcS1hNpSZNqgAiei4CN29cxVSacp2klSgVQMtiOhwphe0ORqoR4MUt8k8f3mDaCs33gcgFSKXX8EotSgVEy0wBWx6OigroOnoYZqZjupcgvfDoxWcW5Qcj9IcbJYhHY8U3TtCjTyWPSp9ZlPcBMhDt9iphSwGi06gSLIAFsAAc5cICWAALYAGWCqh3WAALYAEsoKEF/AcMEWLfwRXQ7AAAAABJRU5ErkJggg==);--px:64" role="img" aria-label="64 px (master)"></span><figcaption>64 px (master)</figcaption></figure></div>
+      </div>
+      <p class="fine">≤ 32 px → masters/mark-small-*.svg. ≥ 40 px → masters/mark-*.svg (its rod caps only read
+      from ~64 px). <b>16 px → masters/mark-16-*.svg</b> (the 2+2 composition on the 16 px grid).
+      Measured at true 16 px (resvg, decoded): the 2+2 cut carries 39 solid ink px, a mush score of
+      1.476 and 7 partial-only rows (the master: 42 / 1.5); the 16 px cut carries
+      46 ink px, mush <b>0.769</b> and <b>no partial-only row</b>. At 32 px the small cut is the crisper
+      raster against the master (0.407 vs 0.465) and the favicon stays on it — the 16 px cut is tuned for
+      exactly 16 px (at 20 px it measures worse than the 2+2 cut: 0.947 vs 0.581).
+      The full decoded table, at 16 / 20 / 24 / 32 / 40 px, is in the review sheet (§04) — including the sizes where the
+      per-pixel mush metric goes the other way: it oscillates with pixel alignment, while the structural figures (strokes,
+      fused masses) hold. The dual cut is a structure answer to small sizes, not a hinting pass.
+      Raw-row clearance to the gate: 7.07 / 9.13 u (exact polygon distance,
+      measured in this build; the master's own tightest figure is 4.74).</p>
+    </div>
+  </section>
+
+  <section class="section" id="palette">
+    <div class="col-l">
+      <span class="snum">03 · palette</span>
+      <h2 class="stitle">One ink, one warm row</h2>
+      <p class="slead">Both colorways are three values: a ground, an ink and one accent. The accent is a
+      material value, never a status value.</p>
+    </div>
+    <div class="col-r">
+<div class="grid2">
+  <table class="facts">
+    <caption>Light colorway — paper</caption>
+    <tbody>
+      <tr><td><span class="sw" style="background:#fbfaf6"></span></td><td class="mono">#fbfaf6</td><td>ground</td><td class="note">the sheet, the README, documents</td></tr>
+      <tr><td><span class="sw" style="background:#1c1f23"></span></td><td class="mono">#1c1f23</td><td>ink</td><td class="note">mark, wordmark, text — 15.84:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#a9522b"></span></td><td class="mono">#a9522b</td><td>accent</td><td class="note">the mark's emitted row only — 5.12:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#5f6469"></span></td><td class="mono">#5f6469</td><td>secondary</td><td class="note">product UI text — 5.72:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#9b9fa4"></span></td><td class="mono">#9b9fa4</td><td>faint</td><td class="note">hairlines, disabled marks — 2.55:1: never text</td></tr>
+      <tr><td><span class="sw" style="background:#efece4"></span></td><td class="mono">#efece4</td><td>panel</td><td class="note">UI surface tint — 14.01:1 against ink</td></tr>
+    </tbody>
+  </table>
+  <table class="facts">
+    <caption>Dark colorway — ink</caption>
+    <tbody>
+      <tr><td><span class="sw" style="background:#1c1f23"></span></td><td class="mono">#1c1f23</td><td>ground</td><td class="note">dark README banner, dark cover</td></tr>
+      <tr><td><span class="sw" style="background:#fbfaf6"></span></td><td class="mono">#fbfaf6</td><td>ink</td><td class="note">mark, wordmark, text — 15.84:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#c96a3b"></span></td><td class="mono">#c96a3b</td><td>accent</td><td class="note">the mark's emitted row only — 4.42:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#9b9fa4"></span></td><td class="mono">#9b9fa4</td><td>secondary</td><td class="note">product UI text (dark) — 6.21:1 on ground</td></tr>
+      <tr><td><span class="sw" style="background:#5f6469"></span></td><td class="mono">#5f6469</td><td>faint</td><td class="note">hairlines, disabled marks — 2.77:1: never text</td></tr>
+    </tbody>
+  </table>
+</div>
+<p class="fine">The mark is a strict three-value system in both colorways: ground, ink, one warm row.
+Secondary, faint and panel belong to the product's interface — they never touch the mark, and the
+wordmark is always pure ink. Ratios are WCAG 2.x relative-luminance contrasts, computed from the
+hexes in this build. The dark accent's 4.42:1 is a graphic value, not a text value.
+</p></div>
+  </section>
+
+  <section class="section" id="accent">
+    <div class="col-l">
+      <span class="snum">04 · accent usage</span>
+      <h2 class="stitle">The warm thing is the output</h2>
+      <p class="slead">The accent marks the row that left the machine — the thing you review and apply. One warm
+      element per composition, graphic only, orthogonal to product semantics: it never means “dangerous”,
+      “added” or “error”, so those meanings stay free for the product's own diff and hazard vocabulary.</p>
+      <p class="slead">In every lockup the only warm element is the mark's emitted row; the wordmark and the
+      <span class="mono">studio</span> qualifier are pure ink. Moving the accent into the gate was rendered and
+      rejected twice (die window: the colour stops meaning “changed”; flow bar: at 16 px it cuts the gate in half).</p>
+    </div>
+    <div class="col-r">
+      <svg class="fig-svg" viewBox="0 0 34 8.5" width="476" height="119" role="img" aria-label="accent sample: one emitted row, warm; the rest ink">
+  <g fill="#1c1f23"><path d="M0 0h15v6.5h-15Z"/></g>
+  <g fill="#a9522b"><path d="M19 0h15v6.5h-15Z"/></g>
+</svg>
+      <p class="fine">Accent #a9522b (light) / #c96a3b (dark) — the only warm hexes in the kit. Never text, never a
+      UI state, never a second warm element. In the 3+3 mark: the middle emitted row; in the 2+2 cut: the lower
+      emitted row.</p>
+    </div>
+  </section>
+
+  <section class="section" id="hatch">
+    <div class="col-l">
+      <span class="snum">05 · hatch</span>
+      <h2 class="stitle">An annotation device, not a texture</h2>
+      <p class="slead">Hatch means “this is a hazard / this changed”. It carries meaning only next to the thing it
+      annotates, at ≥ 3-unit pitch and 1.25-unit strokes — a migration step, a diff hunk, an irreversible operation.</p>
+      <p class="slead"><b>Never on the mark.</b> Hatching the gate was built and rendered in two rounds (three
+      pitches at 512 and true 16 px): at 16 px every pitch greys the hero into the lightest element in the file,
+      and the device is spent on decoration.</p>
+    </div>
+    <div class="col-r">
+      <div class="hatchrow">
+  <figure class="fig"><svg class="fig-svg" viewBox="0 0 76 30" width="228" height="90" role="img" aria-label="the hatch device at three-unit pitch">
+    <g fill="#1c1f23" transform="translate(2 2)"><path d="M20.78 0.00L22.54 0.00L24.00 1.46L24.00 3.22ZM16.53 0.00L18.30 0.00L24.00 5.70L24.00 7.47ZM12.29 0.00L14.06 0.00L24.00 9.94L24.00 11.71ZM8.05 0.00L9.82 0.00L24.00 14.18L24.00 15.95ZM3.81 0.00L5.57 0.00L24.00 18.43L24.00 20.19ZM0.00 0.00L1.33 0.00L24.00 22.67L24.00 24.00L23.56 24.00L0.00 0.44ZM21.09 24.00L19.32 24.00L0.00 4.68L0.00 2.91ZM16.85 24.00L15.08 24.00L0.00 8.92L0.00 7.15ZM12.60 24.00L10.84 24.00L0.00 13.16L0.00 11.40ZM8.36 24.00L6.59 24.00L0.00 17.41L0.00 15.64ZM4.12 24.00L2.35 24.00L0.00 21.65L0.00 19.88Z"/></g></svg>
+    <figcaption>the pattern — 3 u pitch, 1.25 u strokes, 45°</figcaption></figure>
+  <figure class="fig"><svg class="fig-svg" viewBox="0 0 76 30" width="228" height="90" role="img" aria-label="the hatch device used beside the thing it annotates">
+    <g fill="#1c1f23"><rect x="5" y="7" width="26" height="1.2"/><rect x="5" y="13" width="18" height="1.2"/><rect x="5" y="19" width="22" height="1.2"/></g>
+    <g fill="#1c1f23" transform="translate(52 5)"><path d="M7.23 0.00L8.00 0.00L8.00 0.77ZM3.55 0.00L4.97 0.00L8.00 3.03L8.00 4.45ZM0.00 0.00L1.29 0.00L8.00 6.71L8.00 8.00L7.88 8.00L0.00 0.12ZM5.62 8.00L4.20 8.00L0.00 3.80L0.00 2.38ZM1.94 8.00L0.52 8.00L0.00 7.48L0.00 6.06Z"/></g></svg>
+    <figcaption>used beside the thing it annotates</figcaption></figure>
+  <figure class="fig"><svg class="fig-svg" viewBox="0 0 26 24" width="228" height="90" role="img" aria-label="the hazard marker: a hatched triangle">
+    <path d="M13 1 L25 22 L1 22 Z" fill="#1c1f23"/>
+    <g fill="#fbfaf6" transform="translate(0 0)"><path d="M15.91 6.10L18.17 10.06L11.59 3.47L12.21 2.39ZM21.57 15.99L23.83 19.95L10.05 6.17L10.66 5.09ZM23.33 22.00L21.63 22.00L8.50 8.87L9.12 7.79ZM19.09 22.00L17.39 22.00L6.96 11.57L7.58 10.49ZM14.85 22.00L13.15 22.00L5.42 14.27L6.03 13.19ZM10.60 22.00L8.91 22.00L3.87 16.97L4.49 15.89ZM6.36 22.00L4.66 22.00L2.33 19.67L2.95 18.59ZM2.12 22.00L1.00 22.00L1.41 21.29Z"/></g></svg>
+    <figcaption>the product's hazard marker</figcaption></figure>
+</div>
+      <p class="fine">The three drawings are illustrative of the product's vocabulary (this sheet's own device);
+      the mark's colorway stays free of them. The device was built inside the mark twice and rejected both
+      times — evidence in <span class="mono">03-the-chute/notes.md</span> and <span class="mono">shapes/a3-material-language/notes.md</span>.</p>
+    </div>
+  </section>
+
+  <section class="section" id="space">
+    <div class="col-l">
+      <span class="snum">06 · clear space</span>
+      <h2 class="stitle">One bar on every side</h2>
+      <p class="slead">Keep at least one bar module (6.5 u = 12.5 % of the mark's 52 u ink height) clear on every
+      side; two modules (13 u) when the mark sits beside type or another mark.</p>
+      <p class="slead">Both lockups already exceed it: the horizontal master holds 26.4 u (0.44 em) between the
+      mark's ink and the wordmark's ink, the stacked master 30.0 u.</p>
+    </div>
+    <div class="col-r"><svg class="measures" viewBox="0 0 88 88" width="248" height="248" role="img" aria-label="clear space: one bar module (6.5 units) around the mark's ink box">
+  <g transform="translate(12 12)" fill="#1c1f23"><path d="M8.5 15.75 H17 A3.25 3.25 0 0 1 17 22.25 H8.5 Z"/><path d="M12.5 28 H16.25 A3.25 3.25 0 0 1 16.25 34.5 H12.5 Z"/><path d="M7 41.75 H17.75 A3.25 3.25 0 0 1 17.75 48.25 H7 Z"/><path d="M24 6 H43 V58 H24 V50 L32 38.5 V25.5 L24 14 Z"/><path d="M42.5 16.25h15v6.5h-15Z"/><path d="M42.5 41.25h15v6.5h-15Z"/><path d="M43 28.75h14.5v6.5h-14.5Z"/></g>
+  <rect x="12.50" y="11.50" width="63.50" height="65.00" fill="none" stroke="#9b9fa4" stroke-width="0.4" stroke-dasharray="1.7 1.7"/>
+  <path d="M12.50 6.50 V10.90" fill="none" stroke="#9b9fa4" stroke-width="0.35"/><path d="M7.50 11.50 H11.90" fill="none" stroke="#9b9fa4" stroke-width="0.35"/>
+  <path d="M76.00 6.50 V10.90" fill="none" stroke="#9b9fa4" stroke-width="0.35"/><path d="M76.00 77.10 V81.50" fill="none" stroke="#9b9fa4" stroke-width="0.35"/>
+</svg>
+      <p class="fine">The 64-unit canvas is a drawing box, not a clear-space guarantee: it leaves 6–7 u inside,
+      which is about one bar. Clear space is a layout duty.</p>
+    </div>
+  </section>
+
+  <section class="section" id="sizes">
+    <div class="col-l">
+      <span class="snum">07 · minimum sizes</span>
+      <h2 class="stitle">Ship it where it can be read</h2>
+      <p class="slead">Verified by rendering the shipped files at true pixels (resvg, both tones) and reading the
+      raster back, not by eye.</p>
+    </div>
+    <div class="col-r">
+      <table class="facts">
+        <thead><tr><th>asset</th><th>minimum</th><th>floor (verified)</th><th>note</th></tr></thead>
+        <tbody>
+          <tr><td>16 px cut</td><td class="mono">16 px (exact)</td><td class="mono">16 px</td><td>favicon / tab icon — 2+2 with every row edge on the 16 px grid</td></tr>
+          <tr><td>small cut 2+2</td><td class="mono">20 px</td><td class="mono">20 px</td><td>the ≤32 px cut for 20–32 px; the 32 px favicon</td></tr>
+          <tr><td>master 3+3</td><td class="mono">40 px</td><td class="mono">32 px</td><td>rod caps and row texture are a ≥64 px tell</td></tr>
+          <tr><td>horizontal lockup</td><td class="mono">240 px wide</td><td class="mono">120 px wide</td><td>holds to 120; the wordmark softens but reads</td></tr>
+          <tr><td>stacked lockup</td><td class="mono">168 × 120 px</td><td class="mono">120 px <i>tall</i></td><td>the floor is the rendered <b>height</b> — below it the wordmark mushes (masters/notes.md)</td></tr>
+          <tr><td>avatar</td><td class="mono">512 px</td><td class="mono">40 px</td><td>circle-safe: worst ink radius 29.97 of 32 u</td></tr>
+          <tr><td>covers</td><td class="mono">1584 × 396</td><td class="mono">—</td><td>lockup scaled to half the canvas width; caption matched to the lockup's ink</td></tr>
+        </tbody>
+      </table>
+      <div class="ladder"><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAYAAACM/rhtAAACMklEQVR4nO2XO0sjURTHz3ZbOPkAG5sUy2pgq324xS6sguIDFBVFMaKmUBR8VFr4aMRGEHyAVj5ARcEXCoIvVFDBZyGCCBY20Q+QiIUWek5CmHhncr03d4hB5lec+SeE4Zd7z5yZ+fT0+PAMCYwtqIqS4NHxKVZx0n7/xCqHkqDr63es4txcX2CVwxaMxBZkeTfBy8srCNzfY9LRkpLA7U7BpNM/OAwDQyOYxLBMsKyixnSEJCc7YWZyNHgME+23ZvxJ+4WVz8zUGFYdKUGipsoDXR1tmEL4fLeQm18CgUAAP6nDrrK0YGd7K3irKzHpjE1MQndPLyZ1YhbUNA2yMjOgCwUdDgd+85ra+ibY3NrBpIaQYCz4/X74+z+bu9Vsf5nB9qllgsTG5jbUNTRjModdHREsFSR4s9FyQbpCF5ZWMAH2nQbFhfl4NPZfJHEVPDw6gXKPF1MId2oKrK7MYYoOT7Dvx2esfIpmT7DqSAkSeztrrwY1i+s9BZ3OL7C/u44pOq54ClIPzi8uYwrhrfYo9aDlgrHg4ghafpHEQkILJvSgplvdv/Sc4DEas9PjWPmwb34GQd5DKM3B5sb64EMDC60craAq7CpLCRJ0FZ+fHWDSievj1luCRORJaBTlFZRyt1aGyHMT0oK0xS1NDZhC0CCngS4C219msH1qEKQV8d3eYTLiTv0W3OIwb/0ZFnZ1RDAIysCbeWbYgiy2IPKxBUXHSxj2jU0EJcF4YAuq8gIl85LIh6atOwAAAABJRU5ErkJggg==);--px:40" role="img" aria-label="master 40"></span><figcaption>master 40</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABw0lEQVR4nO2VPUtCURiA35aEBl0Kog+koUyhTyqdKiKXpDTUSpCCgkIhDYKCCIdyMFz6gKIlCYz8DRm1ZjUEgRoNDWk/QKihhnqPh9DrvSft4kUKn+HwHLjqw7nnHCs+3t8+oYSUA34d0NTchuPPuBcdsORyouWnHPD3AuYdLgifX6KxkTQglUrByJgVkskXnAkjaQDhKnIDNvssmjCSBxA2vFsQOA6i8REdsL27Dzt7B2h8LGYj+H1eNAp5FVO4CrHYA864dHW2g0wmQ+OjblWBZ30VjVJwAOE0eAQ6bS8aJRqNg8FoRePSUF8HCcYe0fb1QOgkgEYpOECtVkEIA+RyOc4yCB1L0QGJRJL5QQ0G5P44QShAPzyUfl4IEmcxm9AonAAxCAWI3oRikCwgcn2LI4W8NxZCASvT4zCobkTjU1VTC8qBUTQKMyD7i3OPYDbZz33jMelA8XyHxqda0w39nkM0SkEBhKfHexy5sI5h0QP8vk1cBRNaBnIR2exzEI3FccZlbVIPqspXND4KZQt0zCyjUZgB+ZDkKi6Ukv4ZkaU3GCfSlxYLSQMWnG44C1+gsZE0IHtzsigH/O+AYlMO+AJNjypwzAfRSwAAAABJRU5ErkJggg==);--px:32" role="img" aria-label="small 32"></span><figcaption>small 32</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABBklEQVR4nKWSu2oCQRSGTx4jmiZFSCaQBHKF2PgCgqCNYCWoKHh5BrVQbLyAliIoCFoJWihYKz6AWPkOu2ChoP7jIOsqszr4wZ45Z1g+9p+du/VquaUbkAqK5Sqqgd12T16PG50ZqeDx6Q3V4O/3m1rNGjozUsH75z/puo5OoCwYDEcUjibQCSwF48mUfP4ARkE+m97nTWVyVKs3sEPE2DPNZnN0gkQsQsl41FqgaRp9fDmwc0GAWcrhMC0jYJWiJOAvv7IX6nXbmMgUwfXDyLlZoBMwbxBP6FzAs/a7HUxkOsSrBMco/UasZ/BP5xEOKAt4nGOUBYVSBdXgwW7b341TpIJr2QGrnJyxJt8XqgAAAABJRU5ErkJggg==);--px:16" role="img" aria-label="16 cut"></span><figcaption>16 cut</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAAArCAYAAAD/uIM2AAAHsUlEQVR4nO2ay29VVRSHtwMn2FscOJF2oAOlrVETXiUqxvIKUG3RFhUp4WECAQM0UR4B2gFFIo9BgVisiRSkBCKgQkKCVC2JqLw0PpK26MCBrX9AmzjQga7vXFfZd/ecc2/prYfH/pK2+5677tr7rPU7e6+9b+/5+68//zEeT0J4AXoSxQvQkyhegJ5E8QL0JIoXoCdR8ibA/v5+093zi7SyUzTuQVNcXCQtz91O3gR46fJVs7BuubSys27NKlO/drW0PHc7XoCeRPEC9CSKF6AnUfImQDYhzzw3xwwMDMireLwAPUrOAgyb3YqLx5mGzRtMYWGhvDLmfMeXZuXqddKKZ9bM6eaxshJphcMuubZmvrQ8dzo5C/DhRx6X30NxZ7MVq9aajs87pRVNcdE409v3h7TCKZ8yyRw/2iat/5eurh7TtGOXtIw51n5Qfnt0Upk9a7ppbdkrV9LohGTH6eSpT82pT86Y0pLxpnHrRrmSnRELsOalarNn53ZppcllKb5VBWjXsb/9+rP89jTvazF79x+QVmZMVA/2NbUdTv5GJEA6QnzuobKdyDC8AG8fWBWa97eYqeWTzfKli+VKGtWDHadRFeBw2bZ9p2k73C6toby2cIF5oXKutMIpTKVMWUyNOFp4AebOLS9AluJ5VQtMX8hM59aNI6G3ty+oOxBPWWmJ/IyXTU7F4MbIBhvq096+PrErMbNmVGQInfdtAZ76+LS5dOWqPBCFgU9mgTD43OUr14K/2JAA/trwHja6weLhpL7CrubFqsFVxO4TP9ReLtxzxxedpqu7J7BjM4gP9561T/wQl7373ws+Y/dJnogf14uLikJjgg8dt3LLCxBeXbQsGLxLvgRI0bt+U4O0MiGwre82ZwRy/aatYn9aWpnsfqdpMLAEWwW4bEldIBKbhi0bMpYhiPJbW1MtvrdLK42dnLFjCwPxKQjn2JEPTNuH7UN82eMD7rlpx+5AODbqw75n7ZN48+AhMgX7s6c/kg1G/ZDrrS3NgUhBfTBuW1SJCZCltbvnurRkAyJPkR0clygBvrlisXmlcqa0wrl3zH3m/ofGSyueJyc+HSQCYcyWox3qyoOHjoiQrpnjsjvTZGhgUrK0U7MWFqaCWWTb27uCzRI7OQJuC5AgIjb8N8tnmclJzo/ffS3vplG/pTK7NG7ZGPhAWG9t3Br4ZdeoM5ja4qN8ysTAN4k/eKg98M1Dk0oVmPo1q8UmJWOTOHdfl3Zmn8S0S67Xr10ls1r6/tSW/rkXxe5z2ZJFwfvcI30yPvosLXk0GEt//4DcZ0vgh9n+/QP7xMMNH8TDFlViAiQAtqi+6jwX3EgYrq3SOH+qGfv7D9IK54GyCebZxlZpxRMWBEBc9phUqLYgALFSb+pDRHJUgCSdxAGFeGX1AmkZmTVODApb/ZJ0kqvgt0nEjUDOnjkhV24kp0g2YBcvfCZX0qgt2LHkHqZVzJFW5nX64wGz78Menx0L7dMVBA8ISz0P5E/ffyNX0vDwcOQC6ifKR1jso2zjGLEA7YS4uLZKvgT4xISngieZZPAUU6doopSo5IRhC9C11YCr2OL8hvmJSk6YreL2GYfa2j60T5Zgu+RhGad0ccdii179qA/XNq4/1zaOmxYgT3KtnAHaN+aiti75EqAG0gYBLl9aJ0tOnbyKT7BLnK0GXMVg28ahfqKSY/tRW8XtE5gB2w4fDT7Hj4vtQ/t0Bcjn6NMdC2if6kd9uLauHUTZxjFsAQ6HKAGma8AZ0grn3jEFOdWAwFN7UpYTgkoNSD0F1IXMilwn2GAHK4w4Ww24isG25VoU2EJUcmw/2fpEfAvrXpcasCeoO6dOmSxlQkosTOAbbB/apxeggxuQfKI1lQYBgeqyYtd1QELt15oYsAMLGnAVQ5zfMKKSM5w+1Zba7eKFcxl9qq3tQ/t0461+3LGA60d9uLauHUTZxjFqAiS5ldUvB4lycQNys3AEUj550uAmArSQtoMwr6o22N25/fJ5CnqOOuwEgx1Y0ICrGED9ukcu1Icr36jPOAqKSs5w+tR7o8xgY6JE+dA+3ftWe3csoH2qH/Xh2rp2EGUbx6gJkOMa9xxN4ZuQqufnSSucVEHBYOKi0CACyeGHowSWY8SPqFSYYbZc48eeTXitdnZgQQOuYgDbnh0vmyEOuc93dAZj0DIAopJj+8jWJw+zzrr0RZ/c87eXrwQPAmDHfygRP+1zNAVIf4wP1JZYckSXyz8k5CTAqKWUjho2rx9MtKI3GEW+vgumH44UtO4DBMUmxA44MHtgy65ZoY7aIzMXyQL86bg1AYoGnGATdAW/2+Qczh4DGzTGoOIDTY57b8Ptk42Xnl8C98uZp+7IQe21z9EUIKitlj/g2kcxIgEqOgDgyZ9WMTf4G0W+BKiw5PX/lxACH4facv6nwssH6heyjWGkEFsOo2G0+xptRixAnkD7MJMahVkhjnwL0HP7kpMAqefY+rtwBMBXRzqTIDwEmA3+I5ovx6NAoO6y7rkzyUmAuUCBzK6X5SEbbk3iuXvJmwC1sM0FL0CP4gXoSRQvQE+ieAF6EiVvAmTzoWdT2WCXy9dJHk/eBOjx3AxegJ5E8QL0JIoXoCdRvAA9ieIF6EmUfwHpvFrUYqMKNwAAAABJRU5ErkJggg==);--px:160" role="img" aria-label="lockup 160"></span><figcaption>lockup 160</figcaption></figure><figure class="chipbox"><span class="chipnat" style="--src:url(data:image/png;base64,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);--px:120" role="img" aria-label="lockup 120"></span><figcaption>lockup 120</figcaption></figure></div>
+    </div>
+  </section>
+
+  <section class="section" id="dodont">
+    <div class="col-l">
+      <span class="snum">08 · do / don't</span>
+      <h2 class="stitle">The short list</h2>
+      <p class="slead">Everything here follows from the rules above; nothing is stylistic preference.</p>
+    </div>
+    <div class="col-r">
+      <div class="dodont">
+        <div class="list do">
+          <h3>Do</h3>
+          <ul>
+            <li>Use the 16 px cut at exactly 16 px, the 2+2 cut at 20–32 px, the 3+3 master at ≥ 40 px.</li>
+            <li>Keep the gate as one mass; keep the rows square, flush and on the 0.25 grid.</li>
+            <li>Keep exactly one warm element: the emitted row (lower row in the small cut).</li>
+            <li>Keep one bar (6.5 u) of clear space on every side.</li>
+            <li>Ship exact pixel sizes, both tones, from the kit's SVGs (no rescaling of a smaller master).</li>
+            <li>Use ink for the wordmark, in both colorways.</li>
+          </ul>
+        </div>
+        <div class="list dont">
+          <h3>Don't</h3>
+          <ul>
+            <li>Don't scale the 3+3 master down to 16 px — that is what the 2+2 and 16 px cuts are for.</li>
+            <li>Don't use the 16 px cut above 16 px, or below it without re-checking: it is tuned for one grid.</li>
+            <li>Don't hatch, texture, outline, gradient or shadow the mark.</li>
+            <li>Don't split the gate, rotate the mark, or box it in another shape.</li>
+            <li>Don't colour the wordmark, the <span class="mono">studio</span> qualifier, or the accent itself
+              (two hexes, two tones — nothing in between).</li>
+            <li>Don't give the accent a status meaning (add / remove / error / hazard).</li>
+            <li>Don't set body copy in <span class="mono">faint</span> (#9b9fa4 on paper is 2.55:1).</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="sfoot">
+    <div>
+      <span class="snum">sources</span>
+      <p class="fine">Mark: <span class="mono">shapes/a3-material-language/</span> (adopted) → <span class="mono">kit/masters/</span>.
+      Small cut: <span class="mono">refinement/03-variants/</span> rows-2x2 table + A3's dressing.
+      16 px cut: that same table with the rows snapped to the 16 px grid (masters/notes.md, measured before/after).
+      Wordmark: IBM Plex Sans Medium, SIL OFL 1.1, outlined at build time (custom details: <span class="mono">kit/wordmark/notes.md</span>).
+      Tagline (covers): “Model your database visually. Change it safely. Keep it local.”.</p>
+    </div>
+    <div>
+      <span class="snum">rebuild + verify</span>
+      <p class="fine mono">cd kit/_tooling &amp;&amp; npm i &amp;&amp; node build.mjs &amp;&amp; node check.mjs &amp;&amp; node verify-ondisk.mjs</p>
+      <p class="fine">This PNG is this sheet, screenshotted at device scale 2 (1180 CSS px wide, full height). Fonts are the
+      system stack — no font is embedded in or fetched by this page.</p>
+    </div>
+  </footer>
+</div>
+<script>
+var h = Math.ceil(document.body.getBoundingClientRect().height);
+document.body.setAttribute('data-sheet-height', String(h));
+</script>
+</body>
+</html>

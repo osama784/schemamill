@@ -9,7 +9,9 @@ import { promisify } from 'node:util';
 
 import { diff, effectiveSequence, plan } from '@schemamill/core';
 import type {
+  CatalogReader,
   Diagnostic,
+  Extension,
   Identity,
   Model,
   ReadResult,
@@ -18,9 +20,9 @@ import type {
   SequenceOwner,
 } from '@schemamill/core';
 
-import { importDump, renderSql } from './index.ts';
+import { catalogReader, importDump, renderSql } from './index.ts';
 import { scenes } from './live-scenes.ts';
-import type { LiveScene, SceneCheck } from './live-scenes.ts';
+import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts';
 
 /**
  * The live-PostgreSQL harness: every scene is built, migrated, dumped, imported back, and
@@ -32,21 +34,34 @@ import type { LiveScene, SceneCheck } from './live-scenes.ts';
  * reason, so `pnpm test` stays green without PostgreSQL. Set but unreachable, it fails loudly
  * rather than skipping. The harness spawns `psql` and `pg_dump` from `PATH` and adds no client
  * dependency of its own; the server must be PostgreSQL 13 or newer (`DROP DATABASE … FORCE`).
+ * The parent test reads `server_version_num` once before the scene loop, and a scene whose
+ * `minServerMajor` exceeds the server's major is skipped with a named reason, so a scene
+ * carrying PostgreSQL 18 shapes still lets older local servers run the rest of the corpus.
+ *
+ * Every render in this file targets that major: the baseline and target builds, the plan
+ * checks' probe renders, and the migration all pass `{ targetVersion: serverMajor }`, so the
+ * SQL is generated for the server that will apply it. A synthesized reset form the server
+ * cannot accept therefore refuses by name before any statement runs, instead of reaching
+ * `psql` as SQL the server rejects.
  *
  * Per scene, sequentially: both databases are created fresh and any raw `setupSql` the scene
  * declares is applied to both, for ambient state like a non-public schema; the baseline
  * database gets the build SQL for the baseline model (the plan from an empty model), the
  * target database the build SQL for the target model plus any raw `targetExtraSql` the scene
  * declares for objects the model cannot represent; the baseline database then gets
- * `renderSql(plan(baseline, target))`. The scene's plan checks run against that plan before any SQL, its catalog checks
- * run against the baseline database after its build, and its probes and remaining checks after
- * the migration. Both databases are dumped with `pg_dump --schema-only --no-owner
+ * `renderSql(plan(baseline, target))`, rendered for the server under test. The scene's plan
+ * checks run against that plan before any SQL, its catalog checks
+ * run against the baseline database after its build, its target checks against the target
+ * database after its build, and its probes and remaining checks after the migration. Both
+ * databases are dumped with `pg_dump --schema-only --no-owner
  * --no-privileges`, both dumps are imported, neither import may report an error diagnostic,
- * the modeled sequences and identity columns must come back exactly (see
- * `assertSequencesRetained` and `assertIdentitiesRetained`), the scene's import checks run
- * against both imported models (see `assertImportChecks`), and `diff` between the imported
- * models must be exactly empty. Databases are dropped best-effort, so a failed scene still
- * cleans up after itself.
+ * the modeled sequences, identity columns, and extensions must come back exactly (see
+ * `assertSequencesRetained`, `assertIdentitiesRetained`, and `assertExtensionsRetained`), the
+ * scene's import checks run against both imported models (see `assertImportChecks`), its
+ * cross-import checks compare the two imports to each other (see `assertCrossImportChecks`),
+ * and `diff` between the imported models must be exactly empty. A scene that declares an `introspection` assertion is then read
+ * back through the production `catalogReader` (see `assertIntrospection`). Databases are
+ * dropped best-effort, so a failed scene still cleans up after itself.
  */
 
 const execFileAsync = promisify(execFile);
@@ -68,30 +83,43 @@ test(
     if (pgUrl === undefined) return; // Unreachable: the test is skipped when the URL is unset.
     const baseUrl = validateBaseUrl(pgUrl);
     await assertReachable(baseUrl);
+    const serverMajor = Math.floor(
+      Number.parseInt(await query(baseUrl, 'show server_version_num'), 10) / 10000,
+    );
 
     const workDir = await mkdtemp(join(tmpdir(), 'schemamill-live-pg-'));
     try {
       for (const scene of scenes) {
-        await t.test(scene.name, async () => {
-          await runScene(baseUrl, workDir, scene);
-        });
+        const minMajor = scene.minServerMajor;
+        await t.test(
+          scene.name,
+          {
+            skip:
+              minMajor !== undefined && minMajor > serverMajor
+                ? `requires PostgreSQL ${minMajor} or newer (server is ${serverMajor})`
+                : false,
+          },
+          async () => {
+            await runScene(baseUrl, workDir, scene, serverMajor);
+          },
+        );
       }
       await t.test(
         'transaction rollback: a failed statement leaves no partial effect',
         async () => {
-          await assertRollbackLeavesNoPartialEffect(baseUrl, workDir);
+          await assertRollbackLeavesNoPartialEffect(baseUrl, workDir, serverMajor);
         },
       );
       await t.test(
         'falsification: without the wrappers a failed statement leaves partial effect',
         async () => {
-          await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir);
+          await assertStrippedWrappersLeavePartialEffect(baseUrl, workDir, serverMajor);
         },
       );
       await t.test(
         'falsification: wrapping the standalone concurrent build is refused',
         async () => {
-          await assertConcurrentBuildRejectsWrapping(baseUrl, workDir);
+          await assertConcurrentBuildRejectsWrapping(baseUrl, workDir, serverMajor);
         },
       );
     } finally {
@@ -121,10 +149,12 @@ test('the sequence retention guard allows state-only skips and rejects structura
   const imported = await importDump(dump);
   const scene: LiveScene = {
     name: 'state-only-skips',
-    baseline: { tables: [], sequences: [] },
+    baseline: { tables: [], sequences: [], views: [], extensions: [] },
     target: {
       tables: [],
       sequences: [effectiveSequence({ schema: 'public', name: 'state_seq' })],
+      views: [],
+      extensions: [],
     },
   };
 
@@ -192,7 +222,12 @@ async function assertReachable(baseUrl: string): Promise<void> {
  * One scene's whole round trip, against fresh databases named after the scene and this run's
  * token, so concurrent runs against one cluster never touch each other's databases.
  */
-async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Promise<void> {
+async function runScene(
+  baseUrl: string,
+  workDir: string,
+  scene: LiveScene,
+  serverMajor: number,
+): Promise<void> {
   const slug = scene.name.replace(/[^a-z0-9]+/g, '_');
   const appliedDb = `schemamill_w6_${slug}_${runToken}`;
   const targetDb = `${appliedDb}_target`;
@@ -205,8 +240,8 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     await createDatabase(baseUrl, appliedDb);
     await createDatabase(baseUrl, targetDb);
 
-    const files = await writeSceneFiles(workDir, slug, scene);
-    assertPlanChecks(scene);
+    const files = await writeSceneFiles(workDir, slug, scene, serverMajor);
+    assertPlanChecks(scene, serverMajor);
 
     if (files.setup !== undefined) {
       await applyFile(appliedUrl, files.setup);
@@ -215,6 +250,7 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
     await applyFile(appliedUrl, files.baselineBuild);
     await assertChecks(appliedUrl, scene.baselineChecks ?? []);
     await applyFile(targetUrl, files.targetBuild);
+    await assertChecks(targetUrl, scene.targetChecks ?? []);
     await applyFile(appliedUrl, files.migration);
     for (const probe of scene.probes ?? []) {
       await psql(appliedUrl, ['-c', probe]);
@@ -239,6 +275,12 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       scene,
       expected,
     );
+    assertExtensionsRetained(`${appliedDb}: imported after the migration`, scene, applied);
+    assertExtensionsRetained(
+      `${targetDb}: imported from the target model's build`,
+      scene,
+      expected,
+    );
     assertImportChecks(`${appliedDb}: imported after the migration`, scene, applied, 'applied');
     assertImportChecks(
       `${targetDb}: imported from the target model's build`,
@@ -246,12 +288,17 @@ async function runScene(baseUrl: string, workDir: string, scene: LiveScene): Pro
       expected,
       'target',
     );
+    assertCrossImportChecks(scene, applied, expected);
 
     assert.deepEqual(
       diff(applied.model, expected.model),
       [],
       `${scene.name}: the migrated database does not match the database built from the target model`,
     );
+
+    if (scene.introspection !== undefined) {
+      await assertIntrospection(appliedUrl, scene.name, applied, scene.introspection);
+    }
   } finally {
     await dropDatabase(baseUrl, appliedDb);
     await dropDatabase(baseUrl, targetDb);
@@ -300,13 +347,18 @@ interface CorruptedMigration {
 const MISSING_RELATION = 'public.t_missing';
 
 /**
- * Renders `scene`'s migration and corrupts exactly its last statement: the table reference is
- * replaced with `missing`, a relation that does not exist, so PostgreSQL fails the statement
- * with `relation "…" does not exist`. The plan is pinned first — two steps, `alter-column` then
- * `add-primary-key` — and the corruption is pinned to change exactly one rendered line, so the
- * failure is attributable to the retargeted statement and nothing else.
+ * Renders `scene`'s migration for `serverMajor` — the server that will apply it — and corrupts
+ * exactly its last statement: the table reference is replaced with `missing`, a relation that
+ * does not exist, so PostgreSQL fails the statement with `relation "…" does not exist`. The
+ * plan is pinned first — two steps, `alter-column` then `add-primary-key` — and the corruption
+ * is pinned to change exactly one rendered line, so the failure is attributable to the
+ * retargeted statement and nothing else.
  */
-function corruptLastStatement(scene: LiveScene, missing: string): CorruptedMigration {
+function corruptLastStatement(
+  scene: LiveScene,
+  missing: string,
+  serverMajor: number,
+): CorruptedMigration {
   const steps = plan(scene.baseline, scene.target).steps;
   assert.deepEqual(
     steps.map((step) => step.kind),
@@ -314,7 +366,9 @@ function corruptLastStatement(scene: LiveScene, missing: string): CorruptedMigra
     `${scene.name}: the transaction tests require the two-step shape`,
   );
 
-  const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+  const lines = renderSql(plan(scene.baseline, scene.target), {
+    targetVersion: serverMajor,
+  }).split('\n');
   const commit = lines.lastIndexOf('COMMIT;');
   assert.ok(commit > 0, `${scene.name}: the rendered migration must end with COMMIT;`);
   const statement = lines[commit - 1]!;
@@ -352,6 +406,7 @@ async function applyExpectingFailure(url: string, path: string): Promise<string>
 async function assertRollbackLeavesNoPartialEffect(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = transactionScene();
   const database = `schemamill_w6_txn_rollback_${runToken}`;
@@ -364,14 +419,16 @@ async function assertRollbackLeavesNoPartialEffect(
     const baselineFile = join(workDir, 'rollback.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
     const baseline = await importDump(await dump(url));
     assertNoErrors(`${database}: the baseline before the corrupted migration`, baseline);
 
-    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION, serverMajor);
     const migrationFile = join(workDir, 'rollback.corrupted.sql');
     await writeFile(migrationFile, corrupted.sql, 'utf8');
     const failure = await applyExpectingFailure(url, migrationFile);
@@ -403,6 +460,7 @@ async function assertRollbackLeavesNoPartialEffect(
 async function assertStrippedWrappersLeavePartialEffect(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = transactionScene();
   const database = `schemamill_w6_txn_stripped_${runToken}`;
@@ -415,12 +473,14 @@ async function assertStrippedWrappersLeavePartialEffect(
     const baselineFile = join(workDir, 'stripped.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
 
-    const corrupted = corruptLastStatement(scene, MISSING_RELATION);
+    const corrupted = corruptLastStatement(scene, MISSING_RELATION, serverMajor);
     const allLines = corrupted.sql.split('\n');
     assert.deepEqual(
       allLines.filter((line) => line === 'BEGIN;' || line === 'COMMIT;'),
@@ -472,6 +532,7 @@ async function assertStrippedWrappersLeavePartialEffect(
 async function assertConcurrentBuildRejectsWrapping(
   baseUrl: string,
   workDir: string,
+  serverMajor: number,
 ): Promise<void> {
   const scene = concurrentScene();
   const database = `schemamill_w6_concurrent_wrapped_${runToken}`;
@@ -484,12 +545,16 @@ async function assertConcurrentBuildRejectsWrapping(
     const baselineFile = join(workDir, 'concurrent.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+        targetVersion: serverMajor,
+      }),
       'utf8',
     );
     await applyFile(url, baselineFile);
 
-    const lines = renderSql(plan(scene.baseline, scene.target)).split('\n');
+    const lines = renderSql(plan(scene.baseline, scene.target), {
+      targetVersion: serverMajor,
+    }).split('\n');
     const concurrent = lines.filter((line) => line.startsWith('CREATE INDEX CONCURRENTLY '));
     assert.equal(concurrent.length, 1, `${scene.name}: exactly one concurrent statement renders`);
     const statement = concurrent[0]!;
@@ -553,11 +618,12 @@ interface SceneFiles {
   readonly targetDump: string;
 }
 
-/** Writes the scene's SQL files into `workDir` and returns every path. */
+/** Writes the scene's SQL files into `workDir`, every render targeting `serverMajor`. */
 async function writeSceneFiles(
   workDir: string,
   slug: string,
   scene: LiveScene,
+  serverMajor: number,
 ): Promise<SceneFiles> {
   const setup = scene.setupSql === undefined ? undefined : join(workDir, `${slug}.setup.sql`);
   if (setup !== undefined) await writeFile(setup, `${scene.setupSql}\n`, 'utf8');
@@ -566,13 +632,22 @@ async function writeSceneFiles(
   const migration = join(workDir, `${slug}.migrate.sql`);
   await writeFile(
     baselineBuild,
-    renderSql(plan({ tables: [], sequences: [] }, scene.baseline)),
+    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+      targetVersion: serverMajor,
+    }),
     'utf8',
   );
-  const targetSql = renderSql(plan({ tables: [], sequences: [] }, scene.target));
+  const targetSql = renderSql(
+    plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.target),
+    { targetVersion: serverMajor },
+  );
   const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
-  await writeFile(migration, renderSql(plan(scene.baseline, scene.target)), 'utf8');
+  await writeFile(
+    migration,
+    renderSql(plan(scene.baseline, scene.target), { targetVersion: serverMajor }),
+    'utf8',
+  );
   return {
     ...(setup === undefined ? {} : { setup }),
     baselineBuild,
@@ -590,11 +665,15 @@ async function assertChecks(url: string, checks: readonly SceneCheck[]): Promise
   }
 }
 
-/** Asserts every plan fact in order against `plan(baseline, target)`. */
-function assertPlanChecks(scene: LiveScene): void {
+/**
+ * Asserts every plan fact in order against `plan(baseline, target)`. Each check also receives
+ * the server's major, so a check that renders can generate the SQL for the same target the
+ * harness applies it to.
+ */
+function assertPlanChecks(scene: LiveScene, serverMajor: number): void {
   const migration = plan(scene.baseline, scene.target);
   for (const check of scene.planChecks ?? []) {
-    const failure = check.failure(migration.steps, migration);
+    const failure = check.failure(migration.steps, migration, serverMajor);
     assert.ok(
       failure === undefined,
       `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
@@ -620,6 +699,80 @@ function assertImportChecks(
       `${scene.name}: ${what}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
     );
   }
+}
+
+/**
+ * Asserts every cross-import fact in order against both dumps' imports. Cross-import facts are
+ * the server-derived equality evidence: both reads come from the same server, each from its own
+ * database's dump, so a check can compare them without pinning deparse text. Both reads must be
+ * clean first — a scene that declares cross-import checks cannot pass on two failed imports.
+ */
+function assertCrossImportChecks(
+  scene: LiveScene,
+  applied: ReadResult<Model, Diagnostic>,
+  target: ReadResult<Model, Diagnostic>,
+): void {
+  const checks = scene.crossImportChecks ?? [];
+  if (checks.length === 0) return;
+  for (const [side, result] of [
+    ['applied', applied],
+    ['target', target],
+  ] as const) {
+    const errors = result.diagnostics
+      .filter((diagnostic) => diagnostic.kind === 'error')
+      .map((diagnostic) => diagnostic.message);
+    assert.deepEqual(
+      errors,
+      [],
+      `${scene.name}: the ${side} import reported errors; cross-import checks need two clean imports`,
+    );
+  }
+  for (const check of checks) {
+    const failure = check.failure(applied, target);
+    assert.ok(
+      failure === undefined,
+      `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,
+    );
+  }
+}
+
+/**
+ * The scene's live-introspection assertion, consuming the production `catalogReader` through
+ * the seam type. The read runs against the migrated database; `matches-import` requires no
+ * diagnostics, an empty `diff` against the applied dump's import, and a model deep-equal to
+ * that import — the order-significant guard — while `flags` pins the diagnostics list exactly.
+ */
+async function assertIntrospection(
+  appliedUrl: string,
+  sceneName: string,
+  applied: ReadResult<Model, Diagnostic>,
+  assertion: SceneIntrospection,
+): Promise<void> {
+  const reader: CatalogReader<string, Model, Diagnostic> = catalogReader;
+  const introspected = await reader.introspect(appliedUrl);
+  if (assertion.assert === 'matches-import') {
+    assert.deepEqual(
+      introspected.diagnostics,
+      [],
+      `${sceneName}: introspection reported diagnostics for a scene the import considers clean`,
+    );
+    assert.deepEqual(
+      diff(introspected.model, applied.model),
+      [],
+      `${sceneName}: the introspected model does not match the applied dump's import`,
+    );
+    assert.deepEqual(
+      introspected.model,
+      applied.model,
+      `${sceneName}: the introspected model is not deep-equal to the applied dump's import`,
+    );
+    return;
+  }
+  assert.deepEqual(
+    introspected.diagnostics,
+    assertion.expected,
+    `${sceneName}: introspection diagnostics differ`,
+  );
 }
 
 /** Asserts that neither dump produced a parse error; skips and flags are allowed. */
@@ -786,6 +939,55 @@ function assertIdentitiesRetained(
     [],
     `${scene.name}: ${what}: the import named identity problems`,
   );
+}
+
+/**
+ * Asserts that every extension the target model declares survived an import with the same
+ * install schema and comment. The map is keyed by name, so an import that drops, renames, or
+ * moves an extension cannot pass by matching descriptors as a set of values. Extra imported
+ * extensions are allowed: a scene's `setupSql` may install an ambient one the model does not
+ * declare, as `introspection-flags-constraints-18` does with `btree_gist`. Scenes whose target
+ * has no extensions still reject any import diagnostic that names one.
+ */
+function assertExtensionsRetained(
+  what: string,
+  scene: LiveScene,
+  imported: ReadResult<Model, Diagnostic>,
+): void {
+  const declared = extensionByName(scene.target);
+  const found = extensionByName(imported.model);
+  const failures: string[] = [];
+  for (const [name, expected] of declared) {
+    const actual = found.get(name);
+    if (actual === undefined) {
+      failures.push(`${name}: dropped (${describeExtension(expected)})`);
+    } else if (!sameExtensionDescriptor(expected, actual)) {
+      failures.push(`${name}: ${describeExtension(expected)} became ${describeExtension(actual)}`);
+    }
+  }
+  assert.deepEqual(failures, [], `${scene.name}: ${what}: extension retention failed`);
+  assert.deepEqual(
+    imported.diagnostics
+      .filter((diagnostic) => diagnostic.message.toLowerCase().includes('extension'))
+      .map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`),
+    [],
+    `${scene.name}: ${what}: the import named extension problems`,
+  );
+}
+
+/** Every extension by name. */
+function extensionByName(model: Model): ReadonlyMap<string, Extension> {
+  return new Map(model.extensions.map((extension) => [extension.name, extension]));
+}
+
+/** Whether two extensions state the same install schema and comment. */
+function sameExtensionDescriptor(left: Extension, right: Extension): boolean {
+  return left.schema === right.schema && left.comment === right.comment;
+}
+
+/** One extension descriptor as one line, for a failure message. */
+function describeExtension(extension: Extension): string {
+  return `schema=${extension.schema} comment=${JSON.stringify(extension.comment)}`;
 }
 
 /** Every identity column's `schema.table.column` key and descriptor, as a map. */

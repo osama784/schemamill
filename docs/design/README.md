@@ -26,3 +26,5 @@ One workspace, one model, one moment: workspace and model `shop`, with the basel
 - **One vocabulary, no synonyms.** If a label here disagrees with `CONTEXT.md`, the glossary wins and the sketch is wrong.
 
 These are index sketches, not specifications: nothing here fixes layout, and the detail belongs in the domain docs and the ADRs.
+
+The brand kit — the marks, the wordmark, the exports and the brand sheet — lives in [`docs/brand/`](../brand/README.md).

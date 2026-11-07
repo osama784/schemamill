@@ -1,12 +1,32 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { effectiveIdentity, plan, sequenceTypeBounds } from './index.ts';
+import {
+  assertNever,
+  canonicalIntType,
+  diff,
+  effectiveIdentity,
+  effectiveSequence,
+  plan,
+  sequenceTypeBounds,
+  sequenceTypeChange,
+} from './index.ts';
 import type { Identity, IdentityInput } from './identity.ts';
-import type { IdentityFieldChange } from './diff.ts';
+import type {
+  Change,
+  ColumnFieldChange,
+  ExtensionFieldChange,
+  IdentityChange,
+  IdentityFieldChange,
+  SequenceFieldChange,
+  TableChange,
+} from './diff.ts';
+import type { SequenceOptions } from './sequence.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -16,13 +36,15 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
 } from './model.ts';
-import type { Step, TransactionGroup } from './plan.ts';
-import { groupSteps, TRANSACTIONAL } from './plan.ts';
+import type { ChangeApplication, CommentTarget, Step, TransactionGroup } from './plan.ts';
+import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the eight global phases with the fifteen table phases at their
+ * Tests for the migration plan: the thirteen global phases with the eighteen table phases at their
  * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
@@ -50,6 +72,8 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  persistence?: TablePersistence;
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -62,6 +86,8 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A table with an `integer` primary key column `id` and the given extra members. */
@@ -115,7 +141,12 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -165,6 +196,44 @@ const unowned = (value: Sequence): Sequence => ({
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+  extensions: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
+  extensions: [],
+});
+
+/** An extension named `name`: installed in `public` unless overridden. */
+const extension = (name: string, fields: Partial<Omit<Extension, 'name'>> = {}): Extension => ({
+  name,
+  schema: 'public',
+  ...fields,
+});
+
+/** A model of the given extensions, with no tables, sequences, or views. */
+const extensionModel = (extensions: readonly Extension[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /**
@@ -199,10 +268,17 @@ const deepFreeze = <T>(value: T): T => {
  * - an identity step must name a live column: `drop-identity` and `alter-identity` require a
  *   live identity, `add-identity` installs the step's descriptor, and `alter-identity` applies
  *   its field changes.
+ * - a sequence step must name a live sequence: `create-sequence` requires it absent and
+ *   ownerless, `drop-sequence` requires it present, and `alter-sequence` applies its field
+ *   changes, checking a detach against the step's `before` owner and an attach target against
+ *   a live table and column.
+ * - `drop-table` and `drop-column` drop every live sequence still owned by the removed owner,
+ *   mirroring the engine's ownership cascade.
  *
  * Add and alter steps update the simulated state, so the end state is compared with the target
- * table by table and constraint by constraint. Every removed table must be dropped exactly
- * once and every added table created exactly once.
+ * table by table, constraint by constraint, and sequence by sequence. Every removed table must
+ * be dropped exactly once, every added table created exactly once, and every added or removed
+ * sequence created or dropped exactly once unless the owner's removal cascades it.
  */
 
 /** The mutable shape of a model payload: the model types are readonly, the state is not. */
@@ -216,15 +292,24 @@ interface SimulatedTable {
   readonly uniqueConstraints: Mutable<UniqueConstraint>[];
   readonly checkConstraints: Mutable<CheckConstraint>[];
   readonly indexes: Mutable<Index>[];
+  persistence: TablePersistence | undefined;
+  comment: string | undefined;
 }
 
-/** The simulated database state: live tables by JSON-encoded identity. */
+/** The simulated database state: live tables by JSON-encoded identity, plus sequences and views. */
 interface SimulatedState {
   readonly tables: Map<string, SimulatedTable>;
+  readonly sequences: Map<string, Mutable<Sequence>>;
+  readonly views: Map<string, Mutable<View>>;
+  readonly extensions: Map<string, Mutable<Extension>>;
 }
 
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
 const keyOf = (identity: TableIdentity): string => JSON.stringify([identity.schema, identity.name]);
+
+/** The map key of an extension identity: its name alone, JSON-encoded. */
+const extensionKey = (identity: { readonly name: string }): string =>
+  JSON.stringify([identity.name]);
 
 /** Whether both identities name the same table. */
 const sameIdentity = (left: TableIdentity, right: TableIdentity): boolean =>
@@ -267,6 +352,14 @@ const copyIdentityDescriptor = (identity: Identity): Identity => ({
   ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
 });
 
+/** A copy of `sequence`, independent of the caller's payload, including its owner. */
+const copySequenceState = (sequence: Sequence): Mutable<Sequence> => ({
+  ...sequence,
+  ...(sequence.ownedBy === undefined
+    ? {}
+    : { ownedBy: { table: { ...sequence.ownedBy.table }, column: sequence.ownedBy.column } }),
+});
+
 /** A structural key for a foreign key, comparing every field including absent ones. */
 const foreignKeyKey = (foreignKey: ForeignKey): string =>
   JSON.stringify([
@@ -277,15 +370,27 @@ const foreignKeyKey = (foreignKey: ForeignKey): string =>
     foreignKey.referencedColumns,
     foreignKey.onUpdate ?? null,
     foreignKey.onDelete ?? null,
+    foreignKey.enforcement ?? null,
+    foreignKey.deferrable ?? null,
+    foreignKey.initiallyDeferred ?? null,
   ]);
 
-/** A structural key for a unique constraint, comparing name and columns. */
+/** A structural key for a unique constraint, comparing name, columns, and deferrability. */
 const uniqueConstraintKey = (uniqueConstraint: UniqueConstraint): string =>
-  JSON.stringify([uniqueConstraint.name ?? null, uniqueConstraint.columns]);
+  JSON.stringify([
+    uniqueConstraint.name ?? null,
+    uniqueConstraint.columns,
+    uniqueConstraint.deferrable ?? null,
+    uniqueConstraint.initiallyDeferred ?? null,
+  ]);
 
-/** A structural key for a check constraint, comparing name and expression. */
+/** A structural key for a check constraint, comparing name, expression, and enforcement. */
 const checkConstraintKey = (checkConstraint: CheckConstraint): string =>
-  JSON.stringify([checkConstraint.name ?? null, checkConstraint.expression]);
+  JSON.stringify([
+    checkConstraint.name ?? null,
+    checkConstraint.expression,
+    checkConstraint.enforcement ?? null,
+  ]);
 
 /** A structural key for an index; `concurrently` is apply metadata and excluded. */
 const indexKey = (entry: Index): string =>
@@ -302,9 +407,17 @@ const stateOf = (model: Model): SimulatedState => {
       uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
       checkConstraints: source.checkConstraints.map(copyCheckConstraint),
       indexes: source.indexes.map(copyIndex),
+      persistence: source.persistence,
+      comment: source.comment,
     });
   }
-  return { tables };
+  const sequences = new Map<string, Mutable<Sequence>>();
+  for (const source of model.sequences) sequences.set(keyOf(source), copySequenceState(source));
+  const views = new Map<string, Mutable<View>>();
+  for (const source of model.views) views.set(keyOf(source), { ...source });
+  const extensions = new Map<string, Mutable<Extension>>();
+  for (const source of model.extensions) extensions.set(extensionKey(source), { ...source });
+  return { tables, sequences, views, extensions };
 };
 
 /**
@@ -336,12 +449,164 @@ const applyIdentityField = (identity: Identity, field: IdentityFieldChange): Ide
       return { ...identity, cache: field.after };
     case 'cycle':
       return { ...identity, cycle: field.after };
+    default:
+      return assertNever(field, 'identity field');
+  }
+};
+
+/**
+ * Drops every live sequence the engine's ownership cascade would drop with the removed owner:
+ * `predicate` selects the live owners a removed table or column covered.
+ */
+const cascadeOwnedSequences = (
+  state: SimulatedState,
+  predicate: (ownedBy: SequenceOwner) => boolean,
+): void => {
+  for (const [key, sequence] of state.sequences) {
+    if (sequence.ownedBy !== undefined && predicate(sequence.ownedBy)) state.sequences.delete(key);
+  }
+};
+
+/**
+ * Applies one emitted `ownedBy` field change to `sequence`: a detach (no `after`) requires the
+ * live owner to deep-equal the step's `before`; an attach or re-own requires the live owner to
+ * be absent or deep-equal `before`, and its target table and column to be live.
+ */
+const applySequenceOwner = (
+  state: SimulatedState,
+  sequence: Mutable<Sequence>,
+  field: { readonly before?: SequenceOwner; readonly after?: SequenceOwner },
+  key: string,
+): void => {
+  if (field.after === undefined) {
+    assert.deepStrictEqual(
+      sequence.ownedBy,
+      field.before,
+      `alter-sequence on ${key} must detach its live owner`,
+    );
+    delete sequence.ownedBy;
+    return;
+  }
+  if (sequence.ownedBy !== undefined) {
+    assert.deepStrictEqual(
+      sequence.ownedBy,
+      field.before,
+      `alter-sequence on ${key} must start from its live owner`,
+    );
+  }
+  const ownerTable = state.tables.get(keyOf(field.after.table));
+  assert.ok(
+    ownerTable !== undefined && ownerTable.columns.has(field.after.column),
+    `alter-sequence on ${key} must own live column ${field.after.column}`,
+  );
+  sequence.ownedBy = {
+    table: { schema: field.after.table.schema, name: field.after.table.name },
+    column: field.after.column,
+  };
+};
+
+/**
+ * The live node a comment step names, failing the test when the target is not live. A node a
+ * structural change recreated is matched by its structural key, so the step must target the
+ * node the plan actually left behind.
+ */
+const commentTargetNode = (
+  state: SimulatedState,
+  target: CommentTarget,
+): Mutable<{ comment?: string }> => {
+  switch (target.kind) {
+    case 'table': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on missing table ${key}`);
+      return table;
+    }
+    case 'column': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on column of missing table ${key}`);
+      const column = table.columns.get(target.column);
+      assert.ok(column !== undefined, `comment on missing column ${target.column} of ${key}`);
+      return column;
+    }
+    case 'sequence': {
+      const key = keyOf(target.sequence);
+      const sequence = state.sequences.get(key);
+      assert.ok(sequence !== undefined, `comment on missing sequence ${key}`);
+      return sequence;
+    }
+    case 'view': {
+      const key = keyOf(target.view);
+      const view = state.views.get(key);
+      assert.ok(view !== undefined, `comment on missing view ${key}`);
+      assert.equal(view.materialized, target.materialized, `comment on ${key} must carry its kind`);
+      return view;
+    }
+    case 'extension': {
+      const key = extensionKey(target.extension);
+      const found = state.extensions.get(key);
+      assert.ok(found !== undefined, `comment on missing extension ${key}`);
+      return found;
+    }
+    case 'index': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on index of missing table ${key}`);
+      const found = table.indexes.find((entry) => indexKey(entry) === indexKey(target.index));
+      assert.ok(found !== undefined, `comment on missing ${indexKey(target.index)} on ${key}`);
+      return found;
+    }
+    case 'primary-key': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on primary key of missing table ${key}`);
+      assert.ok(table.primaryKey !== undefined, `comment on missing primary key of ${key}`);
+      assert.deepStrictEqual(
+        table.primaryKey.columns,
+        target.primaryKey.columns,
+        `comment on a different primary key of ${key}`,
+      );
+      return table.primaryKey;
+    }
+    case 'unique-constraint': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.uniqueConstraints.find(
+        (entry) => uniqueConstraintKey(entry) === uniqueConstraintKey(target.uniqueConstraint),
+      );
+      assert.ok(found !== undefined, `comment on missing unique constraint of ${key}`);
+      return found;
+    }
+    case 'check-constraint': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.checkConstraints.find(
+        (entry) => checkConstraintKey(entry) === checkConstraintKey(target.checkConstraint),
+      );
+      assert.ok(found !== undefined, `comment on missing check constraint of ${key}`);
+      return found;
+    }
+    case 'foreign-key': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.foreignKeys.find(
+        (entry) => foreignKeyKey(entry) === foreignKeyKey(target.foreignKey),
+      );
+      assert.ok(found !== undefined, `comment on missing foreign key of ${key}`);
+      return found;
+    }
   }
 };
 
 /** Applies one step to `state`, failing the test when the step is illegal there. */
 const applyStep = (state: SimulatedState, step: Step): void => {
   switch (step.kind) {
+    case 'create-schema':
+      // Schemas are namespaces, not model state: the simulator tracks objects, not namespaces.
+      return;
     case 'create-table': {
       const key = keyOf(step.table);
       assert.equal(state.tables.has(key), false, `create-table of live table ${key}`);
@@ -353,6 +618,8 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         uniqueConstraints: [],
         checkConstraints: [],
         indexes: [],
+        persistence: step.table.persistence,
+        comment: step.table.comment,
       });
       return;
     }
@@ -369,6 +636,7 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         }
       }
       state.tables.delete(key);
+      cascadeOwnedSequences(state, (ownedBy) => sameIdentity(ownedBy.table, step.table));
       return;
     }
     case 'drop-foreign-key': {
@@ -431,6 +699,10 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         }
       }
       table.columns.delete(step.column.name);
+      cascadeOwnedSequences(
+        state,
+        (ownedBy) => sameIdentity(ownedBy.table, step.table) && ownedBy.column === step.column.name,
+      );
       return;
     }
     case 'add-column': {
@@ -459,12 +731,72 @@ const applyStep = (state: SimulatedState, step: Step): void => {
           case 'notNull':
             altered.notNull = field.after;
             break;
+          case 'notNullName':
+            // The plan consumes a name-involved change into drop-not-null/add-not-null steps,
+            // so an alter-column must never carry one; reaching here is a plan defect.
+            assert.fail(`alter-column on ${step.name} on ${key} must not carry a not-null name`);
+            break;
           case 'default':
             if (field.after === undefined) delete altered.default;
             else altered.default = field.after;
             break;
+          case 'collation':
+            if (field.after === undefined) delete altered.collation;
+            else altered.collation = field.after;
+            break;
+          case 'storage':
+            if (field.after === undefined) delete altered.storage;
+            else altered.storage = field.after;
+            break;
+          case 'compression':
+            if (field.after === undefined) delete altered.compression;
+            else altered.compression = field.after;
+            break;
+          default:
+            // `case 'default':` above is the column field named 'default'; this `default:` is
+            // the exhaustiveness guard and neither shadows the other.
+            assertNever(field, 'column field');
         }
       }
+      return;
+    }
+    case 'drop-not-null': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-not-null on missing table ${key}`);
+      const altered = table.columns.get(step.column);
+      assert.ok(altered !== undefined, `drop-not-null of missing ${step.column} on ${key}`);
+      assert.equal(altered.notNull, true, `drop-not-null of nullable ${step.column} on ${key}`);
+      assert.equal(
+        altered.notNullName,
+        step.name,
+        `drop-not-null of ${step.column} on ${key} must carry the live name`,
+      );
+      altered.notNull = false;
+      delete altered.notNullName;
+      return;
+    }
+    case 'add-not-null': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-not-null on missing table ${key}`);
+      const altered = table.columns.get(step.column);
+      assert.ok(altered !== undefined, `add-not-null of missing ${step.column} on ${key}`);
+      assert.equal(altered.notNull, false, `add-not-null of NOT NULL ${step.column} on ${key}`);
+      assert.equal(
+        altered.notNullName,
+        undefined,
+        `add-not-null of ${step.column} on ${key} must start unnamed`,
+      );
+      altered.notNull = true;
+      if (step.name !== undefined) altered.notNullName = step.name;
+      return;
+    }
+    case 'alter-persistence': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `alter-persistence on missing table ${key}`);
+      table.persistence = step.persistence;
       return;
     }
     case 'add-identity': {
@@ -625,10 +957,132 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       table.indexes.splice(found, 1);
       return;
     }
+    case 'create-sequence': {
+      const key = keyOf(step.sequence);
+      assert.equal(state.sequences.has(key), false, `create-sequence of live ${key}`);
+      assert.equal(
+        step.sequence.ownedBy,
+        undefined,
+        `create-sequence ${key} must carry an ownerless payload`,
+      );
+      state.sequences.set(key, copySequenceState(step.sequence));
+      return;
+    }
+    case 'drop-sequence': {
+      const key = keyOf(step.sequence);
+      assert.ok(state.sequences.has(key), `drop-sequence of missing ${key}`);
+      state.sequences.delete(key);
+      return;
+    }
+    case 'alter-sequence': {
+      const key = keyOf(step.sequence);
+      const altered = state.sequences.get(key);
+      assert.ok(altered !== undefined, `alter-sequence on missing ${key}`);
+      for (const field of step.fields) {
+        switch (field.field) {
+          case 'ownedBy':
+            applySequenceOwner(state, altered, field, key);
+            break;
+          case 'dataType': {
+            // The engine's `AS` change rewrites a bound equal to the old type's bound to the
+            // new type's before the step's explicit option clauses land, so a plan may omit a
+            // bound the conversion moves.
+            const converted = sequenceTypeChange(
+              altered.dataType,
+              altered.minValue,
+              altered.maxValue,
+              field.after,
+            );
+            altered.dataType = field.after;
+            if (converted.resetMin) altered.minValue = converted.minValue;
+            if (converted.resetMax) altered.maxValue = converted.maxValue;
+            break;
+          }
+          case 'increment':
+            altered.increment = field.after;
+            break;
+          case 'minValue':
+            altered.minValue = field.after;
+            break;
+          case 'maxValue':
+            altered.maxValue = field.after;
+            break;
+          case 'start':
+            altered.start = field.after;
+            break;
+          case 'cache':
+            altered.cache = field.after;
+            break;
+          case 'cycle':
+            altered.cycle = field.after;
+            break;
+          default:
+            assertNever(field, 'sequence field');
+        }
+      }
+      return;
+    }
+    case 'create-view':
+    case 'replace-view': {
+      const key = keyOf(step.view);
+      const live = state.views.get(key);
+      if (step.kind === 'create-view') {
+        assert.equal(live, undefined, `create-view of live view ${key}`);
+      } else {
+        assert.ok(live !== undefined, `replace-view of missing view ${key}`);
+        assert.equal(live.materialized, step.view.materialized, `replace-view of ${key} kind`);
+      }
+      state.views.set(key, { ...step.view });
+      return;
+    }
+    case 'drop-view': {
+      const key = keyOf(step.view);
+      const live = state.views.get(key);
+      assert.ok(live !== undefined, `drop-view of missing view ${key}`);
+      assert.equal(live.materialized, step.materialized, `drop-view of ${key} must carry its kind`);
+      state.views.delete(key);
+      return;
+    }
+    case 'create-extension': {
+      const key = extensionKey(step.extension);
+      assert.equal(state.extensions.has(key), false, `create-extension of live extension ${key}`);
+      state.extensions.set(key, { ...step.extension });
+      return;
+    }
+    case 'alter-extension': {
+      const key = extensionKey(step.extension);
+      const live = state.extensions.get(key);
+      assert.ok(live !== undefined, `alter-extension of missing extension ${key}`);
+      for (const field of step.fields) {
+        if (field.field !== 'schema') assertNever(field as never, 'extension field');
+        assert.equal(
+          live.schema,
+          field.before,
+          `alter-extension on ${key} must start from its live schema`,
+        );
+        live.schema = field.after;
+      }
+      return;
+    }
+    case 'drop-extension': {
+      const key = extensionKey(step.extension);
+      assert.ok(state.extensions.has(key), `drop-extension of missing extension ${key}`);
+      state.extensions.delete(key);
+      return;
+    }
+    case 'comment': {
+      const node = commentTargetNode(state, step.target);
+      if (step.text === undefined) delete node.comment;
+      else node.comment = step.text;
+      return;
+    }
+    default:
+      // Exhaustiveness guard: deleting a case or this clause must fail typecheck/tests (#36).
+      assertNever(step, 'step kind');
   }
 };
 
-/** Asserts the simulated state and the target model hold the same tables and constraints. */
+/** Asserts the simulated state and the target model hold the same tables, members, and relations. */
 const assertSameState = (state: SimulatedState, target: Model): void => {
   assert.deepStrictEqual(
     [...state.tables.keys()].sort(),
@@ -652,6 +1106,8 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       );
     }
     assert.deepStrictEqual(actual.primaryKey, expected.primaryKey, `primary key of ${key}`);
+    assert.deepStrictEqual(actual.persistence, expected.persistence, `persistence of ${key}`);
+    assert.equal(actual.comment, expected.comment, `comment of ${key}`);
     assert.deepStrictEqual(
       actual.foreignKeys.map(foreignKeyKey).sort(),
       expected.foreignKeys.map(foreignKeyKey).sort(),
@@ -672,8 +1128,70 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       expected.indexes.map(indexKey).sort(),
       `indexes of ${key}`,
     );
+    assert.deepStrictEqual(
+      commentPairs(actual.foreignKeys, foreignKeyKey),
+      commentPairs(expected.foreignKeys, foreignKeyKey),
+      `foreign-key comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.uniqueConstraints, uniqueConstraintKey),
+      commentPairs(expected.uniqueConstraints, uniqueConstraintKey),
+      `unique-constraint comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.checkConstraints, checkConstraintKey),
+      commentPairs(expected.checkConstraints, checkConstraintKey),
+      `check-constraint comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.indexes, indexKey),
+      commentPairs(expected.indexes, indexKey),
+      `index comments of ${key}`,
+    );
+  }
+  assert.deepStrictEqual(
+    [...state.sequences.keys()].sort(),
+    target.sequences.map(keyOf).sort(),
+    'the plan must leave exactly the target sequences',
+  );
+  for (const expected of target.sequences) {
+    assert.deepStrictEqual(
+      state.sequences.get(keyOf(expected)),
+      expected,
+      `sequence ${keyOf(expected)}`,
+    );
+  }
+  assert.deepStrictEqual(
+    [...state.views.keys()].sort(),
+    target.views.map(keyOf).sort(),
+    'the plan must leave exactly the target views',
+  );
+  for (const expected of target.views) {
+    assert.deepStrictEqual(state.views.get(keyOf(expected)), expected, `view ${keyOf(expected)}`);
+  }
+  assert.deepStrictEqual(
+    [...state.extensions.keys()].sort(),
+    target.extensions.map(extensionKey).sort(),
+    'the plan must leave exactly the target extensions',
+  );
+  for (const expected of target.extensions) {
+    assert.deepStrictEqual(
+      state.extensions.get(extensionKey(expected)),
+      expected,
+      `extension ${extensionKey(expected)}`,
+    );
   }
 };
+
+/**
+ * The comments of `entries` paired with their structural key, sorted: a side whose comment is
+ * absent pairs with `null`, so the comparison names every commented and uncommented member.
+ */
+const commentPairs = <T extends { readonly comment?: string }>(
+  entries: readonly T[],
+  key: (entry: T) => string,
+): readonly string[] =>
+  entries.map((entry) => `${key(entry)} => ${entry.comment ?? '(none)'}`).sort();
 
 /** Plans `baseline` to `target` and runs the whole plan through the simulator. */
 const simulate = (baseline: Model, target: Model): void => {
@@ -681,8 +1199,20 @@ const simulate = (baseline: Model, target: Model): void => {
   const state = stateOf(baseline);
   const baselineKeys = new Set(baseline.tables.map(keyOf));
   const targetKeys = new Set(target.tables.map(keyOf));
+  const baselineSequenceKeys = new Set(baseline.sequences.map(keyOf));
+  const targetSequenceKeys = new Set(target.sequences.map(keyOf));
+  const targetTables = new Map(target.tables.map((table) => [keyOf(table), table]));
   const dropped = new Map<string, number>();
   const created = new Map<string, number>();
+  const sequenceDrops = new Map<string, number>();
+  const sequenceCreates = new Map<string, number>();
+
+  /** Whether the plan removes `ownedBy`'s table or column: the drop-suppression rule. */
+  const ownerRemoved = (ownedBy: SequenceOwner): boolean => {
+    const targetTable = targetTables.get(keyOf(ownedBy.table));
+    if (targetTable === undefined) return true;
+    return !targetTable.columns.some((column) => column.name === ownedBy.column);
+  };
 
   for (const step of steps) {
     applyStep(state, step);
@@ -693,6 +1223,14 @@ const simulate = (baseline: Model, target: Model): void => {
     if (step.kind === 'create-table') {
       const key = keyOf(step.table);
       created.set(key, (created.get(key) ?? 0) + 1);
+    }
+    if (step.kind === 'drop-sequence') {
+      const key = keyOf(step.sequence);
+      sequenceDrops.set(key, (sequenceDrops.get(key) ?? 0) + 1);
+    }
+    if (step.kind === 'create-sequence') {
+      const key = keyOf(step.sequence);
+      sequenceCreates.set(key, (sequenceCreates.get(key) ?? 0) + 1);
     }
   }
 
@@ -707,7 +1245,53 @@ const simulate = (baseline: Model, target: Model): void => {
     assert.equal(created.get(key) ?? 0, 1, `added table ${key} must be created exactly once`);
   }
 
+  for (const removed of baseline.sequences) {
+    const key = keyOf(removed);
+    if (targetSequenceKeys.has(key)) continue;
+    // A sequence the plan removes is dropped explicitly unless its owner's removal cascades it.
+    if (removed.ownedBy !== undefined && ownerRemoved(removed.ownedBy)) continue;
+    assert.equal(
+      sequenceDrops.get(key) ?? 0,
+      1,
+      `removed sequence ${key} must be dropped exactly once`,
+    );
+  }
+  for (const added of target.sequences) {
+    const key = keyOf(added);
+    if (baselineSequenceKeys.has(key)) continue;
+    assert.equal(
+      sequenceCreates.get(key) ?? 0,
+      1,
+      `added sequence ${key} must be created exactly once`,
+    );
+  }
+  for (const key of sequenceDrops.keys()) {
+    assert.ok(
+      baselineSequenceKeys.has(key) && !targetSequenceKeys.has(key),
+      `drop-sequence for neither removed nor kept sequence ${key}`,
+    );
+  }
+  for (const key of sequenceCreates.keys()) {
+    assert.ok(
+      !baselineSequenceKeys.has(key) && targetSequenceKeys.has(key),
+      `create-sequence for neither added nor kept sequence ${key}`,
+    );
+  }
+
   assertSameState(state, target);
+};
+
+/** Whether the plan drops and re-adds one column's identity: the recreation path. */
+const recreatesIdentity = (steps: readonly Step[]): boolean => {
+  const dropped = new Set<string>();
+  for (const step of steps) {
+    if (step.kind === 'drop-identity') {
+      dropped.add(`${keyOf(step.table)}:${step.name}`);
+    } else if (step.kind === 'add-identity' && dropped.has(`${keyOf(step.table)}:${step.name}`)) {
+      return true;
+    }
+  }
+  return false;
 };
 
 /**
@@ -740,6 +1324,9 @@ interface GeneratedTable {
   readonly columns: Mutable<Column>[];
   primaryKey: Mutable<PrimaryKey> | undefined;
   readonly foreignKeys: Mutable<ForeignKey>[];
+  readonly uniqueConstraints: Mutable<UniqueConstraint>[];
+  readonly checkConstraints: Mutable<CheckConstraint>[];
+  readonly indexes: Mutable<Index>[];
 }
 
 /** A fresh `prefix`-numbered column name for `table`. */
@@ -747,6 +1334,163 @@ const freshColumnName = (table: GeneratedTable, prefix: string): string => {
   let index = 0;
   while (table.columns.some((entry) => entry.name === `${prefix}${index}`)) index += 1;
   return `${prefix}${index}`;
+};
+
+/** Canonical identity option variations; `{}` resolves to the engine-default descriptor. */
+const identityVariations: readonly Partial<IdentityInput>[] = [
+  {},
+  { generated: 'by default' },
+  { increment: '2' },
+  { cache: '10' },
+  { cycle: true },
+];
+
+/** A fresh canonical identity for `tableName`'s `columnName`, sometimes with a stated name. */
+const generateIdentity = (tableName: string, columnName: string, random: Random): Identity =>
+  identityColumn({
+    ...random.pick(identityVariations),
+    ...(random.chance(0.6)
+      ? { sequenceName: { schema: 'public', name: `${tableName}_${columnName}_seq` } }
+      : {}),
+  });
+
+/** 1–2 names picked from `columns` without replacement, in pick order. */
+const pickColumnNames = (columns: readonly Column[], random: Random): string[] => {
+  const pool = columns.map((entry) => entry.name);
+  const count = pool.length > 1 && random.chance(0.35) ? 2 : 1;
+  const picked: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    picked.push(pool.splice(Math.floor(random.next() * pool.length), 1)[0]!);
+  }
+  return picked;
+};
+
+/** One fresh ordered column list for `columns` whose identity is not in `taken`. */
+const freshUniqueColumns = (
+  columns: readonly Column[],
+  taken: ReadonlySet<string>,
+  random: Random,
+): string[] | undefined => {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const picked = pickColumnNames(columns, random);
+    if (!taken.has(JSON.stringify(picked))) return picked;
+  }
+  return undefined;
+};
+
+/** 0–2 unique constraints on live `columns` with distinct ordered-column identities. */
+const generateUniqueConstraints = (
+  tableName: string,
+  columns: readonly Column[],
+  random: Random,
+): Mutable<UniqueConstraint>[] => {
+  const constraints: Mutable<UniqueConstraint>[] = [];
+  const taken = new Set<string>();
+  const count = Math.floor(random.next() * 3);
+  for (let index = 0; index < count; index += 1) {
+    const picked = freshUniqueColumns(columns, taken, random);
+    if (picked === undefined) continue;
+    taken.add(JSON.stringify(picked));
+    constraints.push({
+      columns: picked,
+      ...(random.chance(0.5) ? {} : { name: `${tableName}_uq${index}` }),
+    });
+  }
+  return constraints;
+};
+
+/** Simple opaque check expressions; generation and mutation step through them to stay distinct. */
+const checkExpressions: readonly string[] = ['1 = 1', "'' <> 'x'", '2 > 1', "length('abc') > 0"];
+
+/** 0–2 check constraints with distinct expression identities. */
+const generateCheckConstraints = (
+  tableName: string,
+  random: Random,
+): Mutable<CheckConstraint>[] => {
+  const constraints: Mutable<CheckConstraint>[] = [];
+  const count = Math.floor(random.next() * 3);
+  const offset = Math.floor(random.next() * checkExpressions.length);
+  for (let index = 0; index < count; index += 1) {
+    constraints.push({
+      expression: checkExpressions[(offset + index) % checkExpressions.length]!,
+      ...(random.chance(0.5) ? {} : { name: `${tableName}_ck${index}` }),
+    });
+  }
+  return constraints;
+};
+
+/** 0–2 indexes on live `columns`: named `ix0…`, at most one unnamed, some concurrent. */
+const generateIndexes = (columns: readonly Column[], random: Random): Mutable<Index>[] => {
+  const indexes: Mutable<Index>[] = [];
+  const count = Math.floor(random.next() * 3);
+  let unnamed = false;
+  for (let index = 0; index < count; index += 1) {
+    const name = unnamed || !random.chance(0.6) ? `ix${index}` : undefined;
+    if (name === undefined) unnamed = true;
+    indexes.push({
+      ...(name === undefined ? {} : { name }),
+      unique: random.chance(0.4),
+      columns: pickColumnNames(columns, random),
+      ...(random.chance(0.35) ? { concurrently: true } : {}),
+    });
+  }
+  return indexes;
+};
+
+/** A fresh `ix`-numbered name for `table`'s indexes. */
+const freshIndexName = (table: GeneratedTable): string => {
+  let index = 0;
+  while (table.indexes.some((entry) => entry.name === `ix${index}`)) index += 1;
+  return `ix${index}`;
+};
+
+/**
+ * A changed canonical identity for `identity`: exactly one option flips and a stated sequence
+ * name survives, so the diff reports a field change, never a recreation.
+ */
+const alterIdentity = (identity: Identity, random: Random): Identity => {
+  const flips: readonly Partial<IdentityInput>[] = [
+    { generated: identity.generated === 'always' ? 'by default' : 'always' },
+    { increment: identity.increment === '1' ? '2' : '1' },
+    { cache: identity.cache === '1' ? '10' : '1' },
+    { cycle: !identity.cycle },
+  ];
+  return identityColumn({
+    ...random.pick(flips),
+    ...(identity.sequenceName === undefined ? {} : { sequenceName: { ...identity.sequenceName } }),
+  });
+};
+
+/** A restated identity for the recreation path, or `undefined` when `identity` states no name. */
+const recreateIdentity = (identity: Identity, random: Random): Identity | undefined => {
+  const stated = identity.sequenceName;
+  if (stated === undefined) return undefined;
+  return identityColumn({
+    ...random.pick(identityVariations),
+    sequenceName: { schema: stated.schema, name: `${stated.name}_v2` },
+  });
+};
+
+/**
+ * Drops members that fail `valid` or whose identity key repeats an earlier member's, in place.
+ * The keys mirror the diff's matching identities: unique constraints by ordered columns, check
+ * constraints by expression, indexes by name with absence distinct.
+ */
+const retainDistinct = <T>(
+  members: T[],
+  valid: (member: T) => boolean,
+  identityOf: (member: T) => string,
+): void => {
+  const seen = new Set<string>();
+  const kept = members.filter((member) => {
+    if (!valid(member)) return false;
+    const key = identityOf(member);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  members.length = 0;
+  members.push(...kept);
 };
 
 /**
@@ -769,10 +1513,14 @@ const mutatePrimaryKey = (table: GeneratedTable, random: Random): void => {
 
 /**
  * Mutates one generated target table: drops, renames, or reorders a primary key; drops, adds,
- * or alters a text column; and drops or changes a foreign key. A primary key is only added
- * when the baseline table had none, and a rename or reorder keeps its column set, so every
- * generated target stays well-formed. Foreign-key targets are always a present table's
- * `integer` primary-key columns, so the pair stays well-formed too.
+ * or alters a text column; drops, adds, or changes unique and check constraints and indexes;
+ * drops, adds, alters, or recreates an identity; and drops or changes a foreign key. A primary
+ * key is only added when the baseline table had none, and a rename or reorder keeps its column
+ * set, so every generated target stays well-formed. An added identity only ever lands on an
+ * integer column that never carried one, and an alter or recreation preserves the baseline's
+ * sequence-name shape, so the untouched simulator's full-descriptor comparison holds.
+ * Foreign-key targets are always a present table's `integer` primary-key columns, so the pair
+ * stays well-formed too.
  */
 const mutateTable = (
   table: GeneratedTable,
@@ -780,6 +1528,9 @@ const mutateTable = (
   random: Random,
   textTypes: readonly string[],
 ): void => {
+  const identityBearing = new Set(
+    table.columns.filter((entry) => entry.identity !== undefined).map((entry) => entry.name),
+  );
   if (table.primaryKey !== undefined && random.chance(0.3)) {
     table.primaryKey = undefined;
   } else if (table.primaryKey !== undefined && random.chance(0.35)) {
@@ -804,7 +1555,13 @@ const mutateTable = (
   if (alterable.length > 0 && random.chance(0.4)) {
     const altered = random.pick(alterable);
     altered.notNull = !altered.notNull;
-    if (random.chance(0.5)) altered.type = random.pick(textTypes);
+    if (random.chance(0.5)) {
+      const type = random.pick(textTypes);
+      if (altered.identity !== undefined && canonicalIntType(type) === undefined) {
+        delete altered.identity;
+      }
+      altered.type = type;
+    }
     if (random.chance(0.5)) {
       if (altered.default === undefined) altered.default = "'x'";
       else delete altered.default;
@@ -818,14 +1575,238 @@ const mutateTable = (
     if (random.chance(0.5)) changed.name = `${changed.name ?? 'unnamed'}_changed`;
     else changed.onDelete = changed.onDelete === undefined ? 'CASCADE' : undefined;
   }
+
+  // Identity: drop, alter, or recreate one; add one to an integer column that never had any.
+  const identities = table.columns.filter((entry) => entry.identity !== undefined);
+  if (identities.length > 0 && random.chance(0.55)) {
+    const mutated = random.pick(identities);
+    const action = random.next();
+    if (action < 0.3) {
+      delete mutated.identity;
+    } else if (action < 0.8) {
+      mutated.identity = alterIdentity(mutated.identity!, random);
+    } else {
+      mutated.identity =
+        recreateIdentity(mutated.identity!, random) ?? alterIdentity(mutated.identity!, random);
+    }
+  }
+  const identityless = table.columns.filter(
+    (entry) =>
+      entry.identity === undefined &&
+      !identityBearing.has(entry.name) &&
+      canonicalIntType(entry.type) !== undefined,
+  );
+  if (identityless.length > 0 && random.chance(0.3)) {
+    const added = random.pick(identityless);
+    added.identity = generateIdentity(table.name, added.name, random);
+  }
+
+  // Unique constraints: drop, change columns or name, or add one with a fresh identity.
+  if (table.uniqueConstraints.length > 0 && random.chance(0.35)) {
+    table.uniqueConstraints.splice(Math.floor(random.next() * table.uniqueConstraints.length), 1);
+  }
+  if (table.uniqueConstraints.length > 0 && random.chance(0.3)) {
+    const changed = random.pick(table.uniqueConstraints);
+    if (random.chance(0.5)) {
+      changed.name = `${changed.name ?? 'unnamed'}_changed`;
+    } else {
+      const taken = new Set(table.uniqueConstraints.map((entry) => JSON.stringify(entry.columns)));
+      const picked = freshUniqueColumns(table.columns, taken, random);
+      if (picked !== undefined) changed.columns = picked;
+    }
+  }
+  if (table.uniqueConstraints.length < 2 && random.chance(0.3)) {
+    const taken = new Set(table.uniqueConstraints.map((entry) => JSON.stringify(entry.columns)));
+    const picked = freshUniqueColumns(table.columns, taken, random);
+    if (picked !== undefined) {
+      table.uniqueConstraints.push({
+        columns: picked,
+        ...(random.chance(0.5) ? {} : { name: `${table.name}_uq_new` }),
+      });
+    }
+  }
+
+  // Check constraints: drop, change expression or name, or add one with a fresh expression.
+  if (table.checkConstraints.length > 0 && random.chance(0.35)) {
+    table.checkConstraints.splice(Math.floor(random.next() * table.checkConstraints.length), 1);
+  }
+  if (table.checkConstraints.length > 0 && random.chance(0.3)) {
+    const changed = random.pick(table.checkConstraints);
+    if (random.chance(0.5)) {
+      changed.name = `${changed.name ?? 'unnamed'}_changed`;
+    } else {
+      const taken = new Set(table.checkConstraints.map((entry) => entry.expression));
+      const fresh = checkExpressions.find((expression) => !taken.has(expression));
+      if (fresh !== undefined) changed.expression = fresh;
+    }
+  }
+  if (table.checkConstraints.length < 2 && random.chance(0.3)) {
+    const taken = new Set(table.checkConstraints.map((entry) => entry.expression));
+    const fresh = checkExpressions.find((expression) => !taken.has(expression));
+    if (fresh !== undefined) {
+      table.checkConstraints.push({
+        expression: fresh,
+        ...(random.chance(0.5) ? {} : { name: `${table.name}_ck_new` }),
+      });
+    }
+  }
+
+  // Indexes: drop, change columns or uniqueness (toggling `concurrently` only alongside that
+  // structural change), or add one with a fresh name and some concurrency.
+  if (table.indexes.length > 0 && random.chance(0.35)) {
+    table.indexes.splice(Math.floor(random.next() * table.indexes.length), 1);
+  }
+  if (table.indexes.length > 0 && random.chance(0.35)) {
+    const changed = random.pick(table.indexes);
+    if (random.chance(0.5)) {
+      changed.unique = !changed.unique;
+      if (random.chance(0.4)) {
+        changed.concurrently = changed.concurrently === true ? undefined : true;
+      }
+    } else {
+      const previous = JSON.stringify(changed.columns);
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const picked = pickColumnNames(table.columns, random);
+        if (JSON.stringify(picked) === previous) continue;
+        changed.columns = picked;
+        if (random.chance(0.4)) {
+          changed.concurrently = changed.concurrently === true ? undefined : true;
+        }
+        break;
+      }
+    }
+  }
+  if (table.indexes.length < 2 && random.chance(0.3)) {
+    const hasUnnamed = table.indexes.some((entry) => entry.name === undefined);
+    const name = !hasUnnamed && random.chance(0.3) ? undefined : freshIndexName(table);
+    table.indexes.push({
+      ...(name === undefined ? {} : { name }),
+      unique: random.chance(0.4),
+      columns: pickColumnNames(table.columns, random),
+      ...(random.chance(0.4) ? { concurrently: true } : {}),
+    });
+  }
+};
+
+/** Canonical sequence option variations; every pick resolves through `effectiveSequence`. */
+const sequenceVariations: readonly SequenceOptions[] = [
+  {},
+  { dataType: 'integer' },
+  { dataType: 'smallint' },
+  { increment: '2' },
+  { increment: '-1' },
+  { cache: '10' },
+  { cycle: true },
+  { start: '5' },
+  { dataType: 'integer', increment: '2' },
+  { dataType: 'smallint', increment: '-1' },
+  { dataType: 'integer', maxValue: '1000' },
+  { minValue: '2', start: '5' },
+];
+
+/** A canonical `public` sequence named `name`, with a random option variation and owner. */
+const generateSequence = (
+  name: string,
+  ownedBy: SequenceOwner | undefined,
+  random: Random,
+): Mutable<Sequence> =>
+  effectiveSequence({
+    schema: 'public',
+    name,
+    ...random.pick(sequenceVariations),
+    ...(ownedBy === undefined ? {} : { ownedBy }),
+  });
+
+/** Every owner a generated table can supply: one per `public` table column. */
+const sequenceOwnerCandidates = (
+  tables: readonly {
+    readonly name: string;
+    readonly columns: readonly { readonly name: string }[];
+  }[],
+): SequenceOwner[] =>
+  tables.flatMap((table) => table.columns.map((column) => owner(table.name, column.name)));
+
+/**
+ * The pair's sequences: a pool of two identities, each independently present on each side with
+ * a canonical option variation and an optional owner. A baseline sequence sometimes owns a
+ * column the target removes, so a kept sequence has to detach and a removed one cascades; a
+ * target owner always names a live target column.
+ */
+const generateSequences = (
+  baselineTables: readonly Table[],
+  target: ReadonlyMap<string, GeneratedTable>,
+  random: Random,
+): { baseline: Mutable<Sequence>[]; target: Mutable<Sequence>[] } => {
+  const baselineOwners = sequenceOwnerCandidates(baselineTables);
+  const targetOwners = sequenceOwnerCandidates([...target.values()]);
+  const removedOwners: SequenceOwner[] = [];
+  for (const source of baselineTables) {
+    const kept = target.get(source.name);
+    if (kept === undefined) {
+      removedOwners.push(...source.columns.map((column) => owner(source.name, column.name)));
+      continue;
+    }
+    const liveColumns = new Set(kept.columns.map((column) => column.name));
+    for (const column of source.columns) {
+      if (!liveColumns.has(column.name)) removedOwners.push(owner(source.name, column.name));
+    }
+  }
+
+  const pickOwner = (
+    candidates: readonly SequenceOwner[],
+    probability: number,
+  ): SequenceOwner | undefined =>
+    candidates.length > 0 && random.chance(probability) ? random.pick(candidates) : undefined;
+
+  const baseline: Mutable<Sequence>[] = [];
+  const targetSequences: Mutable<Sequence>[] = [];
+  for (const name of ['sq0', 'sq1']) {
+    if (random.chance(0.75)) {
+      // A removed owner forces a detach (kept sequence) or a cascade (removed sequence);
+      // otherwise the owner is usually one that survives the pair.
+      const removed = pickOwner(removedOwners, 0.6);
+      baseline.push(generateSequence(name, removed ?? pickOwner(baselineOwners, 0.6), random));
+    }
+    if (random.chance(0.75)) {
+      targetSequences.push(generateSequence(name, pickOwner(targetOwners, 0.6), random));
+    }
+  }
+  return { baseline, target: targetSequences };
 };
 
 /**
- * One well-formed pseudo-random pair: 2–6 baseline tables, every foreign key pointing at a
+ * Re-validates every sequence owner against `tables`: an owner naming a table or column the
+ * side lacks is re-owned on a live column, or dropped when the side has no columns at all.
+ */
+const revalidateSequenceOwners = (
+  sequences: readonly Mutable<Sequence>[],
+  tables: readonly {
+    readonly name: string;
+    readonly columns: readonly { readonly name: string }[];
+  }[],
+  random: Random,
+): void => {
+  const candidates = sequenceOwnerCandidates(tables);
+  for (const sequence of sequences) {
+    const ownedBy = sequence.ownedBy;
+    if (ownedBy === undefined) continue;
+    const ownerTable = tables.find((table) => table.name === ownedBy.table.name);
+    if (ownerTable?.columns.some((column) => column.name === ownedBy.column) === true) continue;
+    const replacement = candidates.length === 0 ? undefined : random.pick(candidates);
+    if (replacement === undefined) delete sequence.ownedBy;
+    else sequence.ownedBy = { table: { ...replacement.table }, column: replacement.column };
+  }
+};
+
+/**
+ * One well-formed pseudo-random pair: 2–6 baseline tables carrying unique and check
+ * constraints, indexes, and occasional identity columns; every foreign key pointing at a
  * present table's `integer` primary-key columns (single-column or composite), a target built
- * from kept, removed, changed, and added tables, and target foreign keys that never reference
- * a removed table or a dropped primary key. Table order is shuffled so the planner sees
- * arbitrary insertion orders.
+ * from kept, removed, changed, and added tables, target foreign keys that never reference
+ * a removed table or a dropped primary key, and 0–2 sequences per side with canonical options
+ * and owners (kept, changed, dropped, added, attached, detached, transferred, and cascaded).
+ * Constraints and indexes on the target reference only live columns. Table order is shuffled
+ * so the planner sees arbitrary insertion orders.
  */
 const generatePair = (random: Random): { baseline: Model; target: Model } => {
   const textTypes = ['text', 'character varying(12)', 'character varying(24)'];
@@ -842,8 +1823,16 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
 
   const baselineTables = names.map((name): Table => {
     const keyColumns = primaryKeyColumns.get(name)!;
-    const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
-    if (keyColumns.length > 1) columns.push(column('k2', { type: 'integer', notNull: true }));
+    const identityColumnName = random.chance(0.4) ? random.pick(keyColumns) : undefined;
+    const columns: Column[] = keyColumns.map((columnName) =>
+      column(columnName, {
+        type: 'integer',
+        notNull: true,
+        ...(columnName === identityColumnName
+          ? { identity: generateIdentity(name, columnName, random) }
+          : {}),
+      }),
+    );
     const extras = Math.floor(random.next() * 3);
     for (let index = 0; index < extras; index += 1) {
       columns.push(
@@ -883,6 +1872,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
         ? { primaryKey: { name: `${name}_pkey`, columns: [...keyColumns] } }
         : {}),
       foreignKeys,
+      uniqueConstraints: generateUniqueConstraints(name, columns, random),
+      checkConstraints: generateCheckConstraints(name, random),
+      indexes: generateIndexes(columns, random),
     });
   });
 
@@ -891,9 +1883,17 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     if (random.chance(0.25)) continue;
     const generated: GeneratedTable = {
       name: source.name,
-      columns: source.columns.map((entry) => ({ ...entry })),
+      columns: source.columns.map((entry) => ({
+        ...entry,
+        ...(entry.identity === undefined
+          ? {}
+          : { identity: copyIdentityDescriptor(entry.identity) }),
+      })),
       primaryKey: source.primaryKey === undefined ? undefined : copyPrimaryKey(source.primaryKey),
       foreignKeys: source.foreignKeys.map(copyForeignKey),
+      uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
+      checkConstraints: source.checkConstraints.map(copyCheckConstraint),
+      indexes: source.indexes.map(copyIndex),
     };
     if (random.chance(0.55))
       mutateTable(generated, hasPrimaryKey.get(source.name) === true, random, textTypes);
@@ -902,7 +1902,13 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
 
   for (let index = 0; index < 2 && random.chance(0.3); index += 1) {
     const name = `u${index}`;
-    const columns: Column[] = [column('id', { type: 'integer', notNull: true })];
+    const columns: Column[] = [
+      column('id', {
+        type: 'integer',
+        notNull: true,
+        ...(random.chance(0.4) ? { identity: generateIdentity(name, 'id', random) } : {}),
+      }),
+    ];
     if (random.chance(0.5)) columns.push(column('e0', { type: random.pick(textTypes) }));
     const composite = random.chance(0.3);
     if (composite) columns.push(column('k2', { type: 'integer', notNull: true }));
@@ -911,6 +1917,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       columns,
       primaryKey: { name: `${name}_pkey`, columns: composite ? ['id', 'k2'] : ['id'] },
       foreignKeys: [],
+      uniqueConstraints: generateUniqueConstraints(name, columns, random),
+      checkConstraints: generateCheckConstraints(name, random),
+      indexes: generateIndexes(columns, random),
     });
   }
 
@@ -955,6 +1964,42 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     );
   }
 
+  // Final well-formedness sweep, mirroring the foreign-key filter: constraints and indexes
+  // reference only live columns and keep distinct matching identities (at most one unnamed
+  // index), and identities stay on integer-family columns.
+  for (const generated of target.values()) {
+    const columnNames = new Set(generated.columns.map((entry) => entry.name));
+    retainDistinct(
+      generated.uniqueConstraints,
+      (constraint) => constraint.columns.every((name) => columnNames.has(name)),
+      (constraint) => JSON.stringify(constraint.columns),
+    );
+    retainDistinct(
+      generated.checkConstraints,
+      () => true,
+      (constraint) => JSON.stringify(constraint.expression),
+    );
+    retainDistinct(
+      generated.indexes,
+      (member) => member.columns.every((name) => columnNames.has(name)),
+      (member) => JSON.stringify([member.name]),
+    );
+    for (const entry of generated.columns) {
+      if (entry.identity !== undefined && canonicalIntType(entry.type) === undefined) {
+        delete entry.identity;
+      }
+    }
+  }
+
+  // Sequences: 0–2 canonical sequences per side, with owners re-validated against each side.
+  const { baseline: baselineSequences, target: targetSequences } = generateSequences(
+    baselineTables,
+    target,
+    random,
+  );
+  revalidateSequenceOwners(baselineSequences, baselineTables, random);
+  revalidateSequenceOwners(targetSequences, [...target.values()], random);
+
   const shuffle = <T>(values: readonly T[]): T[] => {
     const copy = [...values];
     for (let index = copy.length - 1; index > 0; index -= 1) {
@@ -971,11 +2016,24 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
       columns: generated.columns,
       ...(generated.primaryKey === undefined ? {} : { primaryKey: generated.primaryKey }),
       foreignKeys: generated.foreignKeys,
+      uniqueConstraints: generated.uniqueConstraints,
+      checkConstraints: generated.checkConstraints,
+      indexes: generated.indexes,
     });
 
   return {
-    baseline: model(...shuffle(baselineTables)),
-    target: model(...shuffle([...target.values()].map(toTable))),
+    baseline: {
+      tables: shuffle(baselineTables),
+      sequences: baselineSequences,
+      views: [],
+      extensions: [],
+    },
+    target: {
+      tables: shuffle([...target.values()].map(toTable)),
+      sequences: targetSequences,
+      views: [],
+      extensions: [],
+    },
   };
 };
 
@@ -1065,11 +2123,15 @@ test('an empty step list has no transaction groups', () => {
 
 test('every current step kind is classified, and only the concurrent kinds stand alone', () => {
   const kinds: readonly Step['kind'][] = [
+    'create-schema',
     'create-table',
     'drop-table',
     'add-column',
     'drop-column',
     'alter-column',
+    'drop-not-null',
+    'add-not-null',
+    'alter-persistence',
     'add-identity',
     'drop-identity',
     'alter-identity',
@@ -1088,14 +2150,69 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'create-sequence',
     'drop-sequence',
     'alter-sequence',
+    'create-view',
+    'drop-view',
+    'replace-view',
+    'create-extension',
+    'alter-extension',
+    'drop-extension',
+    'comment',
   ];
 
-  assert.equal(kinds.length, 23);
+  assert.equal(kinds.length, 34);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
     assert.equal(TRANSACTIONAL[kind], !standalone, kind);
   }
+});
+
+test('an unknown step kind is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(model());
+
+  assert.throws(
+    () => applyStep(state, { kind: 'frobnicate' } as unknown as Step),
+    /Unhandled step kind: frobnicate/,
+  );
+});
+
+test('an unknown identity field is rejected by the exhaustiveness guard', () => {
+  assert.throws(
+    () =>
+      applyIdentityField(identityColumn(), {
+        field: 'frobnicate',
+      } as unknown as IdentityFieldChange),
+    /Unhandled identity field: frobnicate/,
+  );
+});
+
+test('an unknown column field is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(model(table('t', { columns: [column('id')] })));
+
+  assert.throws(
+    () =>
+      applyStep(state, {
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'id',
+        fields: [{ field: 'frobnicate' }],
+      } as unknown as Step),
+    /Unhandled column field: frobnicate/,
+  );
+});
+
+test('an unknown sequence field is rejected by the exhaustiveness guard', () => {
+  const state = stateOf(sequenceModel([sequence('sq')]));
+
+  assert.throws(
+    () =>
+      applyStep(state, {
+        kind: 'alter-sequence',
+        sequence: { schema: 'public', name: 'sq' },
+        fields: [{ field: 'frobnicate' }],
+      } as unknown as Step),
+    /Unhandled sequence field: frobnicate/,
+  );
 });
 
 test('plan partitions a mixed migration into one transactional group', () => {
@@ -1546,6 +2663,54 @@ test('a renamed primary key sets aside a foreign key that omits its referenced c
   simulate(baseline, target);
 });
 
+test('a foreign key whose referenced columns change across a primary-key change is set aside once', () => {
+  const before = foreignKey(['pid'], identity('parent'), { name: 'child_pid_fkey' });
+  const after = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['new_id'],
+  });
+  const baseline = model(
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+  );
+  const target = model(
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey2', columns: ['new_id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+  );
+
+  // The baseline omission resolves to `id` while the target states `new_id`, so the pair is the
+  // diff's own replacement; the structural key differs, so the primary-key change's dependent
+  // synthesis does not set aside a second pair.
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey2', columns: ['new_id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: after },
+  ]);
+  simulate(baseline, target);
+});
+
 test('primary-key dependents are set aside in identity order, including a self-reference', () => {
   const aBKey = foreignKey(['b_id'], identity('c'), {
     name: 'a_b_id_fkey',
@@ -1743,7 +2908,7 @@ test('a primary-key change splits into a drop before column work and an add afte
   ]);
 });
 
-test('a changed foreign key drops in phase 1 and adds in phase 15, around column work', () => {
+test('a changed foreign key drops in phase 1 and adds in phase 18, around column work', () => {
   const parent = identity('parent');
   const before = foreignKey(['parent_id'], parent, {
     name: 't_parent_id_fkey',
@@ -1780,6 +2945,324 @@ test('a changed foreign key drops in phase 1 and adds in phase 15, around column
   ]);
 });
 
+test('a named not-null rename decomposes into a drop and an add', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn2' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('attaching and detaching a not-null name brackets the unnamed fact', () => {
+  const unnamed = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+  );
+  const named = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+
+  assertPlan(unnamed, named, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  assertPlan(named, unnamed, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id' },
+  ]);
+  simulate(unnamed, named);
+  simulate(named, unnamed);
+});
+
+test('a named not-null fact added or removed emits one step', () => {
+  const nullable = model(table('t', { columns: [column('id', { type: 'integer' })] }));
+  const named = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+
+  assertPlan(nullable, named, [
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  assertPlan(named, nullable, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+  ]);
+  simulate(nullable, named);
+  simulate(named, nullable);
+});
+
+test('a mixed type and not-null-name change keeps the alter-column name-free', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'bigint', notNull: true, notNullName: 't_id_nn2' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+      attributes: { type: 'bigint' },
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('the not-null steps bracket the column alterations in phase order', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' }),
+        column('v'),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('id', { type: 'bigint', notNull: true, notNullName: 't_id_nn2' }),
+        column('v', { notNull: true }),
+        column('w'),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'add-column', table: identity('t'), column: column('w') },
+    { kind: 'drop-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'id',
+      fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+      attributes: { type: 'bigint' },
+    },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'v',
+      fields: [{ field: 'notNull', before: false, after: true }],
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn2' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('no alter-column step ever carries a not-null name', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'integer', notNull: true, notNullName: 't_a_nn' }),
+        column('b', { type: 'integer', notNull: true, notNullName: 't_b_nn' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'bigint', notNull: true, notNullName: 't_a_nn2', default: '0' }),
+        column('b', { type: 'integer' }),
+      ],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'alter-column'),
+    [
+      {
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'a',
+        fields: [
+          { field: 'type', before: 'integer', after: 'bigint' },
+          { field: 'default', after: '0' },
+        ],
+        attributes: { type: 'bigint' },
+      },
+    ],
+  );
+  for (const step of steps) {
+    if (step.kind !== 'alter-column') continue;
+    for (const field of step.fields) {
+      assert.notEqual(field.field, 'notNullName', 'a name must ride its own step');
+    }
+  }
+  simulate(baseline, target);
+});
+
+test('an attribute-only constraint change decomposes into its drop and add halves', () => {
+  const beforeUnique = uniqueConstraint(['a'], { name: 't_a_key', deferrable: true });
+  const afterUnique = uniqueConstraint(['a'], {
+    name: 't_a_key',
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  const beforeCheck = checkConstraint('a > 0', { name: 't_a_check' });
+  const afterCheck = checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' });
+  const beforeKey = foreignKey(['a'], identity('u'), {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+  });
+  const afterKey = foreignKey(['a'], identity('u'), {
+    name: 't_a_fkey',
+    referencedColumns: ['id'],
+    enforcement: 'not-enforced',
+  });
+  const parent = table('u', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { columns: ['id'] },
+  });
+  const baseline = model(
+    parent,
+    table('t', {
+      columns: [column('a')],
+      uniqueConstraints: [beforeUnique],
+      checkConstraints: [beforeCheck],
+      foreignKeys: [beforeKey],
+    }),
+  );
+  const target = model(
+    parent,
+    table('t', {
+      columns: [column('a')],
+      uniqueConstraints: [afterUnique],
+      checkConstraints: [afterCheck],
+      foreignKeys: [afterKey],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeKey },
+    { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+    { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+    { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+    { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+    { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterKey },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an attribute-only foreign-key change coinciding with a primary-key change is set aside once', () => {
+  const before = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['id'],
+  });
+  const after = foreignKey(['pid'], identity('parent'), {
+    name: 'child_pid_fkey',
+    referencedColumns: ['id'],
+    enforcement: 'not-valid',
+  });
+  const baseline = model(
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+  );
+  const target = model(
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+    }),
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+  );
+
+  // The attribute-only foreign-key change is the diff's own drop + add; threading the new
+  // fields through the synthesis key keeps the primary-key change from setting aside a second
+  // pair for the same foreign key.
+  const { steps } = plan(baseline, target);
+  assert.equal(steps.filter((step) => step.kind === 'drop-foreign-key').length, 1);
+  assert.equal(steps.filter((step) => step.kind === 'add-foreign-key').length, 1);
+  assert.deepStrictEqual(steps, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: after },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an attribute-only foreign-key deferrability change coinciding with a primary-key change is set aside once', () => {
+  // Baseline and target differ only on the field under test, so the diff's drop + add pair is
+  // the only pair: if the synthesis key dropped that field, the dependent-FK synthesis would
+  // fire a second drop + add for the same foreign key.
+  const cases = [
+    { before: { deferrable: true }, after: {} },
+    { before: { deferrable: true, initiallyDeferred: true }, after: { deferrable: true } },
+  ] as const;
+  for (const fields of cases) {
+    const before = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.before,
+    });
+    const after = foreignKey(['pid'], identity('parent'), {
+      name: 'child_pid_fkey',
+      referencedColumns: ['id'],
+      ...fields.after,
+    });
+    const baseline = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [before] }),
+    );
+    const target = model(
+      table('parent', {
+        columns: [column('id', { type: 'integer', notNull: true })],
+        primaryKey: { name: 'parent_pkey2', columns: ['id'] },
+      }),
+      table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [after] }),
+    );
+
+    const { steps } = plan(baseline, target);
+    const label = JSON.stringify(fields);
+    assert.equal(
+      steps.filter((step) => step.kind === 'drop-foreign-key').length,
+      1,
+      `one drop-foreign-key for ${label}`,
+    );
+    assert.equal(
+      steps.filter((step) => step.kind === 'add-foreign-key').length,
+      1,
+      `one add-foreign-key for ${label}`,
+    );
+    simulate(baseline, target);
+  }
+});
+
 test('column payloads keep their exact contents', () => {
   const baseline = model(table('t', { columns: [column('a')] }));
   const target = model(
@@ -1806,6 +3289,7 @@ test('column payloads keep their exact contents', () => {
         { field: 'notNull', before: false, after: true },
         { field: 'default', after: "'x'" },
       ],
+      attributes: { type: 'character varying(12)' },
     },
   ]);
 });
@@ -1971,6 +3455,7 @@ test('a mixed migration pins the exact step sequence across the nine original ta
       table: identity('users'),
       name: 'name',
       fields: [{ field: 'type', before: 'character varying(12)', after: 'text' }],
+      attributes: { type: 'text' },
     },
     {
       kind: 'add-primary-key',
@@ -2232,7 +3717,7 @@ test('an index flag-only difference produces no plan', () => {
   assertPlan(model(concurrent), model(lazy), []);
 });
 
-test('a mixed migration pins the exact step sequence across all fifteen table phases', () => {
+test('a mixed migration pins the exact step sequence across all eighteen table phases', () => {
   const parent = table('parent', {
     columns: [column('id', { type: 'integer', notNull: true })],
     primaryKey: { name: 'parent_pkey', columns: ['id'] },
@@ -2291,6 +3776,7 @@ test('a mixed migration pins the exact step sequence across all fifteen table ph
     uniqueConstraints: [liveKey],
     checkConstraints: [liveCheck],
     indexes: [liveIndex],
+    persistence: 'unlogged',
   });
 
   const freshForeignKey = foreignKey(['parent_id'], identity('parent'), {
@@ -2357,33 +3843,155 @@ test('a mixed migration pins the exact step sequence across all fifteen table ph
     },
     // Phase 9: add-column.
     { kind: 'add-column', table: identity('kept'), column: column('fresh', { type: 'integer' }) },
-    // Phase 10: alter-column.
+    // Phase 11: alter-column.
     {
       kind: 'alter-column',
       table: identity('kept'),
       name: 'note',
       fields: [{ field: 'type', before: 'text', after: 'character varying(12)' }],
+      attributes: { type: 'character varying(12)' },
     },
-    // Phase 11: add-primary-key.
+    // Phase 13: alter-persistence.
+    { kind: 'alter-persistence', table: identity('kept'), persistence: 'unlogged' },
+    // Phase 14: add-primary-key.
     {
       kind: 'add-primary-key',
       table: identity('kept'),
       primaryKey: { name: 'kept_pkey', columns: ['id', 'fresh'] },
     },
-    // Phase 12: add-unique-constraint, in diff order (fresh before kept).
+    // Phase 15: add-unique-constraint, in diff order (fresh before kept).
     { kind: 'add-unique-constraint', table: identity('fresh'), uniqueConstraint: freshKey },
     { kind: 'add-unique-constraint', table: identity('kept'), uniqueConstraint: liveKey },
-    // Phase 13: add-check-constraint.
+    // Phase 16: add-check-constraint.
     { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: freshCheck },
     { kind: 'add-check-constraint', table: identity('kept'), checkConstraint: liveCheck },
-    // Phase 14: create-index.
+    // Phase 17: create-index.
     { kind: 'create-index', table: identity('fresh'), index: freshIndex },
     { kind: 'create-index', table: identity('kept'), index: liveIndex },
-    // Phase 15: add-foreign-key.
+    // Phase 18: add-foreign-key.
     { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: freshForeignKey },
     { kind: 'add-foreign-key', table: identity('kept'), foreignKey: liveForeignKey },
   ]);
   simulate(baseline, target);
+});
+
+test('alter-persistence lands between add-not-null and add-primary-key', () => {
+  const baseline = model(
+    table('t', { columns: [column('id', { type: 'integer', notNull: true })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, notNullName: 't_id_nn' })],
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+      persistence: 'unlogged',
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'id' },
+    { kind: 'add-not-null', table: identity('t'), column: 'id', name: 't_id_nn' },
+    { kind: 'alter-persistence', table: identity('t'), persistence: 'unlogged' },
+    {
+      kind: 'add-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a persistence flip back to logged carries no persistence payload', () => {
+  const unlogged = model(table('t', { columns: [column('c')], persistence: 'unlogged' }));
+  const logged = model(table('t', { columns: [column('c')] }));
+
+  assertPlan(unlogged, logged, [{ kind: 'alter-persistence', table: identity('t') }]);
+  simulate(unlogged, logged);
+});
+
+test('an alter-column step keeps the diff order and carries the target attributes', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          default: '0',
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'bigint',
+          notNull: true,
+          default: '1',
+          collation: 'pg_catalog."en_US"',
+          storage: 'main',
+        }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [
+        { field: 'type', before: 'text', after: 'bigint' },
+        { field: 'notNull', before: false, after: true },
+        { field: 'default', before: '0', after: '1' },
+        { field: 'collation', before: 'pg_catalog."C"', after: 'pg_catalog."en_US"' },
+        { field: 'storage', before: 'extended', after: 'main' },
+        { field: 'compression', before: 'lz4' },
+      ],
+      attributes: {
+        type: 'bigint',
+        collation: 'pg_catalog."en_US"',
+        storage: 'main',
+      },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a create-table step carries the added table persistence as a copy', () => {
+  const source = table('t', {
+    columns: [
+      column('c', {
+        collation: 'pg_catalog."C"',
+        storage: 'main',
+        compression: 'pglz',
+      }),
+    ],
+    persistence: 'unlogged',
+  });
+
+  const { steps } = plan(model(), model(source));
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'create-table',
+      table: table('t', {
+        columns: [
+          column('c', {
+            collation: 'pg_catalog."C"',
+            storage: 'main',
+            compression: 'pglz',
+          }),
+        ],
+        persistence: 'unlogged',
+      }),
+    },
+  ]);
+
+  const step = steps[0];
+  if (step?.kind !== 'create-table') throw new Error('expected a create-table step');
+  assert.notEqual(step.table, source);
+  assert.equal(step.table.persistence, 'unlogged');
 });
 
 test('a deep-frozen model with constraints and indexes can be planned, and steps carry copies', () => {
@@ -2473,6 +4081,8 @@ test('a removed identity precedes DROP NOT NULL and SET DEFAULT on its column', 
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
+    extensions: [],
   };
 
   assertPlan(baseline, target, [
@@ -2723,6 +4333,8 @@ test('serial to identity drops the default, drops the sequence, then adds the id
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
+    views: [],
+    extensions: [],
   };
   const target = model(
     table('t', {
@@ -2774,6 +4386,8 @@ test('identity to serial drops the identity, creates the sequence, then sets the
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
+    extensions: [],
   };
 
   assertPlan(baseline, target, [
@@ -2867,16 +4481,16 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
   );
 
   assertPlan(baseline, target, [
-    // Phase 1: identity drops, in diff order.
+    // Phase 2: identity drops, in diff order.
     { kind: 'drop-identity', table: identity('a_keep'), name: 'id' },
     { kind: 'drop-identity', table: identity('c_ident'), name: 'id' },
     { kind: 'drop-identity', table: identity('f_serial'), name: 'id' },
-    // Phase 2: the conversion's replacement sequence, name-freed by the phase-1 drops.
+    // Phase 3: the conversion's replacement sequence, name-freed by the phase-2 drops.
     {
       kind: 'create-sequence',
       sequence: sequence('f_serial_id_seq', { dataType: 'integer' }),
     },
-    // Phase 4: the table phases.
+    // Phase 6: the table phases.
     {
       kind: 'create-table',
       table: {
@@ -2906,16 +4520,16 @@ test('identity steps pin the exact phase order across a mixed migration', () => 
       name: 'id',
       fields: [{ field: 'default', after: fSerialDefault }],
     },
-    // Phase 5: the replacement sequence's ownership.
+    // Phase 8: the replacement sequence's ownership.
     {
       kind: 'alter-sequence',
       sequence: identity('f_serial_id_seq'),
       fields: [{ field: 'ownedBy', after: owner('f_serial', 'id') }],
     },
-    // Phase 7: sequence drops, after the table phases released them.
+    // Phase 10: sequence drops, after the table phases released them.
     { kind: 'drop-sequence', sequence: identity('b_serial_id_seq') },
     { kind: 'drop-sequence', sequence: identity('gone_seq') },
-    // Phase 8: identity additions, then alters.
+    // Phase 11: identity additions, then alters.
     {
       kind: 'add-identity',
       table: identity('a_keep'),
@@ -3078,6 +4692,21 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
   let cuts = 0;
   let keyChanges = 0;
   let setAsides = 0;
+  let uniqueAdds = 0;
+  let uniqueDrops = 0;
+  let checkAdds = 0;
+  let checkDrops = 0;
+  let indexCreates = 0;
+  let indexDrops = 0;
+  let concurrentIndexCreates = 0;
+  let concurrentIndexDrops = 0;
+  let identityAdds = 0;
+  let identityDrops = 0;
+  let identityAlters = 0;
+  let recreations = 0;
+  let sequenceCreates = 0;
+  let sequenceDrops = 0;
+  let sequenceAlters = 0;
   for (let round = 0; round < 500; round += 1) {
     const { baseline, target } = generatePair(random);
     try {
@@ -3093,9 +4722,41 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
       target.tables.map((table) => [keyOf(table), new Set(table.foreignKeys.map(foreignKeyKey))]),
     );
     const { steps } = plan(baseline, target);
+    for (const step of steps) {
+      if (
+        step.kind === 'create-index' ||
+        step.kind === 'create-index-concurrently' ||
+        step.kind === 'drop-index' ||
+        step.kind === 'drop-index-concurrently'
+      ) {
+        const concurrent =
+          step.kind === 'create-index-concurrently' || step.kind === 'drop-index-concurrently';
+        assert.equal(
+          step.index.concurrently === true,
+          concurrent,
+          `round ${round}: ${step.kind} must ${concurrent ? '' : 'not '}carry the concurrent flag`,
+        );
+      }
+    }
+    if (recreatesIdentity(steps)) recreations += 1;
+    if (steps.some((step) => step.kind === 'create-sequence')) sequenceCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-sequence')) sequenceDrops += 1;
+    if (steps.some((step) => step.kind === 'alter-sequence')) sequenceAlters += 1;
     if (steps.some((step) => step.kind === 'drop-table')) drops += 1;
     if (steps.some((step) => step.kind === 'create-table')) creates += 1;
     if (steps.some((step) => step.kind === 'drop-primary-key')) keyChanges += 1;
+    if (steps.some((step) => step.kind === 'add-unique-constraint')) uniqueAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-unique-constraint')) uniqueDrops += 1;
+    if (steps.some((step) => step.kind === 'add-check-constraint')) checkAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-check-constraint')) checkDrops += 1;
+    if (steps.some((step) => step.kind === 'create-index')) indexCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-index')) indexDrops += 1;
+    if (steps.some((step) => step.kind === 'create-index-concurrently'))
+      concurrentIndexCreates += 1;
+    if (steps.some((step) => step.kind === 'drop-index-concurrently')) concurrentIndexDrops += 1;
+    if (steps.some((step) => step.kind === 'add-identity')) identityAdds += 1;
+    if (steps.some((step) => step.kind === 'drop-identity')) identityDrops += 1;
+    if (steps.some((step) => step.kind === 'alter-identity')) identityAlters += 1;
     if (
       steps.some(
         (step) =>
@@ -3119,6 +4780,24 @@ test('seeded pseudo-random model pairs keep every ordering invariant', () => {
     setAsides > 0,
     'the generated pairs must include primary-key changes with surviving foreign keys',
   );
+  assert.ok(uniqueAdds > 0, 'the generated pairs must include added unique constraints');
+  assert.ok(uniqueDrops > 0, 'the generated pairs must include removed unique constraints');
+  assert.ok(checkAdds > 0, 'the generated pairs must include added check constraints');
+  assert.ok(checkDrops > 0, 'the generated pairs must include removed check constraints');
+  assert.ok(indexCreates > 0, 'the generated pairs must include created indexes');
+  assert.ok(indexDrops > 0, 'the generated pairs must include dropped indexes');
+  assert.ok(
+    concurrentIndexCreates >= 3,
+    'the generated pairs must include concurrent index creates',
+  );
+  assert.ok(concurrentIndexDrops >= 3, 'the generated pairs must include concurrent index drops');
+  assert.ok(identityAdds > 0, 'the generated pairs must include added identities');
+  assert.ok(identityDrops > 0, 'the generated pairs must include dropped identities');
+  assert.ok(identityAlters > 0, 'the generated pairs must include altered identities');
+  assert.ok(recreations > 0, 'the generated pairs must include recreated identities');
+  assert.ok(sequenceCreates > 0, 'the generated pairs must include created sequences');
+  assert.ok(sequenceDrops > 0, 'the generated pairs must include dropped sequences');
+  assert.ok(sequenceAlters > 0, 'the generated pairs must include altered sequences');
 });
 
 test('a new owned sequence is created before its table and attached after it', () => {
@@ -3126,7 +4805,7 @@ test('a new owned sequence is created before its table and attached after it', (
   const owned = sequence('fresh_id_seq', { ownedBy: owner('fresh', 'id') });
   const standalone = sequence('standalone');
 
-  // Phase 1 creates both sequences (identity order), phase 3 the table, phase 4 the ownership.
+  // Phase 3 creates both sequences (identity order), phase 6 the table, phase 8 the ownership.
   assertPlan(model(), sequenceModel([standalone, owned], fresh), [
     { kind: 'create-sequence', sequence: unowned(owned) },
     { kind: 'create-sequence', sequence: standalone },
@@ -3340,4 +5019,2917 @@ test('a deep-frozen model with a changed sequence can be planned without mutatio
       fields: [{ field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'other') }],
     },
   ]);
+});
+
+/**
+ * The `applyChange` seam: the write half of `plan`'s change application, pinned branch by
+ * branch. Every case runs through `applyChange(emptyChangeApplication(), change)` and asserts
+ * exactly which buckets are written and what they carry. This is seam coverage, not pipeline
+ * validation: `diff` never emits a kind outside its unions, so the fabricated-kind tests are
+ * deletion detectors for the exhaustiveness guards, and #50 extends these per-branch
+ * expectations.
+ */
+
+/** Applies one change through the seam and returns the application it wrote. */
+const applyIsolated = (change: Change): ChangeApplication => {
+  const application = emptyChangeApplication();
+  applyChange(application, change);
+  return application;
+};
+
+/**
+ * Asserts that `change` applied to a fresh application writes exactly the buckets named in
+ * `expected`, leaving every other bucket empty. Sets are compared as insertion-ordered arrays.
+ */
+const assertBuckets = (
+  name: string,
+  change: Change,
+  expected: Partial<Record<keyof ChangeApplication, unknown>>,
+): void => {
+  const application = applyIsolated(change);
+  for (const bucket of Object.keys(application) as (keyof ChangeApplication)[]) {
+    const value = application[bucket];
+    const actual = value instanceof Set ? [...value] : value;
+    assert.deepStrictEqual(actual, expected[bucket] ?? [], `${name}: ${String(bucket)}`);
+  }
+};
+
+/** A `table-changed` outer change on table `t` carrying the given sub-change. */
+const tableChanged = (change: TableChange): Change => ({
+  kind: 'table-changed',
+  table: identity('t'),
+  changes: [change],
+});
+
+/** A `column-changed` for column `id` with an empty field list and the given identity change. */
+const columnIdentityChanged = (identity: IdentityChange): Change =>
+  tableChanged({ kind: 'column-changed', name: 'id', fields: [], identity });
+
+/** A `sequence-changed` for sequence `s` carrying the given field changes. */
+const sequenceChanged = (changes: readonly SequenceFieldChange[]): Change => ({
+  kind: 'sequence-changed',
+  sequence: identity('s'),
+  changes,
+});
+
+/** The map key of a table and column pair, mirroring `plan.ts`. */
+const columnKey = (table: TableIdentity, column: string): string =>
+  `${keyOf(table)}\u0000${column}`;
+
+/** A change case for `applyChange` isolation: its exact expected bucket contents. */
+interface BucketCase {
+  readonly name: string;
+  readonly change: Change;
+  readonly buckets: Partial<Record<keyof ChangeApplication, unknown>>;
+}
+
+test('emptyChangeApplication returns fresh independent buckets', () => {
+  const first = emptyChangeApplication();
+  const second = emptyChangeApplication();
+
+  first.foreignKeyDrops.push({ kind: 'drop-table', table: identity('x') });
+  first.removedTableKeys.add(keyOf(identity('x')));
+
+  assert.notEqual(first.foreignKeyDrops, second.foreignKeyDrops);
+  assert.notEqual(first.removedTableKeys, second.removedTableKeys);
+  assert.deepStrictEqual(second.foreignKeyDrops, []);
+  assert.equal(second.removedTableKeys.size, 0);
+});
+
+test('applyChange writes each outer change kind into its buckets', () => {
+  const id = column('id', { type: 'integer', notNull: true });
+  const addedIdentity = column('seq', { type: 'integer', identity: identityColumn() });
+  const addedForeignKey = foreignKey(['id'], identity('other'), { name: 'fresh_id_fkey' });
+  const addedUnique = uniqueConstraint(['id'], { name: 'fresh_id_key' });
+  const addedCheck = checkConstraint('id > 0', { name: 'fresh_id_check' });
+  const addedIndex = index(['id'], { name: 'fresh_ix' });
+  const added = table('fresh', {
+    columns: [id, addedIdentity],
+    primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+    foreignKeys: [addedForeignKey],
+    uniqueConstraints: [addedUnique],
+    checkConstraints: [addedCheck],
+    indexes: [addedIndex],
+  });
+  const removed = table('gone', { columns: [column('id', { type: 'integer', notNull: true })] });
+  const owned = sequence('s', { ownedBy: owner('t', 'id') });
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'table-added',
+      change: { kind: 'table-added', table: added },
+      buckets: {
+        tableCreates: [
+          {
+            kind: 'create-table',
+            table: table('fresh', {
+              columns: [id, addedIdentity],
+              primaryKey: { name: 'fresh_pkey', columns: ['id'] },
+            }),
+          },
+        ],
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: addedForeignKey },
+        ],
+        uniqueConstraintAdds: [
+          {
+            kind: 'add-unique-constraint',
+            table: identity('fresh'),
+            uniqueConstraint: addedUnique,
+          },
+        ],
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: addedCheck },
+        ],
+        indexCreates: [{ kind: 'create-index', table: identity('fresh'), index: addedIndex }],
+        identityAdds: [
+          {
+            kind: 'add-identity',
+            table: identity('fresh'),
+            name: 'seq',
+            identity: identityColumn(),
+          },
+        ],
+      },
+    },
+    {
+      name: 'table-removed',
+      change: { kind: 'table-removed', table: removed },
+      buckets: {
+        removedTables: [{ identity: identity('gone'), table: removed }],
+        removedTableKeys: [keyOf(identity('gone'))],
+      },
+    },
+    {
+      name: 'table-changed',
+      change: tableChanged({ kind: 'column-added', column: column('c', { type: 'integer' }) }),
+      buckets: {
+        columnAdds: [
+          { kind: 'add-column', table: identity('t'), column: column('c', { type: 'integer' }) },
+        ],
+      },
+    },
+    {
+      name: 'sequence-added (owned)',
+      change: { kind: 'sequence-added', sequence: owned },
+      buckets: {
+        sequenceCreates: [{ kind: 'create-sequence', sequence: unowned(owned) }],
+        ownershipChanges: [{ sequence: identity('s'), after: owner('t', 'id') }],
+      },
+    },
+    {
+      name: 'sequence-removed (owned)',
+      change: { kind: 'sequence-removed', sequence: owned },
+      buckets: {
+        removedSequences: [{ identity: identity('s'), ownedBy: owner('t', 'id') }],
+      },
+    },
+    {
+      name: 'sequence-changed (options)',
+      change: sequenceChanged([{ field: 'increment', before: '1', after: '5' }]),
+      buckets: {
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [{ field: 'increment', before: '1', after: '5' }],
+          },
+        ],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange writes each table change kind into its buckets', () => {
+  const beforePrimaryKey: PrimaryKey = { name: 't_pkey', columns: ['id'] };
+  const afterPrimaryKey: PrimaryKey = { name: 't_pkey_2', columns: ['id', 'x'] };
+  const beforeForeignKey = foreignKey(['a'], identity('other'), { name: 't_a_fkey' });
+  const afterForeignKey = foreignKey(['b'], identity('other'), { name: 't_b_fkey' });
+  const beforeUnique = uniqueConstraint(['a'], { name: 't_a_key' });
+  const afterUnique = uniqueConstraint(['b'], { name: 't_b_key' });
+  const beforeCheck = checkConstraint('a > 0', { name: 't_a_check' });
+  const afterCheck = checkConstraint('b > 0', { name: 't_b_check' });
+  const beforeIndex = index(['a'], { name: 't_a_ix' });
+  const afterIndex = index(['b'], { name: 't_b_ix' });
+  const removedColumn = column('gone', { type: 'integer' });
+  const addedColumn = column('fresh', { type: 'integer' });
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'column-added',
+      change: tableChanged({ kind: 'column-added', column: addedColumn }),
+      buckets: {
+        columnAdds: [{ kind: 'add-column', table: identity('t'), column: addedColumn }],
+      },
+    },
+    {
+      name: 'column-removed',
+      change: tableChanged({ kind: 'column-removed', column: removedColumn }),
+      buckets: {
+        columnDrops: [{ kind: 'drop-column', table: identity('t'), column: removedColumn }],
+        removedColumnKeys: [columnKey(identity('t'), 'gone')],
+      },
+    },
+    {
+      name: 'column-changed',
+      change: tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'default', before: '1', after: '2' }],
+      }),
+      buckets: {
+        columnAlters: [
+          {
+            kind: 'alter-column',
+            table: identity('t'),
+            name: 'c',
+            fields: [{ field: 'default', before: '1', after: '2' }],
+          },
+        ],
+      },
+    },
+    {
+      name: 'column-changed (attributes carrier)',
+      change: tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'storage', before: 'extended', after: 'main' }],
+        attributes: { type: 'text', storage: 'main' },
+      }),
+      buckets: {
+        columnAlters: [
+          {
+            kind: 'alter-column',
+            table: identity('t'),
+            name: 'c',
+            fields: [{ field: 'storage', before: 'extended', after: 'main' }],
+            attributes: { type: 'text', storage: 'main' },
+          },
+        ],
+      },
+    },
+    {
+      name: 'persistence-changed (to unlogged)',
+      change: tableChanged({ kind: 'persistence-changed', after: 'unlogged' }),
+      buckets: {
+        persistenceAlters: [
+          { kind: 'alter-persistence', table: identity('t'), persistence: 'unlogged' },
+        ],
+      },
+    },
+    {
+      name: 'persistence-changed (back to logged)',
+      change: tableChanged({ kind: 'persistence-changed', before: 'unlogged' }),
+      buckets: {
+        persistenceAlters: [{ kind: 'alter-persistence', table: identity('t') }],
+      },
+    },
+    {
+      name: 'primary-key-added',
+      change: tableChanged({ kind: 'primary-key-added', primaryKey: afterPrimaryKey }),
+      buckets: {
+        primaryKeyAdds: [
+          { kind: 'add-primary-key', table: identity('t'), primaryKey: afterPrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'primary-key-removed',
+      change: tableChanged({ kind: 'primary-key-removed', primaryKey: beforePrimaryKey }),
+      buckets: {
+        primaryKeyDrops: [
+          { kind: 'drop-primary-key', table: identity('t'), primaryKey: beforePrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'primary-key-changed',
+      change: tableChanged({
+        kind: 'primary-key-changed',
+        before: beforePrimaryKey,
+        after: afterPrimaryKey,
+      }),
+      buckets: {
+        primaryKeyDrops: [
+          { kind: 'drop-primary-key', table: identity('t'), primaryKey: beforePrimaryKey },
+        ],
+        primaryKeyAdds: [
+          { kind: 'add-primary-key', table: identity('t'), primaryKey: afterPrimaryKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-added',
+      change: tableChanged({ kind: 'foreign-key-added', foreignKey: afterForeignKey }),
+      buckets: {
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-removed',
+      change: tableChanged({ kind: 'foreign-key-removed', foreignKey: beforeForeignKey }),
+      buckets: {
+        foreignKeyDrops: [
+          { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'foreign-key-changed',
+      change: tableChanged({
+        kind: 'foreign-key-changed',
+        before: beforeForeignKey,
+        after: afterForeignKey,
+      }),
+      buckets: {
+        foreignKeyDrops: [
+          { kind: 'drop-foreign-key', table: identity('t'), foreignKey: beforeForeignKey },
+        ],
+        foreignKeyAdds: [
+          { kind: 'add-foreign-key', table: identity('t'), foreignKey: afterForeignKey },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-added',
+      change: tableChanged({ kind: 'unique-constraint-added', uniqueConstraint: afterUnique }),
+      buckets: {
+        uniqueConstraintAdds: [
+          { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-removed',
+      change: tableChanged({ kind: 'unique-constraint-removed', uniqueConstraint: beforeUnique }),
+      buckets: {
+        uniqueConstraintDrops: [
+          { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+        ],
+      },
+    },
+    {
+      name: 'unique-constraint-changed',
+      change: tableChanged({
+        kind: 'unique-constraint-changed',
+        before: beforeUnique,
+        after: afterUnique,
+      }),
+      buckets: {
+        uniqueConstraintDrops: [
+          { kind: 'drop-unique-constraint', table: identity('t'), uniqueConstraint: beforeUnique },
+        ],
+        uniqueConstraintAdds: [
+          { kind: 'add-unique-constraint', table: identity('t'), uniqueConstraint: afterUnique },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-added',
+      change: tableChanged({ kind: 'check-constraint-added', checkConstraint: afterCheck }),
+      buckets: {
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-removed',
+      change: tableChanged({ kind: 'check-constraint-removed', checkConstraint: beforeCheck }),
+      buckets: {
+        checkConstraintDrops: [
+          { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+        ],
+      },
+    },
+    {
+      name: 'check-constraint-changed',
+      change: tableChanged({
+        kind: 'check-constraint-changed',
+        before: beforeCheck,
+        after: afterCheck,
+      }),
+      buckets: {
+        checkConstraintDrops: [
+          { kind: 'drop-check-constraint', table: identity('t'), checkConstraint: beforeCheck },
+        ],
+        checkConstraintAdds: [
+          { kind: 'add-check-constraint', table: identity('t'), checkConstraint: afterCheck },
+        ],
+      },
+    },
+    {
+      name: 'index-added',
+      change: tableChanged({ kind: 'index-added', index: afterIndex }),
+      buckets: {
+        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+      },
+    },
+    {
+      name: 'index-removed',
+      change: tableChanged({ kind: 'index-removed', index: beforeIndex }),
+      buckets: {
+        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
+      },
+    },
+    {
+      name: 'index-changed',
+      change: tableChanged({ kind: 'index-changed', before: beforeIndex, after: afterIndex }),
+      buckets: {
+        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
+        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange writes each identity change kind through column-changed', () => {
+  const descriptor = identityColumn();
+
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'identity-added',
+      change: columnIdentityChanged({ kind: 'added', identity: descriptor }),
+      buckets: {
+        identityAdds: [
+          { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+        ],
+      },
+    },
+    {
+      name: 'identity-removed',
+      change: columnIdentityChanged({ kind: 'removed', identity: descriptor }),
+      buckets: {
+        identityDrops: [{ kind: 'drop-identity', table: identity('t'), name: 'id' }],
+      },
+    },
+    {
+      name: 'identity-recreated',
+      change: columnIdentityChanged({ kind: 'recreated', identity: descriptor }),
+      buckets: {
+        identityDrops: [{ kind: 'drop-identity', table: identity('t'), name: 'id' }],
+        identityAdds: [
+          { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+        ],
+      },
+    },
+    {
+      name: 'identity-changed',
+      change: columnIdentityChanged({
+        kind: 'changed',
+        fields: [{ field: 'increment', before: '1', after: '2' }],
+      }),
+      buckets: {
+        identityAlters: [
+          {
+            kind: 'alter-identity',
+            table: identity('t'),
+            name: 'id',
+            fields: [{ field: 'increment', before: '1', after: '2' }],
+          },
+        ],
+      },
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+test('applyChange splits a changed sequence into option and ownership buckets', () => {
+  const cases: readonly BucketCase[] = [
+    {
+      name: 'options only',
+      change: sequenceChanged([
+        { field: 'dataType', before: 'integer', after: 'bigint' },
+        { field: 'increment', before: '1', after: '5' },
+      ]),
+      buckets: {
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [
+              { field: 'dataType', before: 'integer', after: 'bigint' },
+              { field: 'increment', before: '1', after: '5' },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      name: 'ownership only',
+      change: sequenceChanged([
+        { field: 'ownedBy', before: owner('t', 'id'), after: owner('t', 'x') },
+      ]),
+      buckets: {
+        ownershipChanges: [
+          { sequence: identity('s'), before: owner('t', 'id'), after: owner('t', 'x') },
+        ],
+      },
+    },
+    {
+      name: 'mixed',
+      change: sequenceChanged([
+        { field: 'ownedBy', before: owner('t', 'id') },
+        { field: 'maxValue', before: '10', after: '20' },
+        { field: 'ownedBy', after: owner('u', 'id') },
+      ]),
+      buckets: {
+        ownershipChanges: [
+          { sequence: identity('s'), before: owner('t', 'id') },
+          { sequence: identity('s'), after: owner('u', 'id') },
+        ],
+        optionAlters: [
+          {
+            kind: 'alter-sequence',
+            sequence: identity('s'),
+            fields: [{ field: 'maxValue', before: '10', after: '20' }],
+          },
+        ],
+      },
+    },
+    {
+      name: 'no fields',
+      change: sequenceChanged([]),
+      buckets: {},
+    },
+  ];
+
+  for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
+});
+
+/**
+ * Payload-aliasing guards: a step payload must not share nested objects with the `Change` it
+ * came from, even fields the current payload types do not declare. Each case fabricates a
+ * nested `nested` field on the input, applies the change through the seam, mutates the nested
+ * object through the produced step payload, and asserts the input never moved. These pin the
+ * bare spreads converted to `copyStepPayload` deep copies.
+ */
+
+/** One aliasing case: how to build the change around the fabricated object and where to find it. */
+interface AliasCase {
+  readonly name: string;
+  readonly build: (nested: { deep: string }) => Change;
+  readonly payload: (application: ChangeApplication) => Record<string, unknown>;
+}
+
+/** The embedded payload of the only step in `steps`, cast for the aliasing probe. */
+const onlyPayload = (steps: readonly Step[], key: string): Record<string, unknown> => {
+  assert.equal(steps.length, 1, `expected exactly one step, got ${steps.length}`);
+  return (steps[0] as unknown as Record<string, Record<string, unknown>>)[key]!;
+};
+
+/** The only field change of the only step in `steps`, cast for the aliasing probe. */
+const onlyFieldPayload = (steps: readonly Step[]): Record<string, unknown> => {
+  assert.equal(steps.length, 1, `expected exactly one step, got ${steps.length}`);
+  const fields = (steps[0] as unknown as { fields: readonly Record<string, unknown>[] }).fields;
+  assert.equal(fields.length, 1, `expected exactly one field, got ${fields.length}`);
+  return fields[0]!;
+};
+
+const aliasCases: readonly AliasCase[] = [
+  {
+    name: 'index create',
+    build: (nested) =>
+      tableChanged({
+        kind: 'index-added',
+        index: { ...index(['a']), nested } as unknown as Index,
+      }),
+    payload: (application) => onlyPayload(application.indexCreates, 'index'),
+  },
+  {
+    name: 'index drop',
+    build: (nested) =>
+      tableChanged({
+        kind: 'index-removed',
+        index: { ...index(['a']), nested } as unknown as Index,
+      }),
+    payload: (application) => onlyPayload(application.indexDrops, 'index'),
+  },
+  {
+    name: 'check constraint',
+    build: (nested) =>
+      tableChanged({
+        kind: 'check-constraint-added',
+        checkConstraint: {
+          ...checkConstraint('a > 0'),
+          nested,
+        } as unknown as CheckConstraint,
+      }),
+    payload: (application) => onlyPayload(application.checkConstraintAdds, 'checkConstraint'),
+  },
+  {
+    name: 'column field change',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [
+          { field: 'notNull', before: false, after: true, nested } as unknown as ColumnFieldChange,
+        ],
+      }),
+    payload: (application) => onlyFieldPayload(application.columnAlters),
+  },
+  {
+    name: 'column attributes carrier',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [{ field: 'storage', after: 'main' }],
+        attributes: { type: 'text', nested } as unknown as ColumnAttributes,
+      }),
+    payload: (application) => onlyPayload(application.columnAlters, 'attributes'),
+  },
+  {
+    name: 'column identity field change',
+    build: (nested) =>
+      tableChanged({
+        kind: 'column-changed',
+        name: 'c',
+        fields: [],
+        identity: {
+          kind: 'changed',
+          fields: [
+            {
+              field: 'increment',
+              before: '1',
+              after: '2',
+              nested,
+            } as unknown as IdentityFieldChange,
+          ],
+        },
+      }),
+    payload: (application) => onlyFieldPayload(application.identityAlters),
+  },
+  {
+    name: 'sequence option',
+    build: (nested) =>
+      sequenceChanged([
+        { field: 'increment', before: '1', after: '2', nested } as unknown as SequenceFieldChange,
+      ]),
+    payload: (application) => onlyFieldPayload(application.optionAlters),
+  },
+];
+
+for (const { name, build, payload } of aliasCases) {
+  test(`a step payload deep-copies a fabricated nested field: ${name}`, () => {
+    const nested = { deep: 'original' };
+    const application = applyIsolated(build(nested));
+    const produced = payload(application);
+
+    (produced['nested'] as { deep: string }).deep = 'mutated';
+    assert.equal(
+      nested.deep,
+      'original',
+      'mutating the produced step payload must not mutate the input change',
+    );
+  });
+}
+
+// Deletion detectors, not pipeline validation: `diff` never emits an unknown kind, so these
+// pin the guards that make every future union member a compile error, and the seam contract
+// #50 extends with property coverage.
+
+test('a fabricated outer change kind is rejected by the application guard', () => {
+  assert.throws(
+    () => applyChange(emptyChangeApplication(), { kind: 'frobnicate' } as unknown as Change),
+    /Unhandled change kind: frobnicate/,
+  );
+});
+
+test('a fabricated table change kind is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        tableChanged({ kind: 'frobnicate' } as unknown as TableChange),
+      ),
+    /Unhandled table change kind: frobnicate/,
+  );
+});
+
+test('a fabricated identity change kind is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        columnIdentityChanged({ kind: 'frobnicate' } as unknown as IdentityChange),
+      ),
+    /Unhandled identity change kind: frobnicate/,
+  );
+});
+
+test('a fabricated sequence field is rejected by the application guard', () => {
+  assert.throws(
+    () =>
+      applyChange(
+        emptyChangeApplication(),
+        sequenceChanged([{ field: 'frobnicate' } as unknown as SequenceFieldChange]),
+      ),
+    /Unhandled sequence field: frobnicate/,
+  );
+});
+
+// Property coverage for the diff→plan change application (#50). Four seeded properties pin the
+// invariants over generated input: P1 order-independence and determinism, P2 diff-closed write
+// accounting, P3 transaction-group invariants, and P4 unnamed-index twins. Columns are
+// positional, so no permutation touches them. Each property draws from its own seed constant
+// and prints the round and its input on failure; rounds are bounded so the suite stays fast.
+
+/** P1's seed: the golden-ratio constant. */
+const ORDER_SEED = 0x9e3779b9;
+/** P2's seed: the MurmurHash3 finalizer constant. */
+const ACCOUNTING_SEED = 0x85ebca6b;
+/** P3's seed: the MurmurHash3 block constant. */
+const GROUP_SEED = 0xc2b2ae35;
+/** P4's seed: the FNV-1a prime. */
+const TWIN_SEED = 0x27d4eb2f;
+
+/** Rounds for P1–P3; the generated pairs are 2–6 tables and the shapes are small. */
+const PROPERTY_ROUNDS = 250;
+/** Rounds for P4; the twin shapes are hand-built and tiny. */
+const TWIN_ROUNDS = 200;
+/** P1's permutations per pair: K shuffles of the order-independent arrays. */
+const ORDER_PERMUTATIONS = 3;
+/** P4's permutations of the twin-bearing target per round. */
+const TWIN_PERMUTATIONS = 3;
+
+/** A Fisher–Yates shuffle of `values` driven by `random`; the input is untouched. */
+const shuffleWith = <T>(random: Random, values: readonly T[]): T[] => {
+  const copy = [...values];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random.next() * (index + 1));
+    const held = copy[index]!;
+    copy[index] = copy[swap]!;
+    copy[swap] = held;
+  }
+  return copy;
+};
+
+/**
+ * A copy of `source` whose order-independent arrays are shuffled with `random`: the tables, the
+ * sequences, and each table's foreign keys, unique constraints, check constraints, and indexes.
+ * Columns stay in place: they are positional, so permuting them would false-fail.
+ */
+const permutedModel = (source: Model, random: Random): Model => ({
+  tables: shuffleWith(random, source.tables).map((table) => ({
+    ...table,
+    foreignKeys: shuffleWith(random, table.foreignKeys),
+    uniqueConstraints: shuffleWith(random, table.uniqueConstraints),
+    checkConstraints: shuffleWith(random, table.checkConstraints),
+    indexes: shuffleWith(random, table.indexes),
+  })),
+  sequences: shuffleWith(random, source.sequences),
+  views: shuffleWith(random, source.views),
+  extensions: [...source.extensions],
+});
+
+test('seeded pairs keep diff and plan deterministic and order-independent', () => {
+  const random = randomOf(ORDER_SEED);
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const { baseline, target } = generatePair(random);
+    try {
+      const firstDiff = diff(baseline, target);
+      assert.deepStrictEqual(
+        diff(baseline, target),
+        firstDiff,
+        `round ${round}: diff must be deterministic`,
+      );
+      const firstPlan = plan(baseline, target);
+      assert.deepStrictEqual(
+        plan(baseline, target),
+        firstPlan,
+        `round ${round}: plan must be deterministic`,
+      );
+      for (let permutation = 0; permutation < ORDER_PERMUTATIONS; permutation += 1) {
+        const shuffledBaseline = permutedModel(baseline, random);
+        const shuffledTarget = permutedModel(target, random);
+        assert.deepStrictEqual(
+          diff(shuffledBaseline, shuffledTarget),
+          firstDiff,
+          `round ${round} permutation ${permutation}: diff must not depend on array order`,
+        );
+        assert.deepStrictEqual(
+          plan(shuffledBaseline, shuffledTarget),
+          firstPlan,
+          `round ${round} permutation ${permutation}: plan must not depend on array order`,
+        );
+        simulate(shuffledBaseline, shuffledTarget);
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target })}`,
+        { cause: error },
+      );
+    }
+  }
+});
+
+/** The 27 array buckets of a `ChangeApplication`, in interface order. */
+const applicationArrays = [
+  'foreignKeyDrops',
+  'primaryKeyDrops',
+  'columnDrops',
+  'removedTables',
+  'tableCreates',
+  'columnAdds',
+  'columnAlters',
+  'persistenceAlters',
+  'primaryKeyAdds',
+  'foreignKeyAdds',
+  'uniqueConstraintDrops',
+  'uniqueConstraintAdds',
+  'checkConstraintDrops',
+  'checkConstraintAdds',
+  'indexDrops',
+  'indexCreates',
+  'identityDrops',
+  'identityAdds',
+  'identityAlters',
+  'sequenceCreates',
+  'optionAlters',
+  'extensionCreates',
+  'extensionAlters',
+  'extensionDrops',
+  'viewDrops',
+  'viewCreates',
+  'viewReplaces',
+  'comments',
+  'ownershipChanges',
+  'removedSequences',
+] as const satisfies readonly (keyof ChangeApplication)[];
+
+/** One of the application's array bucket names. */
+type ApplicationArray = (typeof applicationArrays)[number];
+
+/** The writes a `Change[]` must produce: per-bucket counts and the removal-key sets. */
+interface ExpectedWrites {
+  readonly counts: Record<ApplicationArray, number>;
+  readonly removedTableKeys: readonly string[];
+  readonly removedColumnKeys: readonly string[];
+}
+
+/**
+ * The bucket writes `changes` must produce, derived from each change's payload by the documented
+ * accounting rules — not by mirroring `applyChange`. A `column-changed` entry with no scalar
+ * fields writes no `columnAlters` step and a `changed` identity with no differing options writes
+ * no `identityAlters` step: the plan never carries an empty change list.
+ */
+const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
+  const counts: Record<ApplicationArray, number> = {
+    foreignKeyDrops: 0,
+    primaryKeyDrops: 0,
+    columnDrops: 0,
+    removedTables: 0,
+    tableCreates: 0,
+    columnAdds: 0,
+    columnAlters: 0,
+    persistenceAlters: 0,
+    primaryKeyAdds: 0,
+    foreignKeyAdds: 0,
+    uniqueConstraintDrops: 0,
+    uniqueConstraintAdds: 0,
+    checkConstraintDrops: 0,
+    checkConstraintAdds: 0,
+    indexDrops: 0,
+    indexCreates: 0,
+    identityDrops: 0,
+    identityAdds: 0,
+    identityAlters: 0,
+    sequenceCreates: 0,
+    optionAlters: 0,
+    extensionCreates: 0,
+    extensionAlters: 0,
+    extensionDrops: 0,
+    viewDrops: 0,
+    viewCreates: 0,
+    viewReplaces: 0,
+    comments: 0,
+    ownershipChanges: 0,
+    removedSequences: 0,
+  };
+  const removedTableKeys = new Set<string>();
+  const removedColumnKeys = new Set<string>();
+  const count = (bucket: ApplicationArray): void => {
+    counts[bucket] += 1;
+  };
+  for (const change of changes) {
+    switch (change.kind) {
+      case 'table-removed':
+        count('removedTables');
+        removedTableKeys.add(keyOf(change.table));
+        break;
+      case 'table-added':
+        count('tableCreates');
+        counts.foreignKeyAdds += change.table.foreignKeys.length;
+        counts.uniqueConstraintAdds += change.table.uniqueConstraints.length;
+        counts.checkConstraintAdds += change.table.checkConstraints.length;
+        counts.indexCreates += change.table.indexes.length;
+        counts.identityAdds += change.table.columns.filter(
+          (column) => column.identity !== undefined,
+        ).length;
+        break;
+      case 'table-changed':
+        for (const tableChange of change.changes) {
+          switch (tableChange.kind) {
+            case 'column-removed':
+              count('columnDrops');
+              removedColumnKeys.add(columnKey(change.table, tableChange.column.name));
+              break;
+            case 'column-added':
+              count('columnAdds');
+              if (tableChange.column.identity !== undefined) count('identityAdds');
+              break;
+            case 'column-changed':
+              if (tableChange.fields.length > 0) count('columnAlters');
+              if (tableChange.identity !== undefined) {
+                switch (tableChange.identity.kind) {
+                  case 'added':
+                    count('identityAdds');
+                    break;
+                  case 'removed':
+                    count('identityDrops');
+                    break;
+                  case 'recreated':
+                    count('identityDrops');
+                    count('identityAdds');
+                    break;
+                  case 'changed':
+                    if (tableChange.identity.fields.length > 0) count('identityAlters');
+                    break;
+                  default:
+                    assertNever(tableChange.identity, 'identity change kind');
+                }
+              }
+              break;
+            case 'primary-key-added':
+              count('primaryKeyAdds');
+              break;
+            case 'primary-key-removed':
+              count('primaryKeyDrops');
+              break;
+            case 'primary-key-changed':
+              count('primaryKeyDrops');
+              count('primaryKeyAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'foreign-key-added':
+              count('foreignKeyAdds');
+              break;
+            case 'foreign-key-removed':
+              count('foreignKeyDrops');
+              break;
+            case 'foreign-key-changed':
+              count('foreignKeyDrops');
+              count('foreignKeyAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'unique-constraint-added':
+              count('uniqueConstraintAdds');
+              break;
+            case 'unique-constraint-removed':
+              count('uniqueConstraintDrops');
+              break;
+            case 'unique-constraint-changed':
+              count('uniqueConstraintDrops');
+              count('uniqueConstraintAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'check-constraint-added':
+              count('checkConstraintAdds');
+              break;
+            case 'check-constraint-removed':
+              count('checkConstraintDrops');
+              break;
+            case 'check-constraint-changed':
+              count('checkConstraintDrops');
+              count('checkConstraintAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'index-added':
+              count('indexCreates');
+              break;
+            case 'index-removed':
+              count('indexDrops');
+              break;
+            case 'index-changed':
+              count('indexDrops');
+              count('indexCreates');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'persistence-changed':
+              count('persistenceAlters');
+              break;
+            default:
+              assertNever(tableChange, 'table change kind');
+          }
+        }
+        break;
+      case 'sequence-added':
+        count('sequenceCreates');
+        if (change.sequence.ownedBy !== undefined) count('ownershipChanges');
+        break;
+      case 'sequence-removed':
+        count('removedSequences');
+        break;
+      case 'sequence-changed':
+        if (change.changes.some((field) => field.field !== 'ownedBy')) count('optionAlters');
+        counts.ownershipChanges += change.changes.filter(
+          (field) => field.field === 'ownedBy',
+        ).length;
+        break;
+      case 'view-added':
+        count('viewCreates');
+        break;
+      case 'view-removed':
+        count('viewDrops');
+        break;
+      case 'view-changed':
+        if (change.before.materialized === false && change.after.materialized === false) {
+          count('viewReplaces');
+        } else {
+          count('viewDrops');
+          count('viewCreates');
+          if (change.after.comment !== undefined) count('comments');
+        }
+        break;
+      case 'extension-added':
+        count('extensionCreates');
+        break;
+      case 'extension-removed':
+        count('extensionDrops');
+        break;
+      case 'extension-changed':
+        if (change.changes.length > 0) count('extensionAlters');
+        break;
+      case 'comment-changed':
+        count('comments');
+        break;
+      default:
+        assertNever(change, 'change kind');
+    }
+  }
+  return {
+    counts,
+    removedTableKeys: [...removedTableKeys].sort(),
+    removedColumnKeys: [...removedColumnKeys].sort(),
+  };
+};
+
+/** Appends every bucket of `source` onto `target`: the bucket-wise merge of one change's run. */
+const appendApplication = (target: ChangeApplication, source: ChangeApplication): void => {
+  target.foreignKeyDrops.push(...source.foreignKeyDrops);
+  target.primaryKeyDrops.push(...source.primaryKeyDrops);
+  target.columnDrops.push(...source.columnDrops);
+  target.removedTables.push(...source.removedTables);
+  target.tableCreates.push(...source.tableCreates);
+  target.columnAdds.push(...source.columnAdds);
+  target.columnAlters.push(...source.columnAlters);
+  target.persistenceAlters.push(...source.persistenceAlters);
+  target.primaryKeyAdds.push(...source.primaryKeyAdds);
+  target.foreignKeyAdds.push(...source.foreignKeyAdds);
+  target.uniqueConstraintDrops.push(...source.uniqueConstraintDrops);
+  target.uniqueConstraintAdds.push(...source.uniqueConstraintAdds);
+  target.checkConstraintDrops.push(...source.checkConstraintDrops);
+  target.checkConstraintAdds.push(...source.checkConstraintAdds);
+  target.indexDrops.push(...source.indexDrops);
+  target.indexCreates.push(...source.indexCreates);
+  target.identityDrops.push(...source.identityDrops);
+  target.identityAdds.push(...source.identityAdds);
+  target.identityAlters.push(...source.identityAlters);
+  target.sequenceCreates.push(...source.sequenceCreates);
+  target.optionAlters.push(...source.optionAlters);
+  target.extensionCreates.push(...source.extensionCreates);
+  target.extensionAlters.push(...source.extensionAlters);
+  target.extensionDrops.push(...source.extensionDrops);
+  target.viewDrops.push(...source.viewDrops);
+  target.viewCreates.push(...source.viewCreates);
+  target.viewReplaces.push(...source.viewReplaces);
+  target.comments.push(...source.comments);
+  target.ownershipChanges.push(...source.ownershipChanges);
+  target.removedSequences.push(...source.removedSequences);
+  for (const key of source.removedTableKeys) target.removedTableKeys.add(key);
+  for (const key of source.removedColumnKeys) target.removedColumnKeys.add(key);
+};
+
+test('seeded diffs are consumed exactly once by the change application', () => {
+  const random = randomOf(ACCOUNTING_SEED);
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const { baseline, target } = generatePair(random);
+    try {
+      const changes = diff(baseline, target);
+      const application = emptyChangeApplication();
+      for (const change of changes) applyChange(application, change);
+      const expected = expectedWrites(changes);
+      for (const bucket of applicationArrays) {
+        assert.equal(
+          application[bucket].length,
+          expected.counts[bucket],
+          `round ${round}: ${bucket} count`,
+        );
+      }
+      assert.deepStrictEqual(
+        [...application.removedTableKeys].sort(),
+        expected.removedTableKeys,
+        `round ${round}: removedTableKeys`,
+      );
+      assert.deepStrictEqual(
+        [...application.removedColumnKeys].sort(),
+        expected.removedColumnKeys,
+        `round ${round}: removedColumnKeys`,
+      );
+
+      // Secondary: the whole run must equal the bucket-wise merge of one fresh application per
+      // change, so a wrong payload or a wrong order cannot hide behind matching counts.
+      const merged = emptyChangeApplication();
+      for (const change of changes) {
+        const single = emptyChangeApplication();
+        applyChange(single, change);
+        appendApplication(merged, single);
+      }
+      assert.deepStrictEqual(application, merged, `round ${round}: whole run equals the merge`);
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target })}`,
+        { cause: error },
+      );
+    }
+  }
+});
+
+test('randomized step-kind sequences partition into transaction groups', () => {
+  const random = randomOf(GROUP_SEED);
+  const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
+  assert.equal(kinds.length, 34, 'every step kind must be classified');
+  const seen = new Set<Step['kind']>();
+  for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
+    const length = round === 0 ? 0 : Math.floor(random.next() * 13);
+    const sequence: Step['kind'][] = [];
+    for (let index = 0; index < length; index += 1) sequence.push(random.pick(kinds));
+    for (const kind of sequence) seen.add(kind);
+    const steps = sequence.map((kind) => ({ kind }) as unknown as Step);
+    try {
+      const groups = groupSteps(steps);
+      let cursor = 0;
+      for (const group of groups) {
+        assert.equal(group.start, cursor, 'groups must tile the sequence from 0');
+        assert.ok(group.end > group.start, 'groups must be non-empty');
+        const first = steps[group.start]!;
+        assert.equal(group.transactional, TRANSACTIONAL[first.kind], 'group flag must match');
+        if (group.transactional) {
+          for (let index = group.start; index < group.end; index += 1) {
+            assert.ok(
+              TRANSACTIONAL[steps[index]!.kind],
+              'transactional groups hold only transactional steps',
+            );
+          }
+        } else {
+          assert.equal(group.end - group.start, 1, 'non-transactional steps must stand alone');
+          assert.equal(
+            TRANSACTIONAL[first.kind],
+            false,
+            'a non-transactional group must hold a non-transactional step',
+          );
+        }
+        cursor = group.end;
+      }
+      assert.equal(cursor, steps.length, 'groups must tile the whole sequence');
+      for (let index = 1; index < groups.length; index += 1) {
+        assert.ok(
+          !(groups[index - 1]!.transactional && groups[index]!.transactional),
+          'consecutive transactional groups must coalesce',
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ kinds: sequence })}`,
+        { cause: error },
+      );
+    }
+  }
+  assert.deepStrictEqual(
+    [...seen].sort(),
+    [...kinds].sort(),
+    'the rounds must exercise every step kind',
+  );
+});
+
+/** P4's table columns; the twin shapes index one or two of them. */
+const twinTableColumns: readonly Column[] = [column('a'), column('b'), column('c')];
+
+/** One twin shape: the pair, the explicit twin's payload, and whether σ survives in the target. */
+interface TwinShape {
+  readonly baseline: Model;
+  readonly target: Model;
+  readonly twin: Index;
+  readonly kept: boolean;
+}
+
+/**
+ * One unnamed-index twin shape, built directly (never through `mutateTable`): the baseline keeps
+ * an unnamed index σ; the target either keeps σ beside the explicit twin or replaces σ with it.
+ * The twin is named by the conventional `<table>_<cols>_idx` formula for its own ordered columns,
+ * is the only conventional-named index, and filler indexes (non-conventional names) stay on both
+ * sides. Shapes vary columns, `unique`, `concurrently`, and filler members across rounds.
+ */
+const generateTwinShape = (random: Random): TwinShape => {
+  const pickColumns = (): string[] => {
+    const count = random.chance(0.35) ? 2 : 1;
+    const pool = ['a', 'b', 'c'];
+    const picked: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      picked.push(pool.splice(Math.floor(random.next() * pool.length), 1)[0]!);
+    }
+    return picked;
+  };
+  const conventionalName = (columns: readonly string[]): string => `t_${columns.join('_')}_idx`;
+  const sigma: Mutable<Index> = {
+    unique: random.chance(0.4),
+    columns: pickColumns(),
+    ...(random.chance(0.35) ? { concurrently: true } : {}),
+  };
+  const mode = random.pick(['same', 'different', 'replace'] as const);
+  let twinColumns = pickColumns();
+  if (mode === 'different') {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (JSON.stringify(twinColumns) !== JSON.stringify(sigma.columns)) break;
+      twinColumns = pickColumns();
+    }
+  } else {
+    twinColumns = [...sigma.columns];
+  }
+  const twin: Mutable<Index> = {
+    name: conventionalName(twinColumns),
+    unique: mode === 'different' ? random.chance(0.5) : sigma.unique,
+    columns: twinColumns,
+    ...(random.chance(0.5) ? { concurrently: true } : {}),
+  };
+  const fillers: Mutable<Index>[] = [];
+  const fillerCount = Math.floor(random.next() * 3);
+  for (let index = 0; index < fillerCount; index += 1) {
+    fillers.push({
+      name: `f${index}`,
+      unique: random.chance(0.4),
+      columns: pickColumns(),
+      ...(random.chance(0.35) ? { concurrently: true } : {}),
+    });
+  }
+  const kept = mode !== 'replace';
+  const shape = (indexes: readonly Index[]): Model =>
+    model(table('t', { columns: twinTableColumns, indexes }));
+  return {
+    baseline: shape([sigma, ...fillers]),
+    target: shape(kept ? [sigma, twin, ...fillers] : [twin, ...fillers]),
+    twin,
+    kept,
+  };
+};
+
+/** The index-level changes of a diff, split by kind. */
+const indexChanges = (
+  changes: readonly Change[],
+): { added: Index[]; removed: Index[]; changed: number } => {
+  const added: Index[] = [];
+  const removed: Index[] = [];
+  let changed = 0;
+  for (const change of changes) {
+    if (change.kind !== 'table-changed') continue;
+    for (const tableChange of change.changes) {
+      if (tableChange.kind === 'index-added') added.push(tableChange.index);
+      else if (tableChange.kind === 'index-removed') removed.push(tableChange.index);
+      else if (tableChange.kind === 'index-changed') changed += 1;
+    }
+  }
+  return { added, removed, changed };
+};
+
+test('unnamed-index twins produce a stable, order-independent diff and plan', () => {
+  const random = randomOf(TWIN_SEED);
+  for (let round = 0; round < TWIN_ROUNDS; round += 1) {
+    const { baseline, target, twin, kept } = generateTwinShape(random);
+    try {
+      const forward = indexChanges(diff(baseline, target));
+      assert.equal(forward.added.length, 1, 'the twin must be the only index addition');
+      assert.deepStrictEqual(forward.added[0], twin, 'the addition must carry the twin payload');
+      assert.equal(forward.removed.length, kept ? 0 : 1, 'a replaced σ must be removed');
+      assert.equal(forward.changed, 0, 'an unnamed index and its twin must never pair as changed');
+      const backward = indexChanges(diff(target, baseline));
+      assert.equal(backward.removed.length, 1, 'the reversed diff must remove the twin');
+      assert.deepStrictEqual(backward.removed[0], twin, 'the removal must carry the twin payload');
+      assert.equal(
+        backward.added.length,
+        kept ? 0 : 1,
+        'the reversed diff must restore a replaced σ',
+      );
+      assert.equal(backward.changed, 0, 'an unnamed index and its twin must never pair as changed');
+
+      const forwardPlan = plan(baseline, target);
+      for (let permutation = 0; permutation < TWIN_PERMUTATIONS; permutation += 1) {
+        const shuffledTarget = permutedModel(target, random);
+        assert.deepStrictEqual(
+          diff(baseline, shuffledTarget),
+          diff(baseline, target),
+          `permutation ${permutation}: diff must not depend on index order`,
+        );
+        assert.deepStrictEqual(
+          plan(baseline, shuffledTarget),
+          forwardPlan,
+          `permutation ${permutation}: plan must not depend on index order`,
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `round ${round} failed: ${(error as Error).message}\n${JSON.stringify({ baseline, target, twin, kept })}`,
+        { cause: error },
+      );
+    }
+  }
+});
+
+test("the fallback cut skips the chosen table's own self-reference", () => {
+  const a = table('a', {
+    columns: [column('b_id', { type: 'integer' }), column('parent_id', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['b_id'], identity('b'), { name: 'a_to_b', referencedColumns: ['id'] }),
+      foreignKey(['parent_id'], identity('a'), { name: 'a_self', referencedColumns: ['id'] }),
+    ],
+  });
+  const b = table('b', {
+    columns: [column('a_id', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['a_id'], identity('a'), { name: 'b_to_a', referencedColumns: ['id'] }),
+    ],
+  });
+  const baseline = model(a, b);
+
+  // `a` and `b` reference each other, so the cut falls back to `a`; `a`'s own self-reference
+  // must not become a cut of its own table, while `b`'s reference to `a` still is one.
+  assertPlan(baseline, model(), [
+    { kind: 'drop-foreign-key', table: identity('b'), foreignKey: b.foreignKeys[0]! },
+    { kind: 'drop-table', table: identity('a') },
+    { kind: 'drop-table', table: identity('b') },
+  ]);
+  simulate(baseline, model());
+});
+
+test('drop ordering compares schemas, not just table names', () => {
+  const removed = table('a', { schema: 's1', columns: [column('id')] });
+  const kept = table('a', { schema: 's2', columns: [column('id')] });
+  const dependent = table('b', {
+    schema: 's2',
+    columns: [column('id')],
+    foreignKeys: [
+      foreignKey(['id'], identity('a', 's2'), { name: 'to_s2_a', referencedColumns: ['id'] }),
+    ],
+  });
+  const baseline = model(removed, kept, dependent);
+  const target = model(kept);
+
+  // `b` references `s2.a`, not its same-named `s1.a` sibling, so both removed tables are
+  // ready and `s1.a` still drops first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('a', 's1') },
+    { kind: 'drop-table', table: identity('b', 's2') },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a primary-key change sets aside only foreign keys that reference the key columns', () => {
+  const baselineParent = table('parent', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+    uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
+  });
+  const targetParent = table('parent', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('code', { type: 'integer' }),
+    ],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    uniqueConstraints: [uniqueConstraint(['code'], { name: 'p_code_key' })],
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [
+      foreignKey(['pid'], identity('parent'), {
+        name: 'child_code_fk',
+        referencedColumns: ['code'],
+      }),
+    ],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // The child's foreign key names the unique `code` column explicitly, so it does not depend
+  // on the recreated primary key and needs no drop/add pair around it.
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a restored foreign key pairs once per surviving occurrence', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const restored = foreignKey(['pid'], identity('parent'), { name: 'f_dup' });
+  const baseline = model(
+    baselineParent,
+    table('child', { columns: [column('pid', { type: 'integer' })], foreignKeys: [restored] }),
+  );
+  const target = model(
+    targetParent,
+    table('child', {
+      columns: [column('pid', { type: 'integer' })],
+      foreignKeys: [restored, restored],
+    }),
+  );
+
+  // One baseline occurrence survives on both sides, so exactly one drop/add pair is set
+  // aside; the second target occurrence is the diff's own addition.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: restored },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restored },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restored },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign keys order by columns before names', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const laterColumn = foreignKey(['a', 'z'], identity('parent'), { name: 'aa' });
+  const earlierColumn = foreignKey(['a', 'b'], identity('parent'), { name: 'zz' });
+  const child = table('child', {
+    columns: [column('a'), column('b'), column('z')],
+    foreignKeys: [laterColumn, earlierColumn],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both keys share their first referencing column, so the second column decides — `zz`
+  // (columns a, b) sorts before `aa` (columns a, z) — and the name order must not decide.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: earlierColumn },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: laterColumn },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: earlierColumn },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: laterColumn },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign key grouping distinguishes update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const cascade = foreignKey(['pid'], identity('parent'), {
+    name: 'f_cascade',
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const restrict = foreignKey(['pid'], identity('parent'), {
+    name: 'f_restrict',
+    onDelete: 'RESTRICT',
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [cascade, restrict],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both keys reference the same columns and table, so only their actions distinguish the
+  // occurrence counts: each survives once and gets its own drop/add pair.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: restrict },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: restrict },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a sequence detaching from a surviving owner carries only its before side', () => {
+  const kept = table('t', { columns: [column('id', { type: 'bigint' })] });
+  const baseline = sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], kept);
+  const target = sequenceModel([sequence('s')], kept);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-sequence',
+      sequence: identity('s'),
+      fields: [{ field: 'ownedBy', before: owner('t', 'id') }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a duplicated surviving foreign key is set aside once per occurrence', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const wide = foreignKey(['pid', 'x'], identity('parent'), { name: 'wide' });
+  const alternate = foreignKey(['q'], identity('parent'), { name: 'bb' });
+  const unnamed1 = foreignKey(['pid'], identity('parent'));
+  const unnamed2 = foreignKey(['pid'], identity('parent'));
+  const first = foreignKey(['pid'], identity('parent'), { name: 'aa' });
+  const second = foreignKey(['pid'], identity('parent'), { name: 'aa' });
+  const single = foreignKey(['pid'], identity('parent'), { name: 'zz' });
+  const child = table('child', {
+    columns: [
+      column('pid', { type: 'integer' }),
+      column('x', { type: 'integer' }),
+      column('q', { type: 'integer' }),
+    ],
+    foreignKeys: [alternate, wide, single, second, unnamed2, first, unnamed1],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Sorted by referencing columns, then presence before name: the two unnamed keys, the two
+  // `aa` twins, `zz`, then `wide`, then the same-length `bb` on a later column. Each surviving
+  // occurrence gets its own drop/add pair — duplicates yield two pairs, none three — and input
+  // order must not leak.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: single },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: alternate },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed1 },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: first },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: single },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: alternate },
+  ]);
+  simulate(baseline, target);
+});
+
+test('same-name dependent foreign keys distinguish update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const cascade = foreignKey(['pid'], identity('parent'), {
+    name: 'f_dup',
+    onUpdate: 'CASCADE',
+    onDelete: 'RESTRICT',
+  });
+  const setNull = foreignKey(['pid'], identity('parent'), {
+    name: 'f_dup',
+    onUpdate: 'SET NULL',
+    onDelete: 'RESTRICT',
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [setNull, cascade],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Equal names and equal delete actions leave only the update actions to tell the duplicate
+  // keys apart: each survives once and gets its own drop/add pair, `CASCADE` before `SET NULL`.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: setNull },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: setNull },
+  ]);
+  simulate(baseline, target);
+});
+
+test('dependent foreign keys compare shared columns before lengths', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const wide = foreignKey(['m', 'n'], identity('parent'));
+  const narrow = foreignKey(['z'], identity('parent'));
+  const child = table('child', {
+    columns: [column('m'), column('n'), column('z')],
+    foreignKeys: [narrow, wide],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // `m` sorts before `z`, so the first shared element decides and the wider key is set aside
+  // first, even though the narrower key is shorter and the model lists it first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: narrow },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: wide },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: narrow },
+  ]);
+  simulate(baseline, target);
+});
+
+test('unnamed dependent foreign keys order by their update actions', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const withoutUpdate = foreignKey(['pid'], identity('parent'));
+  const cascade = foreignKey(['pid'], identity('parent'), { onUpdate: 'CASCADE' });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [withoutUpdate, cascade],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // Both names are absent, so that comparison ties and the update-action presence decides:
+  // the key without an update action is set aside first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: withoutUpdate },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: cascade },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: withoutUpdate },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: cascade },
+  ]);
+  simulate(baseline, target);
+});
+
+test('named dependent foreign keys are set aside after unnamed ones', () => {
+  const baselineParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey', columns: ['id'] },
+  });
+  const targetParent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'p_pkey2', columns: ['id'] },
+  });
+  const named = foreignKey(['pid'], identity('parent'), {
+    name: 'f_named',
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const unnamed = foreignKey(['pid'], identity('parent'), {
+    onUpdate: 'CASCADE',
+    onDelete: 'CASCADE',
+  });
+  const child = table('child', {
+    columns: [column('pid', { type: 'integer' })],
+    foreignKeys: [named, unnamed],
+  });
+  const baseline = model(baselineParent, child);
+  const target = model(targetParent, child);
+
+  // The absent name sorts before the present one, so the unnamed key is set aside first even
+  // though the model lists the named key first.
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: unnamed },
+    { kind: 'drop-foreign-key', table: identity('child'), foreignKey: named },
+    {
+      kind: 'drop-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('parent'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: unnamed },
+    { kind: 'add-foreign-key', table: identity('child'), foreignKey: named },
+  ]);
+  simulate(baseline, target);
+});
+
+test('views are dropped before the table phases and created after them', () => {
+  const gone = table('gone', { columns: [column('id', { type: 'integer' })] });
+  const fresh = table('fresh', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('old'), view('mat', { materialized: true })], gone);
+  const target = viewModel([view('new')], fresh);
+  const newView = view('new');
+
+  assertPlan(baseline, target, [
+    // Global phase 5: view drops, in view identity order.
+    { kind: 'drop-view', view: identity('mat'), materialized: true },
+    { kind: 'drop-view', view: identity('old'), materialized: false },
+    // Global phase 6: the table phases.
+    { kind: 'drop-table', table: identity('gone') },
+    { kind: 'create-table', table: fresh },
+    // Global phase 7: view creates.
+    { kind: 'create-view', view: newView },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed plain view is replaced after the table phases', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const tTarget = table('t', {
+    columns: [column('id', { type: 'integer' }), column('extra')],
+  });
+  const baseline = viewModel([view('v')], t);
+  const target = viewModel([view('v', { definition: 'SELECT 2' })], tTarget);
+
+  assertPlan(baseline, target, [
+    { kind: 'add-column', table: identity('t'), column: column('extra') },
+    // Global phase 7: a plain-view change is a CREATE OR REPLACE, never a drop and create.
+    { kind: 'replace-view', view: view('v', { definition: 'SELECT 2' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed plain view carries the target check option into its replace', () => {
+  const baseline = viewModel([view('v')]);
+  const target = viewModel([view('v', { checkOption: 'local' })]);
+
+  assertPlan(baseline, target, [
+    { kind: 'replace-view', view: view('v', { checkOption: 'local' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a changed materialized view is dropped before the table phases and recreated after', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('m', { materialized: true })], t);
+  const target = viewModel([view('m', { materialized: true, definition: 'SELECT 2' })], t);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    { kind: 'create-view', view: view('m', { materialized: true, definition: 'SELECT 2' }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a view-to-materialized-view change drops and recreates the view', () => {
+  const baseline = viewModel([view('v')]);
+  const materialized = view('v', { materialized: true });
+  const target = viewModel([materialized]);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+    { kind: 'create-view', view: materialized },
+  ]);
+
+  assertPlan(viewModel([materialized]), viewModel([view('v')]), [
+    { kind: 'drop-view', view: identity('v'), materialized: true },
+    { kind: 'create-view', view: view('v') },
+  ]);
+});
+
+test('the change application routes view changes into the view buckets', () => {
+  const baseline = viewModel([
+    view('a'),
+    view('gone', { materialized: true }),
+    view('m', { materialized: true }),
+    view('v'),
+  ]);
+  const target = viewModel([
+    view('a', { definition: 'SELECT 2', checkOption: 'cascaded' }),
+    view('fresh'),
+    view('m', { materialized: true, definition: 'SELECT 3' }),
+    view('v', { materialized: true }),
+  ]);
+
+  const application = emptyChangeApplication();
+  for (const change of diff(baseline, target)) applyChange(application, change);
+
+  assert.deepStrictEqual(application.viewDrops, [
+    { kind: 'drop-view', view: identity('gone'), materialized: true },
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+  ]);
+  assert.deepStrictEqual(application.viewCreates, [
+    { kind: 'create-view', view: view('fresh') },
+    {
+      kind: 'create-view',
+      view: view('m', { materialized: true, definition: 'SELECT 3' }),
+    },
+    { kind: 'create-view', view: view('v', { materialized: true }) },
+  ]);
+  assert.deepStrictEqual(application.viewReplaces, [
+    {
+      kind: 'replace-view',
+      view: view('a', { definition: 'SELECT 2', checkOption: 'cascaded' }),
+    },
+  ]);
+});
+
+test('view steps are classified transactional', () => {
+  assert.equal(TRANSACTIONAL['drop-view'], true);
+  assert.equal(TRANSACTIONAL['create-view'], true);
+  assert.equal(TRANSACTIONAL['replace-view'], true);
+});
+
+test('a comment-only table change is one terminal comment step', () => {
+  const baseline = model(table('t', { columns: [column('id')], comment: 'old' }));
+  const target = model(table('t', { columns: [column('id')], comment: 'new' }));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'table', table: identity('t') }, text: 'new' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an added commented table asserts its comments after every create', () => {
+  const added = table('users', {
+    columns: [column('id', { type: 'integer', comment: 'key' })],
+    comment: 'accounts',
+    primaryKey: { name: 'users_pkey', columns: ['id'], comment: 'pk' },
+    indexes: [index(['id'], { name: 'users_id_idx', comment: 'idx' })],
+  });
+
+  const { steps } = plan(model(), model(added));
+  const firstComment = steps.findIndex((step) => step.kind === 'comment');
+  let lastCreate = -1;
+  steps.forEach((step, index) => {
+    if (step.kind.startsWith('create-')) lastCreate = index;
+  });
+
+  assert.ok(firstComment > lastCreate, 'every comment step must follow every create');
+  assert.deepStrictEqual(steps.slice(firstComment), [
+    {
+      kind: 'comment',
+      target: { kind: 'column', table: identity('users'), column: 'id' },
+      text: 'key',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'index',
+        table: identity('users'),
+        index: index(['id'], { name: 'users_id_idx' }),
+      },
+      text: 'idx',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'primary-key',
+        table: identity('users'),
+        primaryKey: { name: 'users_pkey', columns: ['id'] },
+      },
+      text: 'pk',
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('users') }, text: 'accounts' },
+  ]);
+  simulate(model(), model(added));
+});
+
+test('a create-table step carries the table comment in its payload', () => {
+  // The terminal comment step re-asserts the text on the server, but the structural step's
+  // payload is still the entity snapshot: a create-table for an added table carries its
+  // comment, so a consumer reading the step sees the true payload rather than a stripped copy.
+  const added = table('fresh', { columns: [column('id')], comment: 'fresh table' });
+
+  const { steps } = plan(model(), model(added));
+  const createTable = steps.find((step) => step.kind === 'create-table');
+  assert.ok(createTable !== undefined && createTable.kind === 'create-table');
+  assert.equal(createTable.table.comment, 'fresh table');
+  assert.equal(steps.filter((step) => step.kind === 'comment').length, 1);
+});
+
+test('the sequence-added application keeps the comment through the owner strip', () => {
+  // `copySequenceWithoutOwner` states the copy contract at the application seam. The diff's
+  // sequence payload currently normalizes through `effectiveSequence`, which rebuilds the
+  // object without `comment`, so this branch is not reachable from a diff-produced change
+  // today; this pin guards the copy if the normalization starts preserving comments. The
+  // comment's SQL is unaffected either way — the terminal comment step comes from the raw
+  // model's comment pass.
+  const application = emptyChangeApplication();
+  applyChange(application, {
+    kind: 'sequence-added',
+    sequence: sequence('s', { comment: 'fresh sequence' }),
+  });
+
+  const [step] = application.sequenceCreates;
+  assert.ok(step !== undefined && step.kind === 'create-sequence');
+  assert.equal(step.sequence.comment, 'fresh sequence');
+});
+
+test('an index recreate re-asserts an unchanged comment after the create', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['a'], { name: 't_idx', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['b'], { name: 't_idx', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-index',
+      table: identity('t'),
+      index: index(['a'], { name: 't_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'create-index',
+      table: identity('t'),
+      index: index(['b'], { name: 't_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['b'], { name: 't_idx' }) },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a recreated index with a changed comment keeps exactly one comment step', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['a'], { name: 't_idx', comment: 'old' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [index(['b'], { name: 't_idx', comment: 'new' })],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'comment'),
+    [
+      {
+        kind: 'comment',
+        target: { kind: 'index', table: identity('t'), index: index(['b'], { name: 't_idx' }) },
+        text: 'new',
+      },
+    ],
+  );
+  simulate(baseline, target);
+});
+
+test('structurally identical unnamed comment targets collapse to the first step', () => {
+  // Two unnamed indexes with the same structure share one server object and one
+  // `commentTargetKey`, so the diff emits two changes and the terminal phase keeps one step.
+  // The kept step is the FIRST in target order (diff order), not the last: `commentPhase`
+  // sorts stably by target key and drops later duplicates. The brief's D3 claimed last-wins;
+  // the implementation is first-wins, and this test pins the actual behavior.
+  const baseline = model(table('t', { columns: [column('id')] }));
+  const target = model(
+    table('t', {
+      columns: [column('id')],
+      indexes: [index(['id'], { comment: 'first' }), index(['id'], { comment: 'second' })],
+    }),
+  );
+
+  const { steps } = plan(baseline, target);
+  assert.deepStrictEqual(
+    steps.filter((step) => step.kind === 'comment'),
+    [
+      {
+        kind: 'comment',
+        target: { kind: 'index', table: identity('t'), index: index(['id']) },
+        text: 'first',
+      },
+    ],
+  );
+  // Both creates are emitted, against the one synthesized name the model cannot distinguish;
+  // the simulator is deliberately not run, because the second create of a live index is
+  // illegal there for the same reason the duplicate target cannot be applied twice.
+  assert.equal(steps.filter((step) => step.kind === 'create-index').length, 2);
+});
+
+test('a primary-key recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'keep' },
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      primaryKey: { name: 't_pkey2', columns: ['id'], comment: 'keep' },
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'keep' },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey2', columns: ['id'], comment: 'keep' },
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'primary-key',
+        table: identity('t'),
+        primaryKey: { name: 't_pkey2', columns: ['id'] },
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a foreign-key recreate re-asserts an unchanged comment', () => {
+  const key = (name: string) =>
+    foreignKey(['pid'], identity('p'), {
+      referencedColumns: ['id'],
+      name,
+      comment: 'keep',
+    });
+  const baseline = model(
+    table('p', { columns: [column('id', { type: 'integer' })] }),
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key('c_old')] }),
+  );
+  const target = model(
+    table('p', { columns: [column('id', { type: 'integer' })] }),
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key('c_new')] }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('c'), foreignKey: key('c_old') },
+    { kind: 'add-foreign-key', table: identity('c'), foreignKey: key('c_new') },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('c'),
+        foreignKey: foreignKey(['pid'], identity('p'), {
+          referencedColumns: ['id'],
+          name: 'c_new',
+        }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a unique-constraint recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      uniqueConstraints: [uniqueConstraint(['id'], { name: 't_old', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      uniqueConstraints: [uniqueConstraint(['id'], { name: 't_new', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_old', comment: 'keep' }),
+    },
+    {
+      kind: 'add-unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_new', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['id'], { name: 't_new' }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a check-constraint recreate re-asserts an unchanged comment', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      checkConstraints: [checkConstraint('id > 0', { name: 't_check', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      checkConstraints: [
+        checkConstraint('id > 0', { name: 't_check', enforcement: 'not-valid', comment: 'keep' }),
+      ],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', { name: 't_check', comment: 'keep' }),
+    },
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', {
+        name: 't_check',
+        enforcement: 'not-valid',
+        comment: 'keep',
+      }),
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('id > 0', {
+          name: 't_check',
+          enforcement: 'not-valid',
+        }),
+      },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a recreated materialized view re-asserts an unchanged comment', () => {
+  const baseline = viewModel([view('m', { materialized: true, comment: 'keep' })]);
+  const target = viewModel([
+    view('m', { materialized: true, definition: 'SELECT 2', comment: 'keep' }),
+  ]);
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    {
+      kind: 'create-view',
+      view: view('m', { materialized: true, definition: 'SELECT 2', comment: 'keep' }),
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('m'), materialized: true },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a commented foreign key is re-asserted when its referenced primary key changes', () => {
+  const key = foreignKey(['pid'], identity('p'), {
+    referencedColumns: ['id'],
+    name: 'c_pid_fkey',
+    comment: 'link',
+  });
+  const parent = (name: string) =>
+    table('p', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name, columns: ['id'] },
+    });
+  const child = () =>
+    table('c', { columns: [column('pid', { type: 'integer' })], foreignKeys: [key] });
+  const baseline = model(parent('p_pkey'), child());
+  const target = model(parent('p_pkey2'), child());
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-foreign-key', table: identity('c'), foreignKey: key },
+    {
+      kind: 'drop-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'add-primary-key',
+      table: identity('p'),
+      primaryKey: { name: 'p_pkey2', columns: ['id'] },
+    },
+    { kind: 'add-foreign-key', table: identity('c'), foreignKey: key },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('c'),
+        foreignKey: foreignKey(['pid'], identity('p'), {
+          referencedColumns: ['id'],
+          name: 'c_pid_fkey',
+        }),
+      },
+      text: 'link',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two sequence comment changes keep one terminal step each, in identity order', () => {
+  const sequences = (comment: string) => [sequence('s2', { comment }), sequence('s1', { comment })];
+  const baseline = sequenceModel(sequences('old'));
+  const target = sequenceModel(sequences('new'));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'sequence', sequence: identity('s1') }, text: 'new' },
+    { kind: 'comment', target: { kind: 'sequence', sequence: identity('s2') }, text: 'new' },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two commented views keep one terminal step each, in identity order', () => {
+  const baseline = viewModel([view('b', { comment: 'old' }), view('a', { comment: 'old' })]);
+  const target = viewModel([view('b', { comment: 'new' }), view('a', { comment: 'new' })]);
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('a'), materialized: false },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'view', view: identity('b'), materialized: false },
+      text: 'new',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two unnamed indexes with different structures keep one terminal step each', () => {
+  const indexes = (comment: string) => [index(['b'], { comment }), index(['a'], { comment })];
+  const baseline = model(
+    table('t', { columns: [column('a'), column('b')], indexes: indexes('old') }),
+  );
+  const target = model(
+    table('t', { columns: [column('a'), column('b')], indexes: indexes('new') }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['a']) },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('t'), index: index(['b']) },
+      text: 'new',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('two commented constraints of each kind keep one terminal step each', () => {
+  const build = (comment: string) =>
+    model(
+      table('t', {
+        columns: [column('a'), column('b')],
+        uniqueConstraints: [
+          uniqueConstraint(['a'], { comment }),
+          uniqueConstraint(['b'], { comment }),
+        ],
+        checkConstraints: [
+          checkConstraint('a > 0', { comment }),
+          checkConstraint('b > 0', { comment }),
+        ],
+        foreignKeys: [
+          foreignKey(['a'], identity('p1'), { referencedColumns: ['id'], comment }),
+          foreignKey(['b'], identity('p2'), { referencedColumns: ['id'], comment }),
+        ],
+      }),
+      table('p1', { columns: [column('id')] }),
+      table('p2', { columns: [column('id')] }),
+    );
+
+  assertPlan(build('old'), build('new'), [
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('a > 0'),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('b > 0'),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['a'], identity('p1'), { referencedColumns: ['id'] }),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['b'], identity('p2'), { referencedColumns: ['id'] }),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a']),
+      },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['b']),
+      },
+      text: 'new',
+    },
+  ]);
+  simulate(build('old'), build('new'));
+});
+
+test('the terminal phase sorts diff changes and recreate re-assertions together', () => {
+  const baseline = model(
+    table('a', { columns: [column('id')], comment: 'old' }),
+    table('b', {
+      columns: [column('x'), column('y')],
+      indexes: [index(['x'], { name: 'b_idx', comment: 'keep' })],
+    }),
+  );
+  const target = model(
+    table('a', { columns: [column('id')], comment: 'new' }),
+    table('b', {
+      columns: [column('x'), column('y')],
+      indexes: [index(['y'], { name: 'b_idx', comment: 'keep' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'drop-index',
+      table: identity('b'),
+      index: index(['x'], { name: 'b_idx', comment: 'keep' }),
+    },
+    {
+      kind: 'create-index',
+      table: identity('b'),
+      index: index(['y'], { name: 'b_idx', comment: 'keep' }),
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('a') }, text: 'new' },
+    {
+      kind: 'comment',
+      target: { kind: 'index', table: identity('b'), index: index(['y'], { name: 'b_idx' }) },
+      text: 'keep',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('a comment removal is a comment step with no text', () => {
+  const baseline = model(table('t', { columns: [column('id')], comment: 'old' }));
+  const target = model(table('t', { columns: [column('id')] }));
+
+  assertPlan(baseline, target, [
+    { kind: 'comment', target: { kind: 'table', table: identity('t') } },
+  ]);
+  simulate(baseline, target);
+});
+
+test('every comment step follows every structural step', () => {
+  const baseline = model(
+    table('kept', { columns: [column('id')], comment: 'old' }),
+    table('gone', { columns: [column('id')] }),
+  );
+  const target = model(
+    table('kept', {
+      columns: [column('id'), column('extra')],
+      comment: 'new',
+      indexes: [index(['id'], { name: 'kept_idx', comment: 'idx' })],
+    }),
+    table('fresh', { columns: [column('id')], comment: 'fresh' }),
+  );
+
+  const { steps } = plan(baseline, target);
+  const firstComment = steps.findIndex((step) => step.kind === 'comment');
+  let lastStructural = -1;
+  steps.forEach((step, index) => {
+    if (step.kind !== 'comment') lastStructural = index;
+  });
+
+  assert.ok(firstComment > lastStructural, 'comments close the plan');
+  assert.ok(steps.filter((step) => step.kind === 'comment').length >= 3);
+  simulate(baseline, target);
+});
+
+test('the simulator applies comment steps to all nine target kinds', () => {
+  const live = table('t', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 't_pkey', columns: ['id'] },
+    foreignKeys: [foreignKey(['id'], identity('p'), { referencedColumns: ['id'], name: 't_fkey' })],
+    uniqueConstraints: [uniqueConstraint(['id'], { name: 't_key' })],
+    checkConstraints: [checkConstraint('id > 0', { name: 't_check' })],
+    indexes: [index(['id'], { name: 't_idx' })],
+  });
+  const state = stateOf({
+    tables: [table('p', { columns: [column('id', { type: 'integer' })] }), live],
+    sequences: [sequence('s')],
+    views: [view('v')],
+    extensions: [],
+  });
+  const targets: readonly CommentTarget[] = [
+    { kind: 'table', table: identity('t') },
+    { kind: 'column', table: identity('t'), column: 'id' },
+    { kind: 'sequence', sequence: identity('s') },
+    { kind: 'view', view: identity('v'), materialized: false },
+    { kind: 'index', table: identity('t'), index: index(['id'], { name: 't_idx' }) },
+    {
+      kind: 'primary-key',
+      table: identity('t'),
+      primaryKey: { name: 't_pkey', columns: ['id'] },
+    },
+    {
+      kind: 'unique-constraint',
+      table: identity('t'),
+      uniqueConstraint: uniqueConstraint(['id'], { name: 't_key' }),
+    },
+    {
+      kind: 'check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', { name: 't_check' }),
+    },
+    {
+      kind: 'foreign-key',
+      table: identity('t'),
+      foreignKey: foreignKey(['id'], identity('p'), {
+        referencedColumns: ['id'],
+        name: 't_fkey',
+      }),
+    },
+  ];
+
+  for (const target of targets) applyStep(state, { kind: 'comment', target, text: 'note' });
+
+  const liveTable = state.tables.get(keyOf(identity('t')));
+  assert.ok(liveTable !== undefined);
+  assert.equal(liveTable.comment, 'note');
+  assert.equal(liveTable.columns.get('id')?.comment, 'note');
+  assert.equal(liveTable.primaryKey?.comment, 'note');
+  assert.equal(liveTable.uniqueConstraints[0]?.comment, 'note');
+  assert.equal(liveTable.checkConstraints[0]?.comment, 'note');
+  assert.equal(liveTable.foreignKeys[0]?.comment, 'note');
+  assert.equal(liveTable.indexes[0]?.comment, 'note');
+  assert.equal(state.sequences.get(keyOf(identity('s')))?.comment, 'note');
+  assert.equal(state.views.get(keyOf(identity('v')))?.comment, 'note');
+
+  for (const target of targets) applyStep(state, { kind: 'comment', target });
+
+  assert.equal(liveTable.comment, undefined);
+  assert.equal(liveTable.columns.get('id')?.comment, undefined);
+  assert.equal(liveTable.primaryKey?.comment, undefined);
+  assert.equal(liveTable.uniqueConstraints[0]?.comment, undefined);
+  assert.equal(liveTable.checkConstraints[0]?.comment, undefined);
+  assert.equal(liveTable.foreignKeys[0]?.comment, undefined);
+  assert.equal(liveTable.indexes[0]?.comment, undefined);
+  assert.equal(state.sequences.get(keyOf(identity('s')))?.comment, undefined);
+  assert.equal(state.views.get(keyOf(identity('v')))?.comment, undefined);
+});
+
+test('a comment step strips the target node so its text is the only source', () => {
+  const application = emptyChangeApplication();
+  applyChange(application, {
+    kind: 'comment-changed',
+    target: {
+      kind: 'index',
+      table: identity('t'),
+      index: index(['id'], { name: 't_idx', comment: 'stale' }),
+    },
+    after: 'fresh',
+  });
+
+  const [step] = application.comments;
+  assert.ok(step !== undefined && step.kind === 'comment');
+  assert.ok(step.target.kind === 'index');
+  assert.equal(Object.hasOwn(step.target.index, 'comment'), false);
+  assert.equal(step.text, 'fresh');
+  assert.deepStrictEqual(step.target.index, index(['id'], { name: 't_idx' }));
+});
+
+test('extension creates open the plan, in name order', () => {
+  const baseline = extensionModel([], table('gone'));
+  const target = extensionModel([extension('b'), extension('a')], table('fresh'));
+
+  assertPlan(baseline, target, [
+    // Global phase 1: extension creates, in name order, before every other step.
+    { kind: 'create-extension', extension: extension('a') },
+    { kind: 'create-extension', extension: extension('b') },
+    // Global phase 6: the table phases.
+    { kind: 'drop-table', table: identity('gone') },
+    { kind: 'create-table', table: table('fresh') },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension comments sort before schema-qualified comments by the empty schema slot', () => {
+  const baseline = {
+    tables: [table('t', { schema: 'A', comment: 'old' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'old' })],
+  };
+  const target = {
+    tables: [table('t', { schema: 'A', comment: 'new' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'new' })],
+  };
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'new',
+    },
+    { kind: 'comment', target: { kind: 'table', table: identity('t', 'A') }, text: 'new' },
+  ]);
+});
+
+test('an extension change with no differing fields adds no alter step', () => {
+  const application = emptyChangeApplication();
+
+  applyChange(application, {
+    kind: 'extension-changed',
+    extension: { name: 'hstore' },
+    changes: [],
+  });
+
+  assert.deepStrictEqual(application.extensionAlters, []);
+});
+
+test('extension comments are phase 12 and the extension alter is phase 13', () => {
+  const baseline = extensionModel([extension('hstore', { schema: 'hs1', comment: 'old' })]);
+  const target = extensionModel([
+    extension('pgcrypto', { comment: 'crypto' }),
+    extension('hstore', { schema: 'hs2', comment: 'new' }),
+  ]);
+
+  assertPlan(baseline, target, [
+    // Global phase 1: the target-only schema, then the added extension carrying its comment.
+    { kind: 'create-schema', schema: 'hs2' },
+    { kind: 'create-extension', extension: extension('pgcrypto', { comment: 'crypto' }) },
+    // Global phase 12: extension comments, in target identity order.
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'new',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      text: 'crypto',
+    },
+    // Global phase 13: the schema move, carrying its destination in the field.
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension alters come before extension drops, both last and in name order', () => {
+  const baseline = extensionModel([
+    extension('z_gone'),
+    extension('a_gone'),
+    extension('hstore', { schema: 'hs1' }),
+  ]);
+  const target = extensionModel([extension('hstore', { schema: 'hs2' })]);
+
+  assertPlan(baseline, target, [
+    // Global phase 1: the target-only destination schema.
+    { kind: 'create-schema', schema: 'hs2' },
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'drop-extension', extension: { name: 'a_gone' } },
+    { kind: 'drop-extension', extension: { name: 'z_gone' } },
+  ]);
+  simulate(baseline, target);
+});
+
+test('extension steps are classified transactional', () => {
+  assert.equal(TRANSACTIONAL['create-extension'], true);
+  assert.equal(TRANSACTIONAL['alter-extension'], true);
+  assert.equal(TRANSACTIONAL['drop-extension'], true);
+});
+
+test('extension changes apply to their buckets with copied payloads', () => {
+  const application = emptyChangeApplication();
+  const created = deepFreeze(extension('pgcrypto', { comment: 'crypto' }));
+  const schemaField: ExtensionFieldChange = {
+    field: 'schema',
+    before: 'hs1',
+    after: 'hs2',
+  };
+
+  applyChange(application, { kind: 'extension-added', extension: created });
+  applyChange(application, {
+    kind: 'extension-removed',
+    extension: extension('gone'),
+  });
+  applyChange(application, {
+    kind: 'extension-changed',
+    extension: { name: 'hstore' },
+    changes: [schemaField],
+  });
+
+  assert.deepStrictEqual(application.extensionCreates, [
+    { kind: 'create-extension', extension: created },
+  ]);
+  assert.deepStrictEqual(application.extensionDrops, [
+    { kind: 'drop-extension', extension: { name: 'gone' } },
+  ]);
+  assert.deepStrictEqual(application.extensionAlters, [
+    { kind: 'alter-extension', extension: { name: 'hstore' }, fields: [schemaField] },
+  ]);
+
+  const create = application.extensionCreates[0]!;
+  assert.ok(create.kind === 'create-extension');
+  assert.notStrictEqual(create.extension, created);
+  const alter = application.extensionAlters[0]!;
+  assert.ok(alter.kind === 'alter-extension');
+  assert.notStrictEqual(alter.fields[0], schemaField);
+});
+
+test('a comment change on an extension becomes an extension comment step', () => {
+  const application = emptyChangeApplication();
+
+  applyChange(application, {
+    kind: 'comment-changed',
+    target: { kind: 'extension', extension: { name: 'hstore' } },
+    after: 'note',
+  });
+
+  assert.deepStrictEqual(application.comments, [
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      text: 'note',
+    },
+  ]);
+});
+
+test('an unknown extension field is rejected by the exhaustiveness guard', () => {
+  const application = emptyChangeApplication();
+
+  assert.throws(
+    () =>
+      applyChange(application, {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'frobnicate' }] as unknown as readonly ExtensionFieldChange[],
+      }),
+    /Unhandled extension field: frobnicate/,
+  );
+});
+
+test('a schema change flows from the diff to the plan destination field', () => {
+  const baseline = extensionModel([extension('hstore', { schema: 'hs1' })]);
+  const target = extensionModel([extension('hstore', { schema: 'hs2' })]);
+
+  assert.deepStrictEqual(diff(baseline, target), [
+    {
+      kind: 'extension-changed',
+      extension: { name: 'hstore' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
+  assertPlan(baseline, target, [
+    // Global phase 1: the target-only destination schema.
+    { kind: 'create-schema', schema: 'hs2' },
+    {
+      kind: 'alter-extension',
+      extension: { name: 'hstore' },
+      fields: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+  ]);
+});
+
+test('schema creates open the plan before every object, in name order', () => {
+  const target: Model = {
+    tables: [table('orders', { schema: 'sales', columns: [column('id')] })],
+    sequences: [sequence('invoice_seq', {}, 'app')],
+    views: [view('totals', {}, 'analytics')],
+    extensions: [extension('hstore', { schema: 'gis' })],
+  };
+
+  assertPlan(model(), target, [
+    // Global phase 1: the target's schemas first, in name order, before extensions and objects.
+    { kind: 'create-schema', schema: 'analytics' },
+    { kind: 'create-schema', schema: 'app' },
+    { kind: 'create-schema', schema: 'gis' },
+    { kind: 'create-schema', schema: 'sales' },
+    { kind: 'create-extension', extension: extension('hstore', { schema: 'gis' }) },
+    { kind: 'create-sequence', sequence: sequence('invoice_seq', {}, 'app') },
+    {
+      kind: 'create-table',
+      table: table('orders', { schema: 'sales', columns: [column('id')] }),
+    },
+    { kind: 'create-view', view: view('totals', {}, 'analytics') },
+  ]);
+  simulate(model(), target);
+});
+
+test('public is never a schema step', () => {
+  const target = model(table('t', { columns: [column('id')] }));
+
+  assert.deepStrictEqual(
+    plan(model(), target).steps.map((step) => step.kind),
+    ['create-table'],
+  );
+});
+
+test('a schema a baseline object uses is not created again', () => {
+  const baseline = model(table('old', { schema: 'app', columns: [column('id')] }));
+  const target = model(table('new', { schema: 'app', columns: [column('id')] }));
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-table', table: identity('old', 'app') },
+    { kind: 'create-table', table: table('new', { schema: 'app', columns: [column('id')] }) },
+  ]);
+  simulate(baseline, target);
+});
+
+test('one schema step covers every family that names the schema', () => {
+  const target: Model = {
+    tables: [
+      table('a', { schema: 'app', columns: [column('id')] }),
+      table('b', { schema: 'app', columns: [column('id')] }),
+    ],
+    sequences: [sequence('s', {}, 'app')],
+    views: [view('v', {}, 'app')],
+    extensions: [extension('hstore', { schema: 'app' })],
+  };
+
+  assert.deepStrictEqual(
+    plan(model(), target).steps.filter((step) => step.kind === 'create-schema'),
+    [{ kind: 'create-schema', schema: 'app' }],
+  );
+});
+
+test('a baseline-only schema emits no step', () => {
+  const baseline = model(table('old', { schema: 'legacy', columns: [column('id')] }));
+  const target = model(table('fresh', { columns: [column('id')] }));
+
+  assert.deepStrictEqual(
+    plan(baseline, target).steps.filter((step) => step.kind === 'create-schema'),
+    [],
+  );
+});
+
+test('an identity sequence name counts as a schema use', () => {
+  const descriptor = identityColumn({ sequenceName: { schema: 'app', name: 't_id_seq' } });
+  const target = model(
+    table('t', {
+      columns: [column('id', { type: 'integer', notNull: true, identity: descriptor })],
+    }),
+  );
+
+  assertPlan(model(), target, [
+    { kind: 'create-schema', schema: 'app' },
+    { kind: 'create-table', table: target.tables[0]! },
+    { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
+  ]);
+  simulate(model(), target);
 });

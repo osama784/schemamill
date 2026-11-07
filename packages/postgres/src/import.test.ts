@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { diff, plan } from '@schemamill/core';
 import type { Diagnostic, Model, Sequence } from '@schemamill/core';
 
+import {
+  describeStatement,
+  extractCollationText,
+  readCreateExtensionOptions,
+  storeComment,
+} from './import.ts';
 import { ddlImporter, importDump } from './index.ts';
+import type { ParsedStatement } from './parse.ts';
 
 /** Kind, code, and object of a diagnostic, with `object` omitted for errors. */
 const summarize = (diagnostic: Diagnostic) =>
@@ -137,20 +145,21 @@ const EXPECTED_MODEL: Model = {
       ],
       foreignKeys: [
         {
-          name: 'orders_parent_id_fkey',
           columns: ['parent_id'],
           referencedTable: { schema: 'app', name: 'orders' },
           referencedColumns: ['id'],
+          deferrable: true,
+          initiallyDeferred: true,
+          enforcement: 'not-valid',
         },
         {
-          name: 'orders_user_id_fkey',
           columns: ['user_id'],
           referencedTable: { schema: 'public', name: 'users' },
           referencedColumns: ['id'],
           onDelete: 'CASCADE',
         },
       ],
-      primaryKey: { name: 'orders_pkey', columns: ['id'] },
+      primaryKey: { columns: ['id'] },
       uniqueConstraints: [],
       checkConstraints: [],
       indexes: [],
@@ -166,7 +175,13 @@ const EXPECTED_MODEL: Model = {
           default: "nextval('public.users_id_seq'::regclass)",
         },
         { name: 'email', type: 'character varying(12)', notNull: true },
-        { name: 'display_name', type: 'text', notNull: false, default: "'anon'" },
+        {
+          name: 'display_name',
+          type: 'text',
+          notNull: false,
+          default: "'anon'",
+          collation: '"C"',
+        },
         { name: 'age', type: 'numeric(12,2)', notNull: false },
         { name: 'score', type: 'double precision', notNull: false, default: '0.0' },
         { name: 'active', type: 'boolean', notNull: true, default: 'true' },
@@ -197,10 +212,11 @@ const EXPECTED_MODEL: Model = {
         },
       ],
       foreignKeys: [],
-      primaryKey: { name: 'users_pkey', columns: ['id'] },
+      primaryKey: { columns: ['id'] },
       uniqueConstraints: [{ columns: ['email'] }],
-      checkConstraints: [{ name: 'users_age_check', expression: '(age >= 0)' }],
+      checkConstraints: [{ expression: '(age >= 0)' }],
       indexes: [{ name: 'idx_users_email', unique: false, columns: ['email'] }],
+      comment: 'people',
     },
   ],
   sequences: [
@@ -216,6 +232,8 @@ const EXPECTED_MODEL: Model = {
       cycle: false,
     },
   ],
+  views: [],
+  extensions: [],
 };
 
 const EXPECTED_DIAGNOSTICS = [
@@ -223,10 +241,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'statement_timeout' },
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'public.users' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
-  { kind: 'flag', code: 'unsupported-attribute', object: 'app.orders' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
   { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
   { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
@@ -234,6 +248,190 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'copy-data', object: 'COPY public.users' },
   { kind: 'skip', code: 'psql-meta-command', object: String.raw`\unrestrict` },
 ] as const;
+
+/**
+ * The long-tail families in the order a dump emits them, captured from the #59 fact report:
+ * every unmodeled statement is skipped with a family-named description, the dump-form extension
+ * imports with its install schema, the plain view and materialized view import, and the two
+ * `CREATE TABLE` attribute leftovers import partially and are flagged. The two plain
+ * `CREATE TABLE`s (`app.t`, `app.rls`) are present for the statements that reference them and
+ * produce nothing.
+ */
+const LONG_TAIL_DUMP = [
+  `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
+  '',
+  `CREATE VIEW app.v AS SELECT 1;`,
+  '',
+  `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 WITH NO DATA;`,
+  '',
+  `CREATE TABLE app.ctas AS SELECT 1;`,
+  '',
+  `REFRESH MATERIALIZED VIEW app.mv;`,
+  '',
+  `CREATE TABLE app.t (id integer);`,
+  '',
+  `CREATE TRIGGER trg AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();`,
+  '',
+  `CREATE FUNCTION app.f(a integer) RETURNS integer LANGUAGE sql AS $$SELECT a + 1$$;`,
+  '',
+  `CREATE PROCEDURE app.p() LANGUAGE sql AS $$ SELECT 1 $$;`,
+  '',
+  `CREATE RULE r AS ON INSERT TO app.t DO NOTHING;`,
+  '',
+  `CREATE POLICY pol ON app.t FOR SELECT USING ((id > 0));`,
+  '',
+  `ALTER POLICY pol ON app.t USING (false);`,
+  '',
+  `CREATE TABLE app.rls (id integer);`,
+  '',
+  `ALTER TABLE app.rls ENABLE ROW LEVEL SECURITY;`,
+  '',
+  `ALTER TABLE app.rls DISABLE ROW LEVEL SECURITY;`,
+  '',
+  `ALTER TABLE app.rls FORCE ROW LEVEL SECURITY;`,
+  '',
+  `ALTER TABLE app.rls NO FORCE ROW LEVEL SECURITY;`,
+  '',
+  `CREATE FOREIGN TABLE app.ft (id integer) SERVER s;`,
+  '',
+  `COMMENT ON MATERIALIZED VIEW app.mv IS 'x';`,
+  '',
+  `COMMENT ON FOREIGN TABLE app.ft IS 'x';`,
+  '',
+  `GRANT SELECT ON TABLE app.t TO app;`,
+  '',
+  `REVOKE SELECT ON TABLE app.t FROM app;`,
+  '',
+  `REVOKE ALL ON TABLE app.t FROM app;`,
+  '',
+  `CREATE TABLE app.like (LIKE app.t INCLUDING ALL);`,
+  '',
+  `CREATE TABLE app.child (b integer) INHERITS (app.parent);`,
+].join('\n');
+
+/** The complete diagnostic contract for `LONG_TAIL_DUMP`, in dump order. */
+const LONG_TAIL_DIAGNOSTICS = [
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.ctas',
+    message: 'skipped CREATE TABLE AS app.ctas',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.mv',
+    message: 'skipped REFRESH MATERIALIZED VIEW app.mv',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'trg',
+    message: 'skipped CREATE TRIGGER trg',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.f',
+    message: 'skipped CREATE FUNCTION app.f',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.p',
+    message: 'skipped CREATE PROCEDURE app.p',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'r',
+    message: 'skipped CREATE RULE r ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'pol',
+    message: 'skipped CREATE POLICY pol ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'pol',
+    message: 'skipped ALTER POLICY pol ON app.t',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.rls',
+    message: 'skipped ALTER TABLE app.rls ENABLE ROW LEVEL SECURITY',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.rls',
+    message: 'skipped ALTER TABLE app.rls DISABLE ROW LEVEL SECURITY',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.rls',
+    message: 'skipped ALTER TABLE app.rls FORCE ROW LEVEL SECURITY',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.rls',
+    message: 'skipped ALTER TABLE app.rls NO FORCE ROW LEVEL SECURITY',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.ft',
+    message: 'skipped CREATE FOREIGN TABLE app.ft',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'app.ft',
+    message: 'skipped COMMENT ON FOREIGN TABLE app.ft',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'GRANT',
+    message: 'skipped GRANT statement',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'REVOKE',
+    message: 'skipped REVOKE statement',
+  },
+  {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'REVOKE',
+    message: 'skipped REVOKE statement',
+  },
+  {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'app.like',
+    message: 'dropped LIKE clause from app.like',
+  },
+  {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'app.child',
+    message: 'dropped inheritance from app.child',
+  },
+] as const;
+
+/** A diagnostic's pinned fields: kind, code, object, and message, with `position` stripped. */
+const describeDiagnostic = (diagnostic: Diagnostic) => ({
+  ...summarize(diagnostic),
+  message: diagnostic.message,
+});
 
 test('imports a pg_dump-shaped dump into the canonical model', async () => {
   const { model } = await importDump(DUMP);
@@ -292,11 +490,15 @@ test('imports a pg_dump-shaped dump into the canonical model', async () => {
     ['parent_id', 'user_id'],
   );
 
-  // Actions are stored only when the source states a non-default one.
+  // Actions are stored only when the source states a non-default one; the modeled attributes
+  // (`DEFERRABLE INITIALLY DEFERRED NOT VALID`) are read rather than flagged.
   const [parentForeignKey, userForeignKey] = orders.foreignKeys;
   assert.ok(parentForeignKey && userForeignKey, 'both foreign keys are imported');
   assert.equal('onDelete' in parentForeignKey, false);
   assert.equal('onUpdate' in parentForeignKey, false);
+  assert.equal(parentForeignKey.deferrable, true);
+  assert.equal(parentForeignKey.initiallyDeferred, true);
+  assert.equal(parentForeignKey.enforcement, 'not-valid');
   assert.equal(userForeignKey.onDelete, 'CASCADE');
   assert.equal('onUpdate' in userForeignKey, false);
 });
@@ -326,7 +528,11 @@ test('reports skips, flags, and failures in dump order', async () => {
     undefined,
     'SET DEFAULT attaches instead of being skipped',
   );
-  assert.ok(byMessage('COMMENT ON TABLE public.users'), 'COMMENT is skipped and named');
+  assert.equal(
+    byMessage('COMMENT ON TABLE public.users'),
+    undefined,
+    'COMMENT attaches instead of being skipped',
+  );
   const failure = diagnostics.find((diagnostic) => diagnostic.code === 'parse-failure');
   assert.match(failure?.message ?? '', /syntax error at or near "UNSIGNED"/);
   // Failures point at the parser's error cursor when it has one.
@@ -335,6 +541,52 @@ test('reports skips, flags, and failures in dump order', async () => {
     line: 68,
     column: 39,
   });
+});
+
+test('names every long-tail family in dump order', async () => {
+  const { model, diagnostics } = await importDump(LONG_TAIL_DUMP);
+
+  assert.deepEqual(diagnostics.map(describeDiagnostic), LONG_TAIL_DIAGNOSTICS);
+
+  // The dump-form extension imports with its install schema; it is no longer a skip.
+  assert.deepEqual(model.extensions, [{ name: 'pgcrypto', schema: 'public' }]);
+
+  // The materialized view's comment lands on the modeled view; the foreign table's stays skipped.
+  const materializedView = model.views.find((view) => view.name === 'mv');
+  assert.equal(materializedView?.comment, 'x');
+});
+
+test('imports LIKE and INHERITS tables partially, flagging the dropped clauses', async () => {
+  const { model, diagnostics } = await importDump(LONG_TAIL_DUMP);
+
+  assert.deepEqual(
+    diagnostics.filter((diagnostic) => diagnostic.kind === 'flag').map(describeDiagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'app.like',
+        message: 'dropped LIKE clause from app.like',
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'app.child',
+        message: 'dropped inheritance from app.child',
+      },
+    ],
+  );
+
+  const like = model.tables.find((table) => table.schema === 'app' && table.name === 'like');
+  assert.ok(like, 'the LIKE table imports');
+  assert.deepEqual(like.columns, []);
+
+  const child = model.tables.find((table) => table.schema === 'app' && table.name === 'child');
+  assert.ok(child, 'the INHERITS table imports');
+  assert.deepEqual(
+    child.columns.map((column) => column.name),
+    ['b'],
+  );
 });
 
 test('records only stated referential actions and flags foreign-key extras', async () => {
@@ -351,29 +603,28 @@ test('records only stated referential actions and flags foreign-key extras', asy
 
   assert.deepEqual(child.foreignKeys, [
     {
-      name: 'child_a_fkey',
       columns: ['a'],
       referencedTable: { schema: 'public', name: 'parent' },
       referencedColumns: ['id'],
       onUpdate: 'RESTRICT',
       onDelete: 'SET DEFAULT',
+      deferrable: true,
     },
     {
-      name: 'child_b_fkey',
       columns: ['b'],
       referencedTable: { schema: 'public', name: 'parent' },
       referencedColumns: ['id'],
     },
   ]);
 
+  // Deferrability is read into the model now; the attributes outside it stay flagged.
+  // Diagnostics are emitted during statement translation, before canonicalization, so they
+  // keep the source name even though the modeled constraint comes back unnamed.
   assert.deepEqual(
     diagnostics
       .filter((diagnostic) => diagnostic.kind === 'flag')
       .map((diagnostic) => diagnostic.message),
-    [
-      'dropped MATCH FULL on foreign key child_a_fkey from public.child',
-      'dropped deferrability on foreign key child_a_fkey from public.child',
-    ],
+    ['dropped MATCH FULL on foreign key child_a_fkey from public.child'],
   );
 });
 
@@ -383,7 +634,10 @@ test('canonicalizes column-level and table-level unique and check constraints', 
     `    a integer UNIQUE,`,
     `    b integer CHECK (b > 0),`,
     `    c integer,`,
+    `    d integer,`,
     `    CONSTRAINT t_named UNIQUE (c),`,
+    `    CONSTRAINT t_d_key UNIQUE (d),`,
+    `    CONSTRAINT t_c_check CHECK (c > 0),`,
     `    CHECK (a < c)`,
     `);`,
   ].join('\n');
@@ -393,12 +647,19 @@ test('canonicalizes column-level and table-level unique and check constraints', 
   assert.ok(table, 'the table is imported');
 
   // Column-level and table-level forms canonicalize alike: a unique constraint is its ordered
-  // columns, a check constraint its expression, and both arrays sort deterministically.
+  // columns, a check constraint its expression, and both arrays sort deterministically. A name
+  // that exactly matches PostgreSQL's conventional formula strips (`t_d_key`, `t_c_check`);
+  // `t_named` does not match any formula and stays.
   assert.deepEqual(table.uniqueConstraints, [
     { columns: ['a'] },
     { name: 't_named', columns: ['c'] },
+    { columns: ['d'] },
   ]);
-  assert.deepEqual(table.checkConstraints, [{ expression: 'a < c' }, { expression: 'b > 0' }]);
+  assert.deepEqual(table.checkConstraints, [
+    { expression: 'a < c' },
+    { expression: 'b > 0' },
+    { expression: 'c > 0' },
+  ]);
   // A constraint-backed index is never a standalone Index.
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics, []);
@@ -424,7 +685,7 @@ test('normalizes a check expression between its parentheses, comments dropped', 
   assert.deepEqual(diagnostics, []);
 });
 
-test('imports ALTER TABLE ADD CONSTRAINT unique and check, flagging dropped attributes', async () => {
+test('imports ALTER TABLE ADD CONSTRAINT unique and check, reading attributes and flagging the rest', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer, c integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
@@ -437,24 +698,652 @@ test('imports ALTER TABLE ADD CONSTRAINT unique and check, flagging dropped attr
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
+  // `t_a_key` matches PostgreSQL's formula for `UNIQUE (a)` and canonicalizes back to unnamed;
+  // the other unique names do not match their formulas and stay. `t_check` names a
+  // single-column expression with the generic shape, not the formula (`t_a_check`), so it
+  // stays named too.
   assert.deepEqual(table.uniqueConstraints, [
-    { name: 't_a_key', columns: ['a'] },
+    { columns: ['a'] },
     { name: 't_nd_key', columns: ['b'] },
-    { name: 't_def_key', columns: ['c'] },
+    { name: 't_def_key', columns: ['c'], deferrable: true, initiallyDeferred: true },
   ]);
-  assert.deepEqual(table.checkConstraints, [{ name: 't_check', expression: '(a > 0)' }]);
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_check', expression: '(a > 0)', enforcement: 'not-valid' },
+  ]);
 
-  // Every unrepresentable attribute is flagged and dropped; the constraint itself imports.
+  // `NOT VALID` and deferrability are read into the model; the remaining unrepresentable
+  // attributes are flagged and dropped, and the constraint itself imports.
   assert.deepEqual(
     diagnostics.map((diagnostic) => diagnostic.message),
     [
       'dropped NO INHERIT on check constraint t_check from public.t',
-      'dropped NOT VALID on check constraint t_check from public.t',
       'dropped NULLS NOT DISTINCT on unique constraint t_nd_key from public.t',
       'dropped INCLUDE on unique constraint t_nd_key from public.t',
-      'dropped deferrability on unique constraint t_def_key from public.t',
     ],
   );
+});
+
+test('decodes NOT VALID and NOT ENFORCED distinctly on foreign keys and check constraints', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_valid FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_not_valid FOREIGN KEY (a) REFERENCES public.parent(id) NOT VALID;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_not_enforced FOREIGN KEY (a) REFERENCES public.parent(id) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT fk_both FOREIGN KEY (a) REFERENCES public.parent(id) NOT VALID NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_valid CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_not_valid CHECK (a > 0) NOT VALID;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_not_enforced CHECK (a > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ck_both CHECK (a > 0) NOT VALID NOT ENFORCED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  const foreignKey = (name: string) =>
+    table.foreignKeys.find((candidate) => candidate.name === name);
+  const check = (name: string) =>
+    table.checkConstraints.find((candidate) => candidate.name === name);
+
+  // The normal shape carries no enforcement field at all.
+  assert.equal('enforcement' in (foreignKey('fk_valid') ?? {}), false);
+  assert.equal('enforcement' in (check('ck_valid') ?? {}), false);
+  // `NOT VALID` carries `is_enforced: true` beside `skip_validation`; `NOT ENFORCED` omits it.
+  assert.equal(foreignKey('fk_not_valid')?.enforcement, 'not-valid');
+  assert.equal(foreignKey('fk_not_enforced')?.enforcement, 'not-enforced');
+  assert.equal(check('ck_not_valid')?.enforcement, 'not-valid');
+  assert.equal(check('ck_not_enforced')?.enforcement, 'not-enforced');
+  // The combined wording collapses to the stronger state, never to the `NOT VALID` wording.
+  assert.equal(foreignKey('fk_both')?.enforcement, 'not-enforced');
+  assert.equal(check('ck_both')?.enforcement, 'not-enforced');
+
+  // Every state is read, so nothing is flagged.
+  assert.deepEqual(diagnostics, []);
+});
+
+test('folds inline constraint attributes into the preceding constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT t_a_ck CHECK (a > 0) NOT ENFORCED,`,
+    `    b integer REFERENCES public.parent(id) NOT ENFORCED,`,
+    `    c integer UNIQUE DEFERRABLE INITIALLY DEFERRED,`,
+    `    d integer PRIMARY KEY INITIALLY DEFERRED,`,
+    `    e integer UNIQUE NOT DEFERRABLE,`,
+    `    f integer CONSTRAINT t_f_ck CHECK (f > 0) ENFORCED,`,
+    `    g integer REFERENCES public.parent(id) NOT DEFERRABLE`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // `NOT ENFORCED` folds into an inline CHECK and FK; `INITIALLY DEFERRED` implies deferrable
+  // and the pair applies sequentially to one constraint; `ENFORCED` and `NOT DEFERRABLE` are
+  // the explicit defaults and are consumed without a flag.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_a_ck', expression: 'a > 0', enforcement: 'not-enforced' },
+    { name: 't_f_ck', expression: 'f > 0' },
+  ]);
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      enforcement: 'not-enforced',
+    },
+    {
+      columns: ['g'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['c'], deferrable: true, initiallyDeferred: true },
+    { columns: ['e'] },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['d'], deferrable: true, initiallyDeferred: true });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps flagging inline attributes on incompatible constraints', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT t_a_nn NOT NULL DEFERRABLE,`,
+    `    b integer CONSTRAINT t_b_nn NOT NULL NOT ENFORCED,`,
+    `    c integer CONSTRAINT t_c_ck CHECK (c > 0) DEFERRABLE,`,
+    `    d integer UNIQUE ENFORCED,`,
+    `    e integer UNIQUE NOT ENFORCED,`,
+    `    f integer DEFERRABLE,`,
+    `    g integer NOT ENFORCED`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The server rejects every one of these placements — including a bare attribute with no
+  // preceding constraint; the raw parser accepts them, so the raw enum label is the
+  // diagnostic. Each constraint still imports with its representable facts.
+  assert.equal(table.columns[0]?.notNull, true);
+  assert.equal(table.columns[0]?.notNullName, 't_a_nn');
+  assert.equal(table.columns[1]?.notNull, true);
+  assert.equal(table.columns[1]?.notNullName, 't_b_nn');
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.a from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.b from public.t',
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.c from public.t',
+      'dropped CONSTR_ATTR_ENFORCED on public.t.d from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.e from public.t',
+      'dropped CONSTR_ATTR_DEFERRABLE on public.t.f from public.t',
+      'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.g from public.t',
+    ],
+  );
+});
+
+test('reads table-level deferrability on primary keys, unique constraints, and foreign keys', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY (a) DEFERRABLE;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (b) INITIALLY DEFERRED;`,
+    `CREATE TABLE public.u (c integer, d integer);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_c_fkey FOREIGN KEY (c) REFERENCES public.parent(id) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_d_fkey FOREIGN KEY (d) REFERENCES public.parent(id) DEFERRABLE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // A primary key's deferrability is read now, not silently dropped.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'], deferrable: true });
+  // `INITIALLY DEFERRED` alone implies `DEFERRABLE`, and the generated `t_b_key` still strips.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['b'], deferrable: true, initiallyDeferred: true },
+  ]);
+  // Both foreign keys carry their attributes and canonicalize their generated names.
+  assert.deepEqual(other.foreignKeys, [
+    {
+      columns: ['c'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+    {
+      columns: ['d'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      deferrable: true,
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads not-null constraints in every shape and strips only the generated name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer, c integer, d integer, e integer);`,
+    `ALTER TABLE public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+    `ALTER TABLE public.t ADD CONSTRAINT custom_b_nn NOT NULL b;`,
+    `ALTER TABLE public.t ADD NOT NULL c;`,
+    `CREATE TABLE public.u (f integer CONSTRAINT u_f_not_null NOT NULL, g integer CONSTRAINT custom_g_nn NOT NULL);`,
+    `CREATE TABLE public.v (h integer, CONSTRAINT v_h_not_null NOT NULL h);`,
+    `CREATE TABLE public.w (i integer NOT NULL);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const columnsOf = (name: string) => {
+    const table = model.tables.find((candidate) => candidate.name === name);
+    assert.ok(table, `table ${name} is imported`);
+    return Object.fromEntries(table.columns.map((column) => [column.name, column]));
+  };
+
+  // The generated `<table>_<column>_not_null` strips to unnamed in every shape: `ALTER ADD`
+  // (`t_a_not_null`), an inline name (`u_f_not_null`), and a table-level name
+  // (`v_h_not_null`). The bare `ADD NOT NULL c` and the unnamed inline declaration stay
+  // unnamed.
+  assert.deepEqual(columnsOf('t').a, { name: 'a', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('t').c, { name: 'c', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('u').f, { name: 'f', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('v').h, { name: 'h', type: 'integer', notNull: true });
+  assert.deepEqual(columnsOf('w').i, { name: 'i', type: 'integer', notNull: true });
+  // A name outside the formula stays named.
+  assert.deepEqual(columnsOf('t').b, {
+    name: 'b',
+    type: 'integer',
+    notNull: true,
+    notNullName: 'custom_b_nn',
+  });
+  assert.deepEqual(columnsOf('u').g, {
+    name: 'g',
+    type: 'integer',
+    notNull: true,
+    notNullName: 'custom_g_nn',
+  });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated not-null name and keeps a collision-suffixed one', async () => {
+  // The `_not_null` label leaves a 53-byte budget beside the 1-byte table, so the 60-byte
+  // column gives up 8 bytes; the collision suffix gives up 9 instead. PG 18's live name is the
+  // same formula, and the strip is unit-only here.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(52)}_not_null`;
+  const suffixed = `t_${'w'.repeat(51)}_not_null1`;
+  const cases = [
+    [generated, { name: longColumn, type: 'integer', notNull: true }],
+    [suffixed, { name: longColumn, type: 'integer', notNull: true, notNullName: suffixed }],
+  ] as const;
+
+  for (const [name, expected] of cases) {
+    const dump = [
+      `CREATE TABLE public.t (${longColumn} integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT ${name} NOT NULL ${longColumn};`,
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    // Only the exact server form strips; the collision-suffixed name stays named.
+    assert.deepEqual(model.tables[0]?.columns, [expected]);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('merges duplicate not-null declarations in either order, flagging only real conflicts', async () => {
+  // Unnamed ∪ named → named, whatever the order.
+  const unnamedFirst = [
+    `CREATE TABLE public.t (a integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+  ];
+  const namedFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    `ALTER TABLE ONLY public.t ADD NOT NULL a;`,
+  ];
+  for (const statements of [unnamedFirst, namedFirst]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+
+  // A generated-formula name reads as unnamed for the comparison, so the duplicate is
+  // ignored and the strip leaves no name.
+  const formulaDuplicate = await importDump(
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD NOT NULL a;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(formulaDuplicate.model.tables[0]?.columns[0], {
+    name: 'a',
+    type: 'integer',
+    notNull: true,
+  });
+  assert.deepEqual(formulaDuplicate.diagnostics, []);
+
+  // A generated formula name and a custom name are not a conflict: the formula reads as
+  // unnamed, so the custom name wins in either order.
+  for (const statements of [
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    ],
+    [
+      `CREATE TABLE public.t (a integer);`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a;`,
+    ],
+  ]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+
+  // Two different real names keep the first declaration and are flagged, never silent.
+  for (const [names, kept] of [
+    [['first_nn', 'second_nn'], 'first_nn'],
+    [['second_nn', 'first_nn'], 'second_nn'],
+  ] as const) {
+    const dump = [
+      `CREATE TABLE public.t (a integer);`,
+      ...names.map((name) => `ALTER TABLE ONLY public.t ADD CONSTRAINT ${name} NOT NULL a;`),
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: kept,
+    });
+    assert.deepEqual(
+      diagnostics.map((diagnostic) => diagnostic.message),
+      ['dropped additional not-null constraint on public.t.a from public.t'],
+    );
+  }
+});
+
+test('merges a truncated generated not-null declaration with an unnamed one, whatever the order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(52)}_not_null`;
+  const declarations = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} NOT NULL ${longColumn};`,
+    `ALTER TABLE ONLY public.t ADD NOT NULL ${longColumn};`,
+  ];
+
+  for (const order of [declarations, [...declarations].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+
+    // The truncated generated name reads as unnamed for the one-fact comparison, so the
+    // duplicate collapses and the strip leaves no name in either order.
+    assert.deepEqual(model.tables[0]?.columns, [
+      { name: longColumn, type: 'integer', notNull: true },
+    ]);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('flags not-null declarations whose column is absent', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_missing_not_null NOT NULL missing);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_missing_not_null NOT NULL missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The declaration is skipped, not applied, and the unknown column is named.
+  assert.deepEqual(model.tables.find((table) => table.name === 't')?.columns, [
+    { name: 'a', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(model.tables.find((table) => table.name === 'u')?.columns, [
+    { name: 'b', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.u.missing' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t.missing' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /not-null constraint on unknown column public\.u\.missing/);
+  assert.match(messages, /not-null constraint on unknown column public\.t\.missing/);
+});
+
+test('flags NOT VALID not-null declarations and keeps the enforced fact', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_not_null NOT NULL a NOT VALID;`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_b_not_null NOT NULL b NOT VALID);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The model carries the enforced not-null fact; the validation state is the named boundary.
+  assert.deepEqual(model.tables.find((table) => table.name === 't')?.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(model.tables.find((table) => table.name === 'u')?.columns, [
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+  ]);
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /dropped NOT VALID on not-null constraint t_a_not_null from public\.t/);
+  assert.match(messages, /dropped NOT VALID on not-null constraint u_b_not_null from public\.u/);
+});
+
+test('keeps a not-null name through DROP IDENTITY', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT custom_nn NOT NULL GENERATED ALWAYS AS IDENTITY);`,
+    `ALTER TABLE public.t ALTER COLUMN a DROP IDENTITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Dropping the identity descriptor is an explicit copy of the column; the not-null fact and
+  // its name survive, only the identity goes.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'custom_nn' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks a plain ADD PRIMARY KEY column not null', async () => {
+  const declared = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE public.t ADD PRIMARY KEY (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(declared);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key implies the not-null fact, and the implied fact is unnamed.
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(diagnostics, []);
+
+  // The hand-written DDL now matches the pg_dump shape of the same database.
+  const serverDump = [
+    `CREATE TABLE public.t (a integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+  ].join('\n');
+  const { model: serverModel } = await importDump(serverDump);
+  assert.deepEqual(diff(model, serverModel), []);
+});
+
+test('marks every column of a composite ADD PRIMARY KEY not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks the consumed USING INDEX columns not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_ab_idx ON public.t USING btree (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_ab_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Both columns the consumed index backed are key columns, so both gain the not-null fact.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a', 'b'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('preserves a named not-null constraint when a primary key is added', async () => {
+  const namedFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+  ];
+  const primaryFirst = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_nn NOT NULL a;`,
+  ];
+
+  for (const statements of [namedFirst, primaryFirst]) {
+    const { model, diagnostics } = await importDump(statements.join('\n'));
+    assert.deepEqual(model.tables[0]?.columns[0], {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'custom_nn',
+    });
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('marks an inline CREATE TABLE primary-key column not null', async () => {
+  const dump = `CREATE TABLE public.t (a integer PRIMARY KEY);`;
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks a table-level CREATE TABLE primary key declared before its column not null', async () => {
+  const dump = `CREATE TABLE public.t (PRIMARY KEY (a), a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('marks an ADD COLUMN primary-key column not null', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE public.t ADD COLUMN b integer PRIMARY KEY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: false },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['b'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('does not mark the columns of a rejected additional primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the retained key's column is marked; the rejected key cannot mark `b`.
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true },
+    { name: 'b', type: 'integer', notNull: false },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped additional primary key from public.t'],
+  );
+});
+
+test('marks known key columns and ignores an unknown one', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a, ghost);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The absent key column is skipped silently; the known one gains the fact.
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(table.primaryKey, { columns: ['a', 'ghost'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test("marks a temporal primary key's period column not null", async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during int4range);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The period column is the last key and is not exempt; the temporal attribute itself is
+  // still outside the model and flagged.
+  assert.deepEqual(table.columns, [
+    { name: 'id', type: 'integer', notNull: true },
+    { name: 'during', type: 'int4range', notNull: true },
+  ]);
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+  ]);
+});
+
+test('attribute-carrying declarations round-trip against the unnamed model with an empty diff', async () => {
+  const declared = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer, c integer NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (b) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.t ADD CHECK (c > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (c) REFERENCES public.parent(id) NOT ENFORCED;`,
+  ].join('\n');
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer, b integer, c integer CONSTRAINT t_c_not_null NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (b) DEFERRABLE INITIALLY DEFERRED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_c_check CHECK (c > 0) NOT ENFORCED;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_c_fkey FOREIGN KEY (c) REFERENCES public.parent(id) NOT ENFORCED;`,
+  ].join('\n');
+
+  const { model: declaredModel, diagnostics } = await importDump(declared);
+  const { model: dumpModel } = await importDump(dump);
+
+  // The dump's generated names and attributes read back as the model's unnamed declarations:
+  // enforcement, deferrability, and the named not-null fact all survive the round trip.
+  assert.deepEqual(diff(declaredModel, dumpModel), []);
+  assert.deepEqual(diagnostics, []);
 });
 
 test('imports standalone indexes, unique and concurrent, in name order', async () => {
@@ -469,13 +1358,571 @@ test('imports standalone indexes, unique and concurrent, in name order', async (
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // Unnamed sorts first; `concurrently` is stored only when the statement states it.
+  // The conventional `t_b_idx` is canonicalized to unnamed and sorts with the other unnamed
+  // entry by insertion order; `concurrently` is stored only when the statement states it.
   assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['b'] },
     { unique: true, columns: ['b'] },
     { name: 't_ab_idx', unique: false, columns: ['a', 'b'], concurrently: true },
-    { name: 't_b_idx', unique: false, columns: ['b'] },
   ]);
   assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional index name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE INDEX t_ab_idx ON public.t USING btree (a, b);`,
+    `CREATE INDEX t_b_idx1 ON public.t USING btree (b);`,
+    `CREATE INDEX t_a_b_idx ON public.t USING btree (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The prediction joins columns with `_`, so `t_ab_idx` is not the conventional name for
+  // `(a, b)` and is kept; a collision suffix (`t_b_idx1`) is beyond the offline prediction and
+  // is kept too. The two exact predictions become unnamed and sort first by insertion order.
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['b'] },
+    { unique: false, columns: ['a', 'b'] },
+    { name: 't_ab_idx', unique: false, columns: ['a', 'b'] },
+    { name: 't_b_idx1', unique: false, columns: ['b'] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated index name and keeps a collision-suffixed one', async () => {
+  // `makeObjectName` spends 4 bytes on `_idx` and its separator, so the 60-byte column gives
+  // up 3 bytes to fit 63: the server form is `t_` plus 57 bytes plus `_idx`. A collision suffix
+  // grows the label and the column part gives up 4 bytes instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_idx`;
+  const suffixed = `t_${'w'.repeat(56)}_idx1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `CREATE INDEX ${generated} ON public.t USING btree (${longColumn});`,
+    `CREATE INDEX ${suffixed} ON public.t USING btree (${longColumn});`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name is beyond the offline
+  // prediction and stays named (no unnamed entry shares its structure, so no guard fires).
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: [longColumn] },
+    { name: suffixed, unique: false, columns: [longColumn] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a conventional name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE INDEX ON public.t USING btree (b);`,
+  ];
+  const expected = [
+    { unique: false, columns: ['b'] },
+    { name: 't_b_idx', unique: false, columns: ['b'] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer, b integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the conventional entry: exactly one unnamed structural
+    // entry survives in either order, and the result array is identical.
+    assert.deepEqual(table.indexes, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a truncated conventional index name when an unnamed twin exists, whatever the statement order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_idx`;
+  const statements = [
+    `CREATE INDEX ${generated} ON public.t USING btree (${longColumn});`,
+    `CREATE INDEX ON public.t USING btree (${longColumn});`,
+  ];
+  const expected = [
+    { unique: false, columns: [longColumn] },
+    { name: generated, unique: false, columns: [longColumn] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the truncated conventional entry: exactly one unnamed
+    // structural entry survives in either order, as for the short-name form.
+    assert.deepEqual(table.indexes, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('a conventional name round-trips against an unnamed declaration with an empty diff', async () => {
+  const named = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX ON public.t USING btree (b);`,
+  ].join('\n');
+
+  const { model: baseline } = await importDump(named);
+  const { model: target } = await importDump(unnamed);
+  assert.deepEqual(diff(baseline, target), []);
+});
+
+test('canonicalizes the conventional primary-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_pkey PRIMARY KEY (a));`,
+    `CREATE TABLE public.u (b integer, CONSTRAINT u_custom_pkey PRIMARY KEY (b));`,
+    `CREATE TABLE public.v (c integer, CONSTRAINT v_pkey1 PRIMARY KEY (c));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const primaryKeyOf = (name: string) =>
+    model.tables.find((table) => table.name === name)?.primaryKey;
+
+  // PostgreSQL names an unnamed primary key `<table>_pkey`; a collision suffix (`v_pkey1`) and
+  // any other name (`u_custom_pkey`) are outside the formula and stay named. There is no twin
+  // guard: PostgreSQL allows one primary key per table.
+  assert.deepEqual(primaryKeyOf('t'), { columns: ['a'] });
+  assert.deepEqual(primaryKeyOf('u'), { name: 'u_custom_pkey', columns: ['b'] });
+  assert.deepEqual(primaryKeyOf('v'), { name: 'v_pkey1', columns: ['c'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated primary-key name', async () => {
+  // A 63-byte table name leaves `_pkey` its 5 bytes only after the table part gives up 5 bytes,
+  // so the server names the primary key with a 58-byte table part. A name one byte short of the
+  // server form is outside the formula and stays named.
+  const longTable = 't'.repeat(63);
+  const generated = `${'t'.repeat(58)}_pkey`;
+  const nearMissTable = 'u'.repeat(63);
+  const nearMiss = `${'u'.repeat(57)}_pkey`;
+  const dump = [
+    `CREATE TABLE public.${longTable} (c integer, CONSTRAINT ${generated} PRIMARY KEY (c));`,
+    `CREATE TABLE public.${nearMissTable} (c integer, CONSTRAINT ${nearMiss} PRIMARY KEY (c));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const primaryKeyOf = (name: string) =>
+    model.tables.find((candidate) => candidate.name === name)?.primaryKey;
+
+  assert.deepEqual(primaryKeyOf(longTable), { columns: ['c'] });
+  assert.deepEqual(primaryKeyOf(nearMissTable), { name: nearMiss, columns: ['c'] });
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional unique-constraint name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key1 UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_key UNIQUE (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_a_key UNIQUE (a, b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_ab_key UNIQUE (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact `<table>_<cols>_key` formula strips, in the constraint's own column order:
+  // `t_b_key` names the wrong column for `(a)`, `t_a_key1` is a collision suffix,
+  // `t_b_a_key` lists the columns in the wrong order, and `t_ab_key` lacks the separator.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: ['a'] },
+    { name: 't_a_key1', columns: ['a'] },
+    { name: 't_b_key', columns: ['a'] },
+    { columns: ['a', 'b'] },
+    { name: 't_ab_key', columns: ['a', 'b'] },
+    { name: 't_b_a_key', columns: ['a', 'b'] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated unique-constraint name and keeps a collision-suffixed one', async () => {
+  // The `_key` label leaves a 58-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 3 bytes; the collision suffix gives up 4 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_key`;
+  const suffixed = `t_${'w'.repeat(56)}_key1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} UNIQUE (${longColumn});`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} UNIQUE (${longColumn});`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.uniqueConstraints, [
+    { columns: [longColumn] },
+    { name: suffixed, columns: [longColumn] },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional foreign-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.parent2 (x integer, y integer, PRIMARY KEY (x, y));`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey1 FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_a_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_ab_fkey FOREIGN KEY (a, b) REFERENCES public.parent2(x, y);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact `<table>_<cols>_fkey` formula strips, in the constraint's own column order:
+  // `t_b_fkey` names the wrong column for `(a)`, `t_a_fkey1` is a collision suffix,
+  // `t_b_a_fkey` lists the columns in the wrong order, and `t_ab_fkey` lacks the separator.
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 't_a_fkey1',
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      name: 't_b_fkey',
+      columns: ['a'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+    {
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+    {
+      name: 't_ab_fkey',
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+    {
+      name: 't_b_a_fkey',
+      columns: ['a', 'b'],
+      referencedTable: { schema: 'public', name: 'parent2' },
+      referencedColumns: ['x', 'y'],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated foreign-key name and keeps a collision-suffixed one', async () => {
+  // The `_fkey` label leaves a 57-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 4 bytes; the collision suffix gives up 5 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(56)}_fkey`;
+  const suffixed = `t_${'w'.repeat(55)}_fkey1`;
+  const parent = { schema: 'public', name: 'parent' };
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} FOREIGN KEY (${longColumn}) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} FOREIGN KEY (${longColumn}) REFERENCES public.parent(id);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.foreignKeys, [
+    { columns: [longColumn], referencedTable: parent, referencedColumns: ['id'] },
+    {
+      name: suffixed,
+      columns: [longColumn],
+      referencedTable: parent,
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes only the exact conventional check-constraint name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_check CHECK (a > 0 AND b > 0);`,
+    `CREATE TABLE public.u (c integer);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_c_check CHECK (c IS NOT NULL);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_check CHECK (true);`,
+    `CREATE TABLE public.v (d integer);`,
+    `ALTER TABLE ONLY public.v ADD CONSTRAINT v_check CHECK (d > 0);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const checksOf = (name: string) =>
+    model.tables.find((candidate) => candidate.name === name)?.checkConstraints;
+
+  // A single-column expression strips only as `<table>_<col>_check`: `t_b_check` names the
+  // wrong column for `a > 0`, and a generic `<table>_check` on a single-column expression
+  // (`v_check`) stays, because PostgreSQL would have assigned `v_d_check`. A multi-column
+  // expression (`t_check`) and a zero-column one (`u_check`) are the generic shape and strip.
+  assert.deepEqual(checksOf('t'), [
+    { expression: 'a > 0' },
+    { name: 't_b_check', expression: 'a > 0' },
+    { expression: 'a > 0 AND b > 0' },
+  ]);
+  assert.deepEqual(checksOf('u'), [{ expression: 'c IS NOT NULL' }, { expression: 'true' }]);
+  assert.deepEqual(checksOf('v'), [{ name: 'v_check', expression: 'd > 0' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes a truncated generated check-constraint name and keeps a collision-suffixed one', async () => {
+  // The `_check` label leaves a 56-byte budget beside the 1-byte table, so the 60-byte column
+  // gives up 5 bytes; the collision suffix gives up 6 instead.
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(55)}_check`;
+  const suffixed = `t_${'w'.repeat(54)}_check1`;
+  const dump = [
+    `CREATE TABLE public.t (${longColumn} integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} CHECK (${longColumn} > 0);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${suffixed} CHECK (${longColumn} > 0);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the exact server form strips; the collision-suffixed name stays named.
+  assert.deepEqual(table.checkConstraints, [
+    { expression: `${longColumn} > 0` },
+    { name: suffixed, expression: `${longColumn} > 0` },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a conventional unique name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (a);`,
+  ];
+  const expected = [{ columns: ['a'] }, { name: 't_a_key', columns: ['a'] }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer, b integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the conventional entry: exactly one unnamed entry survives
+    // in either order, so no duplicate unnamed entry is manufactured.
+    assert.deepEqual(table.uniqueConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a truncated conventional unique name when an unnamed twin exists, whatever the statement order', async () => {
+  const longColumn = 'w'.repeat(60);
+  const generated = `t_${'w'.repeat(57)}_key`;
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT ${generated} UNIQUE (${longColumn});`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (${longColumn});`,
+  ];
+  const expected = [{ columns: [longColumn] }, { name: generated, columns: [longColumn] }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (${longColumn} integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    // The guard keeps the name on the truncated conventional entry: exactly one unnamed
+    // structural entry survives in either order.
+    assert.deepEqual(table.uniqueConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('keeps a conventional foreign-key name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a) REFERENCES public.parent(id);`,
+  ];
+  const parent = { schema: 'public', name: 'parent' };
+  const expected = [
+    { columns: ['a'], referencedTable: parent, referencedColumns: ['id'] },
+    { name: 't_a_fkey', columns: ['a'], referencedTable: parent, referencedColumns: ['id'] },
+  ];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [
+      `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+      `CREATE TABLE public.t (a integer);`,
+      ...order,
+    ].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    assert.deepEqual(table.foreignKeys, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('strips a conventional foreign-key name beside a twin differing only in an action', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a) REFERENCES public.parent(id) ON DELETE CASCADE;`,
+  ];
+  const parent = { schema: 'public', name: 'parent' };
+  const plain = { columns: ['a'], referencedTable: parent, referencedColumns: ['id'] };
+  const cascading = {
+    columns: ['a'],
+    referencedTable: parent,
+    referencedColumns: ['id'],
+    onDelete: 'CASCADE',
+  };
+  const dump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.t (a integer);`,
+  ];
+
+  // The twin guard's key is equality-minus-name: the named foreign key differs from the
+  // unnamed twin in `onDelete`, so it is not a twin, stripping manufactures no duplicate, and
+  // the name is stripped. The core diff's narrower `foreignKeyIdentity` (columns and target
+  // only) would have treated them as twins and kept the name, silently losing the action —
+  // equality-minus-name here is deliberate.
+  const { model: first } = await importDump([...dump, ...statements].join('\n'));
+  assert.deepEqual(first.tables.find((candidate) => candidate.name === 't')?.foreignKeys, [
+    plain,
+    cascading,
+  ]);
+  const { model: second } = await importDump([...dump, ...[...statements].reverse()].join('\n'));
+  assert.deepEqual(second.tables.find((candidate) => candidate.name === 't')?.foreignKeys, [
+    cascading,
+    plain,
+  ]);
+});
+
+test('keeps a conventional check name when an unnamed twin exists, whatever the statement order', async () => {
+  const statements = [
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (a > 0);`,
+  ];
+  const expected = [{ expression: 'a > 0' }, { name: 't_a_check', expression: 'a > 0' }];
+
+  for (const order of [statements, [...statements].reverse()]) {
+    const dump = [`CREATE TABLE public.t (a integer);`, ...order].join('\n');
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    assert.deepEqual(table.checkConstraints, expected);
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+test('a conventional constraint name round-trips against an unnamed declaration with an empty diff', async () => {
+  const named = [
+    `CREATE TABLE public.parent (x integer, y integer);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_key UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.parent(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (a > 0);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.parent (x integer, y integer);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE (a);`,
+    `ALTER TABLE ONLY public.t ADD FOREIGN KEY (a, b) REFERENCES public.parent(x, y);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (a > 0);`,
+  ].join('\n');
+
+  const { model: baseline } = await importDump(named);
+  const { model: target } = await importDump(unnamed);
+  assert.deepEqual(diff(baseline, target), []);
+});
+
+test('keeps a check name the best-effort formula does not predict', async () => {
+  const named = [
+    `CREATE TABLE public.t (a timestamp);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_check CHECK (EXTRACT(epoch FROM a) = 0);`,
+  ].join('\n');
+  const unnamed = [
+    `CREATE TABLE public.t (a timestamp);`,
+    `ALTER TABLE ONLY public.t ADD CHECK (EXTRACT(epoch FROM a) = 0);`,
+  ].join('\n');
+
+  const { model } = await importDump(named);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The lexical scan counts `epoch` as a column reference — it is not a function name, a type
+  // after `::`, a CAST alias, or a key word — so the helper predicts `t_check`, while
+  // PostgreSQL cooks the expression to one column, `a`, and names the constraint `t_a_check`.
+  // The name therefore stays, and an import compared against an unnamed declaration of the
+  // same check still reads changed: the fail-safe side of the best-effort formula.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_a_check', expression: 'EXTRACT(epoch FROM a) = 0' },
+  ]);
+  const { model: expected } = await importDump(unnamed);
+  assert.deepEqual(diff(model, expected), [
+    {
+      kind: 'table-changed',
+      table: { schema: 'public', name: 't' },
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: { name: 't_a_check', expression: 'EXTRACT(epoch FROM a) = 0' },
+          after: { expression: 'EXTRACT(epoch FROM a) = 0' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('an unnamed foreign key without referenced columns round-trips against a dump', async () => {
+  const declared = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.child (a integer);`,
+    `ALTER TABLE ONLY public.child ADD CONSTRAINT child_a_fkey FOREIGN KEY (a) REFERENCES public.parent;`,
+  ].join('\n');
+  const serverDump = [
+    `CREATE TABLE public.parent (id integer PRIMARY KEY);`,
+    `CREATE TABLE public.child (a integer);`,
+    `ALTER TABLE ONLY public.child ADD CONSTRAINT child_a_fkey FOREIGN KEY (a) REFERENCES public.parent(id);`,
+  ].join('\n');
+
+  const { model: declaredModel } = await importDump(declared);
+  const { model: serverModel } = await importDump(serverDump);
+
+  // Both declarations canonicalize `child_a_fkey` back to unnamed; the server dump carries the
+  // concrete referenced-column list, but the declaration's omission resolves against its own
+  // model's referenced-table primary key (`public.parent.id`), so the two compare equal.
+  assert.deepEqual(diff(declaredModel, serverModel), []);
 });
 
 test('skips whole indexes with elements or clauses outside the minimal envelope', async () => {
@@ -532,6 +1979,146 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
   assert.match(messages, /CREATE INDEX t_nd_idx \(NULLS NOT DISTINCT\)/);
 });
 
+test('flags and drops IF NOT EXISTS on a named standalone index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The conventional `t_a_idx` still canonicalizes to unnamed; the flag names the
+  // source-stated name, which the model no longer carries.
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 't_a_idx',
+      message: 'dropped IF NOT EXISTS from t_a_idx',
+    },
+  ]);
+});
+
+test('rejects IF NOT EXISTS on an unnamed CREATE INDEX as a syntax error', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS ON public.t (a);`,
+    `CREATE TABLE public.after (id integer);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // After `IF NOT EXISTS` the grammar needs an index name; `ON` is reserved and cannot be one, so
+  // the unnamed form cannot carry the clause. The statement fails at that `ON` with `syntax error
+  // at or near "ON"`, while its neighbours still import.
+  assert.deepEqual(
+    model.tables.map((table) => table.name),
+    ['after', 't'],
+  );
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(table.indexes, []);
+  assert.equal(diagnostics.length, 1);
+  const [diagnostic] = diagnostics;
+  assert.ok(diagnostic, 'the failure is reported');
+  assert.deepEqual(summarize(diagnostic), { kind: 'error', code: 'parse-failure' });
+  assert.match(diagnostic.message, /syntax error at or near "ON"/);
+  assert.deepEqual(diagnostic.position, {
+    offset: dump.indexOf('ON public'),
+    line: 2,
+    column: 28,
+  });
+});
+
+test('flags IF NOT EXISTS on a unique concurrent named index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (b integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS custom_b_idx ON public.t USING btree (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // A non-conventional name survives canonicalization, so the flag and the model name agree.
+  assert.deepEqual(table.indexes, [
+    { name: 'custom_b_idx', unique: true, columns: ['b'], concurrently: true },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'custom_b_idx',
+      message: 'dropped IF NOT EXISTS from custom_b_idx',
+    },
+  ]);
+});
+
+test('skips an IF NOT EXISTS index whole when INCLUDE falls outside the envelope', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX IF NOT EXISTS t_i_idx ON public.t USING btree (a) INCLUDE (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // An index is never partially imported: the whole-statement skip is the only finding, and
+  // the dropped clause is moot.
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_i_idx',
+      message: 'skipped CREATE INDEX t_i_idx (INCLUDE)',
+    },
+  ]);
+});
+
+test('skips an IF NOT EXISTS index whole when its table is not imported', async () => {
+  const dump = `CREATE INDEX IF NOT EXISTS x_idx ON public.missing (a);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The table gate wins: the clause is moot on an index that never imports.
+  assert.deepEqual(model.tables, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'x_idx',
+      message: 'skipped CREATE INDEX x_idx (table not imported)',
+    },
+  ]);
+});
+
+test('flags IF NOT EXISTS once per statement, in statement order', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX IF NOT EXISTS custom_a_idx ON public.t (a);`,
+    `CREATE INDEX IF NOT EXISTS custom_b_idx ON public.t (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Two flags, one per statement, in source order; the named indexes sort by name.
+  assert.deepEqual(table.indexes, [
+    { name: 'custom_a_idx', unique: false, columns: ['a'] },
+    { name: 'custom_b_idx', unique: false, columns: ['b'] },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped IF NOT EXISTS from custom_a_idx', 'dropped IF NOT EXISTS from custom_b_idx'],
+  );
+});
+
 test('consumes a plain unique index into a USING INDEX constraint', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
@@ -546,10 +2133,32 @@ test('consumes a plain unique index into a USING INDEX constraint', async () => 
   assert.ok(table, 'the table is imported');
 
   // The constraint absorbs the index, taking the stated name or the index's when unnamed; no
-  // standalone Index survives.
+  // standalone Index survives. A swallowed name that matches the conventional unique formula
+  // (`t_a_key` for `(a)`) canonicalizes back to unnamed; `t_b_idx` is an index name, not the
+  // formula for `(b)`, so it stays named.
   assert.deepEqual(table.uniqueConstraints, [
-    { name: 't_a_key', columns: ['a'] },
+    { columns: ['a'] },
     { name: 't_b_idx', columns: ['b'] },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads deferrability from a USING INDEX unique constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD UNIQUE USING INDEX t_a_idx DEFERRABLE INITIALLY DEFERRED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The consumed index's constraint still reads the attributes the statement states; its name
+  // is the index's (`t_a_idx`), which is not the unique formula for `(a)` and stays.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_idx', columns: ['a'], deferrable: true, initiallyDeferred: true },
   ]);
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics, []);
@@ -590,10 +2199,11 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The non-unique index stays standalone; the expression index was skipped whole, and every
-  // USING INDEX constraint that cannot consume a plain unique index is skipped and named.
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
+  // skipped whole, and every USING INDEX constraint that cannot consume a plain unique index is
+  // skipped and named.
   assert.deepEqual(table.uniqueConstraints, []);
-  assert.deepEqual(table.indexes, [{ name: 't_a_idx', unique: false, columns: ['a'] }]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(summarize), [
     { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
     { kind: 'skip', code: 'unsupported-statement', object: 't_a_key' },
@@ -606,6 +2216,645 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   assert.match(messages, /unique constraint t_a_key on public\.t \(USING INDEX t_a_idx\)/);
   assert.match(messages, /unique constraint t_b_key on public\.t \(USING INDEX t_b_idx\)/);
   assert.match(messages, /unique constraint t_missing_key on public\.t \(USING INDEX t_missing\)/);
+});
+
+test('consumes a plain unique index into a USING INDEX primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key absorbs the index, taking the stated name; no standalone Index survives.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test("consumes the primary key's named index, not another unique index", async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Resolution is name-exact: the referenced index backs the key, while the unreferenced one
+  // survives as a standalone index and canonicalizes to unnamed.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['b'] });
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('takes the index name and deferrability for an unnamed USING INDEX primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY USING INDEX t_a_idx DEFERRABLE INITIALLY DEFERRED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // An unnamed constraint is named after the index it consumes, not the conventional
+  // `<table>_pkey`; the stated deferrability survives.
+  assert.deepEqual(table.primaryKey, {
+    name: 't_a_idx',
+    columns: ['a'],
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('canonicalizes an index name that is the conventional primary-key name', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_pkey ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD PRIMARY KEY USING INDEX t_pkey;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The consumed index's name is the conventional primary-key name, so the finalize pass
+  // strips it back to unnamed.
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips a USING INDEX primary key whole when the index cannot back it', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE INDEX t_a_idx ON public.t (a);`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t ((b + 1));`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_missing_pk PRIMARY KEY USING INDEX t_missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
+  // skipped whole, and every USING INDEX primary key that cannot consume a plain unique index is
+  // skipped and named.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_a_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_b_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 't_missing_pk' },
+  ]);
+
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /CREATE INDEX t_b_idx \(expression element\)/);
+  assert.match(messages, /skipped primary key t_a_pk on public\.t \(USING INDEX t_a_idx\)/);
+  assert.match(messages, /skipped primary key t_b_pk on public\.t \(USING INDEX t_b_idx\)/);
+  assert.match(messages, /skipped primary key t_missing_pk on public\.t \(USING INDEX t_missing\)/);
+});
+
+test('flags a USING INDEX primary key stated in CREATE TABLE', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx);`,
+    `CREATE TABLE public.u (a integer, PRIMARY KEY USING INDEX u_idx);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const t = model.tables.find((candidate) => candidate.name === 't');
+  const u = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(t, 'the first table is imported');
+  assert.ok(u, 'the second table is imported');
+
+  // PostgreSQL rejects the form at execution: the table imports without the key, and the drop is
+  // a flag on the table, not a skip of the statement.
+  assert.equal(t.primaryKey, undefined);
+  assert.equal(u.primaryKey, undefined);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.u' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /dropped primary key t_pk \(USING INDEX t_a_idx; cannot use an existing index in CREATE TABLE\) from public\.t/,
+  );
+  assert.match(
+    diagnostics[1]?.message ?? '',
+    /dropped primary key \(USING INDEX u_idx; cannot use an existing index in CREATE TABLE\) from public\.u/,
+  );
+});
+
+test('keeps a USING INDEX primary key unresolved when the index statement comes later', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Resolution is in order, against the draft's indexes only: the key is skipped, and the later
+  // index still imports standalone, canonicalized to unnamed.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_pk' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /skipped primary key t_pk on public\.t \(USING INDEX t_a_idx\)/,
+  );
+});
+
+test('keeps the first USING INDEX consumer and skips later references', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk2 PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_key UNIQUE USING INDEX u_a_idx;`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_pk PRIMARY KEY USING INDEX u_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const t = model.tables.find((candidate) => candidate.name === 't');
+  const u = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(t, 'the first table is imported');
+  assert.ok(u, 'the second table is imported');
+
+  // The first consumer splices the index out, so the second reference cannot resolve; a unique
+  // constraint that consumed the index first keeps the primary key from doing so.
+  assert.deepEqual(t.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(t.indexes, []);
+  assert.equal(u.primaryKey, undefined);
+  assert.deepEqual(u.uniqueConstraints, [{ name: 'u_key', columns: ['a'] }]);
+  assert.deepEqual(u.indexes, []);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'skip', code: 'unsupported-statement', object: 't_pk2' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'u_pk' },
+  ]);
+  assert.match(
+    diagnostics[0]?.message ?? '',
+    /skipped primary key t_pk2 on public\.t \(USING INDEX t_a_idx\)/,
+  );
+  assert.match(
+    diagnostics[1]?.message ?? '',
+    /skipped primary key u_pk on public\.u \(USING INDEX u_a_idx\)/,
+  );
+});
+
+test('flags a UNIQUE USING INDEX constraint stated in CREATE TABLE', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_u UNIQUE USING INDEX t_a_idx);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL rejects the form at execution: the unique constraint is dropped with a flag on
+  // the table, while the index it names still imports standalone (canonicalized, since
+  // `t_a_idx` is the synthesized name for its structure).
+  assert.deepEqual(table.uniqueConstraints, []);
+  assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped unique constraint t_u (USING INDEX t_a_idx; cannot use an existing index in CREATE TABLE) from public.t',
+    },
+  ]);
+});
+
+test('flags INCLUDE on a primary key and keeps the key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer, CONSTRAINT t_pk PRIMARY KEY (a) INCLUDE (b));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key imports with its representable identity; the covering columns it cannot carry are
+  // named and dropped.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on primary key t_pk from public.t',
+    },
+  ]);
+});
+
+test('copies an index comment into a consumed unique constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The comment travels with the index onto the constraint it becomes; nothing is dropped.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'backing index' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('copies an index comment into a consumed primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The key takes the consumed index's comment the same way a unique constraint does.
+  assert.deepEqual(table.primaryKey, {
+    name: 't_a_pk',
+    columns: ['a'],
+    comment: 'backing index',
+  });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags a dropped comment when a consumed unique index dedupes onto a commented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL rejects a duplicate constraint name; the importer keeps the existing constraint
+  // and its comment, so the consumed index's differing comment has nowhere to land and is named.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'existing' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
+test('flags a dropped comment when a consumed primary key dedupes onto a commented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The conventional `t_pkey` name is stripped by finalization, so that model carries no name to
+  // assert (the issue's `{ name: 't_pkey', … }` expectation is wrong); the non-conventional
+  // `t_a_pk` keeps the retained name assertable, as the unique-side pin and consumed-PK siblings
+  // do. Both forms reach this `samePrimaryKey` dedupe — the whole-array diagnostic comparison
+  // below separates its one comment flag from the rejection branch's additional-key flag.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'existing' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
+test('flags a dropped comment when a consumed unique index dedupes onto an uncommented constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The retained constraint has no comment to compare, so the consumed text is still dropped
+  // and named rather than merged into the existing node.
+  assert.deepEqual(table.uniqueConstraints, [{ name: 't_a_unique', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
+});
+
+test('silences the comment flag when a consumed unique index and the retained constraint agree', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'same';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX t_a_idx IS 'same';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The retained constraint already carries the consumed text, so no model fact is lost.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'same' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags a dropped comment when a consumed primary key is rejected as an additional key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `COMMENT ON INDEX t_b_idx IS 'backing';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // PostgreSQL allows one primary key; the importer keeps the first and names the rejected
+  // declaration, then names its differing comment because the retained key keeps its own.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'existing' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_b_idx',
+      message: 'dropped comment from public.t_b_idx',
+    },
+  ]);
+});
+
+test('silences the comment flag when a rejected primary key matches the retained comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
+    `COMMENT ON CONSTRAINT t_a_pk ON public.t IS 'same';`,
+    `CREATE UNIQUE INDEX t_b_idx ON public.t USING btree (b);`,
+    `COMMENT ON INDEX t_b_idx IS 'same';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_pk PRIMARY KEY USING INDEX t_b_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Only the rejected declaration is a dropped fact; its comment duplicates the retained text.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'same' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+  ]);
+});
+
+test('emits no comment flag when a deduped consumed index carries no comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
+    `COMMENT ON CONSTRAINT t_a_unique ON public.t IS 'existing';`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // No consumed comment exists to lose, so the dedupe stays silent.
+  assert.deepEqual(table.uniqueConstraints, [
+    { name: 't_a_unique', columns: ['a'], comment: 'existing' },
+  ]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags a comment on an index consumed by a constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `COMMENT ON INDEX public.t_a_idx IS 'late';`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_a_key UNIQUE USING INDEX u_a_idx;`,
+    `COMMENT ON INDEX public.u_a_idx IS 'late';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // The index is gone by the time its comment arrives, so the comment cannot be placed; the
+  // after-consumption order keeps the pre-existing flag wording for both kinds.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(other.uniqueConstraints, [{ columns: ['a'] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.u_a_idx',
+      message: 'dropped comment from public.u_a_idx',
+    },
+  ]);
+});
+
+test('flags CONCURRENTLY on consumed primary-key and unique indexes', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+    `CREATE TABLE public.u (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY u_a_idx ON public.u USING btree (a);`,
+    `ALTER TABLE ONLY public.u ADD CONSTRAINT u_key UNIQUE USING INDEX u_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  const other = model.tables.find((candidate) => candidate.name === 'u');
+  assert.ok(table && other, 'both tables are imported');
+
+  // A constraint carries no apply metadata, so each consumed concurrent index is named once
+  // while the constraint itself still imports.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
+  assert.deepEqual(other.uniqueConstraints, [{ name: 'u_key', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(other.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped CONCURRENTLY on primary key t_pk (index t_a_idx; a constraint cannot carry it) from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.u',
+      message:
+        'dropped CONCURRENTLY on unique constraint u_key (index u_a_idx; a constraint cannot carry it) from public.u',
+    },
+  ]);
+});
+
+test('copies the comment and flags CONCURRENTLY for a consumed commented concurrent primary key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_a_idx IS 'kept';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Two facts on one consumed index: the comment survives on the key, the apply metadata
+  // cannot and is named once.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'], comment: 'kept' });
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message:
+        'dropped CONCURRENTLY on primary key t_pk (index t_a_idx; a constraint cannot carry it) from public.t',
+    },
+  ]);
+});
+
+test('keeps the existing skips for an INCLUDE index referenced by USING INDEX', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a) INCLUDE (b);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_a_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The covering index is outside the envelope, so it is skipped whole; the key then has no
+  // index to consume and is skipped and named too. Neither statement is partially imported.
+  assert.equal(table.primaryKey, undefined);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_a_idx',
+      message: 'skipped CREATE INDEX t_a_idx (INCLUDE)',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 't_pk',
+      message: 'skipped primary key t_pk on public.t (USING INDEX t_a_idx)',
+    },
+  ]);
+});
+
+test('flags an inline NOT ENFORCED attribute on a primary key', async () => {
+  const dump = [`CREATE TABLE public.t (a integer PRIMARY KEY NOT ENFORCED);`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The server rejects the placement, but the raw parser accepts it: the key imports and the
+  // misplaced attribute keeps its raw parser label.
+  assert.deepEqual(table.primaryKey, { columns: ['a'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped CONSTR_ATTR_NOT_ENFORCED on public.t.a from public.t',
+    },
+  ]);
 });
 
 test('attaches SET DEFAULT, keeps existing defaults, and reports conflicts and unknowns', async () => {
@@ -691,6 +2940,8 @@ test('replaces a repeated CREATE TABLE wholesale', async () => {
       },
     ],
     sequences: [],
+    views: [],
+    extensions: [],
   });
   assert.deepEqual(diagnostics, []);
 });
@@ -748,6 +2999,118 @@ test('skips a partition and flags a partitioned table', async () => {
   assert.match(diagnostics[1]?.message ?? '', /partition app\.events_2026/);
 });
 
+test('flags and drops IF NOT EXISTS on a table, importing it', async () => {
+  const dump = `CREATE TABLE IF NOT EXISTS public.t (a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The clause is dropped with a flag; the table still imports into the model.
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'public',
+      name: 't',
+      columns: [{ name: 'a', type: 'integer', notNull: false }],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+  ]);
+});
+
+test('imports a plain CREATE TABLE without diagnostics', async () => {
+  const dump = `CREATE TABLE public.t (a integer);`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(
+    model.tables.map((table) => `${table.schema}.${table.name}`),
+    ['public.t'],
+  );
+  assert.deepEqual(diagnostics, []);
+});
+
+test('flags IF NOT EXISTS on every repeated CREATE TABLE and keeps the last draft', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS public.t (a integer);`,
+    `CREATE TABLE IF NOT EXISTS public.t (b text NOT NULL);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // Diagnostics are per statement: both clauses flag, in statement order. The repeated create
+  // still replaces the draft wholesale, so only the last definition's column survives.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped IF NOT EXISTS from public.t',
+    },
+  ]);
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'public',
+      name: 't',
+      columns: [{ name: 'b', type: 'text', notNull: true }],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+    },
+  ]);
+});
+
+test('flags IF NOT EXISTS on a partitioned parent but not on a partition child', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS app.events (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+    `CREATE TABLE IF NOT EXISTS app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The parent imports: its existing partitioning flag comes first, then the clause flag. The
+  // child early-returns before the clause is read, so its skip is the only finding.
+  assert.deepEqual(
+    model.tables.map((table) => `${table.schema}.${table.name}`),
+    ['app.events'],
+  );
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.events',
+      message: 'dropped partitioning clauses from app.events',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.events',
+      message: 'dropped IF NOT EXISTS from app.events',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.events_2026',
+      message: 'skipped partition app.events_2026 (a partition is not a plain table)',
+    },
+  ]);
+});
+
 test('isolates a parse failure and imports the statements around it', async () => {
   const dump = [
     `CREATE TABLE public.before (id integer);`,
@@ -792,6 +3155,8 @@ test('binds the DdlImporter seam', async () => {
       },
     ],
     sequences: [],
+    views: [],
+    extensions: [],
   });
 });
 
@@ -1289,6 +3654,118 @@ test('replaces a repeated CREATE SEQUENCE wholesale', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
+test('flags and drops IF NOT EXISTS on a sequence, importing it', async () => {
+  const dump = `CREATE UNLOGGED SEQUENCE IF NOT EXISTS public.s;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The sequence still imports, as a plain one; an unlogged sequence carries both findings, so
+  // their order pins the clause after the persistence flag.
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.s',
+      message: 'dropped unlogged-sequence persistence from public.s',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.s',
+      message: 'dropped IF NOT EXISTS from public.s',
+    },
+  ]);
+});
+
+test('imports a plain CREATE SEQUENCE without diagnostics', async () => {
+  const dump = `CREATE SEQUENCE public.s;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reports only the last repeated CREATE SEQUENCE clause and keeps the last draft', async () => {
+  const clause = {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'public.s',
+    message: 'dropped IF NOT EXISTS from public.s',
+  };
+  const last = sequence('s', { dataType: 'integer', maxValue: '2147483647' });
+
+  // clause → clause: the findings buffer is replaced, so one flag for the last statement.
+  const both = await importDump(
+    [
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS smallint CYCLE;`,
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(both.model.sequences, [last]);
+  assert.deepEqual(both.diagnostics.map(describeDiagnostic), [clause]);
+
+  // clause → plain: the replacement clears the earlier flag.
+  const cleared = await importDump(
+    [
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS smallint;`,
+      `CREATE SEQUENCE public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(cleared.model.sequences, [last]);
+  assert.deepEqual(cleared.diagnostics, []);
+
+  // plain → clause: only the last statement's clause flags.
+  const flagged = await importDump(
+    [
+      `CREATE SEQUENCE public.s AS smallint;`,
+      `CREATE SEQUENCE IF NOT EXISTS public.s AS integer;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(flagged.model.sequences, [last]);
+  assert.deepEqual(flagged.diagnostics.map(describeDiagnostic), [clause]);
+});
+
+test('drops an IF NOT EXISTS sequence flag with a sequence dropped by owner reconciliation', async () => {
+  const dump = [
+    `CREATE TABLE public.kept (id bigint);`,
+    `CREATE SEQUENCE IF NOT EXISTS public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.kept.missing;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The findings buffer is discarded with the dropped sequence: only the owner skip remains.
+  assert.deepEqual(model.sequences, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.s',
+      message:
+        'skipped sequence public.s belongs to unread column public.kept.missing; it is not represented',
+    },
+  ]);
+});
+
+test('reports only the unsupported-option skip when IF NOT EXISTS is also present', async () => {
+  const dump = `CREATE SEQUENCE IF NOT EXISTS public.bad AS numeric;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The option gate returns before the clause is read, so the clause is moot.
+  assert.deepEqual(model.sequences, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.bad',
+      message: 'skipped CREATE SEQUENCE public.bad (unsupported data type)',
+    },
+  ]);
+});
+
 test('skips sequence state, missing sequences, and unmapped options by name', async () => {
   const dump = [
     `CREATE SEQUENCE public.s;`,
@@ -1330,6 +3807,285 @@ test('skips sequence state, missing sequences, and unmapped options by name', as
   assert.match(messages, /SELECT setval\('public\.s', 1, false\)/);
 });
 
+/**
+ * One dump with an owner for every unread shape the import must recognize: an absent table, a
+ * partitioned parent, a partition child, a view, a missing column, and a skipped
+ * `CREATE TABLE AS`; plus one dropped unlogged and one dropped temporary sequence, so each
+ * deferred persistence flag is discriminated, and one kept sequence.
+ */
+const MIXED_OWNER_DUMP = [
+  `CREATE TABLE public.kept (id bigint);`,
+  `CREATE SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`,
+  `ALTER SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`,
+  `CREATE TABLE public.parted (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+  `CREATE TABLE public.parted_2026 PARTITION OF public.parted FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+  `CREATE SEQUENCE public.child_seq;`,
+  `ALTER SEQUENCE public.child_seq OWNED BY public.parted_2026.id;`,
+  `CREATE VIEW public.v AS SELECT 1;`,
+  `CREATE SEQUENCE public.view_seq;`,
+  `ALTER SEQUENCE public.view_seq OWNED BY public.v.id;`,
+  `CREATE SEQUENCE public.parent_seq;`,
+  `ALTER SEQUENCE public.parent_seq OWNED BY public.parted.id;`,
+  `CREATE SEQUENCE public.column_seq;`,
+  `ALTER SEQUENCE public.column_seq OWNED BY public.kept.missing;`,
+  `CREATE TABLE public.ctas AS SELECT 1 AS id;`,
+  `CREATE SEQUENCE public.ctas_seq;`,
+  `ALTER SEQUENCE public.ctas_seq OWNED BY public.ctas.id;`,
+  `CREATE UNLOGGED SEQUENCE public.dropped_unlogged;`,
+  `ALTER SEQUENCE public.dropped_unlogged OWNED BY public.absent.id;`,
+  `CREATE TEMPORARY SEQUENCE public.dropped_temporary;`,
+  `ALTER SEQUENCE public.dropped_temporary OWNED BY public.absent.id;`,
+  `CREATE SEQUENCE public.kept_seq;`,
+  `ALTER SEQUENCE public.kept_seq OWNED BY public.kept.id;`,
+].join('\n');
+
+test('skips sequences whose owners are not in the imported model, in source order', async () => {
+  const at = (statement: string, line: number) => ({
+    offset: MIXED_OWNER_DUMP.indexOf(statement),
+    line,
+    column: 1,
+  });
+
+  const { model, diagnostics } = await importDump(MIXED_OWNER_DUMP);
+
+  assert.deepEqual(model.sequences, [
+    sequence('kept_seq', {
+      ownedBy: { table: { schema: 'public', name: 'kept' }, column: 'id' },
+    }),
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ({
+      ...describeDiagnostic(diagnostic),
+      position: diagnostic.position,
+    })),
+    [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.absent_owner_seq',
+        message:
+          'skipped sequence public.absent_owner_seq belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.absent_owner_seq OWNED BY public.absent.id;`, 3),
+      },
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.parted',
+        message: 'dropped partitioning clauses from public.parted',
+        position: at(
+          `CREATE TABLE public.parted (id bigint, happened_on date) PARTITION BY RANGE (happened_on);`,
+          4,
+        ),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.parted_2026',
+        message: 'skipped partition public.parted_2026 (a partition is not a plain table)',
+        position: at(
+          `CREATE TABLE public.parted_2026 PARTITION OF public.parted FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');`,
+          5,
+        ),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.child_seq',
+        message:
+          'skipped sequence public.child_seq belongs to unread relation public.parted_2026; it is not represented',
+        position: at(`ALTER SEQUENCE public.child_seq OWNED BY public.parted_2026.id;`, 7),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.view_seq',
+        message:
+          'skipped sequence public.view_seq belongs to unread relation public.v; it is not represented',
+        position: at(`ALTER SEQUENCE public.view_seq OWNED BY public.v.id;`, 10),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.parent_seq',
+        message:
+          'skipped sequence public.parent_seq belongs to unread relation public.parted; it is not represented',
+        position: at(`ALTER SEQUENCE public.parent_seq OWNED BY public.parted.id;`, 12),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.column_seq',
+        message:
+          'skipped sequence public.column_seq belongs to unread column public.kept.missing; it is not represented',
+        position: at(`ALTER SEQUENCE public.column_seq OWNED BY public.kept.missing;`, 14),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.ctas',
+        message: 'skipped CREATE TABLE AS public.ctas',
+        position: at(`CREATE TABLE public.ctas AS SELECT 1 AS id;`, 15),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.ctas_seq',
+        message:
+          'skipped sequence public.ctas_seq belongs to unread relation public.ctas; it is not represented',
+        position: at(`ALTER SEQUENCE public.ctas_seq OWNED BY public.ctas.id;`, 17),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.dropped_unlogged',
+        message:
+          'skipped sequence public.dropped_unlogged belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.dropped_unlogged OWNED BY public.absent.id;`, 19),
+      },
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.dropped_temporary',
+        message:
+          'skipped sequence public.dropped_temporary belongs to unread relation public.absent; it is not represented',
+        position: at(`ALTER SEQUENCE public.dropped_temporary OWNED BY public.absent.id;`, 21),
+      },
+    ],
+  );
+});
+
+test('keeps a sequence whose owner table appears later in the dump', async () => {
+  const dump = [
+    // The owner is set before its table exists; the post-pass judges final state, so it survives.
+    `CREATE SEQUENCE public.early;`,
+    `ALTER SEQUENCE public.early OWNED BY public.t.id;`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE TABLE public.t (id bigint);`,
+    `ALTER SEQUENCE public.s OWNED BY public.t.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('early', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps a sequence whose owner column is added after the OWNED BY statement', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id bigint);`,
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.t.added;`,
+    `ALTER TABLE public.t ADD COLUMN added bigint;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'added' } }),
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('OWNED BY NONE clears an earlier unread owner and keeps the sequence', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.absent.id;`,
+    `ALTER SEQUENCE public.s OWNED BY NONE;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [sequence('s')]);
+  assert.equal(model.sequences[0]?.ownedBy, undefined);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('validates inline OWNED BY and keeps a resolvable inline owner', async () => {
+  const dump = [
+    `CREATE SEQUENCE public.unread OWNED BY public.absent.id;`,
+    `CREATE TABLE public.t (id bigint);`,
+    `CREATE SEQUENCE public.kept OWNED BY public.t.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('kept', { ownedBy: { table: { schema: 'public', name: 't' }, column: 'id' } }),
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ({
+      ...describeDiagnostic(diagnostic),
+      position: diagnostic.position,
+    })),
+    [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.unread',
+        message:
+          'skipped sequence public.unread belongs to unread relation public.absent; it is not represented',
+        position: { offset: 0, line: 1, column: 1 },
+      },
+    ],
+  );
+});
+
+test('a re-created partition parent is a plain table and its sequence survives', async () => {
+  const dump = [
+    `CREATE TABLE public.p (a bigint) PARTITION BY RANGE (a);`,
+    `CREATE TABLE public.p (a bigint);`,
+    `CREATE SEQUENCE public.s;`,
+    `ALTER SEQUENCE public.s OWNED BY public.p.a;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.sequences, [
+    sequence('s', { ownedBy: { table: { schema: 'public', name: 'p' }, column: 'a' } }),
+  ]);
+  assert.deepEqual(diagnostics.map(summarize), [
+    { kind: 'flag', code: 'unsupported-attribute', object: 'public.p' },
+  ]);
+});
+
+test('never plans an ownership attach to a relation the model does not carry', async () => {
+  const { model } = await importDump(MIXED_OWNER_DUMP);
+
+  const tables = new Map(
+    model.tables.map((table) => [`${table.schema}\u0000${table.name}`, table]),
+  );
+  for (const entry of model.sequences) {
+    const owner = entry.ownedBy;
+    if (owner === undefined) continue;
+    const table = tables.get(`${owner.table.schema}\u0000${owner.table.name}`);
+    assert.ok(
+      table,
+      `${entry.name} owns ${owner.table.schema}.${owner.table.name}, which is modeled`,
+    );
+    assert.ok(
+      table.columns.some((column) => column.name === owner.column),
+      `${entry.name} owns ${owner.table.schema}.${owner.table.name}.${owner.column}, which is modeled`,
+    );
+  }
+
+  const emptyModel: Model = { tables: [], sequences: [], views: [], extensions: [] };
+  const attached = plan(emptyModel, model).steps.filter((step) => step.kind === 'alter-sequence');
+  assert.ok(attached.length > 0, 'the kept sequence contributes an ownership attach');
+  for (const step of attached) {
+    for (const field of step.fields) {
+      if (field.field !== 'ownedBy') continue;
+      const owner = field.after ?? field.before;
+      assert.ok(
+        owner === undefined || tables.has(`${owner.table.schema}\u0000${owner.table.name}`),
+        `no alter-sequence step names an absent owner relation`,
+      );
+    }
+  }
+});
+
 test('names a setval call and keeps non-setval or non-literal select generic', async () => {
   const dump = [
     `SELECT setval('public.s', 1, false);`,
@@ -1347,4 +4103,1529 @@ test('names a setval call and keeps non-setval or non-literal select generic', a
   const messages = diagnostics.map((diagnostic) => diagnostic.message);
   assert.equal(messages[0], "skipped SELECT setval('public.s', 1, false)");
   assert.deepEqual(messages.slice(1), ['skipped SELECT statement', 'skipped SELECT statement']);
+});
+
+test('reads inline collations as written, whitespace-normalized', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text COLLATE pg_catalog."C",`,
+    `    b text COLLATE probe77."User_C" DEFAULT 'x',`,
+    `    c text DEFAULT 'y'::text COLLATE "C",`,
+    `    d text   COLLATE   pg_catalog."C"   NOT NULL,`,
+    `    e text COLLATE c_lower /* the default */,`,
+    `    f text COLLATE "My Schema"."Coll"`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  // Every spelling reads as written: qualified, quoted, mixed-case, and the dump's
+  // DEFAULT-before-COLLATE order; whitespace runs collapse and comments drop.
+  assert.deepEqual(
+    t.columns.map((column) => column.collation),
+    [
+      'pg_catalog."C"',
+      'probe77."User_C"',
+      '"C"',
+      'pg_catalog."C"',
+      'c_lower',
+      '"My Schema"."Coll"',
+    ],
+  );
+  assert.deepEqual(diagnostics, []);
+  // Boundaries hold in both orders: the DEFAULT and NOT NULL beside a COLLATE survive.
+  assert.equal(t.columns[1]?.default, "'x'");
+  assert.equal(t.columns[3]?.notNull, true);
+});
+
+test('reconstructs a collation from parsed name parts when no location is written', () => {
+  const string = (sval: string) => ({ String: { sval } });
+  assert.equal(
+    extractCollationText('', { collname: [string('pg_catalog'), string('C')], location: -1 }, []),
+    'pg_catalog."C"',
+  );
+  assert.equal(extractCollationText('', { collname: [string('c_lower')] }, []), 'c_lower');
+  assert.equal(extractCollationText('', { collname: [] }, []), undefined);
+});
+
+test('reads inline storage and compression qualifiers as model words', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text STORAGE EXTERNAL COMPRESSION LZ4,`,
+    `    b text STORAGE "plain",`,
+    `    c text COMPRESSION pglz,`,
+    `    d text STORAGE default,`,
+    `    e text STORAGE sideways,`,
+    `    f text COMPRESSION zstd,`,
+    `    g text COMPRESSION default`,
+    `);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  // PostgreSQL matches storage words and compression methods case-insensitively.
+  assert.equal(t.columns[0]?.storage, 'external');
+  assert.equal(t.columns[0]?.compression, 'lz4');
+  assert.equal(t.columns[1]?.storage, 'plain');
+  assert.equal(t.columns[2]?.compression, 'pglz');
+  // An explicit default is the model's absent value, not a flag; an unreadable word drops the
+  // attribute and flags it.
+  assert.equal('storage' in (t.columns[3] ?? {}), false);
+  assert.equal('storage' in (t.columns[4] ?? {}), false);
+  assert.equal('compression' in (t.columns[5] ?? {}), false);
+  assert.equal('compression' in (t.columns[6] ?? {}), false);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped storage on public.t.e from public.t',
+      'dropped compression on public.t.f from public.t',
+    ],
+  );
+});
+
+test('applies post-data SET STORAGE and SET COMPRESSION to the column draft', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a text, b text, c text, d text);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET STORAGE MAIN;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION pglz;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN d SET COMPRESSION lz4;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN d SET COMPRESSION default;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET STORAGE DEFAULT;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN missing SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET COMPRESSION sideways;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  assert.equal(t.columns[0]?.storage, 'external');
+  assert.equal(t.columns[0]?.compression, undefined);
+  assert.equal(t.columns[1]?.storage, undefined);
+  assert.equal(t.columns[2]?.compression, 'pglz');
+  assert.equal(t.columns[3]?.compression, undefined);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'skipped SET STORAGE for unknown column public.t.missing',
+      'dropped compression on public.t.a from public.t',
+    ],
+  );
+});
+
+test('reads table persistence, flips it, and resets it on a repeated CREATE TABLE', async () => {
+  const dump = [
+    `CREATE UNLOGGED TABLE public.u (id integer);`,
+    `CREATE TABLE public.l (id integer);`,
+    `ALTER TABLE public.l SET UNLOGGED;`,
+    `ALTER TABLE public.l SET LOGGED;`,
+    `ALTER TABLE public.u SET LOGGED;`,
+    `CREATE UNLOGGED TABLE public.m (id integer);`,
+    `CREATE TABLE public.m (id integer);`,
+    `CREATE TEMPORARY TABLE public.tmp (id integer);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const byName = new Map(model.tables.map((table) => [table.name, table]));
+  // SET LOGGED clears the persisted fact; a repeated CREATE TABLE replaces the table
+  // wholesale; temporary persists as a flag only (it is not modeled).
+  assert.equal(byName.get('u')?.persistence, undefined);
+  assert.equal(byName.get('l')?.persistence, undefined);
+  assert.equal(byName.get('m')?.persistence, undefined);
+  assert.equal(byName.get('tmp')?.persistence, undefined);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped temporary-table persistence from public.tmp'],
+  );
+});
+
+test('keeps column attributes through the generated not-null-name strip and DROP IDENTITY', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a text CONSTRAINT t_a_not_null NOT NULL COLLATE "C",`,
+    `    b bigint GENERATED ALWAYS AS IDENTITY`,
+    `);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN a SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b SET COMPRESSION lz4;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN b DROP IDENTITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  const t = model.tables[0];
+  assert.ok(t !== undefined, 'the table imports');
+  const [a, b] = t.columns;
+  assert.ok(a !== undefined && b !== undefined, 'both columns import');
+  // The generated not-null name strips without taking the collation or storage with it.
+  assert.equal('notNullName' in a, false);
+  assert.equal(a.collation, '"C"');
+  assert.equal(a.storage, 'external');
+  // DROP IDENTITY drops the descriptor without taking the compression with it.
+  assert.equal('identity' in b, false);
+  assert.equal(b.notNull, true);
+  assert.equal(b.compression, 'lz4');
+});
+
+test('reads the pg_dump attribute spellings captured live (PostgreSQL 16.15)', async () => {
+  // Byte-for-byte shapes from the probe dump: CREATE UNLOGGED TABLE, a qualified pg_catalog
+  // collation, a quoted user collation, DEFAULT before COLLATE in pg_dump's order, and the
+  // post-data ALTER TABLE ONLY … SET STORAGE / SET COMPRESSION forms.
+  const dump = [
+    `CREATE UNLOGGED TABLE probe77.attrs (`,
+    `    id integer NOT NULL,`,
+    `    c_qualified text DEFAULT 'q'::text COLLATE pg_catalog."C",`,
+    `    c_user text DEFAULT 'u'::text COLLATE probe77."User_C",`,
+    `    s_ext text,`,
+    `    s_main text,`,
+    `    comp_pglz text`,
+    `);`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN s_ext SET STORAGE EXTERNAL;`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN s_main SET STORAGE MAIN;`,
+    `ALTER TABLE ONLY probe77.attrs ALTER COLUMN comp_pglz SET COMPRESSION pglz;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables, [
+    {
+      schema: 'probe77',
+      name: 'attrs',
+      columns: [
+        { name: 'id', type: 'integer', notNull: true },
+        {
+          name: 'c_qualified',
+          type: 'text',
+          notNull: false,
+          default: "'q'::text",
+          collation: 'pg_catalog."C"',
+        },
+        {
+          name: 'c_user',
+          type: 'text',
+          notNull: false,
+          default: "'u'::text",
+          collation: 'probe77."User_C"',
+        },
+        { name: 's_ext', type: 'text', notNull: false, storage: 'external' },
+        { name: 's_main', type: 'text', notNull: false, storage: 'main' },
+        { name: 'comp_pglz', type: 'text', notNull: false, compression: 'pglz' },
+      ],
+      foreignKeys: [],
+      uniqueConstraints: [],
+      checkConstraints: [],
+      indexes: [],
+      persistence: 'unlogged',
+    },
+  ]);
+});
+
+test('imports plain views and materialized views, sorted by identity', async () => {
+  const dump = [
+    `CREATE VIEW public.upper AS SELECT 1 AS one;`,
+    '',
+    `CREATE MATERIALIZED VIEW app.totals AS`,
+    ` SELECT team_id, count(*) AS n FROM app.t GROUP BY team_id WITH NO DATA;`,
+    '',
+    `CREATE VIEW app.plain AS`,
+    ` SELECT a, b /* keep columns */, 'AS' AS label`,
+    `   FROM app.t WHERE a <> 'x' AND b IS NOT NULL;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The body is the source text after the top-level AS, whitespace-normalized: commas tighten,
+  // comments drop, and a quoted 'AS' is body text, not the terminator. Views sort like tables.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'plain',
+      materialized: false,
+      definition: "SELECT a,b,'AS' AS label FROM app.t WHERE a <> 'x' AND b IS NOT NULL",
+    },
+    {
+      schema: 'app',
+      name: 'totals',
+      materialized: true,
+      definition: 'SELECT team_id,count(*) AS n FROM app.t GROUP BY team_id',
+    },
+    { schema: 'public', name: 'upper', materialized: false, definition: 'SELECT 1 AS one' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads view check options from the clause and from a check_option reloption', async () => {
+  const dump = [
+    `CREATE VIEW app.local AS SELECT id FROM app.t WITH LOCAL CHECK OPTION;`,
+    `CREATE VIEW app.implicit AS SELECT id FROM app.t WITH CHECK OPTION;`,
+    `CREATE VIEW app.option WITH (check_option='cascaded') AS SELECT id FROM app.t;`,
+    `CREATE VIEW app.both WITH (check_option='cascaded') AS SELECT id FROM app.t WITH LOCAL CHECK OPTION;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The clause wins over the reloption; a bare WITH CHECK OPTION is cascaded, as the engine
+  // reads it. The overridden option is flagged, never silently dropped.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'both',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'local',
+    },
+    {
+      schema: 'app',
+      name: 'implicit',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'cascaded',
+    },
+    {
+      schema: 'app',
+      name: 'local',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'local',
+    },
+    {
+      schema: 'app',
+      name: 'option',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+      checkOption: 'cascaded',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.both',
+      message: 'dropped view option check_option=cascaded from app.both',
+    },
+  ]);
+});
+
+test('flags every view reloption by name, still importing the view', async () => {
+  const dump = [
+    `CREATE VIEW app.options WITH (security_barrier, security_invoker=true, fillfactor=70, toast.autovacuum_enabled=false) AS SELECT id FROM app.t;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'options',
+      materialized: false,
+      definition: 'SELECT id FROM app.t',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option security_barrier from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option security_invoker=true from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option fillfactor=70 from app.options',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.options',
+      message: 'dropped view option toast.autovacuum_enabled=false from app.options',
+    },
+  ]);
+});
+
+test('flags view and materialized-view column lists, keeping the views', async () => {
+  const dump = [
+    `CREATE VIEW app.columns (a, b) AS SELECT 1, 2;`,
+    `CREATE MATERIALIZED VIEW app.mv_columns (a) AS SELECT 1 WITH NO DATA;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'columns',
+      materialized: false,
+      definition: 'SELECT 1,2',
+    },
+    {
+      schema: 'app',
+      name: 'mv_columns',
+      materialized: true,
+      definition: 'SELECT 1',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.columns',
+      message: 'dropped view column list from app.columns',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_columns',
+      message: 'dropped materialized view column list from app.mv_columns',
+    },
+  ]);
+});
+
+test('flags the materialized-view access method, tablespace, IF NOT EXISTS, and data clause', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW IF NOT EXISTS app.mv_flags (a) USING heap WITH (fillfactor=70, check_option='local') TABLESPACE pg_default AS SELECT 1 WITH DATA;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The options are named but the view imports; a check option cannot travel on a materialized
+  // view, so it stays a dropped option rather than a modeled field.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv_flags',
+      materialized: true,
+      definition: 'SELECT 1',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped IF NOT EXISTS from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view column list from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view access method heap from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped view option fillfactor=70 from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped view option check_option=local from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped materialized view tablespace pg_default from app.mv_flags',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_flags',
+      message: 'dropped WITH DATA from app.mv_flags',
+    },
+  ]);
+});
+
+test('distinguishes WITH NO DATA, WITH DATA, and the implicit populated state', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv_no_data AS SELECT 1 WITH NO DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_data AS SELECT 'WITH DATA' AS note WITH DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_none AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The model has no populated state and render always writes WITH NO DATA: an explicit
+  // WITH DATA and a clause-less (server-default populated) statement are both losses, with
+  // distinct names. The body's quoted 'WITH DATA' is untouched.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv_data',
+      materialized: true,
+      definition: "SELECT 'WITH DATA' AS note",
+    },
+    { schema: 'app', name: 'mv_no_data', materialized: true, definition: 'SELECT 1' },
+    { schema: 'app', name: 'mv_none', materialized: true, definition: 'SELECT 1' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_data',
+      message: 'dropped WITH DATA from app.mv_data',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.mv_none',
+      message: 'dropped implicit populated state from app.mv_none',
+    },
+  ]);
+});
+
+test('flags non-default view and materialized-view persistence defensively', async () => {
+  const dump = [
+    `CREATE TEMP VIEW app.temp_view AS SELECT 1;`,
+    `CREATE UNLOGGED VIEW app.unlogged_view AS SELECT 1;`,
+    `CREATE UNLOGGED MATERIALIZED VIEW app.unlogged_mv AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // PostgreSQL rejects unlogged views and materialized views and pg_dump never emits temp
+  // objects, so these forms only arrive hand-authored; they import as plain objects and the
+  // dropped persistence is named rather than normalized away silently.
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'temp_view', materialized: false, definition: 'SELECT 1' },
+    { schema: 'app', name: 'unlogged_mv', materialized: true, definition: 'SELECT 1' },
+    { schema: 'app', name: 'unlogged_view', materialized: false, definition: 'SELECT 1' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.temp_view',
+      message: 'dropped temporary-view persistence from app.temp_view',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_view',
+      message: 'dropped unlogged-view persistence from app.unlogged_view',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_mv',
+      message: 'dropped unlogged-materialized-view persistence from app.unlogged_mv',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.unlogged_mv',
+      message: 'dropped implicit populated state from app.unlogged_mv',
+    },
+  ]);
+});
+
+test('skips recursive views once, matching the keyword case and ignoring comments and quotes', async () => {
+  const dump = [
+    `CREATE RECURSIVE VIEW app.recursive_view (n) AS SELECT 1;`,
+    `CREATE TEMP RECURSIVE VIEW app.temp_recursive_view (n) AS SELECT 1;`,
+    `CREATE /* not recursive */ VIEW app.not_recursive AS SELECT 1;`,
+    `CREATE VIEW app."Recursive" AS SELECT 1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The parser rewrites the form into a view-named recursive CTE with synthetic locations and
+  // the raw body after AS omits the CTE, so it is skipped whole — once, even with TEMP, whose
+  // persistence flag would otherwise also fire. A comment or quoted identifier never matches.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.recursive_view',
+      message:
+        'skipped CREATE RECURSIVE VIEW app.recursive_view (recursive views are not represented yet)',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.temp_recursive_view',
+      message:
+        'skipped CREATE RECURSIVE VIEW app.temp_recursive_view (recursive views are not represented yet)',
+    },
+  ]);
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'Recursive', materialized: false, definition: 'SELECT 1' },
+    { schema: 'app', name: 'not_recursive', materialized: false, definition: 'SELECT 1' },
+  ]);
+});
+
+test('keeps the last definition of a repeated view, including the loop-repair CREATE OR REPLACE', async () => {
+  const dump = [
+    `CREATE VIEW app.loop AS SELECT 1 AS a;`,
+    `CREATE OR REPLACE VIEW app.loop AS SELECT 1 AS a, 2 AS b;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // pg_dump emits a dummy CREATE VIEW and a post-data CREATE OR REPLACE VIEW to break a
+  // dependency loop; the import holds one view and the last definition wins.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'loop',
+      materialized: false,
+      definition: 'SELECT 1 AS a,2 AS b',
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('lets a repeated identity change kind, last definition winning', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.kind AS SELECT 1;`,
+    `CREATE VIEW app.kind AS SELECT 2;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // A duplicate with a different materialized flag is an invalid dump; overwrite keeps the
+  // model single-valued. The first statement's populated-state loss is still reported.
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'kind', materialized: false, definition: 'SELECT 2' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.kind',
+      message: 'dropped implicit populated state from app.kind',
+    },
+  ]);
+});
+
+test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-ASCII text', async () => {
+  const dump = [
+    `CREATE VIEW app.cte AS WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t;`,
+    `CREATE VIEW app.quoted AS SELECT (a + 1) AS "AS" FROM app.t;`,
+    `CREATE VIEW app.dollar AS SELECT a, (b + 1) AS c, $$WITH NO DATA$$ AS d, $tag$ ? AS ? $tag$ AS e FROM app.t;`,
+    `/* café */ CREATE VIEW app.utf8 AS SELECT 'é' AS e;`,
+    `CREATE MATERIALIZED VIEW app.mv_literal AS SELECT 'WITH NO DATA' AS note WITH NO DATA;`,
+    `CREATE MATERIALIZED VIEW app.mv_ord AS SELECT * FROM generate_series(1, 2) WITH ORDINALITY WITH NO DATA;`,
+    `CREATE VIEW app.ord_view AS SELECT * FROM generate_series(1, 2) WITH ORDINALITY;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'cte',
+      materialized: false,
+      definition:
+        'WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t',
+    },
+    {
+      schema: 'app',
+      name: 'dollar',
+      materialized: false,
+      definition: 'SELECT a,(b + 1) AS c,$$WITH NO DATA$$ AS d,$tag$ ? AS ? $tag$ AS e FROM app.t',
+    },
+    {
+      schema: 'app',
+      name: 'mv_literal',
+      materialized: true,
+      definition: "SELECT 'WITH NO DATA' AS note",
+    },
+    {
+      schema: 'app',
+      name: 'mv_ord',
+      materialized: true,
+      definition: 'SELECT * FROM generate_series(1,2) WITH ORDINALITY',
+    },
+    {
+      schema: 'app',
+      name: 'ord_view',
+      materialized: false,
+      definition: 'SELECT * FROM generate_series(1,2) WITH ORDINALITY',
+    },
+    {
+      schema: 'app',
+      name: 'quoted',
+      materialized: false,
+      definition: 'SELECT(a + 1) AS "AS" FROM app.t',
+    },
+    { schema: 'app', name: 'utf8', materialized: false, definition: "SELECT 'é' AS e" },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips a materialized view index as a table that was not imported', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a WITH NO DATA;`,
+    `CREATE UNIQUE INDEX mv_a_idx ON app.mv USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // Matview indexes are not modeled in this slice and the matview is not a table draft, so the
+  // existing missing-table skip names it without manufacturing a phantom table.
+  assert.deepEqual(model.tables, []);
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'mv_a_idx',
+      message: 'skipped CREATE INDEX mv_a_idx (table not imported)',
+    },
+  ]);
+});
+
+test('flags WITHOUT OVERLAPS on a primary key and imports the plain key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during tsrange);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The temporal attribute is dropped and the plain key imports; `t_pkey` is PostgreSQL's
+  // conventional primary-key name, so it canonicalizes back to unnamed as it does without the
+  // attribute.
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+  ]);
+});
+
+test('flags WITHOUT OVERLAPS on a unique constraint and imports the plain key', async () => {
+  const dump = [
+    `CREATE TABLE public.t (id integer, during tsrange);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT u_period UNIQUE (id, during WITHOUT OVERLAPS);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.uniqueConstraints, [{ name: 'u_period', columns: ['id', 'during'] }]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['dropped WITHOUT OVERLAPS on unique constraint u_period from public.t'],
+  );
+});
+
+test('flags PERIOD once per foreign key, whichever side carries it', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_ref FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_target FOREIGN KEY (a) REFERENCES public.p (id, PERIOD during);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period_both FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id, PERIOD during);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  const foreignKey = (name: string) =>
+    table.foreignKeys.find((candidate) => candidate.name === name);
+  assert.deepEqual(foreignKey('f_period_ref')?.columns, ['a', 'b']);
+  assert.deepEqual(foreignKey('f_period_ref')?.referencedColumns, ['id']);
+  assert.deepEqual(foreignKey('f_period_target')?.columns, ['a']);
+  assert.deepEqual(foreignKey('f_period_target')?.referencedColumns, ['id', 'during']);
+  assert.deepEqual(foreignKey('f_period_both')?.columns, ['a', 'b']);
+  assert.deepEqual(foreignKey('f_period_both')?.referencedColumns, ['id', 'during']);
+
+  // A period on either side, or on both, is one dropped attribute, never two.
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped PERIOD on foreign key f_period_ref from public.t',
+      'dropped PERIOD on foreign key f_period_target from public.t',
+      'dropped PERIOD on foreign key f_period_both from public.t',
+    ],
+  );
+});
+
+test('flags NO INHERIT on a not-null constraint in every shape', async () => {
+  const dump = [
+    `CREATE TABLE public.nn (a integer NOT NULL NO INHERIT);`,
+    `CREATE TABLE public.named (a integer, CONSTRAINT nn_a NOT NULL a NO INHERIT);`,
+    `CREATE TABLE public.altered (a integer);`,
+    `ALTER TABLE ONLY public.altered ADD CONSTRAINT nn_a NOT NULL a NO INHERIT;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const columnsOf = (name: string) => {
+    const table = model.tables.find((candidate) => candidate.name === name);
+    assert.ok(table, `table ${name} is imported`);
+    return table.columns;
+  };
+
+  // The not-null fact survives every shape; the inheritance attribute is the dropped part.
+  assert.deepEqual(columnsOf('nn'), [{ name: 'a', type: 'integer', notNull: true }]);
+  assert.deepEqual(columnsOf('named'), [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'nn_a' },
+  ]);
+  assert.deepEqual(columnsOf('altered'), [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'nn_a' },
+  ]);
+
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped NO INHERIT on not-null constraint from public.nn',
+      'dropped NO INHERIT on not-null constraint nn_a from public.named',
+      'dropped NO INHERIT on not-null constraint nn_a from public.altered',
+    ],
+  );
+});
+
+test('reads unnamed temporal and inheritance forms with the bare constraint kind', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (a integer, b integer, PRIMARY KEY (a, b WITHOUT OVERLAPS), UNIQUE (a, b WITHOUT OVERLAPS), FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id));`,
+    `CREATE TABLE public.nn (a integer NOT NULL NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Unnamed PK and unique constraints read the bare kind; the unnamed foreign key keeps the
+  // builder's `on <identity>` label.
+  assert.deepEqual(table.primaryKey, { columns: ['a', 'b'] });
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a', 'b'] }]);
+  assert.deepEqual(
+    table.foreignKeys.map((foreignKey) => ({
+      name: foreignKey.name,
+      columns: foreignKey.columns,
+    })),
+    [{ name: undefined, columns: ['a', 'b'] }],
+  );
+
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped WITHOUT OVERLAPS on primary key from public.t',
+      'dropped WITHOUT OVERLAPS on unique constraint from public.t',
+      'dropped PERIOD on foreign key on public.t from public.t',
+      'dropped NO INHERIT on not-null constraint from public.nn',
+    ],
+  );
+});
+
+test('orders the temporal and inheritance flags with the constraint they drop from', async () => {
+  const dump = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, b integer, CONSTRAINT t_a_nn NOT NULL a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey_dup PRIMARY KEY (id, during WITHOUT OVERLAPS);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT u_period UNIQUE NULLS NOT DISTINCT (id, during WITHOUT OVERLAPS) INCLUDE (a);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT f_period FOREIGN KEY (a, PERIOD b) REFERENCES public.p (id, PERIOD during);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_other NOT NULL a NO INHERIT;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The duplicate primary key keeps the first declaration; its attribute flag precedes the
+  // `additional primary key` flag the attach path adds.
+  assert.deepEqual(table.primaryKey, { columns: ['id', 'during'] });
+
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on primary key t_pkey_dup from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional primary key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NULLS NOT DISTINCT on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped INCLUDE on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped WITHOUT OVERLAPS on unique constraint u_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped PERIOD on foreign key f_period from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped additional not-null constraint on public.t.a from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on not-null constraint t_other from public.t',
+    },
+  ]);
+});
+
+test('flags NO INHERIT beside a not-null merge conflict', async () => {
+  // Two real names for one not-null fact: the merge keeps the first and reports the conflict,
+  // and the inheritance attribute is dropped either way, after the conflict flag.
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT t_a_nn NOT NULL, CONSTRAINT t_other NOT NULL a NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 't_a_nn' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped additional not-null constraint on public.t.a from public.t',
+      'dropped NO INHERIT on not-null constraint t_other from public.t',
+    ],
+  );
+});
+
+test('flags NO INHERIT beside an inline not-null merge conflict', async () => {
+  // Two real inline names for one not-null fact: the merge keeps the first and reports the
+  // conflict, and the inline inheritance attribute is dropped either way, after the conflict
+  // flag — the inline twin of the table-level case above.
+  const dump = [
+    `CREATE TABLE public.t (a integer CONSTRAINT t_a_nn NOT NULL CONSTRAINT t_other NOT NULL NO INHERIT);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 't_a_nn' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped additional not-null constraint on public.t.a from public.t',
+      'dropped NO INHERIT on not-null constraint t_other from public.t',
+    ],
+  );
+});
+
+test('drops temporal and inheritance forms whole, leaving the same model', async () => {
+  const withForms = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, CONSTRAINT t_pkey PRIMARY KEY (id, during WITHOUT OVERLAPS), CONSTRAINT u_period UNIQUE (id, during WITHOUT OVERLAPS), CONSTRAINT f_period FOREIGN KEY (a, PERIOD during) REFERENCES public.p (id, PERIOD during), CONSTRAINT nn_a NOT NULL a NO INHERIT);`,
+  ].join('\n');
+  const withoutForms = [
+    `CREATE TABLE public.p (id integer, during tsrange);`,
+    `CREATE TABLE public.t (id integer, during tsrange, a integer, CONSTRAINT t_pkey PRIMARY KEY (id, during), CONSTRAINT u_period UNIQUE (id, during), CONSTRAINT f_period FOREIGN KEY (a, during) REFERENCES public.p (id, during), CONSTRAINT nn_a NOT NULL a);`,
+  ].join('\n');
+
+  const { model: withModel, diagnostics } = await importDump(withForms);
+  const { model: withoutModel } = await importDump(withoutForms);
+
+  assert.deepEqual(diff(withModel, withoutModel), []);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped WITHOUT OVERLAPS on primary key t_pkey from public.t',
+      'dropped WITHOUT OVERLAPS on unique constraint u_period from public.t',
+      'dropped PERIOD on foreign key f_period from public.t',
+      'dropped NO INHERIT on not-null constraint nn_a from public.t',
+    ],
+  );
+});
+
+test('imports CREATE EXTENSION with its install schema, ignoring IF NOT EXISTS', async () => {
+  const dump = [
+    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;`,
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `CREATE EXTENSION citext WITH SCHEMA first SCHEMA second;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  // Extensions sort by name, not by source order: pgcrypto is written first and imports last.
+  assert.deepEqual(model.extensions, [
+    { name: 'citext', schema: 'second' },
+    { name: 'hstore', schema: 'hs1' },
+    { name: 'pgcrypto', schema: 'public' },
+  ]);
+});
+
+test('flags CREATE EXTENSION version and cascade options, keeping the extension', async () => {
+  const dump = `CREATE EXTENSION hstore WITH SCHEMA hs1 VERSION '1.4' CASCADE;`;
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped VERSION from extension hstore',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped CASCADE from extension hstore',
+    },
+  ]);
+});
+
+test('replaces a repeated CREATE EXTENSION wholesale and clears its comment', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `COMMENT ON EXTENSION hstore IS 'gone';`,
+    `CREATE EXTENSION hstore WITH SCHEMA public;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'public' }]);
+});
+
+test('skips a CREATE EXTENSION without WITH SCHEMA and keeps an earlier draft', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `COMMENT ON EXTENSION hstore IS 'kept';`,
+    `CREATE EXTENSION hstore;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The schema-less definition is named and never replaces the imported draft or its comment.
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1', comment: 'kept' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped CREATE EXTENSION hstore (no WITH SCHEMA)',
+    },
+  ]);
+});
+
+test('imports and clears an extension comment', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `CREATE EXTENSION citext WITH SCHEMA public;`,
+    `CREATE EXTENSION pgcrypto WITH SCHEMA public;`,
+    `COMMENT ON EXTENSION hstore IS 'key/value store';`,
+    `COMMENT ON EXTENSION citext IS 'case';`,
+    `COMMENT ON EXTENSION citext IS NULL;`,
+    `COMMENT ON EXTENSION pgcrypto IS 'crypto';`,
+    `COMMENT ON EXTENSION pgcrypto IS '';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.extensions, [
+    { name: 'citext', schema: 'public' },
+    { name: 'hstore', schema: 'hs1', comment: 'key/value store' },
+    { name: 'pgcrypto', schema: 'public' },
+  ]);
+});
+
+test('flags a comment on an extension the import has not seen', async () => {
+  const dump = [
+    `COMMENT ON EXTENSION hstore IS 'x';`,
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The unresolved comment is named, never turned into a phantom extension.
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'hstore',
+      message: 'dropped comment from hstore',
+    },
+  ]);
+});
+
+test('skips extension updates, member statements, and drops by name', async () => {
+  const dump = [
+    `CREATE EXTENSION hstore WITH SCHEMA hs1;`,
+    `ALTER EXTENSION hstore UPDATE;`,
+    `ALTER EXTENSION hstore UPDATE TO '1.4';`,
+    `ALTER EXTENSION hstore SET SCHEMA hs2;`,
+    `ALTER EXTENSION hstore ADD TABLE public.t;`,
+    `ALTER EXTENSION hstore DROP FUNCTION public.f(integer);`,
+    `DROP EXTENSION hstore;`,
+    `DROP EXTENSION IF EXISTS citext;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.extensions, [{ name: 'hstore', schema: 'hs1' }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore UPDATE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore UPDATE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore SET SCHEMA hs2',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore ADD TABLE',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped ALTER EXTENSION hstore DROP FUNCTION',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'hstore',
+      message: 'skipped DROP EXTENSION hstore',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'citext',
+      message: 'skipped DROP EXTENSION citext',
+    },
+  ]);
+});
+
+test('flags an unknown CREATE EXTENSION option the grammar cannot write', () => {
+  // The extension grammar admits only SCHEMA, VERSION, and CASCADE, so the catch-all flag is
+  // pinned on a fabricated option list rather than through DDL.
+  const position = { offset: 0, line: 1, column: 1 };
+  const statement: ParsedStatement = { sql: '', start: position, end: position, result: {} };
+  const diagnostics: Parameters<typeof readCreateExtensionOptions>[3] = [];
+
+  const schema = readCreateExtensionOptions(
+    statement,
+    'hstore',
+    [{ DefElem: { defname: 'something_else' } }],
+    diagnostics,
+  );
+
+  assert.equal(schema, undefined);
+  assert.deepEqual(
+    diagnostics.map((entry) => entry.diagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'hstore',
+        message: 'dropped something_else from extension hstore',
+        position,
+      },
+    ],
+  );
+});
+
+test('describes an extension rename, which the grammar cannot write', () => {
+  // PostgreSQL has no ALTER EXTENSION … RENAME; the branch is defensive, and its wording is
+  // pinned directly so a fabricated or future tree cannot fall back to the generic description.
+  assert.deepEqual(
+    describeStatement({
+      RenameStmt: {
+        renameType: 'OBJECT_EXTENSION',
+        object: { String: { sval: 'hstore' } },
+        newname: 'hstore2',
+      },
+    }),
+    { description: 'ALTER EXTENSION hstore RENAME', object: 'hstore' },
+  );
+});
+
+test('imports comments on every modeled family, including synthesized names', async () => {
+  // The constraints and the index are declared unnamed (or with their conventional names), so
+  // each comment resolves against the server form the importer would synthesize, and stays on
+  // the node after canonicalization strips the name.
+  const dump = [
+    `CREATE SEQUENCE public.s;`,
+    `CREATE TABLE public.t (`,
+    `    id bigint PRIMARY KEY,`,
+    `    a integer UNIQUE,`,
+    `    b integer,`,
+    `    CONSTRAINT t_b_check CHECK (b > 0)`,
+    `);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_b_fkey FOREIGN KEY (b) REFERENCES public.other(id);`,
+    `CREATE TABLE public.other (id bigint PRIMARY KEY);`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE MATERIALIZED VIEW public.mv AS SELECT 1 WITH NO DATA;`,
+    `COMMENT ON TABLE public.t IS 'table';`,
+    `COMMENT ON COLUMN public.t.a IS 'column';`,
+    `COMMENT ON SEQUENCE public.s IS 'sequence';`,
+    `COMMENT ON VIEW public.v IS 'view';`,
+    `COMMENT ON MATERIALIZED VIEW public.mv IS 'matview';`,
+    `COMMENT ON INDEX t_b_idx IS 'index';`,
+    `COMMENT ON CONSTRAINT t_pkey ON public.t IS 'primary';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'unique';`,
+    `COMMENT ON CONSTRAINT t_b_check ON public.t IS 'check';`,
+    `COMMENT ON CONSTRAINT t_b_fkey ON public.t IS 'foreign';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+
+  assert.equal(table.comment, 'table');
+  assert.equal(table.columns.find((column) => column.name === 'a')?.comment, 'column');
+  assert.deepEqual(table.primaryKey, { columns: ['id'], comment: 'primary' });
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a'], comment: 'unique' }]);
+  assert.deepEqual(table.checkConstraints, [{ expression: 'b > 0', comment: 'check' }]);
+  assert.deepEqual(table.foreignKeys, [
+    {
+      columns: ['b'],
+      referencedTable: { schema: 'public', name: 'other' },
+      referencedColumns: ['id'],
+      comment: 'foreign',
+    },
+  ]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['b'], comment: 'index' }]);
+
+  assert.equal(model.sequences[0]?.comment, 'sequence');
+  assert.deepEqual(
+    model.views.map((view) => `${view.name}:${String(view.comment)}`),
+    ['mv:matview', 'v:view'],
+  );
+});
+
+test('defaults unqualified comment targets to public and flags an under-qualified column', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `COMMENT ON TABLE t IS 'table';`,
+    `COMMENT ON SEQUENCE s IS 'sequence';`,
+    `COMMENT ON VIEW v IS 'view';`,
+    `COMMENT ON COLUMN t.a IS 'column';`,
+    `COMMENT ON COLUMN a IS 'lost';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  assert.equal(model.tables[0]?.comment, 'table');
+  assert.equal(model.tables[0]?.columns[0]?.comment, 'column');
+  assert.equal(model.sequences[0]?.comment, 'sequence');
+  assert.equal(model.views[0]?.comment, 'view');
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'a',
+      message: 'dropped comment from a',
+    },
+  ]);
+});
+
+test("clears a comment on IS NULL and on IS ''", async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `COMMENT ON TABLE public.t IS 'gone';`,
+    `COMMENT ON COLUMN public.t.a IS 'gone';`,
+    `COMMENT ON TABLE public.t IS NULL;`,
+    `COMMENT ON COLUMN public.t.a IS '';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables[0];
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.equal('comment' in table, false);
+  assert.equal('comment' in table.columns[0]!, false);
+});
+
+test('flags every comment target the import cannot resolve, keeping skips for unmodeled families', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE MATERIALIZED VIEW public.mv AS SELECT 1 WITH NO DATA;`,
+    `CREATE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON TABLE public.missing IS 'x';`,
+    `COMMENT ON COLUMN public.t.missing IS 'x';`,
+    `COMMENT ON COLUMN public.v.c IS 'x';`,
+    `COMMENT ON SEQUENCE public.missing IS 'x';`,
+    `COMMENT ON VIEW public.missing IS 'x';`,
+    `COMMENT ON VIEW public.mv IS 'x';`,
+    `COMMENT ON MATERIALIZED VIEW public.v IS 'x';`,
+    `COMMENT ON INDEX public.missing IS 'x';`,
+    `COMMENT ON CONSTRAINT missing ON public.t IS 'x';`,
+    `COMMENT ON SCHEMA public IS '';`,
+    `COMMENT ON FOREIGN TABLE public.ft IS 'x';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.missing',
+      message: 'dropped comment from public.t.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.v.c',
+      message: 'dropped comment from public.v.c',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.mv',
+      message: 'dropped comment from public.mv',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.v',
+      message: 'dropped comment from public.v',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.missing',
+      message: 'dropped comment from public.missing',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.missing',
+      message: 'dropped comment from public.t.missing',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public',
+      message: 'skipped COMMENT ON SCHEMA public',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.ft',
+      message: 'skipped COMMENT ON FOREIGN TABLE public.ft',
+    },
+  ]);
+
+  // A flagged comment is never stored anywhere.
+  const table = model.tables[0];
+  assert.ok(table, 'the table is imported');
+  assert.equal('comment' in table, false);
+  assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: false }]);
+});
+
+test('flags not-null comments with the deferral wording, after the constraint slots', async () => {
+  const dump = [
+    `CREATE TABLE public.t (`,
+    `    a integer CONSTRAINT a_nn NOT NULL,`,
+    `    b integer NOT NULL,`,
+    `    c integer NOT NULL,`,
+    `    CONSTRAINT t_b_not_null CHECK (b > 0)`,
+    `);`,
+    `COMMENT ON CONSTRAINT a_nn ON public.t IS 'x';`,
+    `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'x';`,
+    `COMMENT ON CONSTRAINT t_b_not_null ON public.t IS 'x';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The explicit check name wins over column b's generated not-null name: constraint slots are
+  // searched before the columns' not-null facts. The stored custom name and the generated name
+  // both take the deferral's wording.
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_b_not_null', expression: 'b > 0', comment: 'x' },
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'dropped comment on a not-null constraint from public.t.a_nn',
+      'dropped comment on a not-null constraint from public.t.t_c_not_null',
+    ],
+  );
+});
+
+test('keeps the last repeated comment on every modeled family', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer UNIQUE);`,
+    `CREATE SEQUENCE public.s;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `CREATE INDEX t_a_idx ON public.t USING btree (a);`,
+    `COMMENT ON TABLE public.t IS 'first';`,
+    `COMMENT ON TABLE public.t IS 'second';`,
+    `COMMENT ON COLUMN public.t.a IS 'first';`,
+    `COMMENT ON COLUMN public.t.a IS 'second';`,
+    `COMMENT ON SEQUENCE public.s IS 'first';`,
+    `COMMENT ON SEQUENCE public.s IS 'second';`,
+    `COMMENT ON VIEW public.v IS 'first';`,
+    `COMMENT ON VIEW public.v IS 'second';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'first';`,
+    `COMMENT ON CONSTRAINT t_a_key ON public.t IS 'second';`,
+    `COMMENT ON INDEX t_a_idx IS 'first';`,
+    `COMMENT ON INDEX t_a_idx IS 'second';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.equal(table.comment, 'second');
+  assert.equal(table.columns[0]?.comment, 'second');
+  assert.deepEqual(table.uniqueConstraints, [{ columns: ['a'], comment: 'second' }]);
+  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'], comment: 'second' }]);
+  assert.equal(model.sequences[0]?.comment, 'second');
+  assert.equal(model.views[0]?.comment, 'second');
+});
+
+test('clears table, sequence, and view comments when a create is repeated', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `COMMENT ON TABLE public.t IS 'gone';`,
+    `CREATE TABLE public.t (b integer);`,
+    `CREATE SEQUENCE public.s;`,
+    `COMMENT ON SEQUENCE public.s IS 'gone';`,
+    `CREATE SEQUENCE public.s START WITH 5;`,
+    `CREATE VIEW public.v AS SELECT 1;`,
+    `COMMENT ON VIEW public.v IS 'gone';`,
+    `CREATE OR REPLACE VIEW public.v AS SELECT 2;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(
+    table.columns.map((column) => column.name),
+    ['b'],
+  );
+  assert.equal('comment' in table, false);
+  assert.equal(model.sequences[0]?.start, '5');
+  assert.equal('comment' in (model.sequences[0] ?? {}), false);
+  assert.equal(model.views[0]?.definition, 'SELECT 2');
+  assert.equal('comment' in (model.views[0] ?? {}), false);
+});
+
+test('refuses a comment carrying NUL before it can reach the model', () => {
+  // libpg-query rejects a NUL byte in a string literal at parse time, so the guard cannot be
+  // reached through DDL; the store seam is the door a future non-DDL producer would pass through.
+  const position = { offset: 0, line: 1, column: 1 };
+  const statement: ParsedStatement = { sql: '', start: position, end: position, result: {} };
+  const diagnostics: Parameters<typeof storeComment>[4] = [];
+  const stored: (string | undefined)[] = [];
+
+  storeComment(statement, 'public.t', 'a\u0000b', (text) => stored.push(text), diagnostics);
+  assert.equal(stored.length, 0);
+  assert.deepEqual(
+    diagnostics.map((entry) => entry.diagnostic),
+    [
+      {
+        kind: 'flag',
+        code: 'unsupported-attribute',
+        object: 'public.t',
+        message: 'dropped comment from public.t',
+        position,
+      },
+    ],
+  );
+
+  // An ordinary text stores, and an absent one reaches the store as a clear.
+  storeComment(statement, 'public.t', 'plain', (text) => stored.push(text), diagnostics);
+  storeComment(statement, 'public.t', undefined, (text) => stored.push(text), diagnostics);
+  assert.deepEqual(stored, ['plain', undefined]);
+  assert.equal(diagnostics.length, 1);
 });

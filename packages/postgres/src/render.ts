@@ -1,7 +1,15 @@
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  ColumnCompression,
   ColumnFieldChange,
+  ColumnStorage,
+  CommentTarget,
+  ConstraintEnforcement,
+  Extension,
+  ExtensionFieldChange,
+  ExtensionIdentity,
   ForeignKey,
   Identity,
   IdentityFieldChange,
@@ -16,25 +24,43 @@ import type {
   Table,
   TableIdentity,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
+
+import {
+  synthesizedCheckConstraintName,
+  synthesizedForeignKeyName,
+  synthesizedIndexName,
+  synthesizedPrimaryKeyName,
+  synthesizedUniqueConstraintName,
+  truncateIdentifier,
+} from './names.ts';
 
 /**
  * Migration SQL rendering: a migration plan → the migration SQL that moves one schema toward
  * another.
  *
- * `renderSql` is a pure function of the plan — the plan carries every payload the SQL needs,
- * and the same plan always renders the same text. One statement per line, terminated with a
- * semicolon, and a single trailing newline at the end of the output; an empty plan renders as
- * the empty string. The plan's groups must partition its steps — non-empty half-open ranges
- * that tile `[0, steps.length)` in order, with no groups when there are no steps; `plan()`
- * guarantees this contract, and a malformed partition throws before any SQL is rendered,
- * naming the violated invariant and the offending indices. `renderSql` walks the plan's
+ * `renderSql` is pure in the plan and the declared target — the plan carries every payload the
+ * SQL needs, and the same plan and target always render the same text. One statement per line,
+ * terminated with a semicolon, and a single trailing newline at the end of the output; an empty
+ * plan renders as the empty string. The plan's groups must partition its steps — non-empty
+ * half-open ranges that tile `[0, steps.length)` in order, with no groups when there are no
+ * steps; `plan()` guarantees this contract, and a malformed partition throws before any SQL is
+ * rendered, naming the violated invariant and the offending indices. A plan that renders two
+ * index statements of one polarity on one table under one server-form name is refused with
+ * `RenderRefusalError` before anything renders: the second create could not claim the name,
+ * and the second drop would already be gone. A drop and a create of one name are different
+ * statements — `index-changed` decomposes that way — and render. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
  * a standalone group renders its statements bare. A plan with more than one group separates
  * them with one blank line; single-group output is unchanged. `create-table` is the one
  * multi-line statement: its columns go one per line, indented four spaces, and its primary
  * key, when present, is the trailing line. A table with neither columns nor a primary key
  * renders on one line as `CREATE TABLE <q> ();`.
+ *
+ * `create-schema` renders `CREATE SCHEMA IF NOT EXISTS <schema>;`. Schemas are not modeled, so
+ * a namespace the target database already carries is not a difference; the guard keeps that
+ * ordinary case from aborting the migration.
  *
  * `create-sequence` renders the canonical full-explicit form — `AS`, `INCREMENT BY`,
  * `MINVALUE`, `MAXVALUE`, `START WITH`, `CACHE`, and `CYCLE`/`NO CYCLE` — with the plan's
@@ -52,6 +78,23 @@ import type {
  * as a whole. `drop-identity` renders `DROP IDENTITY`. A column's identity never renders
  * inline in `create-table` or `add-column`: the plan adds it with its own step.
  *
+ * `create-view` renders `CREATE [MATERIALIZED] VIEW <qname> AS <definition>` and
+ * `replace-view` renders `CREATE OR REPLACE VIEW <qname> AS <definition>`; a plain view's
+ * check option, when it has one, appends `WITH LOCAL CHECK OPTION` or `WITH CASCADED CHECK
+ * OPTION`, and a materialized view always appends `WITH NO DATA` because its populated state
+ * is not modeled. `drop-view` renders `DROP VIEW` or `DROP MATERIALIZED VIEW` from the step's
+ * `materialized` flag. The definition is emitted exactly as stored, on one line; the renderer
+ * never re-deparses it. A materialized `replace-view` is a hand-built-plan error and refuses
+ * with `RenderRefusalError` rather than render SQL PostgreSQL would reject.
+ *
+ * `create-extension` renders `CREATE EXTENSION <name> WITH SCHEMA <schema>;` — never
+ * `IF NOT EXISTS`, since drift must surface at apply. `alter-extension` renders
+ * `ALTER EXTENSION <name> SET SCHEMA <schema>;` reading the destination from the step's
+ * value-carrying `schema` field, with no baseline lookup; a hand-built step without that field
+ * throws. `drop-extension` renders `DROP EXTENSION <name>;`. All three names are bare — an
+ * extension name is database-unique and never schema-qualified — and quoted only when the
+ * identifier rule requires it. The `COMMENT ON EXTENSION` target follows the same rule.
+ *
  * `add-unique-constraint` renders `ALTER TABLE … ADD [CONSTRAINT name] UNIQUE (cols)`,
  * `add-check-constraint` renders `… ADD [CONSTRAINT name] CHECK (expr)` with the expression
  * exactly as the model stores it, and `create-index` renders
@@ -59,6 +102,45 @@ import type {
  * the model has none, mirroring primary-key and foreign-key rendering. The concurrent index
  * kinds render the same statements with `CONCURRENTLY`; the plan stands them in standalone
  * groups, so they render bare.
+ *
+ * Constraint attributes render after every other clause of their constraint, in PostgreSQL's
+ * order: `DEFERRABLE`, `INITIALLY DEFERRED`, then the enforcement state — `NOT VALID` for
+ * `not-valid`, `NOT ENFORCED` for `not-enforced`. `INITIALLY DEFERRED` implies deferrable, so a
+ * stated `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT
+ * DEFERRABLE` and valid-and-enforced being the defaults. A not-null fact with a name renders
+ * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
+ * `CREATE TABLE` and `ADD COLUMN`. The declarations the model carries — that inline name, `NOT
+ * ENFORCED`, an explicit storage letter, an explicit compression method — render as declared at
+ * every target, even one below the form's own floor. Only the renderer's own synthesized reset
+ * statements consult the declared target: `SET STORAGE DEFAULT` refuses below PostgreSQL 16 and
+ * `SET COMPRESSION default` below PostgreSQL 14, rather than emit SQL the declared server would
+ * reject.
+ *
+ * Column attributes render in PostgreSQL's grammar order. `renderColumn` states an explicit
+ * collation inline, after the type and before the constraints: `name type COLLATE <collation>
+ * [NOT NULL] [DEFAULT <x>]`. Inline `STORAGE` and `COMPRESSION` qualifiers are never rendered —
+ * both are recent grammar — so a created or added column's explicit storage and compression
+ * follow its statement as post-data `ALTER TABLE ONLY` statements, storage before compression,
+ * each statement only when the column states it. `CREATE UNLOGGED TABLE` states an `unlogged`
+ * table's persistence, and an `alter-persistence` step states the target persistence as
+ * `ALTER TABLE <t> SET UNLOGGED;` or the absent `LOGGED` default as `SET LOGGED;`.
+ *
+ * An `alter-column` step renders its statements in a fixed order: the merged `TYPE` statement
+ * when the type or the collation differs, the per-field not-null and default statements, then
+ * `SET STORAGE`, then `SET COMPRESSION`. The merged statement is exactly one
+ * `ALTER TABLE <t> ALTER COLUMN <c> TYPE <target.type>[ COLLATE <target.collation>];`, both
+ * halves read from the step's target `attributes` carrier — a type change on a collated column
+ * restates the unchanged collation, and a collation removal renders the bare target type —
+ * because PostgreSQL rejects two `TYPE` clauses for one change. A `TYPE` statement resets the
+ * column's storage and compression to the type's defaults, so the carrier's explicit values
+ * are restated after it; a standalone storage or compression change states its `SET` statement
+ * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. Every
+ * `SET STORAGE`/`SET COMPRESSION` statement — create tail, add tail, post-`TYPE` restatement,
+ * or standalone — carries the dump's post-data `ONLY` form; only the merged `TYPE` statement
+ * stays bare. The order is target-independent; the two synthesized reset forms alone consult
+ * the declared target, refusing below their floor. A plan that reaches the renderer malformed —
+ * a `type` or `collation` field whose step carries no `attributes` carrier, or any attribute
+ * field reaching the per-field renderer — throws rather than render a guess.
  *
  * Every table and sequence reference is schema-qualified: `<schema>.<name>`. An identifier —
  * table, sequence, column, constraint, or index name — is emitted bare only when it is a
@@ -74,13 +156,29 @@ import type {
  * key, `<table>_<column>_…_fkey` for a foreign key, `<table>_<column>_…_key` for a unique
  * constraint, and `<table>_<column>_check` for a check constraint whose expression references
  * one column (`<table>_check` otherwise) — and `<table>_<column>_…_idx` for an unnamed index
- * drop. Index drops are schema-qualified (`DROP INDEX <schema>.<name>`): a bare index name
+ * drop. The synthesis mirrors the server's own naming, `makeObjectName` and the column
+ * addition loop, including the 63-byte identifier limit: a name longer than 63 bytes renders
+ * in the form PostgreSQL would have stored (see `names.ts`). An explicit name renders exactly
+ * as the model stores it, even longer than 63 bytes; PostgreSQL clips such a name at parse
+ * time, so the statement still resolves the stored name — a documented residual, not a fix.
+ * Index drops are schema-qualified (`DROP INDEX <schema>.<name>`): a bare index name
  * resolves through `search_path`, while `CREATE INDEX` places the index in its table's schema.
  * This is best-effort: PostgreSQL appends numbered suffixes on name collisions, which
  * cannot be known offline, and pg_dump output always carries real constraint names, so
  * unnamed constraints are the unusual case.
  *
- * This module emits no comments. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
+ * A `comment` step renders one `COMMENT ON <kind> <identity> IS <literal>` statement for its
+ * target: `TABLE`, `COLUMN`, `SEQUENCE`, `VIEW`/`MATERIALIZED VIEW`, schema-qualified `INDEX`,
+ * or `CONSTRAINT <name> ON <table>` for each of the four constraint kinds, with an unnamed index
+ * or constraint named by the same conventional formulas a drop uses. The step's `text` is the
+ * only source of the value; an absent text renders `IS NULL`, and a target node's own `comment`
+ * is never read. A line-safe text renders as `'…'` with quotes doubled; a text carrying a
+ * backslash or a C0/DEL control renders as `E'…'` (`\\`, `''`, `\n`, `\r`, `\t`, and `\xHH` for
+ * the other controls), so a multi-line comment stays one statement on one line and unicode
+ * passes through unchanged. NUL refuses with `RenderRefusalError`.
+ *
+ * This module writes no SQL decoration comments of its own; the only comments it emits are the
+ * model's `COMMENT ON` statements. `sqlRenderer` binds `renderSql` to core's `SqlRenderer` seam.
  */
 
 /**
@@ -198,19 +296,69 @@ export const RESERVED_KEYWORDS: ReadonlySet<string> = new Set([
 /** The shape of an identifier PostgreSQL accepts without double quotes. */
 const BARE_IDENTIFIER = /^[a-z_][a-z0-9_$]*$/;
 
+/** The oldest PostgreSQL major the renderer targets. */
+export const MIN_TARGET_VERSION = 13;
+
+/** The newest PostgreSQL major whose forms the renderer knows. */
+export const MAX_TARGET_VERSION = 18;
+
+/** The first PostgreSQL major that accepts an in-place foreign-key enforcement change. */
+const FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR = 18;
+
+/** Options for {@link renderSql}. */
+export interface RenderOptions {
+  /**
+   * The PostgreSQL major the SQL is generated for. Defaults to `MIN_TARGET_VERSION`;
+   * a major newer than `MAX_TARGET_VERSION` is accepted and behaves like the newest one.
+   */
+  readonly targetVersion?: number;
+}
+
 /**
- * The migration SQL for `plan`, deterministic. `plan.groups` must tile `[0, plan.steps.length)`;
- * a malformed partition throws before anything renders.
+ * Thrown by `renderSql` when a plan cannot render soundly: two index statements of one polarity
+ * on one table resolve to the same name, a comment carries NUL, a materialized view is asked to
+ * be replaced, or a renderer-synthesized reset statement needs a newer target than the declared
+ * one. Callers that report the refusal instead of crashing — the CLI — catch exactly this class.
  */
-export function renderSql(plan: Plan): string {
+export class RenderRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RenderRefusalError';
+  }
+}
+
+/**
+ * The migration SQL for `plan`, deterministic in the plan and the declared target.
+ * `plan.groups` must tile `[0, plan.steps.length)`; a malformed partition throws before
+ * anything renders, and so does a plan whose index statements of one table and polarity would
+ * share a name. `options.targetVersion` is the PostgreSQL major the SQL is generated for,
+ * defaulting to `MIN_TARGET_VERSION`; a renderer-synthesized reset form below its floor refuses
+ * with `RenderRefusalError`, while a declaration the model carries renders as declared at every
+ * target. A target that is not an integer major at or above `MIN_TARGET_VERSION` is a caller
+ * bug and throws a plain `Error`.
+ */
+export function renderSql(plan: Plan, options?: RenderOptions): string {
+  const targetVersion = options?.targetVersion ?? MIN_TARGET_VERSION;
+  if (!Number.isInteger(targetVersion) || targetVersion < MIN_TARGET_VERSION) {
+    throw new Error(
+      `targetVersion must be a PostgreSQL major of ${MIN_TARGET_VERSION} or newer, got ${String(targetVersion)}`,
+    );
+  }
   assertGroupsTileSteps(plan);
+  assertIndexNamesUnique(plan);
   if (plan.steps.length === 0) return '';
+  const collapsed =
+    targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
+      ? collapseEnforcementFlips(plan)
+      : undefined;
   const groups: string[] = [];
   for (const group of plan.groups) {
     const lines: string[] = [];
     if (group.transactional) lines.push('BEGIN;');
     for (let index = group.start; index < group.end; index += 1) {
-      lines.push(renderStep(plan.steps[index]!));
+      if (collapsed !== undefined && collapsed.suppressed.has(index)) continue;
+      const replacement = collapsed?.statements.get(index);
+      lines.push(replacement ?? renderStep(plan.steps[index]!, targetVersion));
     }
     if (group.transactional) lines.push('COMMIT;');
     groups.push(lines.join('\n'));
@@ -257,6 +405,383 @@ function assertGroupsTileSteps(plan: Plan): void {
   }
 }
 
+/**
+ * Refuses a plan that renders two index statements of one polarity on one table under one
+ * server-form name — an explicit name clipped by PostgreSQL's 63-byte identifier limit, the
+ * conventional prediction for an unnamed one. Two creates would collide at apply time, and
+ * two drops would drop one name twice, so the SQL cannot satisfy the plan;
+ * explicit-vs-explicit duplicates are refused too. A drop and a create of one name are
+ * different statements — `index-changed` decomposes that way — and render. Only same-table
+ * groups are considered: a named index's uniqueness spans its schema, which the plan does not
+ * model. A refusal whose unnamed claimant predicted a longer, untruncated name shows that
+ * prediction beside the claimant, so a truncation collapse is visible.
+ */
+function assertIndexNamesUnique(plan: Plan): void {
+  const claimed = new Map<string, IndexStatement>();
+  for (const step of plan.steps) {
+    const statement = indexStatement(step);
+    if (statement === undefined) continue;
+    const { table, index, polarity } = statement;
+    const name = serverIndexName(table, index);
+    const key = JSON.stringify([table.schema, table.name, polarity, name]);
+    const previous = claimed.get(key);
+    if (previous !== undefined) {
+      throw new RenderRefusalError(
+        `refusing to render: index ${polarity} on ${renderTable(table)} would share the name ` +
+          `${JSON.stringify(name)}: ${describeIndex(previous.table, previous.index, name)} and ` +
+          `${describeIndex(table, index, name)}`,
+      );
+    }
+    claimed.set(key, statement);
+  }
+}
+
+/**
+ * The server form of an index statement's name: an explicit name clipped by PostgreSQL's
+ * 63-byte identifier limit, an unnamed one predicted by the conventional-name mirror.
+ */
+function serverIndexName(table: TableIdentity, index: Index): string {
+  return index.name === undefined
+    ? synthesizedIndexName(table, index)
+    : truncateIdentifier(index.name);
+}
+
+/** One index statement's table, index, and polarity, for the duplicate-name guard. */
+interface IndexStatement {
+  readonly table: TableIdentity;
+  readonly index: Index;
+  readonly polarity: 'creates' | 'drops';
+}
+
+/** The index payload of an index step, or `undefined` for every other kind. */
+function indexStatement(step: Step): IndexStatement | undefined {
+  switch (step.kind) {
+    case 'create-index':
+    case 'create-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'creates' };
+    case 'drop-index':
+    case 'drop-index-concurrently':
+      return { table: step.table, index: step.index, polarity: 'drops' };
+    case 'create-schema':
+    case 'create-table':
+    case 'drop-table':
+    case 'add-column':
+    case 'drop-column':
+    case 'alter-column':
+    case 'drop-not-null':
+    case 'add-not-null':
+    case 'alter-persistence':
+    case 'add-identity':
+    case 'drop-identity':
+    case 'alter-identity':
+    case 'add-primary-key':
+    case 'drop-primary-key':
+    case 'add-foreign-key':
+    case 'drop-foreign-key':
+    case 'add-unique-constraint':
+    case 'drop-unique-constraint':
+    case 'add-check-constraint':
+    case 'drop-check-constraint':
+    case 'create-sequence':
+    case 'drop-sequence':
+    case 'alter-sequence':
+    case 'create-extension':
+    case 'alter-extension':
+    case 'drop-extension':
+    case 'create-view':
+    case 'drop-view':
+    case 'replace-view':
+    case 'comment':
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * A refusal-message fragment naming one index by its columns and, when stated, its name. When
+ * an unnamed index's conventional prediction was truncated to the shared server-form name,
+ * the fragment also shows the untruncated prediction, so the reader can see why two
+ * structurally different indexes collapsed onto one name; a stated name is already displayed,
+ * so it needs no repetition.
+ */
+function describeIndex(table: TableIdentity, index: Index, serverName: string): string {
+  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
+  if (index.name !== undefined) {
+    return `an index named ${JSON.stringify(index.name)} on (${columns})`;
+  }
+  const description = `an unnamed index on (${columns})`;
+  const prediction = untruncatedIndexName(table, index);
+  return prediction === serverName
+    ? description
+    : `${description} (predicting ${JSON.stringify(prediction)})`;
+}
+
+/**
+ * The name an unnamed index's conventional formula assembles before PostgreSQL's 63-byte
+ * truncation — what the refusal message shows when the server form hides the prediction. It
+ * is the raw table name, each raw column, and the `idx` label joined by underscores, with no
+ * clipping at all.
+ */
+function untruncatedIndexName(table: TableIdentity, index: Index): string {
+  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+}
+
+/** One indexed step of a foreign-key polarity, for the in-place collapse pass. */
+type ForeignKeyDropStep = Extract<Step, { kind: 'drop-foreign-key' }>;
+type ForeignKeyAddStep = Extract<Step, { kind: 'add-foreign-key' }>;
+
+/** The PostgreSQL 18 form an in-place enforcement change emits. */
+type ForeignKeyEnforcementForm = 'ENFORCED' | 'NOT ENFORCED';
+
+/** One indexed step, keeping the plan position the emission loop walks. */
+interface IndexedStep<StepType extends Step> {
+  readonly index: number;
+  readonly step: StepType;
+}
+
+/** One drop's single matching add, with the in-place form the pair would emit. */
+interface EnforcementFlipMatch {
+  readonly add: IndexedStep<ForeignKeyAddStep>;
+  readonly form: ForeignKeyEnforcementForm;
+}
+
+/** The replacement statements and suppressed steps of the in-place collapse pass. */
+interface EnforcementCollapse {
+  readonly statements: ReadonlyMap<number, string>;
+  readonly suppressed: ReadonlySet<number>;
+}
+
+/**
+ * Pairs the `drop-foreign-key` and `add-foreign-key` halves of a pure enforcement change when
+ * PostgreSQL 18 can state it in place, and returns the drop-positioned `ALTER` plus the add
+ * positions to suppress. A pair must share one table identity, differ only in `enforcement`
+ * (strict raw equality, comments ignored), take one of the two legal directions, sit in one
+ * transaction group, carry no deferrable tightening, and have no other non-`comment` step
+ * whose principal table is either the referencing or the referenced table. A drop matching more
+ * than one add, or an add matching more than one drop, is a malformed plan and throws before
+ * anything renders; a lone half is normal and renders unchanged.
+ *
+ * The plan keeps its semantic drop+add shape — this pass reads it, never rewrites it — so
+ * targets below PostgreSQL 18 run no pass at all and render exactly today's pair.
+ */
+function collapseEnforcementFlips(plan: Plan): EnforcementCollapse {
+  const drops: IndexedStep<ForeignKeyDropStep>[] = [];
+  const adds: IndexedStep<ForeignKeyAddStep>[] = [];
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    const step = plan.steps[index]!;
+    if (step.kind === 'drop-foreign-key') drops.push({ index, step });
+    else if (step.kind === 'add-foreign-key') adds.push({ index, step });
+  }
+
+  const statements = new Map<number, string>();
+  const suppressed = new Set<number>();
+  if (drops.length === 0 || adds.length === 0) return { statements, suppressed };
+
+  const matches = new Map<number, EnforcementFlipMatch[]>();
+  for (const drop of drops) {
+    const candidates: EnforcementFlipMatch[] = [];
+    for (const add of adds) {
+      const form = sameTableIdentity(drop.step.table, add.step.table)
+        ? enforcementFlipForm(drop.step.foreignKey, add.step.foreignKey)
+        : undefined;
+      if (form !== undefined) candidates.push({ add, form });
+    }
+    if (candidates.length > 1) {
+      throw new Error(
+        `render: drop-foreign-key on ${renderTable(drop.step.table)} matches more than one add-foreign-key`,
+      );
+    }
+    matches.set(drop.index, candidates);
+  }
+  for (const add of adds) {
+    const candidates = drops.filter(
+      (drop) =>
+        sameTableIdentity(drop.step.table, add.step.table) &&
+        enforcementFlipForm(drop.step.foreignKey, add.step.foreignKey) !== undefined,
+    );
+    if (candidates.length > 1) {
+      throw new Error(
+        `render: add-foreign-key on ${renderTable(add.step.table)} matches more than one drop-foreign-key`,
+      );
+    }
+  }
+
+  const groupOf = stepGroupIndices(plan);
+  for (const drop of drops) {
+    const match = matches.get(drop.index)?.[0];
+    if (match === undefined) continue;
+    const add = match.add;
+    const dropGroup = groupOf[drop.index];
+    const addGroup = groupOf[add.index];
+    if (dropGroup === undefined || dropGroup !== addGroup) continue;
+    if (match.form === 'ENFORCED' && tighteningLosesDeferrability(add.step.foreignKey)) continue;
+    if (enforcementPairCrowded(plan, drop, add)) continue;
+    statements.set(
+      drop.index,
+      renderAlterConstraint(drop.step.table, add.step.foreignKey, match.form),
+    );
+    suppressed.add(add.index);
+  }
+  return { statements, suppressed };
+}
+
+/**
+ * The in-place form for a drop/add pair, or `undefined` when the two are not one pure
+ * enforcement change. Every field but `enforcement` compares raw — including
+ * `referencedColumns` as a plain array, unlike the diff's empty-vs-explicit-primary-key
+ * equivalence — and `comment` never participates. Only the two directions PostgreSQL 18 can
+ * state are legal: any transition into `not-enforced` relaxes, `not-enforced` back to the
+ * absent default tightens, and validation-only changes (`absent ↔ not-valid`) and
+ * `not-enforced → not-valid` stay drop/add.
+ */
+function enforcementFlipForm(
+  before: ForeignKey,
+  after: ForeignKey,
+): ForeignKeyEnforcementForm | undefined {
+  if (!sameForeignKeyExceptEnforcement(before, after)) return undefined;
+  if (after.enforcement === 'not-enforced') return 'NOT ENFORCED';
+  if (before.enforcement === 'not-enforced' && after.enforcement === undefined) return 'ENFORCED';
+  return undefined;
+}
+
+/** Whether two foreign keys are equal in every field but `enforcement` and `comment`. */
+function sameForeignKeyExceptEnforcement(before: ForeignKey, after: ForeignKey): boolean {
+  return (
+    before.name === after.name &&
+    sameStringList(before.columns, after.columns) &&
+    sameTableIdentity(before.referencedTable, after.referencedTable) &&
+    sameStringList(before.referencedColumns, after.referencedColumns) &&
+    before.onUpdate === after.onUpdate &&
+    before.onDelete === after.onDelete &&
+    before.deferrable === after.deferrable &&
+    before.initiallyDeferred === after.initiallyDeferred &&
+    before.enforcement !== after.enforcement
+  );
+}
+
+/** Raw, order-sensitive equality of two string arrays. */
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** Raw equality of two table identities: schema and name. */
+function sameTableIdentity(left: TableIdentity, right: TableIdentity): boolean {
+  return left.schema === right.schema && left.name === right.name;
+}
+
+/**
+ * Whether the tightening direction would lose a deferrable foreign key's trigger attributes on
+ * PostgreSQL 18.0–18.3 — fixed in 18.4, which a major target cannot distinguish — so the pair
+ * falls back to drop/add. Relaxation directions are unaffected.
+ */
+function tighteningLosesDeferrability(foreignKey: ForeignKey): boolean {
+  return foreignKey.deferrable === true || foreignKey.initiallyDeferred === true;
+}
+
+/**
+ * One in-place enforcement statement, named after the target foreign key: an explicit name
+ * quoted as stored, an unnamed one by the same conventional formula the drop path uses.
+ */
+function renderAlterConstraint(
+  table: TableIdentity,
+  after: ForeignKey,
+  form: ForeignKeyEnforcementForm,
+): string {
+  const name = after.name ?? synthesizedForeignKeyName(table, after);
+  return `ALTER TABLE ${renderTable(table)} ALTER CONSTRAINT ${quoteIdentifier(name)} ${form};`;
+}
+
+/**
+ * Whether another step's principal table is the pair's referencing or referenced table. The
+ * pair's own drop and add are excluded, and `comment` steps never count. Steps that merely
+ * mention a table in their payload — a different foreign key's `referencedTable`, a sequence's
+ * `ownedBy`, a view body — carry no ordering dependency on this pair and never count either.
+ */
+function enforcementPairCrowded(
+  plan: Plan,
+  drop: IndexedStep<ForeignKeyDropStep>,
+  add: IndexedStep<ForeignKeyAddStep>,
+): boolean {
+  const referencing = drop.step.table;
+  const referenced = add.step.foreignKey.referencedTable;
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    if (index === drop.index || index === add.index) continue;
+    const step = plan.steps[index]!;
+    if (step.kind === 'comment') continue;
+    const principal = stepPrincipalTable(step);
+    if (principal === undefined) continue;
+    if (sameTableIdentity(principal, referencing) || sameTableIdentity(principal, referenced)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The group index of every step, from the plan's walked groups. `assertGroupsTileSteps` has
+ * already pinned the partition, so every step index is assigned.
+ */
+function stepGroupIndices(plan: Plan): number[] {
+  const groupOf: number[] = [];
+  for (let groupIndex = 0; groupIndex < plan.groups.length; groupIndex += 1) {
+    const group = plan.groups[groupIndex]!;
+    for (let index = group.start; index < group.end; index += 1) {
+      groupOf[index] = groupIndex;
+    }
+  }
+  return groupOf;
+}
+
+/**
+ * The table a step principally alters, or `undefined` for a step that only carries tables
+ * inside its payload. Every table-level kind — create/drop-table, column, not-null,
+ * persistence, identity, primary-key, foreign-key, unique-constraint, check-constraint, and
+ * index — answers with its `table`; schema, sequence, extension, view, and comment steps answer
+ * `undefined`, because a `referencedTable`, an `ownedBy`, or a view body is never a step's
+ * principal table. The switch is exhaustive over `Step`, so a new kind cannot quietly acquire
+ * an accidental answer.
+ */
+function stepPrincipalTable(step: Step): TableIdentity | undefined {
+  switch (step.kind) {
+    case 'create-table':
+    case 'drop-table':
+    case 'add-column':
+    case 'drop-column':
+    case 'alter-column':
+    case 'drop-not-null':
+    case 'add-not-null':
+    case 'alter-persistence':
+    case 'add-identity':
+    case 'drop-identity':
+    case 'alter-identity':
+    case 'add-primary-key':
+    case 'drop-primary-key':
+    case 'add-foreign-key':
+    case 'drop-foreign-key':
+    case 'add-unique-constraint':
+    case 'drop-unique-constraint':
+    case 'add-check-constraint':
+    case 'drop-check-constraint':
+    case 'create-index':
+    case 'drop-index':
+    case 'create-index-concurrently':
+    case 'drop-index-concurrently':
+      return step.table;
+    case 'create-schema':
+    case 'create-sequence':
+    case 'drop-sequence':
+    case 'alter-sequence':
+    case 'create-extension':
+    case 'alter-extension':
+    case 'drop-extension':
+    case 'create-view':
+    case 'replace-view':
+    case 'drop-view':
+    case 'comment':
+      return undefined;
+  }
+}
+
 /** Binds `renderSql` to the `SqlRenderer` seam. */
 export const sqlRenderer: SqlRenderer<Plan> = { render: renderSql };
 
@@ -267,22 +792,40 @@ export function quoteIdentifier(identifier: string): string {
 }
 
 /** One plan step as one or more statements, without a trailing newline. */
-function renderStep(step: Step): string {
+function renderStep(step: Step, targetVersion: number): string {
   switch (step.kind) {
+    case 'create-schema':
+      return `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(step.schema)};`;
     case 'create-table':
-      return renderCreateTable(step.table);
+      return renderCreateTable(step.table, targetVersion);
     case 'drop-table':
       return `DROP TABLE ${renderTable(step.table)};`;
     case 'add-column':
-      return `ALTER TABLE ${renderTable(step.table)} ADD COLUMN ${renderColumn(step.column)};`;
+      return renderAddColumn(step.table, step.column, targetVersion);
     case 'drop-column':
       return `ALTER TABLE ${renderTable(step.table)} DROP COLUMN ${quoteIdentifier(
         step.column.name,
       )};`;
     case 'alter-column':
-      return step.fields
-        .map((field) => renderColumnAlteration(step.table, step.name, field))
-        .join('\n');
+      return renderAlterColumn(step.table, step.name, step.fields, step.attributes, targetVersion);
+    case 'drop-not-null':
+      return step.name === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
+            step.column,
+          )} DROP NOT NULL;`
+        : `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(step.name)};`;
+    case 'add-not-null':
+      return step.name === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
+            step.column,
+          )} SET NOT NULL;`
+        : `ALTER TABLE ${renderTable(step.table)} ADD CONSTRAINT ${quoteIdentifier(
+            step.name,
+          )} NOT NULL ${quoteIdentifier(step.column)};`;
+    case 'alter-persistence':
+      return step.persistence === undefined
+        ? `ALTER TABLE ${renderTable(step.table)} SET LOGGED;`
+        : `ALTER TABLE ${renderTable(step.table)} SET UNLOGGED;`;
     case 'add-identity':
       return renderAddIdentity(step.table, step.name, step.identity);
     case 'drop-identity':
@@ -293,7 +836,7 @@ function renderStep(step: Step): string {
       return `ALTER TABLE ${renderTable(step.table)} ADD ${renderPrimaryKey(step.primaryKey)};`;
     case 'drop-primary-key':
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
-        step.primaryKey.name ?? `${step.table.name}_pkey`,
+        step.primaryKey.name ?? synthesizedPrimaryKeyName(step.table),
       )};`;
     case 'add-foreign-key':
       return `ALTER TABLE ${renderTable(step.table)} ADD ${renderForeignKey(step.foreignKey)};`;
@@ -333,40 +876,262 @@ function renderStep(step: Step): string {
       return `DROP SEQUENCE ${renderSequence(step.sequence)};`;
     case 'alter-sequence':
       return renderAlterSequence(step.sequence, step.fields);
+    case 'create-extension':
+      return renderCreateExtension(step.extension);
+    case 'alter-extension':
+      return renderAlterExtension(step.extension, step.fields);
+    case 'drop-extension':
+      return renderDropExtension(step.extension);
+    case 'create-view':
+      return renderView(step.view, false);
+    case 'replace-view':
+      return renderView(step.view, true);
+    case 'drop-view':
+      return step.materialized
+        ? `DROP MATERIALIZED VIEW ${renderTable(step.view)};`
+        : `DROP VIEW ${renderTable(step.view)};`;
+    case 'comment':
+      return renderComment(step.target, step.text);
   }
 }
 
-/** `CREATE TABLE` for `table`, one column per line and the primary key trailing. */
-function renderCreateTable(table: Table): string {
+/**
+ * One `COMMENT ON` statement for `target`: `text` is the single source of the value, and an
+ * absent text is the removal (`IS NULL`). A carried node's own `comment` is never read, so a
+ * stale node field cannot diverge from the step.
+ */
+function renderComment(target: CommentTarget, text: string | undefined): string {
+  const value = text === undefined ? 'NULL' : renderCommentLiteral(text);
+  return `COMMENT ON ${renderCommentTarget(target)} IS ${value};`;
+}
+
+/**
+ * The object clause of a `COMMENT ON` statement. An unnamed index or constraint is named by the
+ * same conventional formula its drop uses, because PostgreSQL keeps the server-generated name;
+ * an index is schema-qualified like a drop, while a constraint is scoped by `ON <table>`.
+ */
+function renderCommentTarget(target: CommentTarget): string {
+  switch (target.kind) {
+    case 'table':
+      return `TABLE ${renderTable(target.table)}`;
+    case 'column':
+      return `COLUMN ${renderTable(target.table)}.${quoteIdentifier(target.column)}`;
+    case 'sequence':
+      return `SEQUENCE ${renderSequence(target.sequence)}`;
+    case 'view':
+      return `${target.materialized ? 'MATERIALIZED VIEW' : 'VIEW'} ${renderTable(target.view)}`;
+    case 'extension':
+      return `EXTENSION ${quoteIdentifier(target.extension.name)}`;
+    case 'index': {
+      const name = target.index.name ?? synthesizedIndexName(target.table, target.index);
+      return `INDEX ${quoteIdentifier(target.table.schema)}.${quoteIdentifier(name)}`;
+    }
+    case 'primary-key': {
+      const name = target.primaryKey.name ?? synthesizedPrimaryKeyName(target.table);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'unique-constraint': {
+      const name =
+        target.uniqueConstraint.name ??
+        synthesizedUniqueConstraintName(target.table, target.uniqueConstraint);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'check-constraint': {
+      const name =
+        target.checkConstraint.name ??
+        synthesizedCheckConstraintName(target.table, target.checkConstraint);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'foreign-key': {
+      const name =
+        target.foreignKey.name ?? synthesizedForeignKeyName(target.table, target.foreignKey);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+  }
+}
+
+/**
+ * `text` as a PostgreSQL string literal. A line-safe text — no backslash and no C0/DEL control —
+ * renders as `'…'` with embedded quotes doubled. Any backslash or control character switches to
+ * `E'…'`: `\` becomes `\\`, `'` becomes `''`, newline/tab/carriage return become `\n`/`\t`/`\r`,
+ * and every other C0/DEL control becomes `\xHH`, so a multi-line comment stays one statement on
+ * one line. Unicode passes through unchanged. NUL is the one refused input: no PostgreSQL text
+ * can carry it, and rendering it would silently truncate the statement at the server.
+ */
+function renderCommentLiteral(text: string): string {
+  if (text.includes('\u0000')) {
+    throw new RenderRefusalError('refusing to render: a comment cannot contain a NUL character');
+  }
+  let escaped = false;
+  let body = '';
+  for (const character of text) {
+    if (character === '\\') {
+      escaped = true;
+      body += '\\\\';
+    } else if (character === "'") {
+      body += "''";
+    } else if (character === '\n') {
+      escaped = true;
+      body += '\\n';
+    } else if (character === '\r') {
+      escaped = true;
+      body += '\\r';
+    } else if (character === '\t') {
+      escaped = true;
+      body += '\\t';
+    } else {
+      const codePoint = character.codePointAt(0)!;
+      if (codePoint < 0x20 || codePoint === 0x7f) {
+        escaped = true;
+        body += `\\x${codePoint.toString(16).padStart(2, '0')}`;
+      } else {
+        body += character;
+      }
+    }
+  }
+  return escaped ? `E'${body}'` : `'${body}'`;
+}
+
+/**
+ * `CREATE [UNLOGGED] TABLE` for `table`, one column per line and the primary key trailing.
+ * An explicit storage or compression cannot render inline in the create statement, so each
+ * such column's post-data `ALTER TABLE ONLY` statements follow it, storage before compression,
+ * in column order. An `unlogged` table states `UNLOGGED`.
+ */
+function renderCreateTable(table: Table, targetVersion: number): string {
+  const persistence = table.persistence === 'unlogged' ? 'UNLOGGED ' : '';
   const lines = table.columns.map((column) => `    ${renderColumn(column)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${renderPrimaryKey(table.primaryKey)}`);
-  if (lines.length === 0) return `CREATE TABLE ${renderTable(table)} ();`;
+  if (lines.length === 0) return `CREATE ${persistence}TABLE ${renderTable(table)} ();`;
 
   const body = lines
     .map((line, index) => (index === lines.length - 1 ? line : `${line},`))
     .join('\n');
-  return `CREATE TABLE ${renderTable(table)} (\n${body}\n);`;
+  const statements = [`CREATE ${persistence}TABLE ${renderTable(table)} (\n${body}\n);`];
+  for (const column of table.columns) {
+    statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
+  }
+  return statements.join('\n');
 }
 
 /**
- * One column definition: name, type, and the `NOT NULL` / `DEFAULT` clauses it carries. An
- * identity descriptor renders nothing here: the plan adds it with its own step.
+ * One added column: the `ADD COLUMN` statement and, for explicit attributes, the post-data
+ * `ALTER TABLE ONLY` statements that state them, storage before compression.
  */
-function renderColumn(column: Column): string {
-  const notNull = column.notNull ? ' NOT NULL' : '';
-  const fallback = column.default === undefined ? '' : ` DEFAULT ${column.default}`;
-  return `${quoteIdentifier(column.name)} ${column.type}${notNull}${fallback}`;
+function renderAddColumn(table: TableIdentity, column: Column, targetVersion: number): string {
+  const statements = [`ALTER TABLE ${renderTable(table)} ADD COLUMN ${renderColumn(column)};`];
+  statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
+  return statements.join('\n');
 }
 
-/** A primary-key constraint clause, with its name when it has one. */
+/**
+ * One column definition: name, type, and the `COLLATE` / `NOT NULL` / `DEFAULT` clauses it
+ * carries, in PostgreSQL's grammar order. An explicit collation follows the type; a not-null
+ * fact the model names renders PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL`, and
+ * without a name it stays the plain `NOT NULL`. An identity descriptor renders nothing here:
+ * the plan adds it with its own step. Storage and compression never render inline.
+ */
+function renderColumn(column: Column): string {
+  const collation = column.collation === undefined ? '' : ` COLLATE ${column.collation}`;
+  const notNull =
+    column.notNull && column.notNullName !== undefined
+      ? ` CONSTRAINT ${quoteIdentifier(column.notNullName)} NOT NULL`
+      : column.notNull
+        ? ' NOT NULL'
+        : '';
+  const fallback = column.default === undefined ? '' : ` DEFAULT ${column.default}`;
+  return `${quoteIdentifier(column.name)} ${column.type}${collation}${notNull}${fallback}`;
+}
+
+/**
+ * The post-data statements a created or added column's explicit storage and compression need:
+ * `ALTER TABLE ONLY … ALTER COLUMN … SET STORAGE …` and `… SET COMPRESSION …`, in that order,
+ * each only when the column states it. Inline `STORAGE`/`COMPRESSION` qualifiers are never
+ * rendered; `ONLY` matches the dump's post-data form, and inheritance is out of scope. An
+ * absent value emits nothing here — the reset forms exist only for an `alter-column` step.
+ */
+function renderColumnAttributeStatements(
+  table: TableIdentity,
+  column: Column,
+  targetVersion: number,
+): string[] {
+  const statements: string[] = [];
+  if (column.storage !== undefined) {
+    statements.push(renderSetStorage(table, column.name, column.storage, targetVersion));
+  }
+  if (column.compression !== undefined) {
+    statements.push(renderSetCompression(table, column.name, column.compression, targetVersion));
+  }
+  return statements;
+}
+
+/** The first PostgreSQL major that accepts the synthesized `SET STORAGE DEFAULT` reset. */
+const STORAGE_DEFAULT_MIN_MAJOR = 16;
+
+/**
+ * One `SET STORAGE` statement for a column: the explicit method in PostgreSQL's upper-case
+ * word, or `DEFAULT` when the target states none (the storage removal). Every form — the
+ * `CREATE TABLE`/`ADD COLUMN` tail, the post-`TYPE` restatement, and the standalone change —
+ * carries the dump's post-data `ONLY` form; inheritance is out of scope. `DEFAULT` is a form
+ * the renderer synthesizes, not one the model declares, so it consults the declared target:
+ * below PostgreSQL 16 the statement does not exist and the renderer refuses rather than emit
+ * SQL the declared server would reject. An explicit letter renders at every target.
+ */
+function renderSetStorage(
+  table: TableIdentity,
+  name: string,
+  storage: ColumnStorage | undefined,
+  targetVersion: number,
+): string {
+  if (storage === undefined && targetVersion < STORAGE_DEFAULT_MIN_MAJOR) {
+    throw new RenderRefusalError(
+      `refusing to render for PostgreSQL ${targetVersion}: SET STORAGE DEFAULT on ` +
+        `${renderTable(table)} column ${quoteIdentifier(name)} needs PostgreSQL ` +
+        `${STORAGE_DEFAULT_MIN_MAJOR} or newer`,
+    );
+  }
+  const target = storage === undefined ? 'DEFAULT' : storage.toUpperCase();
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET STORAGE ${target};`;
+}
+
+/** The first PostgreSQL major that accepts the synthesized `SET COMPRESSION default` reset. */
+const COMPRESSION_DEFAULT_MIN_MAJOR = 14;
+
+/**
+ * One `SET COMPRESSION` statement for a column: the explicit method, or `default` when the
+ * target states none (the compression removal). Every form — the `CREATE TABLE`/`ADD COLUMN`
+ * tail, the post-`TYPE` restatement, and the standalone change — carries the dump's post-data
+ * `ONLY` form; inheritance is out of scope. `default` is a form the renderer synthesizes, not
+ * one the model declares, so it consults the declared target: below PostgreSQL 14 the statement
+ * does not exist and the renderer refuses rather than emit SQL the declared server would
+ * reject. An explicit method renders at every target.
+ */
+function renderSetCompression(
+  table: TableIdentity,
+  name: string,
+  compression: ColumnCompression | undefined,
+  targetVersion: number,
+): string {
+  if (compression === undefined && targetVersion < COMPRESSION_DEFAULT_MIN_MAJOR) {
+    throw new RenderRefusalError(
+      `refusing to render for PostgreSQL ${targetVersion}: SET COMPRESSION default on ` +
+        `${renderTable(table)} column ${quoteIdentifier(name)} needs PostgreSQL ` +
+        `${COMPRESSION_DEFAULT_MIN_MAJOR} or newer`,
+    );
+  }
+  const target = compression === undefined ? 'default' : compression;
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
+}
+
+/** A primary-key constraint clause, with its name and attributes when it has them. */
 function renderPrimaryKey(primaryKey: PrimaryKey): string {
   const name =
     primaryKey.name === undefined ? '' : `CONSTRAINT ${quoteIdentifier(primaryKey.name)} `;
   const columns = primaryKey.columns.map((column) => quoteIdentifier(column)).join(', ');
-  return `${name}PRIMARY KEY (${columns})`;
+  return `${name}PRIMARY KEY (${columns})${renderDeferrability(primaryKey)}`;
 }
 
-/** A foreign-key constraint clause, with its name, referenced columns, and actions. */
+/** A foreign-key constraint clause, with its name, referenced columns, actions, and attributes. */
 function renderForeignKey(foreignKey: ForeignKey): string {
   const name =
     foreignKey.name === undefined ? '' : `CONSTRAINT ${quoteIdentifier(foreignKey.name)} `;
@@ -377,7 +1142,40 @@ function renderForeignKey(foreignKey: ForeignKey): string {
       : `(${foreignKey.referencedColumns.map((column) => quoteIdentifier(column)).join(', ')})`;
   return `${name}FOREIGN KEY (${columns}) REFERENCES ${renderTable(
     foreignKey.referencedTable,
-  )}${referenced}${renderReferentialActions(foreignKey)}`;
+  )}${referenced}${renderReferentialActions(foreignKey)}${renderDeferrability(
+    foreignKey,
+  )}${renderEnforcement(foreignKey.enforcement)}`;
+}
+
+/**
+ * The deferrability clause of a constraint: `DEFERRABLE` and `INITIALLY DEFERRED`, in that
+ * order and after every other clause. `INITIALLY DEFERRED` implies `DEFERRABLE`, so a stated
+ * `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT DEFERRABLE`
+ * being PostgreSQL's default. Shared by the primary-key, unique, and foreign-key clauses.
+ */
+function renderDeferrability(constraint: {
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}): string {
+  const deferrable = constraint.deferrable === true || constraint.initiallyDeferred === true;
+  const initiallyDeferred = constraint.initiallyDeferred === true;
+  return `${deferrable ? ' DEFERRABLE' : ''}${initiallyDeferred ? ' INITIALLY DEFERRED' : ''}`;
+}
+
+/**
+ * The `NOT VALID` / `NOT ENFORCED` tail of a constraint; absent means valid and enforced, the
+ * default. PostgreSQL reports a `NOT ENFORCED` constraint as `NOT VALID` too, but the model
+ * keeps the two states apart, and the renderer states the declaration the model carries.
+ */
+function renderEnforcement(enforcement: ConstraintEnforcement | undefined): string {
+  switch (enforcement) {
+    case undefined:
+      return '';
+    case 'not-valid':
+      return ' NOT VALID';
+    case 'not-enforced':
+      return ' NOT ENFORCED';
+  }
 }
 
 /** The stated `ON UPDATE` / `ON DELETE` actions, in that order; each is optional. */
@@ -387,53 +1185,28 @@ function renderReferentialActions(foreignKey: ForeignKey): string {
   return `${onUpdate}${onDelete}`;
 }
 
-/** PostgreSQL's conventional foreign-key name for an unnamed constraint. */
-function synthesizedForeignKeyName(table: TableIdentity, foreignKey: ForeignKey): string {
-  return `${table.name}${foreignKey.columns.map((column) => `_${column}`).join('')}_fkey`;
-}
-
-/** A unique-constraint clause, with its name when it has one. */
+/** A unique-constraint clause, with its name and attributes when it has them. */
 function renderUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
   const name =
     uniqueConstraint.name === undefined
       ? ''
       : `CONSTRAINT ${quoteIdentifier(uniqueConstraint.name)} `;
   const columns = uniqueConstraint.columns.map((column) => quoteIdentifier(column)).join(', ');
-  return `${name}UNIQUE (${columns})`;
+  return `${name}UNIQUE (${columns})${renderDeferrability(uniqueConstraint)}`;
 }
 
-/** A check-constraint clause, with its name when it has one; the expression is opaque text. */
+/**
+ * A check-constraint clause, with its name when it has one and its enforcement tail; the
+ * expression is opaque text.
+ */
 function renderCheckConstraint(checkConstraint: CheckConstraint): string {
   const name =
     checkConstraint.name === undefined
       ? ''
       : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
-  return `${name}CHECK (${checkConstraint.expression})`;
-}
-
-/** PostgreSQL's conventional unique-constraint name for an unnamed constraint. */
-function synthesizedUniqueConstraintName(
-  table: TableIdentity,
-  uniqueConstraint: UniqueConstraint,
-): string {
-  return `${table.name}${uniqueConstraint.columns.map((column) => `_${column}`).join('')}_key`;
-}
-
-/**
- * PostgreSQL's conventional check-constraint name for an unnamed constraint: the single
- * column the expression references when it references exactly one, the table alone otherwise.
- */
-function synthesizedCheckConstraintName(
-  table: TableIdentity,
-  checkConstraint: CheckConstraint,
-): string {
-  const column = checkExpressionColumn(checkConstraint.expression);
-  return column === undefined ? `${table.name}_check` : `${table.name}_${column}_check`;
-}
-
-/** PostgreSQL's conventional index name for an unnamed index. */
-function synthesizedIndexName(table: TableIdentity, index: Index): string {
-  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+  return `${name}CHECK (${checkConstraint.expression})${renderEnforcement(
+    checkConstraint.enforcement,
+  )}`;
 }
 
 /** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */
@@ -460,174 +1233,81 @@ function renderDropIndex(table: TableIdentity, index: Index, concurrently: boole
 }
 
 /**
- * The words a check expression can carry that are never a column reference, for the
- * best-effort conventional-name scan. Function-like words (`COALESCE`, `NULLIF`, …) are
- * already excluded by their call parentheses.
+ * One `alter-column` step as its statements, joined `\n`, in the step's fixed order: the
+ * merged `TYPE` statement when the type or the collation differs, the per-field not-null and
+ * default statements, then `SET STORAGE`, then `SET COMPRESSION`. The merged statement reads
+ * both halves from the step's target `attributes` carrier and states the target collation only
+ * when it has one; a `TYPE` statement resets storage and compression to the type's defaults,
+ * so the carrier's explicit values are restated after it. With no type or collation change, a
+ * storage or compression field states its own `SET` statement, the absent target restoring the
+ * default. Every `SET` statement carries the dump's post-data `ONLY` form; only the merged
+ * `TYPE` statement stays bare. A `type` or `collation` field without its carrier is a
+ * malformed plan and throws.
  */
-const CHECK_KEYWORDS: ReadonlySet<string> = new Set([
-  'all',
-  'and',
-  'any',
-  'array',
-  'as',
-  'between',
-  'case',
-  'cast',
-  'collate',
-  'current_catalog',
-  'current_date',
-  'current_role',
-  'current_schema',
-  'current_time',
-  'current_timestamp',
-  'current_user',
-  'default',
-  'distinct',
-  'else',
-  'end',
-  'escape',
-  'exists',
-  'false',
-  'from',
-  'ilike',
-  'in',
-  'interval',
-  'is',
-  'isnull',
-  'like',
-  'localtime',
-  'localtimestamp',
-  'not',
-  'notnull',
-  'null',
-  'or',
-  'overlaps',
-  'row',
-  'session_user',
-  'similar',
-  'some',
-  'then',
-  'to',
-  'true',
-  'unknown',
-  'user',
-  'when',
-]);
-
-/** The shape of an identifier's first character and its continuation. */
-const IDENTIFIER_START = /[A-Za-z_\u0080-\uffff]/;
-const IDENTIFIER_CONTINUATION = /[A-Za-z0-9_$\u0080-\uffff]/;
-
-/** Matches a dollar-quote delimiter, mirroring the importer's scanner. */
-const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
+function renderAlterColumn(
+  table: TableIdentity,
+  name: string,
+  fields: readonly ColumnFieldChange[],
+  attributes: ColumnAttributes | undefined,
+  targetVersion: number,
+): string {
+  const statement = `ALTER TABLE ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)}`;
+  const merged = fields.some((field) => field.field === 'type' || field.field === 'collation');
+  const carrier = merged ? requiredAttributes(table, name, attributes) : undefined;
+  const statements: string[] = [];
+  if (carrier !== undefined) {
+    const collation = carrier.collation === undefined ? '' : ` COLLATE ${carrier.collation}`;
+    statements.push(`${statement} TYPE ${carrier.type}${collation};`);
+  }
+  for (const field of fields) {
+    if (field.field === 'notNull' || field.field === 'default') {
+      statements.push(renderColumnAlteration(table, name, field));
+    }
+  }
+  if (carrier !== undefined) {
+    // The TYPE statement's reset matches a target that states no value, so only the explicit
+    // ones restate.
+    if (carrier.storage !== undefined) {
+      statements.push(renderSetStorage(table, name, carrier.storage, targetVersion));
+    }
+    if (carrier.compression !== undefined) {
+      statements.push(renderSetCompression(table, name, carrier.compression, targetVersion));
+    }
+  } else {
+    for (const field of fields) {
+      if (field.field === 'storage') {
+        statements.push(renderSetStorage(table, name, field.after, targetVersion));
+      } else if (field.field === 'compression') {
+        statements.push(renderSetCompression(table, name, field.after, targetVersion));
+      }
+    }
+  }
+  return statements.join('\n');
+}
 
 /**
- * The column a check expression references, when it references exactly one, for PostgreSQL's
- * conventional constraint name. The scan is lexical and best-effort: it counts bare and quoted
- * identifiers that are not function names, type names after `::`, `CAST` aliases, or key
- * words. `undefined` when the expression references zero or several columns.
+ * The step's target `attributes` carrier, or a malformed-plan error: a `type` or `collation`
+ * field drives the merged `TYPE` statement whose type and collation both come from the
+ * carrier, so a step without one cannot render the change it carries.
  */
-function checkExpressionColumn(expression: string): string | undefined {
-  const columns = new Set<string>();
-  let index = 0;
-  while (index < expression.length) {
-    const character = expression[index]!;
-
-    if (character === "'") {
-      index = quotedSpanEnd(expression, index);
-      continue;
-    }
-    if (character === '$') {
-      const end = dollarQuotedEnd(expression, index);
-      if (end !== null) {
-        index = end;
-        continue;
-      }
-    }
-    if (character === '"') {
-      const end = quotedSpanEnd(expression, index);
-      if (isColumnReference(expression, index, end)) {
-        columns.add(expression.slice(index + 1, end - 1).replaceAll('""', '"'));
-      }
-      index = end;
-      continue;
-    }
-    if (IDENTIFIER_START.test(character)) {
-      let end = index + 1;
-      while (end < expression.length && IDENTIFIER_CONTINUATION.test(expression[end]!)) end += 1;
-      const word = expression.slice(index, end);
-      if (isColumnReference(expression, index, end) && !CHECK_KEYWORDS.has(word.toLowerCase())) {
-        columns.add(word);
-      }
-      index = end;
-      continue;
-    }
-    index += 1;
+function requiredAttributes(
+  table: TableIdentity,
+  name: string,
+  attributes: ColumnAttributes | undefined,
+): ColumnAttributes {
+  if (attributes === undefined) {
+    throw new Error(
+      `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must carry the target attributes of a type or collation change`,
+    );
   }
-  return columns.size === 1 ? [...columns][0] : undefined;
+  return attributes;
 }
 
-/** Whether the identifier spanning `[start, end)` reads as a column reference. */
-function isColumnReference(text: string, start: number, end: number): boolean {
-  return !isFunctionName(text, end) && !isCastType(text, start) && !isCastAlias(text, start);
-}
-
-/** Whether the token ending at `end` is a function name: the next non-space character is `(`. */
-function isFunctionName(text: string, end: number): boolean {
-  let index = end;
-  while (index < text.length && isWhitespace(text[index]!)) index += 1;
-  return text[index] === '(';
-}
-
-/** Whether the token starting at `start` is a type name: it follows `::`. */
-function isCastType(text: string, start: number): boolean {
-  let index = start - 1;
-  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
-  return index >= 1 && text[index] === ':' && text[index - 1] === ':';
-}
-
-/** Whether the token starting at `start` is a `CAST` alias: it follows the word `AS`. */
-function isCastAlias(text: string, start: number): boolean {
-  let index = start - 1;
-  while (index >= 0 && isWhitespace(text[index]!)) index -= 1;
-  if (index < 0) return false;
-  const end = index + 1;
-  while (index >= 0 && IDENTIFIER_CONTINUATION.test(text[index]!)) index -= 1;
-  return text.slice(index + 1, end).toLowerCase() === 'as';
-}
-
-/** Index just past the quoted span starting at `index` (a `'` or `"`), or the end of text. */
-function quotedSpanEnd(text: string, index: number): number {
-  const quote = text[index];
-  let cursor = index + 1;
-  while (cursor < text.length) {
-    const character = text[cursor]!;
-    if (character === quote) {
-      if (text[cursor + 1] === quote) {
-        cursor += 2;
-        continue;
-      }
-      return cursor + 1;
-    }
-    cursor += 1;
-  }
-  return text.length;
-}
-
-/** Index just past a dollar-quoted span starting at `index`, or `null` when none starts there. */
-function dollarQuotedEnd(text: string, index: number): number | null {
-  DOLLAR_QUOTE.lastIndex = index;
-  const delimiter = DOLLAR_QUOTE.exec(text)?.[0] ?? null;
-  if (delimiter === null) return null;
-  const close = text.indexOf(delimiter, index + delimiter.length);
-  return close === -1 ? text.length : close + delimiter.length;
-}
-
-function isWhitespace(character: string): boolean {
-  return /\s/.test(character);
-}
-
-/** One `ALTER COLUMN` statement for one differing field. */
+/**
+ * One per-field `ALTER COLUMN` statement for a differing not-null or default value; every
+ * other field belongs to the merged `TYPE` builder or the storage/compression statements, so
+ * reaching here means the plan is malformed.
+ */
 function renderColumnAlteration(
   table: TableIdentity,
   name: string,
@@ -635,10 +1315,25 @@ function renderColumnAlteration(
 ): string {
   const statement = `ALTER TABLE ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)}`;
   switch (field.field) {
-    case 'type':
-      return `${statement} TYPE ${field.after};`;
     case 'notNull':
       return `${statement} ${field.after ? 'SET' : 'DROP'} NOT NULL;`;
+    case 'notNullName':
+      // The plan consumes a name-involved change into drop-not-null/add-not-null steps, so a
+      // name never reaches an alter-column; reaching here means the plan is malformed.
+      throw new Error(
+        `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a not-null name`,
+      );
+    case 'type':
+    case 'collation':
+    case 'storage':
+    case 'compression':
+      // The merged TYPE builder and the storage/compression statements own these fields — a
+      // TYPE statement restates the target collation and the SET statements state storage and
+      // compression — so they never reach the per-field renderer; reaching here means the
+      // plan is malformed.
+      throw new Error(
+        `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a ${field.field} change`,
+      );
     case 'default':
       return field.after === undefined
         ? `${statement} DROP DEFAULT;`
@@ -709,9 +1404,68 @@ function renderTable(identity: TableIdentity): string {
   return `${quoteIdentifier(identity.schema)}.${quoteIdentifier(identity.name)}`;
 }
 
+/**
+ * `CREATE [OR REPLACE] [MATERIALIZED] VIEW <qname> AS <definition>[ WITH … CHECK OPTION]`, a
+ * materialized view always ending in `WITH NO DATA`. The definition is emitted exactly as
+ * stored. A `replace-view` step that carries a materialized view cannot render soundly —
+ * PostgreSQL has no `CREATE OR REPLACE MATERIALIZED VIEW` — so the hand-built plan is refused.
+ */
+function renderView(view: View, replace: boolean): string {
+  if (replace && view.materialized) {
+    throw new RenderRefusalError(
+      `refusing to render: replace-view on ${renderTable(view)} cannot replace a materialized view`,
+    );
+  }
+  const kind = view.materialized ? 'MATERIALIZED VIEW' : 'VIEW';
+  const replacement = replace ? 'OR REPLACE ' : '';
+  const checkOption =
+    view.checkOption === undefined
+      ? ''
+      : ` WITH ${view.checkOption === 'local' ? 'LOCAL' : 'CASCADED'} CHECK OPTION`;
+  const data = view.materialized ? ' WITH NO DATA' : '';
+  return `CREATE ${replacement}${kind} ${renderTable(view)} AS ${view.definition}${checkOption}${data};`;
+}
+
 /** A schema-qualified sequence reference, quoted exactly like a table reference. */
 function renderSequence(identity: SequenceIdentity): string {
   return renderTable(identity);
+}
+
+/**
+ * `CREATE EXTENSION <name> WITH SCHEMA <schema>`, both identifiers quoted by need. The name is
+ * never schema-qualified and the statement never states `IF NOT EXISTS`: a create applies to a
+ * database without the extension, and drift must surface rather than be silently tolerated.
+ */
+function renderCreateExtension(extension: Extension): string {
+  return (
+    `CREATE EXTENSION ${quoteIdentifier(extension.name)}` +
+    ` WITH SCHEMA ${quoteIdentifier(extension.schema)};`
+  );
+}
+
+/**
+ * `ALTER EXTENSION <name> SET SCHEMA <schema>`, the destination read from the step's
+ * value-carrying `schema` field, so no baseline lookup is needed. A hand-built step without the
+ * field is malformed and throws rather than render a guessed destination.
+ */
+function renderAlterExtension(
+  extension: ExtensionIdentity,
+  fields: readonly ExtensionFieldChange[],
+): string {
+  const schema = fields.find((field) => field.field === 'schema');
+  if (schema === undefined) {
+    throw new Error(
+      `render: alter-extension for ${JSON.stringify(extension.name)} carries no schema field`,
+    );
+  }
+  return `ALTER EXTENSION ${quoteIdentifier(extension.name)} SET SCHEMA ${quoteIdentifier(
+    schema.after,
+  )};`;
+}
+
+/** `DROP EXTENSION <name>`, the name bare and never schema-qualified. */
+function renderDropExtension(extension: ExtensionIdentity): string {
+  return `DROP EXTENSION ${quoteIdentifier(extension.name)};`;
 }
 
 /** `CREATE SEQUENCE` in canonical full-explicit form, every effective option stated. */

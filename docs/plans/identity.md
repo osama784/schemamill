@@ -10,27 +10,32 @@ Identity columns as first-class column properties in the model: the DDL forms a 
 
 **Out, named in diagnostics — never silent:** identity state — `RESTART`, `setval`, and `last_value`; sequence renames and `SET SCHEMA`; `LOGGED`/`UNLOGGED` persistence; `AS` and `OWNED BY` inside identity options; a cross-schema `SEQUENCE NAME` (flagged by name, and the identity is modeled without one); identity on a non-integer column; and partitioned, inheritance, typed, and foreign tables, which stay fenced by the existing table-level flags. An identity action on a column the import did not model as an identity is skipped and named.
 
-**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is not introspected, renamed, or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
+**Deliberately shallow for now:** identity is a column property, never a `Sequence` in `Model.sequences`; the internal sequence is read as part of the column's identity descriptor ([#80](https://github.com/osama784/schemamill/issues/80), [ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md)) and is not renamed or altered on its own; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
 ## Plan ordering
 
-Identity steps open and close the plan's eight global phases, in this exact order:
+Identity steps sit in the plan's thirteen global phases, in this exact order:
 
-1. **drop-identity** — every removed identity whose column survives, in diff order. First, always: it must precede the `DROP NOT NULL`/`SET DEFAULT` the table phases put on the same column, and it frees the default sequence name for the replacement sequence the identity→serial conversion creates in phase 2 — or for the replacement identity's own sequence in phase 8.
-2. **create-sequence** — one per added sequence, in identity order.
-3. **Ownership detaches** — `ALTER SEQUENCE … OWNED BY NONE` where a kept sequence's baseline owner is removed, before the owner's drop.
-4. **Table operations** — the nine table phases, unchanged.
-5. **Ownership attaches and re-owns** — the ownership changes whose baseline owner survives.
-6. **Option alters** — one `alter-sequence` per changed sequence.
-7. **drop-sequence** — every removed sequence whose owner the plan does not remove; a column's `DROP DEFAULT` has already released it.
-8. **add-identity, then alter-identity** — additions before option alters, in diff order. Last because `ADD GENERATED` manufactures a fresh sequence and refuses a column that still carries a `DEFAULT`: by then the table phases have produced the column, its `SET NOT NULL`, and its `DROP DEFAULT`, and phases 1 and 7 have freed the sequence names the added identities reuse.
+1. **create-schema, then create-extension** — the target's schemas and added extensions, in name order, before everything else: an object lives in a schema and may use an extension's type or function ([export](./export.md), [extensions](./extensions.md)).
+2. **drop-identity** — every removed identity whose column survives, in diff order. First of the object phases, after the schema and extension creates: it must precede the `DROP NOT NULL`/`SET DEFAULT` the table phases put on the same column, and it frees the default sequence name for the replacement sequence the identity→serial conversion creates in phase 3 — or for the replacement identity's own sequence in phase 11.
+3. **create-sequence** — one per added sequence, in identity order.
+4. **Ownership detaches** — `ALTER SEQUENCE … OWNED BY NONE` where a kept sequence's baseline owner is removed, before the owner's drop.
+5. **View drops** — every removed view and the drop half of every rewritten one, before the table phases so a removed view cannot block a table or column drop ([views](./views.md)).
+6. **Table operations** — the eighteen table phases, unchanged.
+7. **View creates and replaces** — added views and the create half of rewritten ones, then changed plain views, after every table phase so a view can reference a newly created table or column ([views](./views.md)).
+8. **Ownership attaches and re-owns** — the ownership changes whose baseline owner survives.
+9. **Option alters** — one `alter-sequence` per changed sequence.
+10. **drop-sequence** — every removed sequence whose owner the plan does not remove; a column's `DROP DEFAULT` has already released it.
+11. **add-identity, then alter-identity** — additions before option alters, in diff order. Last because `ADD GENERATED` manufactures a fresh sequence and refuses a column that still carries a `DEFAULT`: by then the table phases have produced the column, its `SET NOT NULL`, and its `DROP DEFAULT`, and phases 2 and 10 have freed the sequence names the added identities reuse.
+12. **Comments** — every comment addition, change, and removal, after every identity step and before the extension teardown ([comments](./comments.md)).
+13. **alter-extension, then drop-extension** — the schema moves in name order, then the removals in name order, last (after every dependent object and comment; a dropped extension takes its comment with it) ([extensions](./extensions.md)).
 
 A `drop-identity` needs no suppression: an identity reaches the plan as its own removal only when its column survives, and a removed column or table carries its identity away in its own drop.
 
 Both conversions are compositions of those ordinary steps, with no special cases beyond the phase order:
 
-- **serial → identity** — a table-phase `DROP DEFAULT`, a sequence-phase `drop-sequence`, then a phase-8 `add-identity`; the sequence name is free for reuse.
-- **identity → serial** — a phase-1 `drop-identity`, a phase-2 `create-sequence`, then a table-phase `SET DEFAULT`.
+- **serial → identity** — a table-phase `DROP DEFAULT`, a sequence-phase `drop-sequence`, then a phase-11 `add-identity`; the sequence name is free for reuse.
+- **identity → serial** — a phase-2 `drop-identity`, a phase-3 `create-sequence`, then a table-phase `SET DEFAULT`.
 
 ## Effective values and type
 
@@ -66,7 +71,7 @@ Three levels pin the slice:
   - Each scene also checks that the identity columns come back column by column: the harness's retention guard matches every target identity against the re-imported model by `schema.table.column`, rejects an invented or moved identity, and fails the scene on any import diagnostic that names identity.
 - **Dogfood** — the sequences slice's 24-table corpus across `public`, `app`, and `"Sales"` (bigserial primary keys, a standalone `public.invoice_seq START WITH 1000`), plus a target that converts `public.audit_log.id` from `bigserial` to `GENERATED ALWAYS AS IDENTITY` reusing `public.audit_log_id_seq` and adds `public.identity_events` with a nameless identity: plan → apply the plan SQL verbatim → re-dump → import → `No changes.`, with no `audit_log_id_seq1` collision, the engine-chosen `public.identity_events_id_seq` for the nameless identity, and `attidentity` `a`/`d` after the migration. Commands and output on [#20](https://github.com/osama784/schemamill/issues/20#issuecomment-5913091302).
 
-On PostgreSQL 16.15 the live suite is 176 tests across 31 scenes, 0 skipped; the `verify-postgres` CI job runs the same harness against PostgreSQL 18.
+On PostgreSQL 16.15 the live suite is 485 tests across 53 scenes, 4 skipped — the four PostgreSQL 18 scenes skip with a named reason — and the `verify-postgres` CI job runs the same harness against PostgreSQL 18, where all 53 run.
 
 ## Done means
 
@@ -76,4 +81,4 @@ On PostgreSQL 16.15 the live suite is 176 tests across 31 scenes, 0 skipped; the
 
 ## Non-goals
 
-Introspection of identity columns from a live catalog; state-aware planning; sequence renames and `SET SCHEMA`; identity persistence; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md); hazards, likewise listed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.
+Identity introspection shipped in [#80](https://github.com/osama784/schemamill/issues/80) ([ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md)); state-aware planning; sequence renames and `SET SCHEMA`; identity persistence modeling; and partitioned, inheritance, typed, or foreign tables, which stay behind the existing table-level flags. Transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md); hazards, likewise listed, have since shipped in the [hazards slice](./hazards.md). Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate.

@@ -1,0 +1,11 @@
++ extension btree_gist
+
+- extension citext
+
+~ extension hstore: schema hs1 → hs2
+
++ comment on extension btree_gist: (none) → "GiST index support"
+
+~ comment on extension pgcrypto: "crypto v1" → "crypto v2"
+
+- comment on extension uuid-ossp: "uuid generators" → (none)

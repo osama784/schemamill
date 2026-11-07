@@ -6,6 +6,9 @@ import { effectiveIdentity, plan, sequenceTypeBounds } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
+  CommentTarget,
+  ConstraintEnforcement,
+  Extension,
   ForeignKey,
   Identity,
   IdentityInput,
@@ -18,14 +21,17 @@ import type {
   Step,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
 } from '@schemamill/core';
 
-import { renderSql, sqlRenderer } from './index.ts';
+import { importDump, RenderRefusalError, renderSql, sqlRenderer } from './index.ts';
+import type { RenderOptions } from './index.ts';
 
 /**
  * Tests for migration SQL rendering: the inline edge cases pin the quoting and statement
- * rules, the golden files pin ten whole scenes, and the determinism test pins that only the
+ * rules, the golden files pin sixteen whole scenes, and the determinism test pins that only the
  * models' structure — not their array order — reaches the SQL.
  */
 
@@ -42,24 +48,28 @@ const column = (name: string, fields: Partial<Omit<Column, 'name'>> = {}): Colum
 
 interface TableParts {
   schema?: string;
+  persistence?: TablePersistence;
   columns?: readonly Column[];
   primaryKey?: PrimaryKey;
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
 const table = (name: string, parts: TableParts = {}): Table => ({
   schema: parts.schema ?? 'public',
   name,
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   columns: parts.columns ?? [],
   ...(parts.primaryKey === undefined ? {} : { primaryKey: parts.primaryKey }),
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A unique constraint on `columns`: unnamed unless overridden. */
@@ -92,8 +102,38 @@ const foreignKey = (
   ...rest,
 });
 
+/**
+ * The child-side foreign key the in-place enforcement tests flip: `parent_id` referencing
+ * `public.parent(id)`, named and enforcing `enforcement` when stated.
+ */
+const enforcementKey = (
+  enforcement: ConstraintEnforcement | undefined,
+  rest: Partial<Omit<ForeignKey, 'enforcement'>> = {},
+): ForeignKey =>
+  foreignKey(['parent_id'], identity('parent'), {
+    name: 'child_parent_id_fkey',
+    referencedColumns: ['id'],
+    ...(enforcement === undefined ? {} : { enforcement }),
+    ...rest,
+  });
+
+/** The drop and add steps one foreign-key change on `table` decomposes to. */
+const foreignKeyPairSteps = (
+  before: ForeignKey,
+  after: ForeignKey,
+  table: TableIdentity = identity('child'),
+): readonly [Step, Step] => [
+  { kind: 'drop-foreign-key', table, foreignKey: before },
+  { kind: 'add-foreign-key', table, foreignKey: after },
+];
+
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /**
  * A sequence named `name`: ascending defaults in range for its data type unless overridden. The
@@ -130,6 +170,44 @@ const identityColumn = (fields: Partial<IdentityInput> = {}): Identity =>
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+  extensions: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
+  extensions: [],
+});
+
+/** An extension named `name`, installed in `public` unless a schema or fields are given. */
+const extension = (
+  name: string,
+  fields: Partial<Omit<Extension, 'name'>> = {},
+  schema = 'public',
+): Extension => ({ name, schema, ...fields });
+
+/** A model of the given extensions, with no tables, sequences, or views unless supplied. */
+const extensionModel = (extensions: readonly Extension[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** A plan of the given steps as one transactional group, for renderer edge cases. */
@@ -145,9 +223,25 @@ const dropStep = (name: string): Step => ({ kind: 'drop-table', table: identity(
 const golden = (name: string): string =>
   readFileSync(new URL(`../test/goldens/${name}.sql`, import.meta.url), 'utf8');
 
-/** Asserts that planning `baseline` to `target` renders exactly the golden `<name>.sql`. */
-const assertGolden = (name: string, baseline: Model, target: Model): void => {
-  assert.equal(renderSql(plan(baseline, target)), golden(name));
+/**
+ * Asserts that planning `baseline` to `target` renders exactly the golden `<name>.sql` for the
+ * declared `options`. With no explicit options, the same plan must also render the same bytes at
+ * the PostgreSQL 13 floor: a default-drift tripwire over every golden that carries no reset form.
+ */
+const assertGolden = (
+  name: string,
+  baseline: Model,
+  target: Model,
+  options?: RenderOptions,
+): void => {
+  assert.equal(renderSql(plan(baseline, target), options), golden(name));
+  if (options === undefined) {
+    assert.equal(
+      renderSql(plan(baseline, target), { targetVersion: 13 }),
+      golden(name),
+      `golden ${name} must render byte-identically at the PostgreSQL 13 floor`,
+    );
+  }
 };
 
 /**
@@ -542,6 +636,1017 @@ test("unnamed check drops synthesize PostgreSQL's conventional column name", () 
   }
 });
 
+test('renders the four not-null step statements, named or unnamed', () => {
+  // The plan decomposes a name-involved not-null change into its drop and add halves: a named
+  // half states the name in its own statement, an unnamed half keeps the plain `ALTER COLUMN`.
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-not-null', table: identity('t'), column: 'a', name: 't_a_not_null' },
+        { kind: 'drop-not-null', table: identity('t'), column: 'b' },
+        { kind: 'add-not-null', table: identity('t'), column: 'c', name: 't_c_not_null' },
+        { kind: 'add-not-null', table: identity('t'), column: 'd' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP CONSTRAINT t_a_not_null;',
+      'ALTER TABLE public.t ALTER COLUMN b DROP NOT NULL;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_c_not_null NOT NULL c;',
+      'ALTER TABLE public.t ALTER COLUMN d SET NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('quotes the identifiers a not-null step carries', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-not-null',
+          table: identity('Order', 'app'),
+          column: 'Mixed Case',
+          name: 'we"ird',
+        },
+        { kind: 'add-not-null', table: identity('Order', 'app'), column: 'Mixed Case' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE app."Order" DROP CONSTRAINT "we""ird";',
+      'ALTER TABLE app."Order" ALTER COLUMN "Mixed Case" SET NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders add-primary-key deferrability, named or unnamed', () => {
+  // Only a true `deferrable` or `initiallyDeferred` states a word; `false` and absent render
+  // nothing, `NOT DEFERRABLE` being PostgreSQL's default. A stated `initiallyDeferred` implies
+  // deferrable and emits both words.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
+        },
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { columns: ['a', 'b'], initiallyDeferred: true },
+        },
+        {
+          kind: 'add-primary-key',
+          table: identity('t'),
+          primaryKey: { name: 't_pkey_immediate', columns: ['id'], deferrable: false },
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE;',
+      'ALTER TABLE public.t ADD PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_pkey_immediate PRIMARY KEY (id);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders create-table primary-key attributes inline', () => {
+  const accounts = table('accounts', {
+    columns: [column('id', { type: 'bigint', notNull: true })],
+    primaryKey: {
+      name: 'accounts_pkey',
+      columns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(accounts))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.accounts (',
+      '    id bigint NOT NULL,',
+      '    CONSTRAINT accounts_pkey PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders unique-constraint deferrability', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+        },
+        {
+          kind: 'add-unique-constraint',
+          table: identity('t'),
+          uniqueConstraint: uniqueConstraint(['a', 'b'], { initiallyDeferred: true }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a) DEFERRABLE;',
+      'ALTER TABLE public.t ADD UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders foreign-key enforcement and deferrability after its actions', () => {
+  // The attribute tail comes last and in PostgreSQL's order: `DEFERRABLE`, `INITIALLY
+  // DEFERRED`, then the enforcement state; nothing is stated for the defaults.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['parent_id'], identity('parent'), {
+            name: 'child_parent_id_fkey',
+            referencedColumns: ['id'],
+            onUpdate: 'CASCADE',
+            onDelete: 'SET NULL',
+            deferrable: true,
+            initiallyDeferred: true,
+            enforcement: 'not-valid',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['tenant_id'], identity('parent'), {
+            name: 'child_tenant_id_fkey',
+            deferrable: true,
+            initiallyDeferred: true,
+            enforcement: 'not-enforced',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['other_id'], identity('parent'), {
+            name: 'child_other_id_fkey',
+            enforcement: 'not-enforced',
+          }),
+        },
+        {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: foreignKey(['owner_id'], identity('parent'), { deferrable: true }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED NOT VALID;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.parent DEFERRABLE INITIALLY DEFERRED NOT ENFORCED;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_other_id_fkey FOREIGN KEY (other_id) REFERENCES public.parent NOT ENFORCED;',
+      'ALTER TABLE public.child ADD FOREIGN KEY (owner_id) REFERENCES public.parent DEFERRABLE;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('target 18 renders an absent-to-not-enforced flip in place', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(sql.match(/ALTER CONSTRAINT/g)?.length, 1, 'exactly one ALTER CONSTRAINT');
+  assert.ok(!sql.includes('DROP CONSTRAINT'), 'the drop half is collapsed');
+  assert.ok(!sql.includes('ADD CONSTRAINT'), 'the add half is collapsed');
+});
+
+test('target 18 renders a not-enforced-to-absent flip in place', () => {
+  const before = enforcementKey('not-enforced');
+  const after = enforcementKey(undefined);
+  const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(sql.match(/ALTER CONSTRAINT/g)?.length, 1, 'exactly one ALTER CONSTRAINT');
+  assert.ok(!sql.includes('DROP CONSTRAINT'), 'the drop half is collapsed');
+  assert.ok(!sql.includes('ADD CONSTRAINT'), 'the add half is collapsed');
+});
+
+test('targets below 18 render a pure enforcement flip as the drop and add pair', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const planned = planOf(...foreignKeyPairSteps(before, after));
+  const expected = [
+    'BEGIN;',
+    'ALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;',
+    'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) NOT ENFORCED;',
+    'COMMIT;',
+    '',
+  ].join('\n');
+
+  assert.equal(renderSql(planned), expected, 'the default target keeps the pair');
+  for (const targetVersion of [13, 16, 17]) {
+    assert.equal(renderSql(planned, { targetVersion }), expected, `target ${targetVersion}`);
+    assert.equal(
+      renderSql(planned, { targetVersion }),
+      renderSql(planned),
+      `target ${targetVersion}`,
+    );
+  }
+});
+
+test('target 18 keeps a deferrable tightening as drop and add', () => {
+  const deferrableForms = [
+    ['deferrable', { deferrable: true }],
+    ['initially deferred', { initiallyDeferred: true }],
+  ] as const;
+
+  for (const [label, fields] of deferrableForms) {
+    const before = enforcementKey('not-enforced', fields);
+    const after = enforcementKey(undefined, fields);
+    const sql = renderSql(planOf(...foreignKeyPairSteps(before, after)), { targetVersion: 18 });
+
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY .* DEFERRABLE/, label);
+  }
+});
+
+test('work on either table keeps a pure enforcement flip as drop and add', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+
+  const crowds: readonly (readonly [string, Step])[] = [
+    [
+      'an alter-column on the referencing table',
+      {
+        kind: 'alter-column',
+        table: identity('child'),
+        name: 'parent_id',
+        fields: [{ field: 'notNull', before: false, after: true }],
+      },
+    ],
+    [
+      'an add-column on the referenced table',
+      { kind: 'add-column', table: identity('parent'), column: column('extra') },
+    ],
+  ];
+
+  for (const [label, crowd] of crowds) {
+    const sql = renderSql(planOf(drop, crowd, add), { targetVersion: 18 });
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/, label);
+  }
+
+  const comment: Step = {
+    kind: 'comment',
+    target: { kind: 'foreign-key', table: identity('child'), foreignKey: after },
+    text: 'kept',
+  };
+  const withComment = renderSql(planOf(drop, add, comment), { targetVersion: 18 });
+  assert.match(withComment, /ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;/);
+  assert.ok(!withComment.includes('DROP CONSTRAINT'), 'a comment never blocks the collapse');
+  assert.ok(!withComment.includes('ADD CONSTRAINT'), 'a comment never blocks the collapse');
+});
+
+test('a concurrent index between the halves keeps a pure enforcement flip as drop and add', () => {
+  const [drop, add] = foreignKeyPairSteps(
+    enforcementKey(undefined),
+    enforcementKey('not-enforced'),
+  );
+  const concurrent: Step = {
+    kind: 'create-index-concurrently',
+    table: identity('log'),
+    index: tableIndex(['at'], { name: 'log_at_idx' }),
+  };
+  const sql = renderSql(
+    {
+      steps: [drop, concurrent, add],
+      groups: [
+        { start: 0, end: 1, transactional: true },
+        { start: 1, end: 2, transactional: false },
+        { start: 2, end: 3, transactional: true },
+      ],
+    },
+    { targetVersion: 18 },
+  );
+
+  assert.ok(!sql.includes('ALTER CONSTRAINT'));
+  assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/);
+});
+
+test('an in-place enforcement flip synthesizes and quotes the constraint name', () => {
+  const unnamedBefore = enforcementKey(undefined, { name: undefined });
+  const unnamedAfter = enforcementKey('not-enforced', { name: undefined });
+  assert.equal(
+    renderSql(planOf(...foreignKeyPairSteps(unnamedBefore, unnamedAfter)), { targetVersion: 18 }),
+    'BEGIN;\nALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;\nCOMMIT;\n',
+  );
+
+  const quotedBefore = enforcementKey('not-enforced', { name: 'we"ird' });
+  const quotedAfter = enforcementKey(undefined, { name: 'we"ird' });
+  const quoted = renderSql(planOf(...foreignKeyPairSteps(quotedBefore, quotedAfter)), {
+    targetVersion: 18,
+  });
+  assert.match(quoted, /ALTER TABLE public\.child ALTER CONSTRAINT "we""ird" ENFORCED;/);
+});
+
+test('ambiguous enforcement matches are a plain Error', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+
+  assert.throws(
+    () =>
+      renderSql(
+        planOf(drop, add, {
+          kind: 'add-foreign-key',
+          table: identity('child'),
+          foreignKey: after,
+        }),
+        { targetVersion: 18 },
+      ),
+    { name: 'Error', message: /matches more than one add-foreign-key/ },
+  );
+  assert.throws(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'drop-foreign-key', table: identity('child'), foreignKey: before },
+          drop,
+          add,
+        ),
+        { targetVersion: 18 },
+      ),
+    { name: 'Error', message: /matches more than one drop-foreign-key/ },
+  );
+
+  assert.equal(
+    renderSql(planOf(drop), { targetVersion: 18 }),
+    'BEGIN;\nALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;\nCOMMIT;\n',
+  );
+  assert.equal(
+    renderSql(planOf(add), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('two independent enforcement pairs collapse at their drop positions', () => {
+  const beforeA = enforcementKey(undefined, { name: 'child_a_parent_id_fkey' });
+  const afterA = enforcementKey('not-enforced', { name: 'child_a_parent_id_fkey' });
+  const beforeB = enforcementKey('not-enforced', { name: 'child_b_parent_id_fkey' });
+  const afterB = enforcementKey(undefined, { name: 'child_b_parent_id_fkey' });
+  const [dropA, addA] = foreignKeyPairSteps(beforeA, afterA, identity('child_a'));
+  const [dropB, addB] = foreignKeyPairSteps(beforeB, afterB, identity('child_b'));
+
+  assert.equal(
+    renderSql(planOf(dropA, dropB, addA, addB), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child_a ALTER CONSTRAINT child_a_parent_id_fkey NOT ENFORCED;',
+      'ALTER TABLE public.child_b ALTER CONSTRAINT child_b_parent_id_fkey ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('in-place ALTERs stay at their drop positions across an unrelated step', () => {
+  // The plan's phase-major shape is `drop child_a, drop child_b, …add`s`. The ALTERs replace the
+  // drop positions, so an unrelated step that sits between the phases must render after them.
+  const [dropA, addA] = foreignKeyPairSteps(
+    enforcementKey(undefined, { name: 'child_a_parent_id_fkey' }),
+    enforcementKey('not-enforced', { name: 'child_a_parent_id_fkey' }),
+    identity('child_a'),
+  );
+  const [dropB, addB] = foreignKeyPairSteps(
+    enforcementKey('not-enforced', { name: 'child_b_parent_id_fkey' }),
+    enforcementKey(undefined, { name: 'child_b_parent_id_fkey' }),
+    identity('child_b'),
+  );
+  const middle: Step = { kind: 'add-column', table: identity('other'), column: column('extra') };
+
+  assert.equal(
+    renderSql(planOf(dropA, dropB, middle, addA, addB), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child_a ALTER CONSTRAINT child_a_parent_id_fkey NOT ENFORCED;',
+      'ALTER TABLE public.child_b ALTER CONSTRAINT child_b_parent_id_fkey ENFORCED;',
+      'ALTER TABLE public.other ADD COLUMN extra text;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a comment on the flipped foreign key survives the collapse', () => {
+  const before = enforcementKey(undefined);
+  const after = enforcementKey('not-enforced');
+  const [drop, add] = foreignKeyPairSteps(before, after);
+  const comment: Step = {
+    kind: 'comment',
+    target: { kind: 'foreign-key', table: identity('child'), foreignKey: after },
+    text: 'kept',
+  };
+
+  assert.equal(
+    renderSql(planOf(drop, add, comment), { targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child ALTER CONSTRAINT child_parent_id_fkey NOT ENFORCED;',
+      "COMMENT ON CONSTRAINT child_parent_id_fkey ON public.child IS 'kept';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('non-eligible enforcement transitions keep drop and add at target 18', () => {
+  const transitions: readonly (readonly [
+    string,
+    ConstraintEnforcement | undefined,
+    ConstraintEnforcement | undefined,
+  ])[] = [
+    ['absent to not-valid', undefined, 'not-valid'],
+    ['not-valid to absent', 'not-valid', undefined],
+    ['not-enforced to not-valid', 'not-enforced', 'not-valid'],
+  ];
+
+  for (const [label, beforeEnforcement, afterEnforcement] of transitions) {
+    const sql = renderSql(
+      planOf(
+        ...foreignKeyPairSteps(enforcementKey(beforeEnforcement), enforcementKey(afterEnforcement)),
+      ),
+      { targetVersion: 18 },
+    );
+    assert.ok(!sql.includes('ALTER CONSTRAINT'), label);
+    assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/, label);
+    assert.match(sql, /ADD CONSTRAINT child_parent_id_fkey/, label);
+  }
+});
+
+test('an equal-enforcement pair keeps drop and add at target 18', () => {
+  const direct = renderSql(
+    planOf(...foreignKeyPairSteps(enforcementKey('not-enforced'), enforcementKey('not-enforced'))),
+    { targetVersion: 18 },
+  );
+  assert.ok(!direct.includes('ALTER CONSTRAINT'), 'equal enforcement is not a flip');
+  assert.match(direct, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(direct, /ADD CONSTRAINT child_parent_id_fkey/);
+
+  // A primary-key change drops and restores the surviving dependent key with equal enforcement.
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const child = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [
+      foreignKey(['parent_id'], identity('parent'), {
+        name: 'child_parent_id_fkey',
+        referencedColumns: ['id'],
+      }),
+    ],
+  });
+  const parentTarget = {
+    ...parent,
+    primaryKey: { name: 'parent_pkey_v2', columns: ['id'] },
+  };
+  const dependent = renderSql(plan(model(parent, child), model(parentTarget, child)), {
+    targetVersion: 18,
+  });
+  assert.ok(!dependent.includes('ALTER CONSTRAINT'), 'the dependent-key pair is not a flip');
+  assert.match(dependent, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(dependent, /ADD CONSTRAINT child_parent_id_fkey/);
+});
+
+test('a diff-produced empty-vs-explicit referenced-columns flip keeps drop and add', () => {
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const child = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [foreignKey(['parent_id'], identity('parent'), { name: 'child_parent_id_fkey' })],
+  });
+  const childTarget = table('child', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('parent_id', { type: 'integer' }),
+    ],
+    foreignKeys: [
+      foreignKey(['parent_id'], identity('parent'), {
+        name: 'child_parent_id_fkey',
+        referencedColumns: ['id'],
+        enforcement: 'not-enforced',
+      }),
+    ],
+  });
+
+  const sql = renderSql(plan(model(parent, child), model(parent, childTarget)), {
+    targetVersion: 18,
+  });
+  assert.ok(!sql.includes('ALTER CONSTRAINT'), 'raw referenced columns must be equal');
+  assert.match(sql, /DROP CONSTRAINT child_parent_id_fkey;/);
+  assert.match(
+    sql,
+    /ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY \(parent_id\) REFERENCES public\.parent\(id\) NOT ENFORCED;/,
+  );
+});
+
+test('a diff-produced columns change alongside enforcement keeps drop and add', () => {
+  // The diff groups foreign keys by referencing columns, so a changed column list is a drop and
+  // an add even when the enforcement flips too. Only a pair equal in every field but
+  // `enforcement` may collapse, and `columns` is one of those fields.
+  const parent = table('parent', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'parent_pkey', columns: ['id'] },
+  });
+  const columns = [
+    column('id', { type: 'integer', notNull: true }),
+    column('parent_id', { type: 'integer' }),
+    column('other_id', { type: 'integer' }),
+  ];
+  const child = (referencing: string, enforcement?: ConstraintEnforcement): Table =>
+    table('child', {
+      columns,
+      foreignKeys: [
+        foreignKey([referencing], identity('parent'), {
+          name: 'child_fk',
+          referencedColumns: ['id'],
+          ...(enforcement === undefined ? {} : { enforcement }),
+        }),
+      ],
+    });
+
+  const sql = renderSql(
+    plan(model(parent, child('parent_id')), model(parent, child('other_id', 'not-enforced'))),
+    { targetVersion: 18 },
+  );
+
+  assert.ok(!sql.includes('ALTER CONSTRAINT'), 'raw referencing columns must be equal');
+  assert.match(sql, /DROP CONSTRAINT child_fk;/);
+  assert.match(
+    sql,
+    /ADD CONSTRAINT child_fk FOREIGN KEY \(other_id\) REFERENCES public\.parent\(id\) NOT ENFORCED;/,
+  );
+});
+
+test('renders check-constraint enforcement after the expression', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('age >= 0', {
+            name: 't_age_check',
+            enforcement: 'not-valid',
+          }),
+        },
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('age <= 150', { enforcement: 'not-enforced' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_age_check CHECK (age >= 0) NOT VALID;',
+      'ALTER TABLE public.t ADD CHECK (age <= 150) NOT ENFORCED;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a named not-null constraint inline, unnamed unchanged', () => {
+  const users = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true, notNullName: 'users_email_not_null' }),
+      column('nickname'),
+    ],
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(users))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.users (',
+      '    id integer NOT NULL,',
+      '    email text CONSTRAINT users_email_not_null NOT NULL,',
+      '    nickname text',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-column',
+          table: identity('Order', 'app'),
+          column: column('Mixed Case', { notNull: true, notNullName: 'we"ird' }),
+        },
+        { kind: 'add-column', table: identity('t'), column: column('name', { notNull: true }) },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE app."Order" ADD COLUMN "Mixed Case" text CONSTRAINT "we""ird" NOT NULL;',
+      'ALTER TABLE public.t ADD COLUMN name text NOT NULL;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders an explicit collation inline after the type, before the constraints', () => {
+  // PostgreSQL's grammar order: the collation follows the type, then the not-null clause (its
+  // name inside `CONSTRAINT`), then the default. The model's collation text is opaque and
+  // emitted exactly as stored, quoted or qualified.
+  const users = table('users', {
+    columns: [
+      column('c', { collation: 'pg_catalog."C"', notNull: true, default: "'x'" }),
+      column('named', {
+        collation: 'pg_catalog."C"',
+        notNull: true,
+        notNullName: 'users_named_not_null',
+      }),
+      column('bare', { collation: 'app."User_C"' }),
+    ],
+  });
+
+  assert.equal(
+    renderSql(plan(model(), model(users))),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.users (',
+      '    c text COLLATE pg_catalog."C" NOT NULL DEFAULT \'x\',',
+      '    named text COLLATE pg_catalog."C" CONSTRAINT users_named_not_null NOT NULL,',
+      '    bare text COLLATE app."User_C"',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-column',
+        table: identity('t'),
+        column: column('c', { collation: 'pg_catalog."C"', notNull: true }),
+      }),
+    ),
+    'BEGIN;\nALTER TABLE public.t ADD COLUMN c text COLLATE pg_catalog."C" NOT NULL;\nCOMMIT;\n',
+  );
+});
+
+test('renders CREATE UNLOGGED TABLE for an unlogged table', () => {
+  assert.equal(
+    renderSql(
+      plan(model(), model(table('logs', { persistence: 'unlogged', columns: [column('id')] }))),
+    ),
+    ['BEGIN;', 'CREATE UNLOGGED TABLE public.logs (', '    id text', ');', 'COMMIT;', ''].join(
+      '\n',
+    ),
+  );
+  assert.equal(
+    renderSql(plan(model(), model(table('empty', { persistence: 'unlogged' })))),
+    'BEGIN;\nCREATE UNLOGGED TABLE public.empty ();\nCOMMIT;\n',
+  );
+});
+
+test("states a created or added column's storage and compression as post-data ONLY tails", () => {
+  // The inline `STORAGE`/`COMPRESSION` qualifiers are recent grammar and never rendered; the
+  // explicit values follow the statement that creates or adds the column, storage before
+  // compression, each under the dump's post-data `ONLY` form.
+  assert.equal(
+    renderSql(
+      plan(
+        model(),
+        model(
+          table('t', {
+            columns: [
+              column('id', { type: 'integer' }),
+              column('c', {
+                collation: 'pg_catalog."C"',
+                storage: 'external',
+                compression: 'pglz',
+              }),
+            ],
+          }),
+        ),
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.t (',
+      '    id integer,',
+      '    c text COLLATE pg_catalog."C"',
+      ');',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION pglz;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-column',
+        table: identity('t'),
+        column: column('c', {
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      }),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD COLUMN c text COLLATE pg_catalog."C";',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTENDED;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('merges a type and collation change into exactly one TYPE statement', () => {
+  // The pinned naive failure mode is two `TYPE` clauses for one change set; the merged
+  // statement reads both halves from the step's target carrier, so a type change on a collated
+  // column restates the unchanged collation, a collation removal renders the bare target type,
+  // and a collation-only add restates the unchanged type.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('changed', { collation: 'pg_catalog."C"' }),
+        column('drop', { collation: 'pg_catalog."C"' }),
+        column('keep', { collation: 'pg_catalog."C"' }),
+        column('gain'),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('changed', { type: 'character varying(12)', collation: 'pg_catalog."POSIX"' }),
+        column('drop', { type: 'character varying(24)' }),
+        column('keep', { type: 'character varying(36)', collation: 'pg_catalog."C"' }),
+        column('gain', { collation: 'pg_catalog."C"' }),
+      ],
+    }),
+  );
+  const sql = renderSql(plan(baseline, target));
+
+  assert.equal(
+    sql,
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN changed TYPE character varying(12) COLLATE pg_catalog."POSIX";',
+      'ALTER TABLE public.t ALTER COLUMN drop TYPE character varying(24);',
+      'ALTER TABLE public.t ALTER COLUMN keep TYPE character varying(36) COLLATE pg_catalog."C";',
+      'ALTER TABLE public.t ALTER COLUMN gain TYPE text COLLATE pg_catalog."C";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  // One merged statement per changed column: one `TYPE` clause each, never two statements.
+  assert.equal(sql.match(/TYPE /g)?.length, 4);
+  assert.equal(sql.match(/ALTER TABLE public\.t ALTER COLUMN /g)?.length, 4);
+});
+
+test('restates target storage and compression after the merged TYPE statement', () => {
+  // A TYPE statement resets storage and compression to the type's defaults, so the target's
+  // explicit values ride after it; a target that states none needs nothing, the reset already
+  // matching it. The restatements carry the dump's post-data `ONLY` form; only the merged
+  // TYPE statement stays bare.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', { collation: 'pg_catalog."C"', storage: 'main', compression: 'pglz' }),
+        column('reset', { storage: 'external', compression: 'pglz' }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(12)',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+        column('reset', { type: 'character varying(24)' }),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(12) COLLATE pg_catalog."C";',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'ALTER TABLE public.t ALTER COLUMN reset TYPE character varying(24);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+/**
+ * The standalone storage/compression scene: explicit changes plus both resets, on one table.
+ * Shared by the pre-existing standalone test (rendered for PostgreSQL 16) and the target-version
+ * tests that cross the two reset floors.
+ */
+const standaloneAttributeScene = (): { readonly baseline: Model; readonly target: Model } => ({
+  baseline: model(
+    table('t', {
+      columns: [
+        column('stored'),
+        column('unstored', { storage: 'main' }),
+        column('moved', { storage: 'external' }),
+        column('compressed'),
+        column('uncompressed', { compression: 'pglz' }),
+      ],
+    }),
+  ),
+  target: model(
+    table('t', {
+      columns: [
+        column('stored', { storage: 'external' }),
+        column('unstored'),
+        column('moved', { storage: 'plain' }),
+        column('compressed', { compression: 'lz4' }),
+        column('uncompressed'),
+      ],
+    }),
+  ),
+});
+
+/** The exact SQL the standalone scene renders for a target that accepts both reset forms. */
+const STANDALONE_ATTRIBUTE_SQL = [
+  'BEGIN;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN stored SET STORAGE EXTERNAL;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN unstored SET STORAGE DEFAULT;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN moved SET STORAGE PLAIN;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN compressed SET COMPRESSION lz4;',
+  'ALTER TABLE ONLY public.t ALTER COLUMN uncompressed SET COMPRESSION default;',
+  'COMMIT;',
+  '',
+].join('\n');
+
+test('renders standalone storage and compression changes, resets included', () => {
+  // With no type or collation change, a storage or compression field states one `SET`
+  // statement; an absent target restores the default (`SET STORAGE DEFAULT`, `SET COMPRESSION
+  // default`), and every statement carries the dump's post-data `ONLY` form.
+  const { baseline, target } = standaloneAttributeScene();
+  const sql = renderSql(plan(baseline, target), { targetVersion: 16 });
+
+  assert.equal(sql, STANDALONE_ATTRIBUTE_SQL);
+  const setStatements = sql.split('\n').filter((line) => line.includes(' SET '));
+  assert.equal(setStatements.length, 5);
+  assert.ok(
+    setStatements.every((line) => line.startsWith('ALTER TABLE ONLY ')),
+    'every standalone SET carries ONLY',
+  );
+});
+
+test('orders a merged TYPE before the per-field and attribute statements', () => {
+  // Inside one step the fixed order is: merged TYPE, the not-null and default statements, then
+  // SET STORAGE, then SET COMPRESSION.
+  const baseline = model(
+    table('t', { columns: [column('c', { storage: 'main', compression: 'pglz' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(9)',
+          notNull: true,
+          default: "'x'",
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(9);',
+      'ALTER TABLE public.t ALTER COLUMN c SET NOT NULL;',
+      "ALTER TABLE public.t ALTER COLUMN c SET DEFAULT 'x';",
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a merged TYPE or COLLATE change without its attributes carrier is malformed', () => {
+  // The merged statement reads its type and collation from the step's target carrier, so a
+  // hand-built step that carries the field without the carrier cannot render; the throw
+  // mirrors the not-null-name guard.
+  assert.throws(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'alter-column',
+          table: identity('t'),
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'integer' }],
+        }),
+      ),
+    /alter-column on public\.t\.c must carry the target attributes of a type or collation change/,
+  );
+  assert.throws(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'alter-column',
+          table: identity('t'),
+          name: 'c',
+          fields: [{ field: 'collation', before: 'pg_catalog."C"' }],
+        }),
+      ),
+    /alter-column on public\.t\.c must carry the target attributes of a type or collation change/,
+  );
+
+  // With the carrier present the same type-only field renders the merged statement, never the
+  // per-field renderer's malformed-plan guard.
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'alter-column',
+        table: identity('t'),
+        name: 'c',
+        fields: [{ field: 'type', before: 'text', after: 'integer' }],
+        attributes: { type: 'integer' },
+      }),
+    ),
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN c TYPE integer;\nCOMMIT;\n',
+  );
+});
+
 test('renders index creates and drops, named or unnamed, unique or not', () => {
   assert.equal(
     renderSql(
@@ -631,6 +1736,61 @@ test('index drops are schema-qualified, named or synthesized, both kinds', () =>
   );
 });
 
+test('renders long unnamed drops in their server forms, index and constraints', () => {
+  // PostgreSQL stores an identifier of at most 63 bytes: a synthesized name longer than that
+  // is shrunk by `makeObjectName`, and the drop must name the stored form to apply.
+  const long = 't'.repeat(70);
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-index', table: identity(long), index: tableIndex(['a']) },
+        { kind: 'drop-primary-key', table: identity(long), primaryKey: { columns: ['id'] } },
+        {
+          kind: 'drop-unique-constraint',
+          table: identity(long),
+          uniqueConstraint: uniqueConstraint(['a']),
+        },
+        {
+          kind: 'drop-check-constraint',
+          table: identity(long),
+          checkConstraint: checkConstraint('a > 0'),
+        },
+        {
+          kind: 'drop-foreign-key',
+          table: identity(long),
+          foreignKey: foreignKey(['a'], identity('u')),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      `DROP INDEX public.${'t'.repeat(57)}_a_idx;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(58)}_pkey;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(57)}_a_key;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(55)}_a_check;`,
+      `ALTER TABLE public.${long} DROP CONSTRAINT ${'t'.repeat(56)}_a_fkey;`,
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders an explicit index drop name exactly as written, even over 63 bytes', () => {
+  // PostgreSQL clips an explicit identifier at parse time; the residual is documented, not
+  // fixed, so the renderer keeps the model's spelling.
+  const explicit = `${'t'.repeat(57)}_a_idx${'y'.repeat(10)}`;
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'drop-index',
+        table: identity('t'),
+        index: tableIndex(['a'], { name: explicit }),
+      }),
+    ),
+    `BEGIN;\nDROP INDEX public.${explicit};\nCOMMIT;\n`,
+  );
+});
+
 test('renders concurrent index kinds bare, one standalone group each', () => {
   const concurrentDrop: Step = {
     kind: 'drop-index-concurrently',
@@ -659,6 +1819,472 @@ test('renders concurrent index kinds bare, one standalone group each', () => {
     }),
     'DROP INDEX CONCURRENTLY public.t_old_idx;\n\nCREATE UNIQUE INDEX CONCURRENTLY t_new_idx ON public.t USING btree (a, b);\n',
   );
+});
+
+/**
+ * Asserts that `render` throws a `RenderRefusalError` with exactly `message`: `instanceof`
+ * pins the exported class, and the text pins the refusal wording.
+ */
+const assertRefusal = (render: () => unknown, message: string): void => {
+  let caught: unknown;
+  try {
+    render();
+  } catch (error) {
+    caught = error;
+  }
+  if (!(caught instanceof RenderRefusalError)) {
+    assert.fail(`expected a RenderRefusalError, caught ${String(caught)}`);
+  }
+  assert.equal(caught.message, message);
+};
+
+/** A plan that resets one column's storage: `main` in the baseline, absent in the target. */
+const storageResetPlan = (tableName = 't', columnName = 'c', schema = 'public'): Plan =>
+  plan(
+    model(table(tableName, { schema, columns: [column(columnName, { storage: 'main' })] })),
+    model(table(tableName, { schema, columns: [column(columnName)] })),
+  );
+
+/** A plan that resets one column's compression: `pglz` in the baseline, absent in the target. */
+const compressionResetPlan = (tableName = 't', columnName = 'c', schema = 'public'): Plan =>
+  plan(
+    model(table(tableName, { schema, columns: [column(columnName, { compression: 'pglz' })] })),
+    model(table(tableName, { schema, columns: [column(columnName)] })),
+  );
+
+test('the default target refuses both synthesized resets below their floors', () => {
+  // Unset means the PostgreSQL 13 floor, so a plan that removes storage or compression cannot
+  // render: `SET STORAGE DEFAULT` needs 16 and `SET COMPRESSION default` needs 14.
+  assertRefusal(
+    () => renderSql(storageResetPlan()),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  assertRefusal(
+    () => renderSql(compressionResetPlan()),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+});
+
+test('target 15 refuses the storage reset and renders the compression reset', () => {
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 15 }),
+    'refusing to render for PostgreSQL 15: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  const at15 = renderSql(compressionResetPlan(), { targetVersion: 15 });
+  assert.equal(at15, renderSql(compressionResetPlan(), { targetVersion: 16 }));
+  assert.equal(
+    at15,
+    'BEGIN;\nALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION default;\nCOMMIT;\n',
+  );
+});
+
+test('target 16 renders both synthesized resets', () => {
+  const { baseline, target } = standaloneAttributeScene();
+  assert.equal(renderSql(plan(baseline, target), { targetVersion: 16 }), STANDALONE_ATTRIBUTE_SQL);
+});
+
+test('the reset floors are PostgreSQL 14 for compression and 16 for storage', () => {
+  const compressionAt14 = renderSql(compressionResetPlan(), { targetVersion: 14 });
+  assert.equal(compressionAt14, renderSql(compressionResetPlan(), { targetVersion: 16 }));
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 14 }),
+    'refusing to render for PostgreSQL 14: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+  assertRefusal(
+    () => renderSql(compressionResetPlan(), { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+  assertRefusal(
+    () => renderSql(storageResetPlan(), { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+});
+
+test('declarations render as declared at every target', () => {
+  // The model's declarations are stated exactly as carried — an explicit storage letter and
+  // compression method, a named not-null inline and as an added constraint, and NOT ENFORCED —
+  // even at a target below the declaration's own floor. Only synthesized resets consult it.
+  const declared = planOf(
+    {
+      kind: 'add-column',
+      table: identity('t'),
+      column: column('c', {
+        storage: 'external',
+        compression: 'lz4',
+        notNull: true,
+        notNullName: 'nn_c',
+      }),
+    },
+    { kind: 'add-not-null', table: identity('t'), column: 'd', name: 'nn_d' },
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('c IS NOT NULL', {
+        name: 'ck',
+        enforcement: 'not-enforced',
+      }),
+    },
+  );
+  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(declared, { targetVersion }));
+
+  for (const output of outputs) {
+    assert.equal(output, outputs[0], 'declarations render identically at every target');
+  }
+  assert.match(outputs[0]!, /SET STORAGE EXTERNAL;/);
+  assert.match(outputs[0]!, /SET COMPRESSION lz4;/);
+  assert.match(outputs[0]!, /CONSTRAINT nn_c NOT NULL/);
+  assert.match(outputs[0]!, /ADD CONSTRAINT nn_d NOT NULL d;/);
+  assert.match(outputs[0]!, /NOT ENFORCED/);
+});
+
+test('a plan with no reset renders byte-identically at every target', () => {
+  const planned = plan(
+    model(),
+    model(
+      table('t', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('c', { storage: 'external', compression: 'pglz' }),
+        ],
+      }),
+    ),
+  );
+  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(planned, { targetVersion }));
+
+  for (const output of outputs) {
+    assert.equal(output, outputs[0], 'a reset-free plan renders identically at every target');
+  }
+});
+
+test('the first reset in plan order names itself', () => {
+  // The gate sits in the emitter, so the first offending statement aborts the render; the later
+  // storage reset never gets a chance to report.
+  const planned = planOf(
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'compression', before: 'pglz' }],
+    },
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'storage', before: 'main' }],
+    },
+  );
+
+  assertRefusal(
+    () => renderSql(planned, { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: SET COMPRESSION default on public.t column c needs PostgreSQL 14 or newer',
+  );
+});
+
+test('a refusal message quotes odd identifiers exactly as the SQL does', () => {
+  assertRefusal(
+    () => renderSql(storageResetPlan('Odd Table', 'Odd Col', 'Odd Schema')),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on "Odd Schema"."Odd Table" column "Odd Col" needs PostgreSQL 16 or newer',
+  );
+});
+
+test('a target-absent storage with a type change emits no reset and never refuses', () => {
+  // The merged TYPE statement resets storage itself, so the carrier branch emits only explicit
+  // values; the gate mirrors that emission and stays silent at the 13 floor.
+  const baseline = model(table('t', { columns: [column('c', { storage: 'main' })] }));
+  const target = model(table('t', { columns: [column('c', { type: 'character varying(12)' })] }));
+  const at13 = renderSql(plan(baseline, target));
+
+  assert.equal(
+    at13,
+    'BEGIN;\nALTER TABLE public.t ALTER COLUMN c TYPE character varying(12);\nCOMMIT;\n',
+  );
+  assert.ok(!at13.includes('SET STORAGE'), 'the TYPE reset covers the absent target');
+  assert.equal(at13, renderSql(plan(baseline, target), { targetVersion: 16 }));
+});
+
+test('a target below the floor or not an integer is a plain Error', () => {
+  assert.throws(() => renderSql(storageResetPlan(), { targetVersion: 12 }), {
+    name: 'Error',
+    message: 'targetVersion must be a PostgreSQL major of 13 or newer, got 12',
+  });
+  assert.throws(() => renderSql(storageResetPlan(), { targetVersion: 13.5 }), {
+    name: 'Error',
+    message: 'targetVersion must be a PostgreSQL major of 13 or newer, got 13.5',
+  });
+  assertRefusal(
+    () => renderSql(storageResetPlan(), {}),
+    'refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.t column c needs PostgreSQL 16 or newer',
+  );
+});
+
+test('refuses two index creates on one table that resolve to one name', () => {
+  // The reproduced shape: an unnamed index (a) beside an explicit t_a_idx on one table.
+  // PostgreSQL would name the first t_a_idx and then reject the second create.
+  const target = model(
+    table('t', {
+      columns: [column('a')],
+      indexes: [tableIndex(['a']), tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assertRefusal(
+    () => renderSql(plan(model(), target)),
+    'refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)',
+  );
+});
+
+test('refuses two index drops on one table that resolve to one name', () => {
+  // The baseline holds the same twin and the target keeps the table without its indexes:
+  // rendering drops t_a_idx twice, and the second DROP INDEX would fail at apply time.
+  const columns = [column('a')];
+  const baseline = model(
+    table('t', {
+      columns,
+      indexes: [tableIndex(['a']), tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assertRefusal(
+    () => renderSql(plan(baseline, model(table('t', { columns })))),
+    'refusing to render: index drops on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)',
+  );
+});
+
+test('refuses two explicit index creates sharing one name', () => {
+  // Hand-built: the planner pairs same-named indexes into `index-changed`, so two explicit
+  // creates never reach `renderSql` through `plan()` — but the public renderer refuses them.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: 't_a_idx' }),
+          },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['b'], { name: 't_a_idx' }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_idx": an index named "t_a_idx" on (a) and an index named "t_a_idx" on (b)',
+  );
+});
+
+test('refuses unnamed indexes whose synthesized names collide within one table', () => {
+  // A single column `a_b` and the pair `(a, b)` both synthesize `t_a_b_idx`; PostgreSQL would
+  // suffix the second name, so the rendered SQL could not round-trip and the plan is refused.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex(['a_b']) },
+          { kind: 'create-index', table: identity('t'), index: tableIndex(['a', 'b']) },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_b_idx": an unnamed index on (a_b) and an unnamed index on (a, b)',
+  );
+});
+
+test('renders an unnamed index beside a differently named explicit one', () => {
+  // The synthesized t_a_idx and the explicit t_b_idx differ, so both creates render.
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('b')],
+      indexes: [tableIndex(['a']), tableIndex(['b'], { name: 't_b_idx' })],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(model(), target)),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.t (',
+      '    a text,',
+      '    b text',
+      ');',
+      'CREATE INDEX ON public.t USING btree (a);',
+      'CREATE INDEX t_b_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a plain create for an imported index whose IF NOT EXISTS clause was flagged', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS t_a_idx ON public.t USING btree (a);`,
+  ].join('\n');
+
+  // The clause is flagged and dropped at import (`import.test.ts` pins the flag) and the
+  // conventional name strips, so the plan renders the plain create: a `CREATE INDEX IF NOT
+  // EXISTS` re-run would hide the drift, which surfaces at apply instead.
+  const { model: imported } = await importDump(dump);
+  const sql = renderSql(plan(model(), imported));
+  assert.ok(sql.includes('CREATE INDEX ON public.t USING btree (a);'));
+  assert.ok(
+    sql.indexOf('CREATE INDEX ON public.t USING btree (a);') > sql.indexOf('BEGIN;') &&
+      sql.indexOf('CREATE INDEX ON public.t USING btree (a);') < sql.indexOf('COMMIT;'),
+    'the index create renders inside the transaction',
+  );
+  assert.doesNotMatch(sql, /IF NOT EXISTS/);
+});
+
+test('renders plain creates for imported tables and sequences whose IF NOT EXISTS was flagged', async () => {
+  const dump = [
+    `CREATE TABLE IF NOT EXISTS public.t (a integer);`,
+    `CREATE SEQUENCE IF NOT EXISTS public.s;`,
+  ].join('\n');
+
+  // Both clauses are flagged and dropped at import (`import.test.ts` pins the flags), so the
+  // plan renders plain creates; a re-run with the clause would hide drift instead of surfacing
+  // it at apply.
+  const { model: imported } = await importDump(dump);
+  const sql = renderSql(plan(model(), imported));
+  assert.ok(sql.includes('CREATE TABLE public.t ('));
+  assert.ok(sql.includes('CREATE SEQUENCE public.s AS bigint'));
+  assert.doesNotMatch(sql, /IF NOT EXISTS/);
+});
+
+test('renders a drop and a create of one name across the polarity', () => {
+  // `index-changed` decomposes into a drop and a create of the same name, which is
+  // legitimate; only same-polarity duplicates are refused.
+  const columns = [column('a'), column('b')];
+  const baseline = model(
+    table('t', { columns, indexes: [tableIndex(['a'], { name: 't_a_idx' })] }),
+  );
+  const target = model(table('t', { columns, indexes: [tableIndex(['b'], { name: 't_a_idx' })] }));
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'DROP INDEX public.t_a_idx;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('refuses unnamed index predictions that collapse under truncation', () => {
+  // Both predictions exceed 63 bytes and collapse onto one server form; without the guard the
+  // second create would fail at apply time, or the second drop would be a no-op.
+  const hundred = 'x'.repeat(100);
+  const hundredOne = 'x'.repeat(101);
+  const server = `t_${'x'.repeat(57)}_idx`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundredOne]) },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an unnamed index on (${hundredOne}) (predicting "t_${hundredOne}_idx")`,
+  );
+});
+
+test('refuses an unnamed prediction against an explicit name equal to its server form', () => {
+  // The explicit name is exactly the server form the unnamed index predicts, so PostgreSQL
+  // would name the first index and then reject the second create.
+  const hundred = 'x'.repeat(100);
+  const server = `t_${'x'.repeat(57)}_idx`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: server }),
+          },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an index named "${server}" on (a)`,
+  );
+});
+
+test('refuses an explicit name longer than 63 bytes that clips onto a prediction', () => {
+  // The guard compares the explicit name in its server form — its first 63 bytes — so the
+  // over-long name collides with the unnamed index's truncated prediction. The stated name is
+  // already shown in full, so no prediction is repeated for it.
+  const hundred = 'x'.repeat(100);
+  const server = `t_${'x'.repeat(57)}_idx`;
+  const explicit = `${server}${'y'.repeat(10)}`;
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
+          {
+            kind: 'create-index',
+            table: identity('t'),
+            index: tableIndex(['a'], { name: explicit }),
+          },
+        ),
+      ),
+    `refusing to render: index creates on public.t would share the name "${server}": ` +
+      `an unnamed index on (${hundred}) (predicting "t_${hundred}_idx") and ` +
+      `an index named "${explicit}" on (a)`,
+  );
+});
+
+test('renders long unnamed names that do not collapse', () => {
+  // Different server forms: the guard must not refuse long names merely for being long.
+  const x = 'x'.repeat(100);
+  const y = 'y'.repeat(100);
+
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-index', table: identity('t'), index: tableIndex([x]) },
+        { kind: 'drop-index', table: identity('t'), index: tableIndex([y]) },
+      ),
+    ),
+    [
+      'BEGIN;',
+      `DROP INDEX public.t_${'x'.repeat(57)}_idx;`,
+      `DROP INDEX public.t_${'y'.repeat(57)}_idx;`,
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('partition violations stay plain Error, never RenderRefusalError', () => {
+  // The guard runs after the partition assertion, so a malformed plan reports its tiling
+  // violation even when it also holds colliding index creates.
+  let caught: unknown;
+  try {
+    renderSql({
+      steps: [
+        { kind: 'create-index', table: identity('t'), index: tableIndex(['a']) },
+        {
+          kind: 'create-index',
+          table: identity('t'),
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+      ],
+      groups: [],
+    });
+  } catch (error) {
+    caught = error;
+  }
+  if (!(caught instanceof Error)) assert.fail(`expected an Error, caught ${String(caught)}`);
+  assert.ok(!(caught instanceof RenderRefusalError), 'the partition check throws first');
+  assert.match(caught.message, /plan\.groups must tile \[0, 2\) in order, but found no groups/);
 });
 
 test('binds the SqlRenderer seam', () => {
@@ -1193,6 +2819,8 @@ test('renders both identity conversions in policy order', () => {
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer', ownedBy: owner('t', 'id') })],
+    views: [],
+    extensions: [],
   };
   const identityTarget = model(
     table('t', {
@@ -1225,6 +2853,8 @@ test('renders both identity conversions in policy order', () => {
       }),
     ],
     sequences: [sequence('t_id_seq', { dataType: 'integer' })],
+    views: [],
+    extensions: [],
   };
 
   assert.equal(
@@ -1328,6 +2958,128 @@ test('golden: drops and adds unique and check constraints', () => {
   assertGolden('constraints', baseline, target);
 });
 
+test('golden: renders constraint attributes in every position', () => {
+  const events = table('events', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('name')],
+  });
+  const eventsTarget = table('events', {
+    columns: [column('id', { type: 'integer', notNull: true }), column('name')],
+    primaryKey: {
+      name: 'events_pkey',
+      columns: ['id'],
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  });
+  const users = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true, notNullName: 'users_email_not_null' }),
+      column('nickname', { notNull: true }),
+      column('handle'),
+    ],
+    uniqueConstraints: [uniqueConstraint(['email'], { name: 'users_email_key' })],
+  });
+  const usersTarget = table('users', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email', { notNull: true }),
+      column('nickname'),
+      column('handle', { notNull: true, notNullName: 'users_handle_not_null' }),
+    ],
+    uniqueConstraints: [
+      uniqueConstraint(['email'], {
+        name: 'users_email_key',
+        deferrable: true,
+        initiallyDeferred: true,
+      }),
+    ],
+    checkConstraints: [
+      checkConstraint("nickname <> ''", {
+        name: 'users_nickname_check',
+        enforcement: 'not-enforced',
+      }),
+    ],
+  });
+  const orders = table('orders', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('user_id', { type: 'integer', notNull: true }),
+    ],
+    foreignKeys: [
+      foreignKey(['user_id'], identity('users'), {
+        name: 'orders_user_id_fkey',
+        referencedColumns: ['id'],
+        onDelete: 'CASCADE',
+      }),
+    ],
+  });
+  const ordersTarget = table('orders', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('user_id', { type: 'integer', notNull: true }),
+    ],
+    foreignKeys: [
+      foreignKey(['user_id'], identity('users'), {
+        name: 'orders_user_id_fkey',
+        referencedColumns: ['id'],
+        onDelete: 'CASCADE',
+        deferrable: true,
+        initiallyDeferred: true,
+        enforcement: 'not-valid',
+      }),
+    ],
+  });
+
+  assertGolden(
+    'constraint-attributes',
+    model(events, users, orders),
+    model(eventsTarget, usersTarget, ordersTarget),
+  );
+});
+
+test('golden: renders two in-place enforcement flips at their drop positions', () => {
+  // The CLI's `constraint-enforcement` fixture shape: an untouched `teams` parent with one
+  // child relaxed and one tightened. The plan keeps its phase-major drop+add decomposition —
+  // `drop guests, drop members, add guests, add members` — and target 18 renders one ALTER at
+  // each drop position instead. This golden is target-18-only and stays out of the 13 floor.
+  const teams = table('teams', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+    primaryKey: { name: 'teams_pkey', columns: ['id'] },
+  });
+  const teamKey = (name: string, enforcement?: ConstraintEnforcement): ForeignKey =>
+    foreignKey(['team_id'], identity('teams'), {
+      name,
+      referencedColumns: ['id'],
+      ...(enforcement === undefined ? {} : { enforcement }),
+    });
+  const guests = (enforcement?: ConstraintEnforcement): Table =>
+    table('guests', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'guests_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('guests_team_fk', enforcement)],
+    });
+  const members = (enforcement?: ConstraintEnforcement): Table =>
+    table('members', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('team_id', { type: 'integer' }),
+      ],
+      primaryKey: { name: 'members_pkey', columns: ['id'] },
+      foreignKeys: [teamKey('members_team_fk', enforcement)],
+    });
+
+  assertGolden(
+    'foreign-key-enforcement',
+    model(teams, guests(undefined), members('not-enforced')),
+    model(teams, guests('not-enforced'), members(undefined)),
+    { targetVersion: 18 },
+  );
+});
+
 test('golden: creates, changes, and drops standalone indexes', () => {
   const columns = [
     column('id', { type: 'integer', notNull: true }),
@@ -1404,4 +3156,652 @@ test('golden: a mixed multi-group plan separates its groups with blank lines', (
   });
 
   assertGolden('multi-group', model(parent, child), model(parent, childTarget));
+});
+
+test('golden: renders column attributes and table persistence', () => {
+  const attrs = table('attrs', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('label', { collation: 'pg_catalog."C"' }),
+      column('code', { collation: 'pg_catalog."C"' }),
+      column('bare'),
+      column('s_add'),
+      column('s_reset', { storage: 'main' }),
+      column('comp_add'),
+      column('comp_reset', { compression: 'pglz' }),
+      column('merged', { collation: 'pg_catalog."C"', storage: 'external' }),
+    ],
+  });
+  const attrsTarget = table('attrs', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('label', { collation: 'pg_catalog."POSIX"' }),
+      column('code'),
+      column('bare', { collation: 'pg_catalog."C"' }),
+      column('s_add', { storage: 'external' }),
+      column('s_reset'),
+      column('comp_add', { compression: 'lz4' }),
+      column('comp_reset'),
+      column('merged', {
+        type: 'character varying(12)',
+        collation: 'pg_catalog."POSIX"',
+        storage: 'external',
+      }),
+      column('added', {
+        collation: 'pg_catalog."C"',
+        storage: 'extended',
+        compression: 'pglz',
+      }),
+    ],
+  });
+  const created = table('created', {
+    persistence: 'unlogged',
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('fresh', { collation: 'pg_catalog."C"', storage: 'external', compression: 'pglz' }),
+    ],
+  });
+  const columns = [column('id', { type: 'integer' })];
+  const flipped = table('flipped', { columns });
+  const flippedTarget = table('flipped', { persistence: 'unlogged', columns });
+  const backed = table('backed', { persistence: 'unlogged', columns });
+
+  assertGolden(
+    'column-attributes',
+    model(attrs, flipped, backed),
+    model(attrsTarget, flippedTarget, table('backed', { columns }), created),
+    { targetVersion: 16 },
+  );
+});
+
+test('a view addition renders CREATE VIEW, with its check option when it has one', () => {
+  const plain = view('active', { definition: 'SELECT id FROM public.accounts WHERE active' });
+  const checked = view('positive', {
+    definition: 'SELECT id FROM public.accounts',
+    checkOption: 'local',
+  });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([plain, checked]))),
+    [
+      'BEGIN;',
+      'CREATE VIEW public.active AS SELECT id FROM public.accounts WHERE active;',
+      'CREATE VIEW public.positive AS SELECT id FROM public.accounts WITH LOCAL CHECK OPTION;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a cascaded check option renders its own words', () => {
+  const checked = view('v', { checkOption: 'cascaded' });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([checked]))),
+    'BEGIN;\nCREATE VIEW public.v AS SELECT 1 WITH CASCADED CHECK OPTION;\nCOMMIT;\n',
+  );
+});
+
+test('a materialized view addition renders WITH NO DATA', () => {
+  const totals = view('totals', { materialized: true, definition: 'SELECT count(*) FROM t' });
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([totals]))),
+    'BEGIN;\nCREATE MATERIALIZED VIEW public.totals AS SELECT count(*) FROM t WITH NO DATA;\nCOMMIT;\n',
+  );
+});
+
+test('a view removal renders the DROP matching its kind', () => {
+  const plain = view('active');
+  const totals = view('totals', { materialized: true });
+
+  assert.equal(
+    renderSql(plan(viewModel([plain, totals]), model())),
+    [
+      'BEGIN;',
+      'DROP VIEW public.active;',
+      'DROP MATERIALIZED VIEW public.totals;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a changed plain view renders one CREATE OR REPLACE statement', () => {
+  const baseline = viewModel([view('v')]);
+  const target = viewModel([view('v', { definition: 'SELECT 2', checkOption: 'cascaded' })]);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'CREATE OR REPLACE VIEW public.v AS SELECT 2 WITH CASCADED CHECK OPTION;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a changed materialized view drops it before the table work and recreates it after', () => {
+  const t = table('t', { columns: [column('id', { type: 'integer' })] });
+  const baseline = viewModel([view('m', { materialized: true })], t);
+  const target = viewModel([view('m', { materialized: true, definition: 'SELECT 2' })], t);
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'DROP MATERIALIZED VIEW public.m;',
+      'CREATE MATERIALIZED VIEW public.m AS SELECT 2 WITH NO DATA;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('view identifiers quote and the definition renders verbatim on one line', () => {
+  const quoted = view('Order View', { definition: "SELECT 'a b' AS label, 1 + 2 AS total" }, 'app');
+
+  assert.equal(
+    renderSql(plan(model(), viewModel([quoted]))),
+    'BEGIN;\nCREATE SCHEMA IF NOT EXISTS app;\nCREATE VIEW app."Order View" AS SELECT \'a b\' AS label, 1 + 2 AS total;\nCOMMIT;\n',
+  );
+});
+
+test('a materialized replace-view is refused with a pinned message', () => {
+  const materialized = view('m', { materialized: true });
+
+  assert.throws(
+    () => renderSql(planOf({ kind: 'replace-view', view: materialized })),
+    (error: unknown) =>
+      error instanceof RenderRefusalError &&
+      error.message ===
+        'refusing to render: replace-view on public.m cannot replace a materialized view',
+  );
+});
+
+test('extension steps render create, alter from field.after, and drop, never IF NOT EXISTS', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-extension', extension: extension('pgcrypto', {}, 'app') },
+        {
+          kind: 'alter-extension',
+          extension: { name: 'hstore' },
+          fields: [{ field: 'schema', before: 'legacy', after: 'app' }],
+        },
+        { kind: 'drop-extension', extension: { name: 'citext' } },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE EXTENSION pgcrypto WITH SCHEMA app;',
+      'ALTER EXTENSION hstore SET SCHEMA app;',
+      'DROP EXTENSION citext;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('extension names stay bare and quote by need, never schema-qualified', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-extension', extension: extension('postgis-topology', {}, 'gis') },
+        { kind: 'create-extension', extension: extension('Order', {}, 'Sales') },
+        { kind: 'create-extension', extension: extension('app.citext') },
+        { kind: 'drop-extension', extension: { name: 'Mixed Case' } },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE EXTENSION "postgis-topology" WITH SCHEMA gis;',
+      'CREATE EXTENSION "Order" WITH SCHEMA "Sales";',
+      'CREATE EXTENSION "app.citext" WITH SCHEMA public;',
+      'DROP EXTENSION "Mixed Case";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('golden: drops, creates, and replaces views and materialized views', () => {
+  // The view drops land before the table work, the creates and replaces after it, and both
+  // view buckets keep identity order: a kind change contributes its baseline-kind drop and its
+  // target-kind create, a changed matview is recreated WITH NO DATA, and a changed plain view
+  // is replaced in place, check option included.
+  const accounts = table('accounts', {
+    columns: [
+      column('id', { type: 'integer', notNull: true }),
+      column('email'),
+      column('active', { type: 'boolean', notNull: true }),
+      column('balance', { type: 'integer', notNull: true }),
+    ],
+  });
+  const stale = table('stale', { columns: [column('id', { type: 'integer' })] });
+  const ledger = table('ledger', {
+    columns: [column('id', { type: 'integer', notNull: true })],
+  });
+
+  const baseline = viewModel(
+    [
+      view(
+        'demote',
+        {
+          materialized: true,
+          definition: 'SELECT team_id,count(*) AS n FROM app.events GROUP BY team_id',
+        },
+        'app',
+      ),
+      view(
+        'gone_totals',
+        { materialized: true, definition: 'SELECT count(*) AS n FROM app.events' },
+        'app',
+      ),
+      view('gone_view', { definition: 'SELECT id FROM app.events' }, 'app'),
+      view('promote', { definition: 'SELECT id,count(*) AS n FROM app.events GROUP BY id' }, 'app'),
+      view('active', {
+        definition: 'SELECT id,email FROM public.accounts WHERE active',
+      }),
+      view('checked', {
+        definition: 'SELECT id FROM public.accounts WHERE balance > 0',
+        checkOption: 'local',
+      }),
+      view('kept', { definition: 'SELECT id FROM public.accounts' }),
+      view('totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+      }),
+    ],
+    accounts,
+    stale,
+  );
+  const target = viewModel(
+    [
+      view(
+        'demote',
+        {
+          definition: 'SELECT team_id,count(*) AS n FROM app.events GROUP BY team_id',
+        },
+        'app',
+      ),
+      view(
+        'promote',
+        {
+          materialized: true,
+          definition: 'SELECT id,count(*) AS n FROM app.events GROUP BY id',
+        },
+        'app',
+      ),
+      view('active', {
+        definition:
+          'SELECT id,email,active FROM public.accounts WHERE active AND email IS NOT NULL',
+      }),
+      view('added', { definition: 'SELECT id FROM public.ledger' }),
+      view('checked', {
+        definition: 'SELECT id FROM public.accounts WHERE balance > 0',
+        checkOption: 'cascaded',
+      }),
+      view('kept', { definition: 'SELECT id FROM public.accounts' }),
+      view('new_totals', {
+        materialized: true,
+        definition: 'SELECT team_id,count(*) AS n FROM public.accounts GROUP BY team_id',
+      }),
+      view('positive', {
+        definition: 'SELECT id FROM public.accounts WHERE balance >= 0',
+        checkOption: 'local',
+      }),
+      view('totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts WHERE active',
+      }),
+    ],
+    accounts,
+    ledger,
+  );
+
+  assertGolden('views', baseline, target);
+});
+
+/** One `comment` step for `target`; an absent `text` is the removal. */
+const commentStep = (target: CommentTarget, text?: string): Step => ({
+  kind: 'comment',
+  target,
+  ...(text === undefined ? {} : { text }),
+});
+
+/**
+ * The single statement one comment step renders, asserting the statement stays on one line:
+ * `BEGIN;`, the statement, `COMMIT;`, and the trailing newline.
+ */
+const commentStatement = (
+  text: string | undefined,
+  target: CommentTarget = { kind: 'table', table: identity('t') },
+): string => {
+  const lines = renderSql(planOf(commentStep(target, text))).split('\n');
+  assert.equal(lines.length, 4, 'BEGIN, one statement, COMMIT, and the trailing newline');
+  return lines[1]!;
+};
+
+test('renders COMMENT ON for every target kind, synthesizing unnamed names', () => {
+  const primaryKey: PrimaryKey = { columns: ['id'] };
+  const unique = uniqueConstraint(['a', 'b']);
+  const check = checkConstraint('a > 0');
+  const key = foreignKey(['a'], identity('parent'), { referencedColumns: ['id'] });
+  const index = tableIndex(['b']);
+  const target = table('t', {
+    columns: [column('a'), column('b')],
+    primaryKey,
+    uniqueConstraints: [unique],
+    checkConstraints: [check],
+    foreignKeys: [key],
+    indexes: [index],
+  });
+
+  assert.equal(
+    renderSql(
+      planOf(
+        commentStep({ kind: 'table', table: target }, 'table'),
+        commentStep({ kind: 'column', table: target, column: 'a' }, 'column'),
+        commentStep({ kind: 'sequence', sequence: identity('s') }, 'sequence'),
+        commentStep({ kind: 'view', view: identity('v'), materialized: false }, 'view'),
+        commentStep({ kind: 'view', view: identity('mv'), materialized: true }, 'matview'),
+        commentStep({ kind: 'extension', extension: { name: 'hstore' } }, 'extension'),
+        commentStep({ kind: 'index', table: target, index }, 'index'),
+        commentStep({ kind: 'primary-key', table: target, primaryKey }, 'primary'),
+        commentStep(
+          { kind: 'unique-constraint', table: target, uniqueConstraint: unique },
+          'unique',
+        ),
+        commentStep({ kind: 'check-constraint', table: target, checkConstraint: check }, 'check'),
+        commentStep({ kind: 'foreign-key', table: target, foreignKey: key }, 'foreign'),
+      ),
+    ),
+    [
+      'BEGIN;',
+      "COMMENT ON TABLE public.t IS 'table';",
+      "COMMENT ON COLUMN public.t.a IS 'column';",
+      "COMMENT ON SEQUENCE public.s IS 'sequence';",
+      "COMMENT ON VIEW public.v IS 'view';",
+      "COMMENT ON MATERIALIZED VIEW public.mv IS 'matview';",
+      "COMMENT ON EXTENSION hstore IS 'extension';",
+      "COMMENT ON INDEX public.t_b_idx IS 'index';",
+      "COMMENT ON CONSTRAINT t_pkey ON public.t IS 'primary';",
+      "COMMENT ON CONSTRAINT t_a_b_key ON public.t IS 'unique';",
+      "COMMENT ON CONSTRAINT t_a_check ON public.t IS 'check';",
+      "COMMENT ON CONSTRAINT t_a_fkey ON public.t IS 'foreign';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('comment statements quote identifiers and keep explicit names as stored', () => {
+  const order = { schema: 'app', name: 'Order' };
+
+  assert.equal(
+    renderSql(
+      planOf(
+        commentStep({ kind: 'column', table: order, column: 'Mixed Case' }, 'column'),
+        commentStep(
+          {
+            kind: 'index',
+            table: order,
+            index: tableIndex(['Mixed Case'], { name: 'we"ird' }),
+          },
+          'index',
+        ),
+        commentStep(
+          {
+            kind: 'unique-constraint',
+            table: order,
+            uniqueConstraint: uniqueConstraint(['Mixed Case'], { name: 'we"ird key' }),
+          },
+          'unique',
+        ),
+        commentStep({ kind: 'sequence', sequence: { schema: 'app', name: 'S q' } }, 'sequence'),
+      ),
+    ),
+    [
+      'BEGIN;',
+      `COMMENT ON COLUMN app."Order"."Mixed Case" IS 'column';`,
+      `COMMENT ON INDEX app."we""ird" IS 'index';`,
+      `COMMENT ON CONSTRAINT "we""ird key" ON app."Order" IS 'unique';`,
+      `COMMENT ON SEQUENCE app."S q" IS 'sequence';`,
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('COMMENT ON EXTENSION keeps the target bare, with text or IS NULL', () => {
+  assert.equal(
+    commentStatement('Key-value pairs', { kind: 'extension', extension: { name: 'hstore' } }),
+    `COMMENT ON EXTENSION hstore IS 'Key-value pairs';`,
+  );
+  assert.equal(
+    commentStatement("it's ordered", { kind: 'extension', extension: { name: 'Order' } }),
+    `COMMENT ON EXTENSION "Order" IS 'it''s ordered';`,
+  );
+  assert.equal(
+    commentStatement(undefined, {
+      kind: 'extension',
+      extension: { name: 'postgis-topology' },
+    }),
+    'COMMENT ON EXTENSION "postgis-topology" IS NULL;',
+  );
+});
+
+test('a comment removal renders IS NULL', () => {
+  assert.equal(commentStatement(undefined), 'COMMENT ON TABLE public.t IS NULL;');
+  assert.equal(
+    commentStatement(undefined, { kind: 'column', table: identity('t'), column: 'a' }),
+    'COMMENT ON COLUMN public.t.a IS NULL;',
+  );
+});
+
+test('comment text renders plainly when line-safe and escapes otherwise', () => {
+  assert.equal(commentStatement("it's ready"), `COMMENT ON TABLE public.t IS 'it''s ready';`);
+  assert.equal(commentStatement('a -- b; c'), `COMMENT ON TABLE public.t IS 'a -- b; c';`);
+  assert.equal(
+    commentStatement('naïve — 日本語'),
+    `COMMENT ON TABLE public.t IS 'naïve — 日本語';`,
+  );
+  assert.equal(commentStatement(''), `COMMENT ON TABLE public.t IS '';`);
+
+  // A backslash or any C0/DEL control forces the E'' form, one statement on one line.
+  assert.equal(commentStatement('a\\b'), `COMMENT ON TABLE public.t IS E'a\\\\b';`);
+  assert.equal(
+    commentStatement('line one\nline two'),
+    `COMMENT ON TABLE public.t IS E'line one\\nline two';`,
+  );
+  assert.equal(commentStatement('a\rb'), `COMMENT ON TABLE public.t IS E'a\\rb';`);
+  assert.equal(commentStatement('a\tb'), `COMMENT ON TABLE public.t IS E'a\\tb';`);
+  assert.equal(commentStatement('a\u0001b'), `COMMENT ON TABLE public.t IS E'a\\x01b';`);
+  assert.equal(commentStatement('a\u007fb'), `COMMENT ON TABLE public.t IS E'a\\x7fb';`);
+  assert.equal(commentStatement("it's \\"), `COMMENT ON TABLE public.t IS E'it''s \\\\';`);
+});
+
+test('a comment containing NUL is refused with RenderRefusalError', () => {
+  assert.throws(
+    () => commentStatement('a\u0000b'),
+    (error: unknown) =>
+      error instanceof RenderRefusalError &&
+      error.message === 'refusing to render: a comment cannot contain a NUL character',
+  );
+});
+
+test("a comment step's text wins over a stale comment on its target node", () => {
+  const staleIndex = tableIndex(['a'], { comment: 'stale' });
+  assert.equal(
+    commentStatement('fresh', { kind: 'index', table: identity('t'), index: staleIndex }),
+    `COMMENT ON INDEX public.t_a_idx IS 'fresh';`,
+  );
+
+  const staleCheck = checkConstraint('a > 0', { comment: 'stale' });
+  assert.equal(
+    commentStatement(undefined, {
+      kind: 'check-constraint',
+      table: identity('t'),
+      checkConstraint: staleCheck,
+    }),
+    'COMMENT ON CONSTRAINT t_a_check ON public.t IS NULL;',
+  );
+});
+
+test('golden: comments on every modeled family, a removal, and escaping', () => {
+  // Only comments differ between the models, so the plan is the terminal comment phase alone:
+  // seven target kinds (both view kinds and each unnamed constraint kind), a table change, a
+  // column removal, and one text exercising the escape matrix.
+  const note = "it's a \\ backslash\nsecond line\twith a tab -- and a semicolon; ok";
+  const baseline: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email'),
+          column('legacy_note', { comment: 'Retired note' }),
+          column('note'),
+        ],
+        primaryKey: { columns: ['id'] },
+        uniqueConstraints: [uniqueConstraint(['email'])],
+        checkConstraints: [checkConstraint('email IS NOT NULL')],
+        indexes: [tableIndex(['email'])],
+        comment: 'Legacy customer accounts',
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), { referencedColumns: ['id'] }),
+        ],
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq')],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+      }),
+      view('active_accounts', { definition: 'SELECT id FROM public.accounts' }),
+    ],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [
+      table('accounts', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('email', { comment: 'Sign-in address' }),
+          column('legacy_note'),
+          column('note', { comment: note }),
+        ],
+        primaryKey: { columns: ['id'], comment: 'Account identity' },
+        uniqueConstraints: [uniqueConstraint(['email'], { comment: 'One account per address' })],
+        checkConstraints: [
+          checkConstraint('email IS NOT NULL', { comment: 'An account needs an address' }),
+        ],
+        indexes: [tableIndex(['email'], { comment: 'Lookup by address' })],
+        comment: 'Customer accounts — one row per signup.',
+      }),
+      table('orders', {
+        columns: [
+          column('id', { type: 'integer', notNull: true }),
+          column('account_id', { type: 'integer' }),
+        ],
+        foreignKeys: [
+          foreignKey(['account_id'], identity('accounts'), {
+            referencedColumns: ['id'],
+            comment: 'Owning account',
+          }),
+        ],
+      }),
+    ],
+    sequences: [sequence('accounts_id_seq', { comment: 'Account id sequence' })],
+    views: [
+      view('account_totals', {
+        materialized: true,
+        definition: 'SELECT count(*) AS n FROM public.accounts',
+        comment: 'Per-account totals',
+      }),
+      view('active_accounts', {
+        definition: 'SELECT id FROM public.accounts',
+        comment: 'Active accounts',
+      }),
+    ],
+    extensions: [],
+  };
+
+  assertGolden('comments', baseline, target);
+});
+
+test('golden: creates, moves, drops, and comments extensions', () => {
+  // Only extensions differ, so the plan is three global phases: phase 1 creates in name order
+  // (a quoted capital name, a plain name, a dashed name), the terminal comment phase in target
+  // identity order — including an addition onto an added extension and a removal — then phase
+  // 13 moves `hstore` and drops `citext`. A removed extension emits no comment step.
+  const baseline = extensionModel([
+    extension('citext', { comment: 'Case-insensitive text' }),
+    extension('hstore', { comment: 'Old comment' }, 'legacy'),
+    extension('pg_trgm', { comment: 'Trigram indexes' }),
+    extension('uuid-ossp', { comment: 'UUID generation' }),
+  ]);
+  const target = extensionModel([
+    extension('Order', { comment: 'Case-sensitive order rows' }, 'sales'),
+    extension('hstore', { comment: 'Key-value pairs' }, 'app'),
+    extension('pgcrypto', { comment: 'Cryptographic functions' }),
+    extension('pg_trgm'),
+    extension('postgis-topology', { comment: 'Topology support' }, 'gis'),
+    extension('uuid-ossp', { comment: 'UUID generation' }),
+  ]);
+
+  assertGolden('extensions', baseline, target);
+});
+
+test('create-schema renders IF NOT EXISTS and quotes when the schema needs it', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'create-schema', schema: 'app' },
+        { kind: 'create-schema', schema: 'Order' },
+        { kind: 'create-schema', schema: 'user' },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE SCHEMA IF NOT EXISTS app;',
+      'CREATE SCHEMA IF NOT EXISTS "Order";',
+      'CREATE SCHEMA IF NOT EXISTS "user";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('schema creates render before extension creates and the objects they hold', () => {
+  const target: Model = {
+    tables: [table('t', { schema: 'app', columns: [column('id')] })],
+    sequences: [],
+    views: [view('v', {}, 'sales')],
+    extensions: [extension('hstore', { schema: 'app' })],
+  };
+
+  assert.equal(
+    renderSql(plan(model(), target)),
+    [
+      'BEGIN;',
+      'CREATE SCHEMA IF NOT EXISTS app;',
+      'CREATE SCHEMA IF NOT EXISTS sales;',
+      'CREATE EXTENSION hstore WITH SCHEMA app;',
+      'CREATE TABLE app.t (',
+      '    id text',
+      ');',
+      'CREATE VIEW sales.v AS SELECT 1;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
 });

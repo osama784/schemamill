@@ -1,6 +1,6 @@
 + table app.gadgets
     id integer NOT NULL
-    primary key gadgets_pkey (id)
+    primary key (id)
 
 ~ table app.widgets
     ~ column id: type integer → bigint
@@ -13,11 +13,11 @@
 + table public.Quoted Added
     Key integer NOT NULL
     Value text
-    primary key Quoted Added_pkey (Key)
+    primary key (Key)
 
 - table public.Quoted Target
     id integer NOT NULL
-    primary key Quoted Target_pkey (id)
+    primary key (id)
 
 ~ table public.empty
     + column id integer NOT NULL

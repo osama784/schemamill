@@ -1,9 +1,9 @@
 /** The schemamill version. */
-export const version = '0.6.0';
+export const version = '0.7.0';
 
 export { diff } from './diff.ts';
 export { canonicalIntType, effectiveIdentity } from './identity.ts';
-export { plan } from './plan.ts';
+export { assertNever, plan } from './plan.ts';
 export type { TransactionGroup } from './plan.ts';
 export {
   defaultSequenceMax,
@@ -12,6 +12,14 @@ export {
   sequenceTypeBounds,
   sequenceTypeChange,
 } from './sequence.ts';
+export {
+  initWorkspace,
+  resolveWorkspace,
+  serializeModel,
+  writeWorkspaceModel,
+  WORKSPACE_DIR_NAME,
+  WORKSPACE_MODEL_FILE_NAME,
+} from './workspace.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';
 export type * from './hazard.ts';
@@ -20,3 +28,4 @@ export type * from './model.ts';
 export type * from './plan.ts';
 export type * from './seam.ts';
 export type * from './sequence.ts';
+export type * from './workspace.ts';

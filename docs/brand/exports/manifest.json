@@ -1,0 +1,315 @@
+{
+  "kit": "schemamill — logo kit exports",
+  "note": "Rendered by _tooling/build.mjs. Deterministic: two runs produce identical bytes. `source` paths are relative to this folder (exports/).",
+  "palette": {
+    "light": {
+      "ground": "#fbfaf6",
+      "ink": "#1c1f23",
+      "accent": "#a9522b"
+    },
+    "dark": {
+      "ground": "#1c1f23",
+      "ink": "#fbfaf6",
+      "accent": "#c96a3b"
+    }
+  },
+  "entries": [
+    {
+      "file": "favicon/favicon-16-light.png",
+      "bytes": 319,
+      "sha256": "01464f06c6a12a812510d306fb66dfede5faafb89892cb20172ef7e3c1210a1e",
+      "source": "../masters/mark-16-light.svg",
+      "tone": "light",
+      "purpose": "favicon 16×16 — 16 px cut (rows on the 16 px grid)",
+      "width": 16,
+      "height": 16,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-16-transparent-light.png",
+      "bytes": 287,
+      "sha256": "a78ac1fab2dde0acb06e54a4f01007e7d2a99be83698b9f93bdc98424ba1deb3",
+      "source": "../masters/mark-16-light.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "light",
+      "purpose": "favicon 16×16 — 16 px cut (rows on the 16 px grid), transparent",
+      "width": 16,
+      "height": 16,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-32-light.png",
+      "bytes": 508,
+      "sha256": "251fa3cb594d96ff42c9d267d204cfb488129740c64962eb45f601842917b769",
+      "source": "../masters/mark-small-light.svg",
+      "tone": "light",
+      "purpose": "favicon 32×32 — small cut (2+2)",
+      "width": 32,
+      "height": 32,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-32-transparent-light.png",
+      "bytes": 499,
+      "sha256": "9cf70f75d88083836b0e2c6f8f4190d5fc72bcdeb439dbedd60bde151b902a8d",
+      "source": "../masters/mark-small-light.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "light",
+      "purpose": "favicon 32×32 — small cut (2+2), transparent",
+      "width": 32,
+      "height": 32,
+      "kind": "png"
+    },
+    {
+      "file": "avatar/avatar-512-light.png",
+      "bytes": 6832,
+      "sha256": "8b9154d51cc9280baac498a554138a20ff50f75aeee933a6d56e12ebcde20cca",
+      "source": "../masters/mark-light.svg",
+      "tone": "light",
+      "purpose": "GitHub avatar 512×512 — master (3+3), circle-safe",
+      "width": 512,
+      "height": 512,
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-480-light.png",
+      "bytes": 6030,
+      "sha256": "31e4ebd46826149813a3f197b2fa1dfa6bfaec705c9024027304c4e7741a988b",
+      "source": "../masters/lockup-horizontal-light.svg",
+      "tone": "light",
+      "width": 480,
+      "height": 128,
+      "purpose": "README header lockup 480 px wide (1×)",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-480-transparent-light.png",
+      "bytes": 7476,
+      "sha256": "4a9ba8e31445221cad76bfaf378c789ae36f9ed7ef8e48f9a0f55363b071953d",
+      "source": "../masters/lockup-horizontal-light.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "light",
+      "width": 480,
+      "height": 128,
+      "purpose": "README header lockup 480 px wide, transparent",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-960-light.png",
+      "bytes": 13089,
+      "sha256": "451e3fe7d58b51782a1a36c91b0cca5f5ae09fb07af16dbed6efb1e48280c01c",
+      "source": "../masters/lockup-horizontal-light.svg",
+      "tone": "light",
+      "width": 960,
+      "height": 256,
+      "purpose": "README header lockup 960 px wide (2×)",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-960-transparent-light.png",
+      "bytes": 17102,
+      "sha256": "f0c32282a68d345374f87cad60602ded9ad43e5bbf25645235d2e587982183d1",
+      "source": "../masters/lockup-horizontal-light.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "light",
+      "width": 960,
+      "height": 256,
+      "purpose": "README header lockup 960 px wide, transparent",
+      "kind": "png"
+    },
+    {
+      "file": "linkedin/cover-lockup-light.svg",
+      "bytes": 6421,
+      "sha256": "14d37535bd3f7b6b77538004093079fdf392046b12e61045c5e81ac6e141b81c",
+      "source": "exports/linkedin/cover-lockup-light.svg — built by _tooling/covers.mjs",
+      "tone": "light",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover, lockup only — SVG source",
+      "kind": "svg-source"
+    },
+    {
+      "file": "linkedin/cover-lockup-light.png",
+      "bytes": 14520,
+      "sha256": "ca1af35da181aa9fcadffb2a9abeaeabd93a9508fe567d6899367929c02792b7",
+      "source": "linkedin/cover-lockup-light.svg",
+      "tone": "light",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover PNG, lockup only",
+      "kind": "png"
+    },
+    {
+      "file": "linkedin/cover-tagline-light.svg",
+      "bytes": 34522,
+      "sha256": "34ce07a81aa8283db096b1a573e5611af32a8b42b23b6bd65b2eaa03d94357c3",
+      "source": "exports/linkedin/cover-tagline-light.svg — built by _tooling/covers.mjs",
+      "tone": "light",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover, with tagline — SVG source",
+      "kind": "svg-source"
+    },
+    {
+      "file": "linkedin/cover-tagline-light.png",
+      "bytes": 25027,
+      "sha256": "96dfe68cec439e2b6c629cff80b6674b17c1b561104c1d7f04bf66d92bc8f15e",
+      "source": "linkedin/cover-tagline-light.svg",
+      "tone": "light",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover PNG, with tagline",
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-16-dark.png",
+      "bytes": 323,
+      "sha256": "1dc2c8140469d1f94a932650e6d693e8289e2d12ca8fffa02f95fbcac5bb0831",
+      "source": "../masters/mark-16-dark.svg",
+      "tone": "dark",
+      "purpose": "favicon 16×16 — 16 px cut (rows on the 16 px grid)",
+      "width": 16,
+      "height": 16,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-16-transparent-dark.png",
+      "bytes": 298,
+      "sha256": "850a9ff35d16d09f75271f03474dcd55c5620dfea4c180c98502c4442d74f928",
+      "source": "../masters/mark-16-dark.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "dark",
+      "purpose": "favicon 16×16 — 16 px cut (rows on the 16 px grid), transparent",
+      "width": 16,
+      "height": 16,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-32-dark.png",
+      "bytes": 504,
+      "sha256": "3c1f38252b12645e07629790fb61abc1116c3bae0715a473689d70f4a4268fd4",
+      "source": "../masters/mark-small-dark.svg",
+      "tone": "dark",
+      "purpose": "favicon 32×32 — small cut (2+2)",
+      "width": 32,
+      "height": 32,
+      "kind": "png"
+    },
+    {
+      "file": "favicon/favicon-32-transparent-dark.png",
+      "bytes": 508,
+      "sha256": "5b535e2ae3c166c612481427d577c1d3855b6c9336f74cab32ddff50401de0e4",
+      "source": "../masters/mark-small-dark.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "dark",
+      "purpose": "favicon 32×32 — small cut (2+2), transparent",
+      "width": 32,
+      "height": 32,
+      "kind": "png"
+    },
+    {
+      "file": "avatar/avatar-512-dark.png",
+      "bytes": 6723,
+      "sha256": "a553cde9aec6151d57274a0babf25f9407c438629063cce9db21ea9060a760a7",
+      "source": "../masters/mark-dark.svg",
+      "tone": "dark",
+      "purpose": "GitHub avatar 512×512 — master (3+3), circle-safe",
+      "width": 512,
+      "height": 512,
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-480-dark.png",
+      "bytes": 6028,
+      "sha256": "cde5f50ffd9ac51e120760c53609ce955ddfbadd88dc511a4a821ebcca40c1a2",
+      "source": "../masters/lockup-horizontal-dark.svg",
+      "tone": "dark",
+      "width": 480,
+      "height": 128,
+      "purpose": "README header lockup 480 px wide (1×)",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-480-transparent-dark.png",
+      "bytes": 6873,
+      "sha256": "dc765a9ca54f2cf42a1996a82809327acd19c810d31f0be7c9f90103dff4da93",
+      "source": "../masters/lockup-horizontal-dark.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "dark",
+      "width": 480,
+      "height": 128,
+      "purpose": "README header lockup 480 px wide, transparent",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-960-dark.png",
+      "bytes": 13033,
+      "sha256": "b5dbf5cd7e97a6235ce15f8994394449cd2c8c61dbac2d40bd67027a124d068d",
+      "source": "../masters/lockup-horizontal-dark.svg",
+      "tone": "dark",
+      "width": 960,
+      "height": 256,
+      "purpose": "README header lockup 960 px wide (2×)",
+      "kind": "png"
+    },
+    {
+      "file": "readme/lockup-horizontal-960-transparent-dark.png",
+      "bytes": 14506,
+      "sha256": "74a32d71932283debedf7e929e6dd7170cf89fac4fabfac068b6cf1efe3ec7c4",
+      "source": "../masters/lockup-horizontal-dark.svg — transparent variant: the `sm-bg` ground rect removed before rendering",
+      "tone": "dark",
+      "width": 960,
+      "height": 256,
+      "purpose": "README header lockup 960 px wide, transparent",
+      "kind": "png"
+    },
+    {
+      "file": "linkedin/cover-lockup-dark.svg",
+      "bytes": 6420,
+      "sha256": "83015f242ebdd58c31f3a9fffaeddbecb3c48441e8b2dbc8eb568f90b751c422",
+      "source": "exports/linkedin/cover-lockup-dark.svg — built by _tooling/covers.mjs",
+      "tone": "dark",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover, lockup only — SVG source",
+      "kind": "svg-source"
+    },
+    {
+      "file": "linkedin/cover-lockup-dark.png",
+      "bytes": 14461,
+      "sha256": "a92ee5f3b8e6e0f20b5f8d96cad4d0392d72f64cf75354b88b92f73b74f7b1a2",
+      "source": "linkedin/cover-lockup-dark.svg",
+      "tone": "dark",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover PNG, lockup only",
+      "kind": "png"
+    },
+    {
+      "file": "linkedin/cover-tagline-dark.svg",
+      "bytes": 34521,
+      "sha256": "3af894b2f8ac0b7960975cab25de448b86b8ec611d9654b12bfc3869702aaa76",
+      "source": "exports/linkedin/cover-tagline-dark.svg — built by _tooling/covers.mjs",
+      "tone": "dark",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover, with tagline — SVG source",
+      "kind": "svg-source"
+    },
+    {
+      "file": "linkedin/cover-tagline-dark.png",
+      "bytes": 24949,
+      "sha256": "3bf607f47fa42abe9036c732768c4bd8e3f3eeb1cff3a5ecfec249f0e5264673",
+      "source": "linkedin/cover-tagline-dark.svg",
+      "tone": "dark",
+      "width": 1584,
+      "height": 396,
+      "purpose": "LinkedIn cover PNG, with tagline",
+      "kind": "png"
+    },
+    {
+      "file": "../brand-sheet/brand-sheet@2x.png",
+      "source": "../brand-sheet/brand-sheet.html — headless Chromium, device scale 2",
+      "kind": "png",
+      "tone": "light",
+      "width": 2360,
+      "height": 7322,
+      "bytes": 1606997,
+      "sha256": "16c15d49bd11319e2561e81fc2b5779c6cd58089e5cda2e7d223e3879bb17172",
+      "purpose": "brand sheet, PNG @2x (the whole sheet, 1180 CSS px wide)"
+    }
+  ]
+}

@@ -7,6 +7,8 @@ import type { Identity } from './identity.ts';
 import type {
   CheckConstraint,
   Column,
+  ColumnAttributes,
+  Extension,
   ForeignKey,
   Index,
   Model,
@@ -16,7 +18,9 @@ import type {
   SequenceOwner,
   Table,
   TableIdentity,
+  TablePersistence,
   UniqueConstraint,
+  View,
 } from './model.ts';
 
 /**
@@ -44,6 +48,8 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  persistence?: TablePersistence;
+  comment?: string;
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -56,6 +62,8 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
+  ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
@@ -90,7 +98,12 @@ const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>>
 });
 
 /** A model of the given tables. */
-const model = (...tables: Table[]): Model => ({ tables, sequences: [] });
+const model = (...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views: [],
+  extensions: [],
+});
 
 /** A sequence named `name`: bigint ascending defaults unless overridden. */
 const sequence = (
@@ -132,6 +145,44 @@ const columnIdentity = (fields: Partial<Identity> = {}): Identity => ({
 const sequenceModel = (sequences: readonly Sequence[], ...tables: Table[]): Model => ({
   tables,
   sequences,
+  views: [],
+  extensions: [],
+});
+
+/** A view named `name`: plain with a `SELECT 1` definition unless overridden. */
+const view = (
+  name: string,
+  fields: Partial<Omit<View, 'schema' | 'name'>> = {},
+  schema = 'public',
+): View => ({
+  schema,
+  name,
+  materialized: false,
+  definition: 'SELECT 1',
+  ...fields,
+});
+
+/** A model of the given views, with no tables or sequences unless they are supplied. */
+const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
+  tables,
+  sequences: [],
+  views,
+  extensions: [],
+});
+
+/** An extension named `name`: installed in `public` unless overridden. */
+const extension = (name: string, fields: Partial<Omit<Extension, 'name'>> = {}): Extension => ({
+  name,
+  schema: 'public',
+  ...fields,
+});
+
+/** A model of the given extensions, with no tables, sequences, or views. */
+const extensionModel = (extensions: readonly Extension[]): Model => ({
+  tables: [],
+  sequences: [],
+  views: [],
+  extensions,
 });
 
 /** Freezes `value` and every object and array nested inside it. */
@@ -292,6 +343,7 @@ test('a column type change reports the type field', () => {
           kind: 'column-changed',
           name: 'c',
           fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -364,6 +416,477 @@ test('a column change reports type, notNull, then default', () => {
             { field: 'notNull', before: false, after: true },
             { field: 'default', before: '0' },
           ],
+          attributes: { type: 'bigint' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a column notNullName rename reports the name field alone', () => {
+  const baseline = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+  const target = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn2' })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNullName', before: 'c_nn', after: 'c_nn2' }],
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNullName', before: 'c_nn2', after: 'c_nn' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a notNullName added or removed reports only the stated side', () => {
+  const unnamed = model(table('t', { columns: [column('c', { notNull: true })] }));
+  const named = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+
+  assertDiff(unnamed, named, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'column-changed', name: 'c', fields: [{ field: 'notNullName', after: 'c_nn' }] },
+      ],
+    },
+  ]);
+  assertDiff(named, unnamed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'column-changed', name: 'c', fields: [{ field: 'notNullName', before: 'c_nn' }] },
+      ],
+    },
+  ]);
+});
+
+test('a column change reports type, notNull, notNullName, then default', () => {
+  const baseline = model(table('t', { columns: [column('c', { type: 'text', default: '0' })] }));
+  const target = model(
+    table('t', {
+      columns: [column('c', { type: 'bigint', notNull: true, notNullName: 'c_nn', default: '1' })],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'bigint' },
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+            { field: 'default', before: '0', after: '1' },
+          ],
+          attributes: { type: 'bigint' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a column change reports collation, storage, then compression after default', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          default: '0',
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'character varying(12)',
+          notNull: true,
+          notNullName: 'c_nn',
+          default: '1',
+          collation: 'pg_catalog."en_US"',
+          storage: 'main',
+          compression: 'pglz',
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'character varying(12)' },
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+            { field: 'default', before: '0', after: '1' },
+            { field: 'collation', before: 'pg_catalog."C"', after: 'pg_catalog."en_US"' },
+            { field: 'storage', before: 'extended', after: 'main' },
+            { field: 'compression', before: 'lz4', after: 'pglz' },
+          ],
+          attributes: {
+            type: 'character varying(12)',
+            collation: 'pg_catalog."en_US"',
+            storage: 'main',
+            compression: 'pglz',
+          },
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'character varying(12)', after: 'text' },
+            { field: 'notNull', before: true, after: false },
+            { field: 'notNullName', before: 'c_nn' },
+            { field: 'default', before: '1', after: '0' },
+            { field: 'collation', before: 'pg_catalog."en_US"', after: 'pg_catalog."C"' },
+            { field: 'storage', before: 'main', after: 'extended' },
+            { field: 'compression', before: 'pglz', after: 'lz4' },
+          ],
+          attributes: {
+            type: 'text',
+            collation: 'pg_catalog."C"',
+            storage: 'extended',
+            compression: 'lz4',
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a notNull-only or default-only column change carries no attributes', () => {
+  const base = column('c', {
+    collation: 'pg_catalog."C"',
+    storage: 'external',
+    compression: 'lz4',
+  });
+  const baseline = model(table('t', { columns: [base] }));
+
+  const qualified = model(
+    table('t', {
+      columns: [
+        column('c', {
+          notNull: true,
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  assertDiff(baseline, qualified, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'notNull', before: false, after: true }],
+        },
+      ],
+    },
+  ]);
+
+  const defaulted = model(
+    table('t', {
+      columns: [
+        column('c', {
+          default: 'now()',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  assertDiff(baseline, defaulted, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'default', after: 'now()' }],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a type change alone carries the unchanged explicit attributes', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'bigint',
+          collation: 'pg_catalog."C"',
+          storage: 'external',
+          compression: 'lz4',
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: {
+            type: 'bigint',
+            collation: 'pg_catalog."C"',
+            storage: 'external',
+            compression: 'lz4',
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('an attribute-only change reports the field and the target attributes', () => {
+  const plain = model(table('t', { columns: [column('c')] }));
+
+  const stored = model(table('t', { columns: [column('c', { storage: 'extended' })] }));
+  assertDiff(plain, stored, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'storage', after: 'extended' }],
+          attributes: { type: 'text', storage: 'extended' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(stored, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'storage', before: 'extended' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+
+  const compressed = model(table('t', { columns: [column('c', { compression: 'lz4' })] }));
+  assertDiff(plain, compressed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'compression', after: 'lz4' }],
+          attributes: { type: 'text', compression: 'lz4' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(compressed, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'compression', before: 'lz4' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+
+  const collated = model(table('t', { columns: [column('c', { collation: 'pg_catalog."C"' })] }));
+  assertDiff(plain, collated, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'collation', after: 'pg_catalog."C"' }],
+          attributes: { type: 'text', collation: 'pg_catalog."C"' },
+        },
+      ],
+    },
+  ]);
+  assertDiff(collated, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'collation', before: 'pg_catalog."C"' }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a persistence flip reports the persistence-changed member', () => {
+  const logged = table('t', { columns: [column('c')] });
+  const unlogged = table('t', { columns: [column('c')], persistence: 'unlogged' });
+
+  assertDiff(model(logged), model(unlogged), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'persistence-changed', after: 'unlogged' }],
+    },
+  ]);
+  assertDiff(model(unlogged), model(logged), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'persistence-changed', before: 'unlogged' }],
+    },
+  ]);
+  assertDiff(model(unlogged), model(unlogged), []);
+});
+
+test('a persistence change follows the column and index members', () => {
+  const before = table('t', {
+    columns: [column('c', { type: 'text' })],
+    indexes: [index(['c'], { name: 't_c_idx' })],
+  });
+  const after = table('t', {
+    columns: [column('c', { type: 'bigint' })],
+    persistence: 'unlogged',
+    indexes: [index(['c'], { name: 't_c_idx2' })],
+  });
+
+  assertDiff(model(before), model(after), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
+        },
+        { kind: 'index-removed', index: index(['c'], { name: 't_c_idx' }) },
+        { kind: 'index-added', index: index(['c'], { name: 't_c_idx2' }) },
+        { kind: 'persistence-changed', after: 'unlogged' },
+      ],
+    },
+  ]);
+});
+
+test('a nullable column gaining a named not-null fact reports both fields', () => {
+  const baseline = model(table('t', { columns: [column('c')] }));
+  const target = model(
+    table('t', { columns: [column('c', { notNull: true, notNullName: 'c_nn' })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'notNull', before: false, after: true },
+            { field: 'notNullName', after: 'c_nn' },
+          ],
+        },
+      ],
+    },
+  ]);
+  assertDiff(target, baseline, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'notNull', before: true, after: false },
+            { field: 'notNullName', before: 'c_nn' },
+          ],
         },
       ],
     },
@@ -390,6 +913,7 @@ test('type and default text compare exactly as stored', () => {
             { field: 'type', before: 'numeric(12, 2)', after: 'numeric(12,2)' },
             { field: 'default', before: 'now()', after: ' now() ' },
           ],
+          attributes: { type: 'numeric(12,2)' },
         },
       ],
     },
@@ -672,6 +1196,7 @@ test('a column type change suppresses an identity bound the AS conversion moves'
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -713,6 +1238,7 @@ test('a column type change restates an identity bound the AS conversion would mo
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
           identity: {
             kind: 'changed',
             fields: [
@@ -763,6 +1289,7 @@ test('a column type change restates an identity minimum the AS conversion would 
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'smallint', after: 'integer' }],
+          attributes: { type: 'integer' },
           identity: {
             kind: 'changed',
             fields: [
@@ -815,6 +1342,7 @@ test('as-written integer aliases do not convert identity bounds', () => {
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'int4', after: 'integer' }],
+          attributes: { type: 'integer' },
         },
       ],
     },
@@ -944,6 +1472,41 @@ test('payload columns carry their identity as an independent copy', () => {
   }
 });
 
+test('added and removed table payloads carry persistence and the new column fields', () => {
+  const unlogged = table('t', {
+    columns: [
+      column('c', {
+        type: 'bigint',
+        collation: 'pg_catalog."C"',
+        storage: 'main',
+        compression: 'pglz',
+      }),
+    ],
+    persistence: 'unlogged',
+  });
+
+  assertDiff(model(), model(unlogged), [{ kind: 'table-added', table: unlogged }]);
+  assertDiff(model(unlogged), model(), [{ kind: 'table-removed', table: unlogged }]);
+});
+
+test('a changed column carries the attributes as an independent copy', () => {
+  const targetStorage = 'main';
+  const baseline = model(table('t', { columns: [column('c', { storage: 'external' })] }));
+  const target = model(table('t', { columns: [column('c', { storage: targetStorage })] }));
+
+  const changed = diff(baseline, target)[0]!;
+  assert.equal(changed.kind, 'table-changed');
+  if (changed.kind !== 'table-changed') throw new Error('expected a changed table');
+  const columnChange = changed.changes[0];
+  assert.equal(columnChange?.kind, 'column-changed');
+  if (columnChange?.kind !== 'column-changed') throw new Error('expected a column change');
+  const attributes = columnChange.attributes;
+  assert.ok(attributes !== undefined, 'a storage change must carry the target attributes');
+
+  (attributes as Mutable<ColumnAttributes>).storage = 'plain';
+  assert.equal(target.tables[0]!.columns[0]!.storage, targetStorage);
+});
+
 test('a deep-frozen model with identities can be diffed', () => {
   const baseline = deepFreeze(
     model(
@@ -975,6 +1538,7 @@ test('a deep-frozen model with identities can be diffed', () => {
           kind: 'column-changed',
           name: 'id',
           fields: [{ field: 'type', before: 'integer', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
       ],
     },
@@ -1104,6 +1668,76 @@ test('a primary key name change is a change', () => {
   ]);
 });
 
+test('a primary key deferrability change is a change', () => {
+  const columns = [column('id', { notNull: true })];
+  const plain = model(table('t', { columns, primaryKey: { name: 't_pkey', columns: ['id'] } }));
+  const deferrable = model(
+    table('t', {
+      columns,
+      primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
+    }),
+  );
+  const deferred = model(
+    table('t', {
+      columns,
+      primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+    }),
+  );
+
+  assertDiff(plain, deferrable, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'] },
+          after: { name: 't_pkey', columns: ['id'], deferrable: true },
+        },
+      ],
+    },
+  ]);
+  assertDiff(deferrable, deferred, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'], deferrable: true },
+          after: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+        },
+      ],
+    },
+  ]);
+  assertDiff(deferred, plain, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+          after: { name: 't_pkey', columns: ['id'] },
+        },
+      ],
+    },
+  ]);
+});
+
+test('equal primary key deferrability produces no change', () => {
+  const columns = [column('id', { notNull: true })];
+  const shape = (): Model =>
+    model(
+      table('t', {
+        columns,
+        primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true, initiallyDeferred: true },
+      }),
+    );
+
+  assertDiff(shape(), shape(), []);
+});
+
 test('a foreign key added or removed reports the whole constraint', () => {
   const key = foreignKey(['user_id'], identity('users'), {
     name: 't_user_id_fkey',
@@ -1188,27 +1822,248 @@ test('a foreign key onDelete change reports before and after', () => {
   ]);
 });
 
-test('referenced columns empty and present differ', () => {
-  const parent = identity('parent');
-  const baseline = model(
-    table('t', { columns: [column('a')], foreignKeys: [foreignKey(['a'], parent)] }),
-  );
-  const target = model(
+test('both sides omitting referenced columns compare equal through a primary-key change', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (): Table =>
     table('t', {
       columns: [column('a')],
-      foreignKeys: [foreignKey(['a'], parent, { referencedColumns: ['id'] })],
-    }),
-  );
+      foreignKeys: [foreignKey(['a'], identity('parent'))],
+    });
 
+  // Both declarations omit the list, so the pair stays equal and out of the diff even though the
+  // referenced key moved: the dependent-foreign-key synthesis re-points it on the new key.
+  assertDiff(
+    model(parent({ name: 'parent_pkey', columns: ['id'] }), child()),
+    model(parent({ name: 'parent_pkey2', columns: ['legacy_id'] }), child()),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('parent'),
+        changes: [
+          {
+            kind: 'primary-key-changed',
+            before: { name: 'parent_pkey', columns: ['id'] },
+            after: { name: 'parent_pkey2', columns: ['legacy_id'] },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('an empty referenced-column list equals an explicit list of its own model primary key', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [column('id', { type: 'integer', notNull: true })],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The declaration omits the list and a dump states the referenced table's primary key; the
+  // equivalence holds in either direction.
+  assertDiff(model(parent(), child([])), model(parent(), child(['id'])), []);
+  assertDiff(model(parent(), child(['id'])), model(parent(), child([])), []);
+});
+
+test('the omitting side resolves against its own model primary key', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The target omits the list and its own model's key is `id`, so the baseline's explicit `id`
+  // list is equivalent; the baseline's `legacy_id` key must not decide the comparison.
+  assertDiff(
+    model(parent({ name: 'parent_pkey', columns: ['legacy_id'] }), child(['id'])),
+    model(parent({ name: 'parent_pkey', columns: ['id'] }), child([])),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('parent'),
+        changes: [
+          {
+            kind: 'primary-key-changed',
+            before: { name: 'parent_pkey', columns: ['legacy_id'] },
+            after: { name: 'parent_pkey', columns: ['id'] },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('an explicit list matching only the other side primary key stays a change', () => {
+  const parent = (primaryKey: PrimaryKey): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('new_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey,
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+  const baseline = model(parent({ name: 'parent_pkey', columns: ['id'] }), child([]));
+  const target = model(parent({ name: 'parent_pkey2', columns: ['new_id'] }), child(['new_id']));
+
+  // The omission means the baseline key `id`; the explicit `new_id` list is the target's own key,
+  // so the pair reads changed and the plan replaces it instead of setting it aside.
   assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('parent'),
+      changes: [
+        {
+          kind: 'primary-key-changed',
+          before: { name: 'parent_pkey', columns: ['id'] },
+          after: { name: 'parent_pkey2', columns: ['new_id'] },
+        },
+      ],
+    },
     {
       kind: 'table-changed',
       table: identity('t'),
       changes: [
         {
           kind: 'foreign-key-changed',
-          before: foreignKey(['a'], parent),
-          after: foreignKey(['a'], parent, { referencedColumns: ['id'] }),
+          before: foreignKey(['a'], identity('parent')),
+          after: foreignKey(['a'], identity('parent'), { referencedColumns: ['new_id'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('the equivalence compares the primary key column order', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [
+        column('a', { type: 'integer', notNull: true }),
+        column('b', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['a', 'b'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('x')],
+      foreignKeys: [foreignKey(['x'], identity('parent'), { referencedColumns })],
+    });
+
+  assertDiff(model(parent(), child([])), model(parent(), child(['a', 'b'])), []);
+  assertDiff(model(parent(), child([])), model(parent(), child(['b', 'a'])), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['x'], identity('parent')),
+          after: foreignKey(['x'], identity('parent'), { referencedColumns: ['b', 'a'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('an unresolved referenced-table primary key keeps an omission and a list unequal', () => {
+  const shape = (parent: Table | undefined, referencedColumns: readonly string[]): Model =>
+    model(
+      ...(parent === undefined ? [] : [parent]),
+      table('t', {
+        columns: [column('a')],
+        foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+      }),
+    );
+  const change: Change[] = [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], identity('parent')),
+          after: foreignKey(['a'], identity('parent'), { referencedColumns: ['id'] }),
+        },
+      ],
+    },
+  ];
+
+  // The referenced table is absent: the omitted list has nothing to resolve to.
+  assertDiff(shape(undefined, []), shape(undefined, ['id']), change);
+  // The table exists but states no primary key: the omission is still unresolved.
+  const keyless = table('parent', { columns: [column('id', { type: 'integer' })] });
+  assertDiff(shape(keyless, []), shape(keyless, ['id']), change);
+});
+
+test('an omission resolves against its own referenced table, not another primary key', () => {
+  const parent = (name: string, keyColumn: string): Table =>
+    table(name, {
+      columns: [column(keyColumn, { type: 'integer', notNull: true })],
+      primaryKey: { name: `${name}_pkey`, columns: [keyColumn] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent_a'), { referencedColumns })],
+    });
+
+  // `other` is indexed after `parent_a`, so a key that ignored the table identity would resolve
+  // the omission to `other`'s primary key and read the explicit `a_id` list as a change.
+  const baseline = model(parent('parent_a', 'a_id'), child([]), parent('other', 'o_id'));
+  const target = model(parent('parent_a', 'a_id'), child(['a_id']), parent('other', 'o_id'));
+
+  assertDiff(baseline, target, []);
+});
+
+test('an explicit list the omitting side does not resolve to stays a change', () => {
+  const parent = (): Table =>
+    table('parent', {
+      columns: [
+        column('id', { type: 'integer', notNull: true }),
+        column('legacy_id', { type: 'integer', notNull: true }),
+      ],
+      primaryKey: { name: 'parent_pkey', columns: ['id'] },
+    });
+  const child = (referencedColumns: readonly string[]): Table =>
+    table('t', {
+      columns: [column('a')],
+      foreignKeys: [foreignKey(['a'], identity('parent'), { referencedColumns })],
+    });
+
+  // The target omits the list and its own key is `id`; the baseline's explicit `legacy_id`
+  // does not match, so the pair reads changed instead of collapsing into the omission.
+  assertDiff(model(parent(), child(['legacy_id'])), model(parent(), child([])), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], identity('parent'), { referencedColumns: ['legacy_id'] }),
+          after: foreignKey(['a'], identity('parent')),
         },
       ],
     },
@@ -1269,6 +2124,104 @@ test('a foreign key name change is a change', () => {
           kind: 'foreign-key-changed',
           before: foreignKey(['a'], parent, { name: 't_a_fkey', referencedColumns: ['id'] }),
           after: foreignKey(['a'], parent, { name: 't_b_fkey', referencedColumns: ['id'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('foreign key enforcement and deferrability changes are changes', () => {
+  const parent = identity('parent');
+  const shape = (rest: Partial<ForeignKey> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        foreignKeys: [
+          foreignKey(['a'], parent, { name: 't_a_fkey', referencedColumns: ['id'], ...rest }),
+        ],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ enforcement: 'not-valid' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ enforcement: 'not-valid' }), shape({ enforcement: 'not-enforced' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-valid',
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            enforcement: 'not-enforced',
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(plain, shape({ deferrable: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+          }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ deferrable: true }), shape({ deferrable: true, initiallyDeferred: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+          }),
+          after: foreignKey(['a'], parent, {
+            name: 't_a_fkey',
+            referencedColumns: ['id'],
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
         },
       ],
     },
@@ -1496,6 +2449,7 @@ test('a table with many changes emits in the documented order', () => {
           kind: 'column-changed',
           name: 'mutate',
           fields: [{ field: 'type', before: 'text', after: 'bigint' }],
+          attributes: { type: 'bigint' },
         },
         {
           kind: 'primary-key-changed',
@@ -1962,6 +2916,48 @@ test("a unique constraint's absent name and empty name are distinct", () => {
   ]);
 });
 
+test('a unique constraint deferrability change is a change', () => {
+  const shape = (rest: Partial<UniqueConstraint> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        uniqueConstraints: [uniqueConstraint(['a'], { name: 't_a_key', ...rest })],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ deferrable: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a'], { name: 't_a_key' }),
+          after: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ deferrable: true }), shape({ deferrable: true, initiallyDeferred: true }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: uniqueConstraint(['a'], { name: 't_a_key', deferrable: true }),
+          after: uniqueConstraint(['a'], {
+            name: 't_a_key',
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
+        },
+      ],
+    },
+  ]);
+});
+
 test('a unique constraint column list change removes then adds', () => {
   const baseline = model(
     table('t', {
@@ -2024,6 +3020,44 @@ test('duplicate unique constraint identities cancel identical constraints first'
       kind: 'table-changed',
       table: identity('t'),
       changes: [{ kind: 'unique-constraint-changed', before: second, after: renamed }],
+    },
+  ]);
+});
+
+test('changed unique constraint pairs with equal baseline names order by their targets', () => {
+  const columns = [column('a')];
+  const duplicate = uniqueConstraint(['a'], { name: 'x' });
+  const baseline = model(
+    table('t', { columns, uniqueConstraints: [duplicate, uniqueConstraint(['a'], { name: 'x' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns,
+      uniqueConstraints: [
+        uniqueConstraint(['a'], { name: 'y' }),
+        uniqueConstraint(['a'], { name: 'z' }),
+      ],
+    }),
+  );
+
+  // The two baseline duplicates both carry the name `x`, so the changed pairs tie on their
+  // baseline member and their target names — `y` then `z` — decide the order.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-changed',
+          before: duplicate,
+          after: uniqueConstraint(['a'], { name: 'y' }),
+        },
+        {
+          kind: 'unique-constraint-changed',
+          before: duplicate,
+          after: uniqueConstraint(['a'], { name: 'z' }),
+        },
+      ],
     },
   ]);
 });
@@ -2114,6 +3148,44 @@ test("a check constraint's absent name and empty name are distinct", () => {
   ]);
 });
 
+test('a check constraint enforcement change is a change', () => {
+  const shape = (rest: Partial<CheckConstraint> = {}): Model =>
+    model(
+      table('t', {
+        columns: [column('a')],
+        checkConstraints: [checkConstraint('a > 0', { name: 't_a_check', ...rest })],
+      }),
+    );
+  const plain = shape();
+
+  assertDiff(plain, shape({ enforcement: 'not-valid' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('a > 0', { name: 't_a_check' }),
+          after: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' }),
+        },
+      ],
+    },
+  ]);
+  assertDiff(shape({ enforcement: 'not-valid' }), shape({ enforcement: 'not-enforced' }), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-valid' }),
+          after: checkConstraint('a > 0', { name: 't_a_check', enforcement: 'not-enforced' }),
+        },
+      ],
+    },
+  ]);
+});
+
 test('a check constraint expression change removes then adds', () => {
   const baseline = model(
     table('orders', {
@@ -2155,6 +3227,44 @@ test('duplicate check constraint identities cancel identical constraints first',
       kind: 'table-changed',
       table: identity('t'),
       changes: [{ kind: 'check-constraint-changed', before: second, after: renamed }],
+    },
+  ]);
+});
+
+test('changed check constraint pairs with equal baseline names order by their targets', () => {
+  const columns = [column('a')];
+  const duplicate = checkConstraint('a > 0', { name: 'x' });
+  const baseline = model(
+    table('t', { columns, checkConstraints: [duplicate, checkConstraint('a > 0', { name: 'x' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns,
+      checkConstraints: [
+        checkConstraint('a > 0', { name: 'y' }),
+        checkConstraint('a > 0', { name: 'z' }),
+      ],
+    }),
+  );
+
+  // The two baseline duplicates both carry the name `x`, so the changed pairs tie on their
+  // baseline member and their target names — `y` then `z` — decide the order.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'check-constraint-changed',
+          before: duplicate,
+          after: checkConstraint('a > 0', { name: 'y' }),
+        },
+        {
+          kind: 'check-constraint-changed',
+          before: duplicate,
+          after: checkConstraint('a > 0', { name: 'z' }),
+        },
+      ],
     },
   ]);
 });
@@ -2709,4 +3819,1018 @@ test('changed sequence owners are independent copies', () => {
     assert.notEqual(field.after, after);
     assert.notEqual(field.after?.table, after.table);
   }
+});
+
+test('sequence owners in different schemas are different owners', () => {
+  const before = owner('t', 'id', 'one');
+  const after = owner('t', 'id', 'two');
+
+  assertDiff(
+    sequenceModel([sequence('s', { ownedBy: before })]),
+    sequenceModel([sequence('s', { ownedBy: after })]),
+    [
+      {
+        kind: 'sequence-changed',
+        sequence: identity('s'),
+        changes: [{ field: 'ownedBy', before, after }],
+      },
+    ],
+  );
+});
+
+test('identity sequence names in different schemas recreate the identity', () => {
+  const baseline = columnIdentity({
+    sequenceName: { schema: 'one', name: 't_id_seq' },
+    cache: '2',
+  });
+  const target = columnIdentity({ sequenceName: { schema: 'two', name: 't_id_seq' } });
+
+  assertDiff(
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: baseline })],
+      }),
+    ),
+    model(
+      table('t', {
+        columns: [column('id', { type: 'bigint', notNull: true, identity: target })],
+      }),
+    ),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          {
+            kind: 'column-changed',
+            name: 'id',
+            fields: [],
+            identity: { kind: 'recreated', identity: target },
+          },
+        ],
+      },
+    ],
+  );
+});
+
+test('foreign key removals, additions, and changes order by their canonical keys', () => {
+  const referenced = identity('r');
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('m'), column('r'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'z1' }),
+        foreignKey(['r'], referenced, { name: 'fk_b', referencedColumns: ['x'] }),
+        foreignKey(['r'], referenced, { name: 'fk_a', referencedColumns: ['y'] }),
+        foreignKey(['m'], referenced, { name: 'mb', referencedColumns: ['x'] }),
+        foreignKey(['m'], referenced, { name: 'ma', referencedColumns: ['y'] }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('m'), column('r'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'z1' }),
+        foreignKey(['z'], referenced, { name: 'z2' }),
+        foreignKey(['a'], referenced, { name: 'a1' }),
+        foreignKey(['m'], referenced, { name: 'md', referencedColumns: ['x'] }),
+        foreignKey(['m'], referenced, { name: 'mc', referencedColumns: ['y'] }),
+      ],
+    }),
+  );
+
+  // Removals leave in the full key order (`fk_a` before `fk_b`), additions in columns then
+  // name order (`a1` before `z2`), and changes by their baseline in the same full key order —
+  // each list differs from the pairing order the duplicates are matched in.
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'foreign-key-removed',
+          foreignKey: foreignKey(['r'], referenced, { name: 'fk_a', referencedColumns: ['y'] }),
+        },
+        {
+          kind: 'foreign-key-removed',
+          foreignKey: foreignKey(['r'], referenced, { name: 'fk_b', referencedColumns: ['x'] }),
+        },
+        {
+          kind: 'foreign-key-added',
+          foreignKey: foreignKey(['a'], referenced, { name: 'a1' }),
+        },
+        {
+          kind: 'foreign-key-added',
+          foreignKey: foreignKey(['z'], referenced, { name: 'z2' }),
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['m'], referenced, { name: 'ma', referencedColumns: ['y'] }),
+          after: foreignKey(['m'], referenced, { name: 'mc', referencedColumns: ['y'] }),
+        },
+        {
+          kind: 'foreign-key-changed',
+          before: foreignKey(['m'], referenced, { name: 'mb', referencedColumns: ['x'] }),
+          after: foreignKey(['m'], referenced, { name: 'md', referencedColumns: ['x'] }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('added constraints order target-only groups ahead of later baseline-group extras', () => {
+  const referenced = identity('r');
+  const baseline = model(
+    table('t', {
+      columns: [column('a'), column('z')],
+      foreignKeys: [foreignKey(['z'], referenced, { name: 'fk_z1' })],
+      uniqueConstraints: [uniqueConstraint(['z'], { name: 'u_z1' })],
+      checkConstraints: [checkConstraint('z > 0', { name: 'c_z1' })],
+      indexes: [index(['z'], { name: 'i_z1' })],
+    }),
+    table('u', {
+      columns: [column('a'), column('w'), column('z')],
+      indexes: [index(['z'], { name: 'i_z1' })],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('a'), column('z')],
+      foreignKeys: [
+        foreignKey(['z'], referenced, { name: 'fk_z1' }),
+        foreignKey(['z'], referenced, { name: 'fk_z2' }),
+        foreignKey(['a'], referenced, { name: 'fk_a1' }),
+      ],
+      uniqueConstraints: [
+        uniqueConstraint(['z'], { name: 'u_z1' }),
+        uniqueConstraint(['z'], { name: 'u_z2' }),
+        uniqueConstraint(['a'], { name: 'u_a1' }),
+      ],
+      checkConstraints: [
+        checkConstraint('z > 0', { name: 'c_z1' }),
+        checkConstraint('z > 0', { name: 'c_z2' }),
+        checkConstraint('a > 0', { name: 'c_a1' }),
+      ],
+      indexes: [
+        index(['z'], { name: 'i_z1' }),
+        index(['z'], { name: 'i_z2' }),
+        index(['a'], { name: 'i_a1' }),
+      ],
+    }),
+    table('u', {
+      columns: [column('a'), column('w'), column('z')],
+      indexes: [
+        index(['z'], { name: 'i_z1' }),
+        index(['w'], { name: 'i_z1' }),
+        index(['a'], { name: 'i_a1' }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'foreign-key-added', foreignKey: foreignKey(['a'], referenced, { name: 'fk_a1' }) },
+        { kind: 'foreign-key-added', foreignKey: foreignKey(['z'], referenced, { name: 'fk_z2' }) },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['a'], { name: 'u_a1' }),
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['z'], { name: 'u_z2' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('a > 0', { name: 'c_a1' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('z > 0', { name: 'c_z2' }),
+        },
+        { kind: 'index-added', index: index(['a'], { name: 'i_a1' }) },
+        { kind: 'index-added', index: index(['z'], { name: 'i_z2' }) },
+      ],
+    },
+    {
+      kind: 'table-changed',
+      table: identity('u'),
+      changes: [
+        { kind: 'index-added', index: index(['a'], { name: 'i_a1' }) },
+        { kind: 'index-added', index: index(['w'], { name: 'i_z1' }) },
+      ],
+    },
+  ]);
+});
+
+test('views in different insertion orders compare as identical', () => {
+  const appView = view('a', {}, 'app');
+  const publicView = view('z', { materialized: true });
+
+  assertDiff(viewModel([publicView, appView]), viewModel([appView, publicView]), []);
+  // The target side sorts independently too: an unsorted target is not a different schema.
+  assertDiff(viewModel([appView, publicView]), viewModel([publicView, appView]), []);
+});
+
+test('removed and added views follow the sequence changes, in identity order', () => {
+  const gone = view('a');
+  const appView = view('z', {}, 'app');
+  const fresh = view('b');
+  const baseline: Model = {
+    tables: [],
+    sequences: [sequence('s')],
+    views: [gone],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [appView, fresh],
+    extensions: [],
+  };
+
+  assertDiff(baseline, target, [
+    { kind: 'sequence-removed', sequence: baseline.sequences[0]! },
+    { kind: 'view-added', view: appView },
+    { kind: 'view-removed', view: gone },
+    { kind: 'view-added', view: fresh },
+  ]);
+});
+
+test('a changed view reports its differing fields in the fixed order', () => {
+  const before = view('v', { definition: 'SELECT 1', checkOption: 'local' });
+  const after = view('v', {
+    materialized: true,
+    definition: 'SELECT 2',
+  });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [
+        { field: 'materialized', before: false, after: true },
+        { field: 'definition', before: 'SELECT 1', after: 'SELECT 2' },
+        { field: 'checkOption', before: 'local' },
+      ],
+      before,
+      after,
+    },
+  ]);
+});
+
+test('a check option addition and change are reported with the absent side omitted', () => {
+  const local = view('v', { checkOption: 'local' });
+  const cascaded = view('v', { checkOption: 'cascaded' });
+
+  assertDiff(viewModel([view('v')]), viewModel([local]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'checkOption', after: 'local' }],
+      before: view('v'),
+      after: local,
+    },
+  ]);
+  assertDiff(viewModel([local]), viewModel([cascaded]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'checkOption', before: 'local', after: 'cascaded' }],
+      before: local,
+      after: cascaded,
+    },
+  ]);
+});
+
+test('a view rematerialization is a change, not a removal and an addition', () => {
+  const plain = view('v');
+  const materialized = view('v', { materialized: true });
+
+  assertDiff(viewModel([plain]), viewModel([materialized]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'materialized', before: false, after: true }],
+      before: plain,
+      after: materialized,
+    },
+  ]);
+  assertDiff(viewModel([materialized]), viewModel([plain]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'materialized', before: true, after: false }],
+      before: materialized,
+      after: plain,
+    },
+  ]);
+});
+
+test('a deep-frozen model with views can be diffed', () => {
+  const baseline = deepFreeze(viewModel([view('v')]));
+  const target = deepFreeze(viewModel([view('v', { definition: 'SELECT 2' })]));
+
+  assert.equal(diff(baseline, target).length, 1);
+});
+
+test('added, removed, and changed views are independent copies', () => {
+  const added = view('added');
+  const target = viewModel([added]);
+  const addedChange = diff(model(), target)[0]!;
+  assert.equal(addedChange.kind, 'view-added');
+  assert.notEqual(addedChange.view, added);
+
+  const removed = view('removed');
+  const removedChange = diff(viewModel([removed]), model())[0]!;
+  assert.equal(removedChange.kind, 'view-removed');
+  assert.notEqual(removedChange.view, removed);
+
+  const before = view('changed');
+  const after = view('changed', { definition: 'SELECT 2' });
+  const changedChange = diff(viewModel([before]), viewModel([after]))[0]!;
+  assert.equal(changedChange.kind, 'view-changed');
+  assert.ok(changedChange.kind === 'view-changed');
+  assert.notEqual(changedChange.before, before);
+  assert.notEqual(changedChange.after, after);
+});
+
+test('a table comment appears, changes, and disappears as one comment change', () => {
+  const bare = table('users', { columns: [column('id')] });
+  const commented = table('users', { columns: [column('id')], comment: 'accounts' });
+  const renamed = table('users', { columns: [column('id')], comment: 'people' });
+  const target = { kind: 'table', table: identity('users') } as const;
+
+  assertDiff(model(bare), model(commented), [
+    { kind: 'comment-changed', target, after: 'accounts' },
+  ]);
+  assertDiff(model(commented), model(bare), [
+    { kind: 'comment-changed', target, before: 'accounts' },
+  ]);
+  assertDiff(model(commented), model(renamed), [
+    { kind: 'comment-changed', target, before: 'accounts', after: 'people' },
+  ]);
+});
+
+test('a column comment appears and changes as one comment change', () => {
+  const bare = table('users', { columns: [column('id'), column('email')] });
+  const commented = table('users', {
+    columns: [column('id'), column('email', { comment: 'login' })],
+  });
+  const renamed = table('users', {
+    columns: [column('id'), column('email', { comment: 'sign-in' })],
+  });
+  const target = { kind: 'column', table: identity('users'), column: 'email' } as const;
+
+  assertDiff(model(bare), model(commented), [{ kind: 'comment-changed', target, after: 'login' }]);
+  assertDiff(model(commented), model(renamed), [
+    { kind: 'comment-changed', target, before: 'login', after: 'sign-in' },
+  ]);
+});
+
+test('a sequence comment is a comment change, not a sequence change', () => {
+  const before = sequence('users_id_seq', { comment: 'keys' });
+  const after = sequence('users_id_seq', { comment: 'identifiers' });
+
+  assertDiff(sequenceModel([before]), sequenceModel([after]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'sequence', sequence: identity('users_id_seq') },
+      before: 'keys',
+      after: 'identifiers',
+    },
+  ]);
+});
+
+test('a view comment is a comment change, not a view change', () => {
+  const plain = view('active', { comment: 'live rows' });
+  const replained = view('active', { comment: 'current rows' });
+  const materialized = view('active', { materialized: true, comment: 'live rows' });
+  const rematerialized = view('active', { materialized: true, comment: 'cached rows' });
+
+  assertDiff(viewModel([plain]), viewModel([replained]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('active'), materialized: false },
+      before: 'live rows',
+      after: 'current rows',
+    },
+  ]);
+  assertDiff(viewModel([materialized]), viewModel([rematerialized]), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('active'), materialized: true },
+      before: 'live rows',
+      after: 'cached rows',
+    },
+  ]);
+});
+
+test('a comment-only change on a constraint or index never recreates it', () => {
+  const constraint = (comment: string) => ({
+    primaryKey: { name: 't_pkey', columns: ['id'], comment },
+    foreignKeys: [
+      foreignKey(['id'], identity('u'), {
+        name: 't_fkey',
+        referencedColumns: ['id'],
+        comment,
+      }),
+    ],
+    uniqueConstraints: [uniqueConstraint(['id'], { name: 't_key', comment })],
+    checkConstraints: [checkConstraint('id > 0', { name: 't_check', comment })],
+    indexes: [index(['id'], { name: 't_idx', comment })],
+  });
+  const baseline = table('t', { columns: [column('id')], ...constraint('old') });
+  const target = table('t', { columns: [column('id')], ...constraint('new') });
+
+  assertDiff(model(baseline), model(target), [
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('id > 0', { name: 't_check' }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'foreign-key',
+        table: identity('t'),
+        foreignKey: foreignKey(['id'], identity('u'), {
+          name: 't_fkey',
+          referencedColumns: ['id'],
+        }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['id'], { name: 't_idx' }) },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'primary-key',
+        table: identity('t'),
+        primaryKey: { name: 't_pkey', columns: ['id'] },
+      },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['id'], { name: 't_key' }),
+      },
+      before: 'old',
+      after: 'new',
+    },
+  ]);
+});
+
+test('a structurally changed constraint reports its unchanged comment as an addition', () => {
+  // A constraint's identity is structural — a check constraint's expression, a unique
+  // constraint's columns — so a structural change reads as absent from the baseline in the
+  // comment pass: the comment change is an addition (`before` omitted) even though the model
+  // held the same comment before. The recreate site's terminal dedupe still yields one step.
+  const baseline = table('t', {
+    columns: [column('a'), column('b')],
+    uniqueConstraints: [uniqueConstraint(['a'], { name: 't_a_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint('a > 0', { name: 't_check', comment: 'ck' })],
+  });
+  const target = table('t', {
+    columns: [column('a'), column('b')],
+    uniqueConstraints: [uniqueConstraint(['a', 'b'], { name: 't_a_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint('a > 1', { name: 't_check', comment: 'ck' })],
+  });
+
+  assertDiff(model(baseline), model(target), [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'unique-constraint-removed',
+          uniqueConstraint: uniqueConstraint(['a'], { name: 't_a_key', comment: 'uq' }),
+        },
+        {
+          kind: 'unique-constraint-added',
+          uniqueConstraint: uniqueConstraint(['a', 'b'], { name: 't_a_key', comment: 'uq' }),
+        },
+        {
+          kind: 'check-constraint-removed',
+          checkConstraint: checkConstraint('a > 0', { name: 't_check', comment: 'ck' }),
+        },
+        {
+          kind: 'check-constraint-added',
+          checkConstraint: checkConstraint('a > 1', { name: 't_check', comment: 'ck' }),
+        },
+      ],
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('a > 1', { name: 't_check' }),
+      },
+      after: 'ck',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a', 'b'], { name: 't_a_key' }),
+      },
+      after: 'uq',
+    },
+  ]);
+});
+
+test('equal comments on every member emit nothing', () => {
+  const build = () =>
+    table('t', {
+      columns: [column('id', { comment: 'key' }), column('email', { comment: 'login' })],
+      comment: 'accounts',
+      primaryKey: { name: 't_pkey', columns: ['id'], comment: 'pk' },
+      foreignKeys: [
+        foreignKey(['id'], identity('u'), {
+          name: 't_fkey',
+          referencedColumns: ['id'],
+          comment: 'fk',
+        }),
+      ],
+      uniqueConstraints: [uniqueConstraint(['email'], { name: 't_key', comment: 'uq' })],
+      checkConstraints: [checkConstraint('id > 0', { comment: 'ck' })],
+      indexes: [index(['email'], { name: 't_idx', comment: 'idx' })],
+    });
+
+  assertDiff(model(build()), model(build()), []);
+});
+
+test('an added table reports one comment change per commented member', () => {
+  const added = table('users', {
+    columns: [column('id', { type: 'integer', comment: 'key' }), column('email')],
+    comment: 'accounts',
+    primaryKey: { name: 'users_pkey', columns: ['id'], comment: 'pk' },
+    foreignKeys: [
+      foreignKey(['email'], identity('profiles'), {
+        name: 'users_email_fkey',
+        referencedColumns: ['email'],
+        comment: 'fk',
+      }),
+    ],
+    uniqueConstraints: [uniqueConstraint(['email'], { name: 'users_email_key', comment: 'uq' })],
+    checkConstraints: [checkConstraint("email <> ''", { comment: 'ck' })],
+    indexes: [index(['email'], { name: 'users_email_idx', comment: 'idx' })],
+  });
+
+  assertDiff(model(), model(added), [
+    { kind: 'table-added', table: added },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'check-constraint',
+        table: identity('users'),
+        checkConstraint: checkConstraint("email <> ''"),
+      },
+      after: 'ck',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'column', table: identity('users'), column: 'id' },
+      after: 'key',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'foreign-key',
+        table: identity('users'),
+        foreignKey: foreignKey(['email'], identity('profiles'), {
+          name: 'users_email_fkey',
+          referencedColumns: ['email'],
+        }),
+      },
+      after: 'fk',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'index',
+        table: identity('users'),
+        index: index(['email'], { name: 'users_email_idx' }),
+      },
+      after: 'idx',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'primary-key',
+        table: identity('users'),
+        primaryKey: { name: 'users_pkey', columns: ['id'] },
+      },
+      after: 'pk',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('users') },
+      after: 'accounts',
+    },
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'unique-constraint',
+        table: identity('users'),
+        uniqueConstraint: uniqueConstraint(['email'], { name: 'users_email_key' }),
+      },
+      after: 'uq',
+    },
+  ]);
+});
+
+test('a removed commented entity emits no comment change', () => {
+  const removed = table('users', {
+    columns: [column('id', { comment: 'key' })],
+    comment: 'accounts',
+    indexes: [index(['id'], { name: 'users_id_idx', comment: 'idx' })],
+  });
+
+  assertDiff(model(removed), model(), [{ kind: 'table-removed', table: removed }]);
+  assertDiff(sequenceModel([sequence('gone', { comment: 'old' })]), sequenceModel([]), [
+    { kind: 'sequence-removed', sequence: sequence('gone') },
+  ]);
+  assertDiff(viewModel([view('gone', { comment: 'old' })]), viewModel([]), [
+    { kind: 'view-removed', view: view('gone', { comment: 'old' }) },
+  ]);
+});
+
+test('comment changes come last, after table, sequence, and view changes, in target order', () => {
+  const baseline: Model = {
+    tables: [
+      table('t', { columns: [column('id')] }),
+      table('u', { columns: [column('id')], comment: 'old u' }),
+    ],
+    sequences: [sequence('s', { comment: 'old s' })],
+    views: [view('v', { comment: 'old v' })],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [
+      table('t', { columns: [column('id'), column('extra')] }),
+      table('u', { columns: [column('id')], comment: 'new u' }),
+    ],
+    sequences: [sequence('s', { cache: '2', comment: 'new s' })],
+    views: [view('v', { definition: 'SELECT 2', comment: 'new v' })],
+    extensions: [],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'column-added', column: column('extra') }],
+    },
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [{ field: 'cache', before: '1', after: '2' }],
+    },
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [{ field: 'definition', before: 'SELECT 1', after: 'SELECT 2' }],
+      before: view('v', { comment: 'old v' }),
+      after: view('v', { definition: 'SELECT 2', comment: 'new v' }),
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'sequence', sequence: identity('s') },
+      before: 'old s',
+      after: 'new s',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('u') },
+      before: 'old u',
+      after: 'new u',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'view', view: identity('v'), materialized: false },
+      before: 'old v',
+      after: 'new v',
+    },
+  ]);
+});
+
+test('comment changes sort by each target identity, not by model insertion order', () => {
+  // Every target key carries its member identity — an index name or structure, a unique
+  // constraint's columns, a foreign key's columns and referenced table, a view identity — so
+  // the comment group sorts by that key even when the model holds the entries in another
+  // order. Named index twins with one structure stay distinct because they key by name, and
+  // differently structured unnamed indexes stay distinct because they key by structure.
+  const indexes = (suffix: string) =>
+    table('t', {
+      columns: [column('a'), column('b'), column('c')],
+      indexes: [
+        index(['b'], { comment: `two${suffix}` }),
+        index(['a'], { comment: `one${suffix}` }),
+        index(['c'], { name: 't_c1', comment: `three${suffix}` }),
+        index(['c'], { name: 't_c2', comment: `four${suffix}` }),
+      ],
+    });
+
+  assertDiff(model(indexes('')), model(indexes('2')), [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['c'], { name: 't_c1' }) },
+      before: 'three',
+      after: 'three2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['c'], { name: 't_c2' }) },
+      before: 'four',
+      after: 'four2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['a']) },
+      before: 'one',
+      after: 'one2',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'index', table: identity('t'), index: index(['b']) },
+      before: 'two',
+      after: 'two2',
+    },
+  ]);
+
+  const parent = table('p', { columns: [column('id')] });
+  const constraints = (suffix: string) =>
+    table('t', {
+      columns: [column('a'), column('b')],
+      uniqueConstraints: [
+        uniqueConstraint(['b'], { comment: `u${suffix}` }),
+        uniqueConstraint(['a'], { comment: `u${suffix}` }),
+      ],
+      foreignKeys: [
+        foreignKey(['b'], identity('p'), { referencedColumns: ['id'], comment: `f${suffix}` }),
+        foreignKey(['a'], identity('p'), { referencedColumns: ['id'], comment: `f${suffix}` }),
+      ],
+    });
+  const views = (suffix: string) => [
+    view('vb', { comment: `v${suffix}` }),
+    view('va', { comment: `v${suffix}` }),
+  ];
+
+  const expected = (suffix: string, before: string) => [
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'foreign-key' as const,
+        table: identity('t'),
+        foreignKey: foreignKey(['a'], identity('p'), { referencedColumns: ['id'] }),
+      },
+      before: `f${before}`,
+      after: `f${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'foreign-key' as const,
+        table: identity('t'),
+        foreignKey: foreignKey(['b'], identity('p'), { referencedColumns: ['id'] }),
+      },
+      before: `f${before}`,
+      after: `f${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'unique-constraint' as const,
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['a']),
+      },
+      before: `u${before}`,
+      after: `u${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: {
+        kind: 'unique-constraint' as const,
+        table: identity('t'),
+        uniqueConstraint: uniqueConstraint(['b']),
+      },
+      before: `u${before}`,
+      after: `u${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: { kind: 'view' as const, view: identity('va'), materialized: false },
+      before: `v${before}`,
+      after: `v${suffix}`,
+    },
+    {
+      kind: 'comment-changed' as const,
+      target: { kind: 'view' as const, view: identity('vb'), materialized: false },
+      before: `v${before}`,
+      after: `v${suffix}`,
+    },
+  ];
+
+  assertDiff(
+    viewModel(views('old'), constraints('old'), parent),
+    viewModel(views('new'), constraints('new'), parent),
+    expected('new', 'old'),
+  );
+});
+
+test('extensions report additions, removals, and value-carrying schema changes by name', () => {
+  const removed = extension('a_gone', { schema: 'old' });
+  const movedBefore = extension('moved', { schema: 'hs1' });
+  const movedAfter = extension('moved', { schema: 'hs2' });
+  const added = extension('z_new');
+
+  // The target's added and changed identities and the baseline's removed identity merge-walk
+  // by name, so each category keeps its own name order while the walk interleaves them.
+  assertDiff(extensionModel([movedBefore, removed]), extensionModel([movedAfter, added]), [
+    { kind: 'extension-removed', extension: removed },
+    {
+      kind: 'extension-changed',
+      extension: { name: 'moved' },
+      changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+    },
+    { kind: 'extension-added', extension: added },
+  ]);
+});
+
+test('an added extension that sorts before a baseline extension reports in the merge walk', () => {
+  // The added identity sorts first, so the merge walk takes its added branch before the shared
+  // identity; the trailing loop alone would not exercise it.
+  assertDiff(
+    extensionModel([extension('moved')]),
+    extensionModel([extension('added'), extension('moved')]),
+    [{ kind: 'extension-added', extension: extension('added') }],
+  );
+});
+
+test('an extension comment sorts before a schema-qualified comment by its empty schema slot', () => {
+  // The key's empty schema slot sorts the extension before every qualified relation, even one
+  // whose schema starts with an uppercase letter.
+  const baseline = {
+    tables: [table('t', { schema: 'A', comment: 'old' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'old' })],
+  };
+  const target = {
+    tables: [table('t', { schema: 'A', comment: 'new' })],
+    sequences: [],
+    views: [],
+    extensions: [extension('hstore', { comment: 'new' })],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'hstore' } },
+      before: 'old',
+      after: 'new',
+    },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'table', table: identity('t', 'A') },
+      before: 'old',
+      after: 'new',
+    },
+  ]);
+});
+
+test('a schema-only extension change carries no comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { schema: 'hs1' })]),
+    extensionModel([extension('hstore', { schema: 'hs2' })]),
+    [
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+    ],
+  );
+});
+
+test('an extension comment change, addition, and removal are separate comment changes', () => {
+  assertDiff(
+    extensionModel([
+      extension('a', { comment: 'one' }),
+      extension('b', { comment: 'two' }),
+      extension('c'),
+    ]),
+    extensionModel([
+      extension('a', { comment: 'uno' }),
+      extension('b'),
+      extension('c', { comment: 'three' }),
+    ]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'a' } },
+        before: 'one',
+        after: 'uno',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'b' } },
+        before: 'two',
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'c' } },
+        after: 'three',
+      },
+    ],
+  );
+});
+
+test('a comment-only extension change emits only its comment change', () => {
+  assertDiff(
+    extensionModel([extension('hstore', { comment: 'old' })]),
+    extensionModel([extension('hstore', { comment: 'new' })]),
+    [
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
+  );
+});
+
+test('an added extension reports its comment as an addition', () => {
+  const added = extension('pgcrypto', { comment: 'crypto' });
+
+  assertDiff(extensionModel([]), extensionModel([added]), [
+    { kind: 'extension-added', extension: added },
+    {
+      kind: 'comment-changed',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      after: 'crypto',
+    },
+  ]);
+});
+
+test('a removed extension emits no comment change', () => {
+  const removed = extension('citext', { comment: 'old' });
+
+  assertDiff(extensionModel([removed]), extensionModel([]), [
+    { kind: 'extension-removed', extension: removed },
+  ]);
+});
+
+test('extension changes follow view changes and precede comment changes', () => {
+  assertDiff(
+    {
+      tables: [],
+      sequences: [],
+      views: [view('gone')],
+      extensions: [extension('hstore', { schema: 'hs1', comment: 'old' })],
+    },
+    {
+      tables: [],
+      sequences: [],
+      views: [view('new')],
+      extensions: [extension('hstore', { schema: 'hs2', comment: 'new' })],
+    },
+    [
+      { kind: 'view-removed', view: view('gone') },
+      { kind: 'view-added', view: view('new') },
+      {
+        kind: 'extension-changed',
+        extension: { name: 'hstore' },
+        changes: [{ field: 'schema', before: 'hs1', after: 'hs2' }],
+      },
+      {
+        kind: 'comment-changed',
+        target: { kind: 'extension', extension: { name: 'hstore' } },
+        before: 'old',
+        after: 'new',
+      },
+    ],
+  );
 });

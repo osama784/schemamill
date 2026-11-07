@@ -3,6 +3,7 @@ import type {
   Column,
   Hazard,
   HazardAnalyzer,
+  HazardEntity,
   Identity,
   Model,
   Plan,
@@ -19,12 +20,15 @@ import type {
  * PostgreSQL hazard analysis: the state edge of a migration plan.
  *
  * `analyzeHazards` reads the baseline and target models together with the plan and reports what
- * PostgreSQL would reject when the plan is applied. It never changes the plan: a hazard is a
- * fact beside it, and every hazard carries the index of the step it belongs to. Entities are
- * sequences — matched by schema and name — and identity columns — matched by table and column
- * name. Each side's options are read as stored, already effective from import. A baseline-only
- * entity is a drop with nothing to apply, and an entity the plan carries no step for reports
- * nothing; the plan is the only source of step indices.
+ * PostgreSQL would reject, what may fail, and what will certainly cost when the plan is
+ * applied. It never changes the plan: a hazard is a fact beside it, and every hazard carries
+ * the index of the step it belongs to and the entity the step applies to — a sequence identity,
+ * an identity column's table and name, or a table. Entities are sequences — matched by schema
+ * and name — identity columns — matched by table and column name — and tables, read from the
+ * plan step rather than matched between the models. Each side's options are read as stored,
+ * already effective from import. A baseline-only entity is a drop with nothing to apply, and an
+ * entity the plan carries no step for reports nothing; the plan is the only source of step
+ * indices.
  *
  * Definite hazards are self-inconsistent targets, rejected at apply regardless of stored state.
  * Each entity is checked in PostgreSQL's order and every violation is reported: `increment-zero`
@@ -43,6 +47,14 @@ import type {
  * values, `min` before `max` when both tightened. An entity with any definite hazard reports
  * none of its conditional ones: the definite failure happens first.
  *
+ * The one certain-cost kind is `table-rewrite`: a persistence flip rewrites the table under an
+ * ACCESS EXCLUSIVE lock at apply — neither a rejection nor a state-dependent failure. This
+ * family reads the plan rather than the models: one hazard attaches to each
+ * `alter-persistence` step, carrying the step's target persistence; an absent persistence is
+ * the `LOGGED` default. A created or dropped unlogged table carries no `alter-persistence` step
+ * and reports nothing. Because the plan is the only source, a hand-built `alter-persistence`
+ * step on a table absent from both models still reports.
+ *
  * A target-only sequence attaches to its `create-sequence` step; a matched one to the first
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
  * whose bounds PostgreSQL applies; an ownership-only alter applies no options at all and so
@@ -60,9 +72,10 @@ import type {
  * conditional hazard because its old sequence is dropped rather than cross-checked. A tightening
  * the column's type conversion moves attaches to the same `alter-column` type step unless the
  * `alter-identity` step restates that bound as its own field: the restatement is the statement
- * that applies the final bound, so it keeps the hazard. Hazards come
- * back in plan order — step index ascending, then the entity's fixed check order. Entities are
- * iterated in sorted identity order, so neither model's array order can affect the result.
+ * that applies the final bound, so it keeps the hazard. A table's persistence rewrite attaches
+ * to its `alter-persistence` step. Hazards come back in plan order — step index ascending, then
+ * the entity's fixed check order. Entities are iterated in sorted identity order, so neither
+ * model's array order can affect the result.
  * Returned hazards are fresh objects: the models and the plan are never mutated.
  *
  * `hazardAnalyzer` binds `analyzeHazards` to core's `HazardAnalyzer` seam.
@@ -77,6 +90,15 @@ export function analyzeHazards(baseline: Model, target: Model, plan: Plan): read
   }
   for (const entry of identityEntries(baseline, target)) {
     hazards.push(...identityHazards(entry, steps));
+  }
+  for (const [index, step] of steps.entries()) {
+    if (step.kind !== 'alter-persistence') continue;
+    hazards.push({
+      kind: 'table-rewrite',
+      step: index,
+      entity: { kind: 'table', table: step.table },
+      ...(step.persistence === undefined ? {} : { persistence: step.persistence }),
+    });
   }
   return inPlanOrder(hazards);
 }
@@ -185,9 +207,10 @@ function sequenceHazards(entry: SequenceEntry, steps: readonly Step[]): readonly
         )
       : findSequenceAlterStep(steps, entry.identity);
   if (step === undefined) return [];
-  const definite = definiteHazards(target.dataType, target, step);
+  const entity: HazardEntity = { kind: 'sequence', sequence: entry.identity };
+  const definite = definiteHazards(target.dataType, target, entity, step);
   if (definite.length > 0 || entry.baseline === undefined) return definite;
-  return tightenedHazards(entry.baseline, target, () => step);
+  return tightenedHazards(entry.baseline, target, entity, () => step);
 }
 
 /**
@@ -213,11 +236,12 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
   const column = entry.targetColumn;
   if (column === undefined || column.identity === undefined) return [];
   const target = column.identity;
+  const entity: HazardEntity = { kind: 'identity-column', table: entry.table, column: entry.name };
   const dataType = canonicalIntType(column.type);
   if (entry.baseline === undefined) {
     const step = findIdentityStep(steps, entry, 'add-identity');
     if (step === undefined) return [];
-    return definiteHazards(dataType, target, step);
+    return definiteHazards(dataType, target, entity, step);
   }
   const baseline = entry.baseline;
   const alterIdentity = findIdentityStep(steps, entry, 'alter-identity');
@@ -242,11 +266,13 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
       target,
       baseline,
       projection,
+      entity,
       alterIdentity,
       typeStep,
     );
   } else {
-    definite = definiteStep === undefined ? [] : definiteHazards(dataType, target, definiteStep);
+    definite =
+      definiteStep === undefined ? [] : definiteHazards(dataType, target, entity, definiteStep);
   }
   if (definite.length > 0) return definite;
   // A recreation drops the old sequence with its stored value; only a surviving identity's
@@ -269,7 +295,7 @@ function identityHazards(entry: IdentityEntry, steps: readonly Step[]): readonly
     (field === 'min'
       ? BigInt(projection.minValue) > BigInt(baseline.minValue)
       : BigInt(projection.maxValue) < BigInt(baseline.maxValue));
-  return tightenedHazards(baseline, target, (field) => {
+  return tightenedHazards(baseline, target, entity, (field) => {
     if (alterIdentity !== undefined && restated(field)) return alterIdentity;
     if (conversionTightens(field) && typeStep !== undefined) return typeStep;
     return conditionalStep;
@@ -288,6 +314,7 @@ function conversionDefiniteHazards(
   target: Options,
   before: Options,
   projection: SequenceTypeChange,
+  entity: HazardEntity,
   alterStep: number,
   typeStep: number,
 ): Hazard[] {
@@ -300,9 +327,10 @@ function conversionDefiniteHazards(
       increment: before.increment,
       cache: before.cache,
     },
+    entity,
     typeStep,
   );
-  return definiteHazards(dataType, target, alterStep).map((hazard) =>
+  return definiteHazards(dataType, target, entity, alterStep).map((hazard) =>
     projected.some((candidate) => sameDefiniteHazard(candidate, hazard))
       ? { ...hazard, step: typeStep }
       : hazard,
@@ -337,6 +365,37 @@ function findIdentityStep(
           sameIdentity(candidate.table, entry.table) &&
           candidate.name === entry.name
         );
+      case 'create-schema':
+      case 'create-table':
+      case 'drop-table':
+      case 'add-column':
+      case 'drop-column':
+      case 'drop-not-null':
+      case 'add-not-null':
+      case 'alter-persistence':
+      case 'drop-identity':
+      case 'add-primary-key':
+      case 'drop-primary-key':
+      case 'add-foreign-key':
+      case 'drop-foreign-key':
+      case 'add-unique-constraint':
+      case 'drop-unique-constraint':
+      case 'add-check-constraint':
+      case 'drop-check-constraint':
+      case 'create-index':
+      case 'drop-index':
+      case 'create-index-concurrently':
+      case 'drop-index-concurrently':
+      case 'create-sequence':
+      case 'drop-sequence':
+      case 'alter-sequence':
+      case 'create-extension':
+      case 'alter-extension':
+      case 'drop-extension':
+      case 'create-view':
+      case 'drop-view':
+      case 'replace-view':
+      case 'comment':
       default:
         return false;
     }
@@ -376,11 +435,12 @@ function findStepIndex(
 function definiteHazards(
   dataType: SequenceDataType | undefined,
   options: Options,
+  entity: HazardEntity,
   step: number,
 ): Hazard[] {
   const hazards: Hazard[] = [];
   if (options.increment === '0') {
-    hazards.push({ kind: 'increment-zero', step, increment: options.increment });
+    hazards.push({ kind: 'increment-zero', step, entity, increment: options.increment });
   }
   if (dataType !== undefined) {
     const bounds = sequenceTypeBounds(dataType);
@@ -391,6 +451,7 @@ function definiteHazards(
       hazards.push({
         kind: 'bound-out-of-type-range',
         step,
+        entity,
         dataType,
         field: 'max',
         value: options.maxValue,
@@ -403,6 +464,7 @@ function definiteHazards(
       hazards.push({
         kind: 'bound-out-of-type-range',
         step,
+        entity,
         dataType,
         field: 'min',
         value: options.minValue,
@@ -413,6 +475,7 @@ function definiteHazards(
     hazards.push({
       kind: 'bounds-inverted',
       step,
+      entity,
       minValue: options.minValue,
       maxValue: options.maxValue,
     });
@@ -424,13 +487,14 @@ function definiteHazards(
     hazards.push({
       kind: 'start-out-of-bounds',
       step,
+      entity,
       start: options.start,
       minValue: options.minValue,
       maxValue: options.maxValue,
     });
   }
   if (BigInt(options.cache) <= 0n) {
-    hazards.push({ kind: 'cache-nonpositive', step, cache: options.cache });
+    hazards.push({ kind: 'cache-nonpositive', step, entity, cache: options.cache });
   }
   return hazards;
 }
@@ -442,6 +506,7 @@ function definiteHazards(
 function tightenedHazards(
   before: Options,
   after: Options,
+  entity: HazardEntity,
   stepFor: (field: 'min' | 'max') => number,
 ): Hazard[] {
   const hazards: Hazard[] = [];
@@ -449,6 +514,7 @@ function tightenedHazards(
     hazards.push({
       kind: 'bound-tightened',
       step: stepFor('min'),
+      entity,
       field: 'min',
       before: before.minValue,
       after: after.minValue,
@@ -458,6 +524,7 @@ function tightenedHazards(
     hazards.push({
       kind: 'bound-tightened',
       step: stepFor('max'),
+      entity,
       field: 'max',
       before: before.maxValue,
       after: after.maxValue,

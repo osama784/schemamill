@@ -1,6 +1,6 @@
 # Sequences — model, plan, render, verify
 
-**Status:** built · **Last updated:** 2026-09-30
+**Status:** built · **Last updated:** 2026-11-06
 
 Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER SEQUENCE` options that map to modeled fields now travel the whole import → diff → plan → render path, and the result was verified against live PostgreSQL. The settled decisions are on [#16](https://github.com/osama784/schemamill/issues/16) (design review rounds 2–3); the feature landed in [#17](https://github.com/osama784/schemamill/pull/17), and the five verification scenes, the dogfood rerun, and this document in [#18](https://github.com/osama784/schemamill/pull/18).
 
@@ -12,13 +12,19 @@ Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER
 
 **Deliberately shallow for now:** a sequence is identified by schema and name, like a table — no rename detection; ownership alone is modeled, so an owned sequence need not back its column's default; hazards, listed here when this slice landed, have since shipped in the [hazards slice](./hazards.md), and transaction grouping has since shipped in the [transactions slice](./transactions.md).
 
+Live catalog reading shipped in [#80](https://github.com/osama784/schemamill/issues/80), recorded in [ADR 0018](../adr/0018-catalog-sequences-and-identity-columns.md): standalone and owned sequences read back from `pg_class`/`pg_sequence`/`pg_depend` with their effective options and ownership, while identity sequences attach only to their column's identity descriptor and never appear as `Sequence` entries. Sequence state, renames, and unlogged or temporary persistence modeling stay deferred.
+
+Import-side owner validation shipped in [#136](https://github.com/osama784/schemamill/issues/136): a post-pass over the final sequence drafts skips a sequence whole when its `OWNED BY` relation is absent from the imported model or is a partitioned parent, or when the owner table is present but the named column is not, and names the skip with `skipped sequence <schema>.<name> belongs to unread relation <ownerSchema>.<ownerTable>; it is not represented` or `skipped sequence <schema>.<name> belongs to unread column <ownerSchema>.<ownerTable>.<column>; it is not represented`. Both the inline `CREATE SEQUENCE … OWNED BY` and the `ALTER SEQUENCE … OWNED BY` paths record where the final owner was set; judging the final drafts keeps a forward reference and honors a later `OWNED BY NONE`. This is the catalog read's disposition — it too omits the whole sequence and names an unread relation — so `matches-import` can agree; the unlogged and temporary persistence flags wait for the pass, so a dropped sequence yields only its skip.
+
+`CREATE SEQUENCE IF NOT EXISTS` is flag-and-drop as well: the sequence still imports and emits one `dropped IF NOT EXISTS from <schema>.<name>` flag naming the schema-qualified identity. The findings ride the per-sequence buffer, so a repeated `CREATE SEQUENCE` reports only the last statement's clause — a later plain create clears an earlier clause's flag — and a sequence dropped by owner reconciliation reports only its skip ([#182](https://github.com/osama784/schemamill/issues/182)).
+
 ## Plan ordering
 
-Sequence steps sit in six global phases around the first slice's table phases, in this exact order:
+Sequence steps sit in thirteen global phases around the first slice's table phases. The numbered list below is the six-phase historical numbering and stays as written; the view phases now sit immediately before and after its table-operations step, comments are phase 12, and the extension alter/drop teardown is phase 13:
 
 1. **Creates** — one `create-sequence` per added sequence, in identity order.
 2. **Detaches** — `ALTER SEQUENCE … OWNED BY NONE` for a kept sequence whose baseline owner the plan removes and whose ownership the target changes. The detach runs before the owner's drop: PostgreSQL cascades an owned sequence away with its table or column, so a later detach would find it gone.
-3. **Table operations** — the first slice's nine phases, unchanged.
+3. **Table operations** — the first slice's nine phases have grown to eighteen table phases.
 4. **Attaches and re-owns** — ownership changes whose baseline owner survives: a first owner, a re-own, or a detach when the target drops ownership but keeps the owner.
 5. **Option alters** — one `alter-sequence` per changed sequence, carrying its non-ownership changes.
 6. **Drops** — every removed sequence whose owner the plan does not remove, last. A `DROP SEQUENCE` is suppressed exactly when the plan also removes the table or column that owned it, because PostgreSQL cascades it; otherwise the drop comes after the table phases, so a column's `DROP DEFAULT` has already released the sequence. A surviving default that still references a dropped sequence is a self-inconsistent target: the drop is emitted and fails loudly at apply (round 2, decision 8).
@@ -67,3 +73,12 @@ Three levels pin the slice:
 ## Non-goals
 
 Sequence state and renames are later slices; transaction grouping, listed here when this slice landed, has since shipped in the [transactions slice](./transactions.md). Identity columns and hazards, listed here when this slice landed, have since shipped in the [identity slice](./identity.md) and the [hazards slice](./hazards.md) respectively. Verification runs against PostgreSQL 16 locally and 18 in CI through the harness's existing gate; the harness itself was not changed.
+
+## Deferred
+
+Named, never silent:
+
+- **Hand-edited workspace models** — a workspace's `model.json` can still declare an `ownedBy` naming no table or column; `workspace.ts` validates the model's shape only, so a hand-edited dangling owner reaches `plan()`. Import-side validation does not cover that path.
+- **Partial-import divergence** — when an owner table is only partially imported (`LIKE`, `INHERITS`, or a skipped `CREATE TABLE AS`), import can skip a sequence the catalog would keep, because the catalog reads the real relation while import judges the imported model.
+- **Statement-level findings on a dropped sequence** — the two create-time persistence flags are buffered with the owner pass, but other statement-level findings about a sequence that is later dropped (for example an unknown-option skip from an `ALTER`) still surface beside the skip; full per-sequence diagnostic buffering is out of scope.
+- **Unqualified owner resolution** — `parseSequenceOwner` resolves an unqualified `OWNED BY t.c` to `public.t.c`, so a hand-written dump whose intended owner is a same-named table in another importable schema is matched against `public` and can be skipped where a live catalog read would keep it.
