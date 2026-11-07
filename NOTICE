@@ -1,8 +1,37 @@
 # Third-party notices
 
-The agent skills under `.agents/skills/` are vendored from [mattpocock/skills](https://github.com/mattpocock/skills).
+Most of the agent skills under `.agents/skills/` are vendored from five upstream repositories; two
+are authored in this repository and listed separately below. All five are MIT licensed. Each
+copyright line below is copied verbatim from that upstream's licence file, and the upstream path of
+every vendored skill is recorded in `skills-lock.json`.
+
+## Vendored skills
+
+- [mattpocock/skills](https://github.com/mattpocock/skills) — MIT — 12 skills
+  `Copyright (c) 2026 Matt Pocock`
+- [emilkowalski/skills](https://github.com/emilkowalski/skills) — MIT — 9 skills
+  `Copyright (c) 2026 Emil Kowalski`
+- [jakubkrehel/skills](https://github.com/jakubkrehel/skills) — MIT — 2 skills
+  `Copyright (c) 2026 Jakub Krehel`
+- [wshobson/agents](https://github.com/wshobson/agents) — MIT — 1 skill
+  `Copyright (c) 2024 Seth Hobson`
+- [mblode/agent-skills](https://github.com/mblode/agent-skills) — MIT — 1 skill
+  `Copyright (c) 2026 Matthew Blode`
+
+## MIT licence
+
+The MIT terms are identical in all five upstream licences and in `humanlayer/skills`, so the single
+copy below covers the 25 vendored skills and the `show-me` material reproduced in the `pr` skill.
+Only the copyright lines differ; the `wshobson/agents` copy ends with a trailing space and no final
+newline, which changes no terms. The `Copyright (c) 2026 HumanLayer` line governs that `show-me`
+prose, not a vendored skill directory.
 
 Copyright (c) 2026 Matt Pocock
+Copyright (c) 2026 Emil Kowalski
+Copyright (c) 2026 Jakub Krehel
+Copyright (c) 2024 Seth Hobson
+Copyright (c) 2026 Matthew Blode
+Copyright (c) 2026 HumanLayer
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -21,3 +50,21 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Skills authored in this repository
+
+`branch-pr-flow` and `changelog-flow` under `.agents/skills/` were written in this repository and are
+covered by this repository's [LICENSE](LICENSE), not by any notice above.
+
+## Third-party material in the pr skill
+
+`.agents/skills/pr/SKILL.md` reproduces prose from the `show-me` skill in
+[humanlayer/skills](https://github.com/humanlayer/skills/blob/main/plugins/show-me/skills/show-me/SKILL.md),
+by Dex Horthy. The Summary section's menu of visuals (pseudocode, call trees, component trees, file
+trees, Mermaid, diffs) and its placement guidance come from that skill, reproduced almost word for
+word and aimed at a diff instead of a live conversation.
+
+That material is MIT licensed — `Copyright (c) 2026 HumanLayer` — and is covered by the licence copy
+above. The specific change is disclosed in [`.agents/skills/pr/CREDITS.md`](.agents/skills/pr/CREDITS.md);
+the skill's own metadata records this path, while the link text in that file names a different
+repository.
