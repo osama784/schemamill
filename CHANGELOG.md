@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-07
+
 ### Added
 
 - **Docs gates: stale counts and broken relative links fail the test gate** — the root `test` chain now ends with `docs:counts --check` and a zero-dependency relative-link check over `docs/**/*.md` and `README.md`; the count scanner now also covers `README.md`, `AGENTS.md`, `CONTEXT.md`, and `DESIGN.md`; guides in [docs/docs-counts.md](docs/docs-counts.md) and [docs/docs-links.md](docs/docs-links.md) ([#185](https://github.com/osama784/schemamill/issues/185)).
