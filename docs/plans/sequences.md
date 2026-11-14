@@ -1,6 +1,6 @@
 # Sequences — model, plan, render, verify
 
-**Status:** built · **Last updated:** 2026-11-06
+**Status:** built · **Last updated:** 2026-11-14
 
 Sequences as first-class entities in the model: `CREATE SEQUENCE` and the `ALTER SEQUENCE` options that map to modeled fields now travel the whole import → diff → plan → render path, and the result was verified against live PostgreSQL. The settled decisions are on [#16](https://github.com/osama784/schemamill/issues/16) (design review rounds 2–3); the feature landed in [#17](https://github.com/osama784/schemamill/pull/17), and the five verification scenes, the dogfood rerun, and this document in [#18](https://github.com/osama784/schemamill/pull/18).
 
@@ -78,7 +78,7 @@ Sequence state and renames are later slices; transaction grouping, listed here w
 
 Named, never silent:
 
-- **Hand-edited workspace models** — a workspace's `model.json` can still declare an `ownedBy` naming no table or column; `workspace.ts` validates the model's shape only, so a hand-edited dangling owner reaches `plan()`. Import-side validation does not cover that path.
+- **Hand-edited workspace models** — plan-side validation shipped in [#189](https://github.com/osama784/schemamill/issues/189): `plan()` resolves every target sequence's `ownedBy` against the target model and refuses a dangling owner with the exported `SequenceOwnershipError`, naming the sequence, the owner, and the missing table or column, before any step is built ([ADR 0027](../adr/0027-plan-refuses-dangling-target-ownership.md)). The guard is target-only by design — a baseline-only hand-edit, including through the CLI's one-path workspace-as-baseline default, still plans — and one baseline residual stays named: an owner column absent from a baseline table the target removes still suppresses the explicit `drop-sequence`, leaving the sequence behind rather than validating it. `workspace.ts` still validates the model's shape only.
 - **Partial-import divergence** — when an owner table is only partially imported (`LIKE`, `INHERITS`, or a skipped `CREATE TABLE AS`), import can skip a sequence the catalog would keep, because the catalog reads the real relation while import judges the imported model.
 - **Statement-level findings on a dropped sequence** — the two create-time persistence flags are buffered with the owner pass, but other statement-level findings about a sequence that is later dropped (for example an unknown-option skip from an `ALTER`) still surface beside the skip; full per-sequence diagnostic buffering is out of scope.
 - **Unqualified owner resolution** — `parseSequenceOwner` resolves an unqualified `OWNED BY t.c` to `public.t.c`, so a hand-written dump whose intended owner is a same-named table in another importable schema is matched against `public` and can be skipped where a live catalog read would keep it.
