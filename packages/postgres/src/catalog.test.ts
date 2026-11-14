@@ -73,6 +73,7 @@ const key = (
   deferrable: false,
   deferred: false,
   period: false,
+  comment: null,
   ...rest,
 });
 
@@ -105,6 +106,7 @@ const constraint = (
   nullsNotDistinct: null,
   including: null,
   period: null,
+  comment: null,
   ...rest,
 });
 
@@ -201,6 +203,7 @@ const index = (
   valid: true,
   ready: true,
   tablespace: null,
+  comment: null,
   ...rest,
 });
 
@@ -272,6 +275,13 @@ const payload = (sections: {
   views: [],
   ...sections,
 });
+
+/** The row with its `comment` field removed: the pre-#192 payload shape. */
+const withoutComment = (row: Record<string, unknown>): Record<string, unknown> => {
+  const copy = { ...row };
+  delete copy.comment;
+  return copy;
+};
 
 test('maps a shuffled payload into the canonical model, order-significant', async () => {
   const read = await mapCatalog(
@@ -1358,6 +1368,356 @@ test('sorts views by JavaScript schema-then-name order, ignoring payload order',
     ['Zebra.B', 'Zebra.a', 'apple.A', 'apple.a (materialized)'],
     'views sort by plain string comparison on schema then name; materialized interleaves',
   );
+});
+
+test('attaches a primary-key comment on a stored non-conventional name', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'account_id', { type: 'uuid', attnotnull: true })],
+      primaryKeys: [
+        key('public', 'accounts', 'accounts_primary', 1, 'account_id', {
+          comment: "the account's primary key",
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.primaryKey, {
+    name: 'accounts_primary',
+    columns: ['account_id'],
+    comment: "the account's primary key",
+  });
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('attaches unique-constraint comments, kept and conventional-stripped', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [
+        column('public', 'accounts', 1, 'email', { attnotnull: true }),
+        column('public', 'accounts', 2, 'handle', { attnotnull: true }),
+      ],
+      constraints: [
+        uniqueConstraint('public', 'accounts', 'accounts_email_key', ['email'], {
+          comment: 'one account per email',
+        }),
+        uniqueConstraint('public', 'accounts', 'accounts_handle_unique', ['handle'], {
+          comment: "the account's handle",
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.uniqueConstraints, [
+    { columns: ['email'], comment: 'one account per email' },
+    {
+      name: 'accounts_handle_unique',
+      columns: ['handle'],
+      comment: "the account's handle",
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('attaches a check-constraint comment', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'balance', { type: 'integer' })],
+      constraints: [
+        checkConstraint('public', 'accounts', 'accounts_nonnegative', 'balance >= 0', {
+          comment: 'balances cannot go negative',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.checkConstraints, [
+    {
+      name: 'accounts_nonnegative',
+      expression: 'balance >= 0',
+      comment: 'balances cannot go negative',
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('attaches a foreign-key comment', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts'), table('public', 'orders')],
+      columns: [
+        column('public', 'accounts', 1, 'account_id', { type: 'uuid', attnotnull: true }),
+        column('public', 'orders', 1, 'account_id', { type: 'uuid' }),
+      ],
+      constraints: [
+        foreignKey(
+          'public',
+          'orders',
+          'orders_account_fk',
+          ['account_id'],
+          'public',
+          'accounts',
+          ['account_id'],
+          { comment: 'the owning account' },
+        ),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.tables.find((candidate) => candidate.name === 'orders')?.foreignKeys,
+    [
+      {
+        name: 'orders_account_fk',
+        columns: ['account_id'],
+        referencedTable: { schema: 'public', name: 'accounts' },
+        referencedColumns: ['account_id'],
+        comment: 'the owning account',
+      },
+    ],
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('attaches a named index comment at the initial push site', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'handle')],
+      indexes: [
+        index(
+          'public',
+          'accounts',
+          'accounts_handle_lookup',
+          definition('public', 'accounts', 'accounts_handle_lookup', 'handle'),
+          { comment: 'fast handle lookup' },
+        ),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.indexes, [
+    {
+      name: 'accounts_handle_lookup',
+      unique: false,
+      columns: ['handle'],
+      comment: 'fast handle lookup',
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('carries an index comment through the conventional-name strip', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'email')],
+      indexes: [
+        index(
+          'public',
+          'accounts',
+          'accounts_email_idx',
+          definition('public', 'accounts', 'accounts_email_idx', 'email'),
+          {
+            comment: 'covers email lookups',
+          },
+        ),
+      ],
+    }),
+  );
+
+  const mappedIndex = read.model.tables[0]?.indexes[0];
+  assert.deepEqual(mappedIndex, {
+    unique: false,
+    columns: ['email'],
+    comment: 'covers email lookups',
+  });
+  assert.equal(
+    Object.hasOwn(mappedIndex, 'name'),
+    false,
+    'the conventional index name strips while the comment stays',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('omits the comment key when a row states none, never an empty string or undefined', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't'), table('public', 'parent')],
+      columns: [
+        column('public', 't', 1, 'a', { type: 'integer', attnotnull: true }),
+        column('public', 't', 2, 'b', { type: 'integer' }),
+        column('public', 't', 3, 'ref', { type: 'integer' }),
+        column('public', 'parent', 1, 'id', { type: 'integer' }),
+      ],
+      primaryKeys: [key('public', 't', 't_primary', 1, 'a')],
+      constraints: [
+        uniqueConstraint('public', 't', 't_b_unique', ['b']),
+        checkConstraint('public', 't', 't_b_positive', 'b > 0'),
+        foreignKey('public', 't', 't_ref_fk', ['ref'], 'public', 'parent', ['id']),
+      ],
+      indexes: [index('public', 't', 't_b_lookup', definition('public', 't', 't_b_lookup', 'b'))],
+    }),
+  );
+
+  const mapped = read.model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(mapped, 'the table is mapped');
+  assert.deepEqual(mapped.primaryKey, { name: 't_primary', columns: ['a'] });
+  assert.deepEqual(mapped.uniqueConstraints, [{ name: 't_b_unique', columns: ['b'] }]);
+  assert.deepEqual(mapped.checkConstraints, [{ name: 't_b_positive', expression: 'b > 0' }]);
+  assert.deepEqual(mapped.foreignKeys, [
+    {
+      name: 't_ref_fk',
+      columns: ['ref'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+    },
+  ]);
+  assert.deepEqual(mapped.indexes, [{ name: 't_b_lookup', unique: false, columns: ['b'] }]);
+  const entries = [
+    ['primary key', mapped.primaryKey, ['columns', 'name']],
+    ['unique constraint', mapped.uniqueConstraints[0], ['columns', 'name']],
+    ['check constraint', mapped.checkConstraints[0], ['expression', 'name']],
+    [
+      'foreign key',
+      mapped.foreignKeys[0],
+      ['columns', 'name', 'referencedColumns', 'referencedTable'],
+    ],
+    ['index', mapped.indexes[0], ['columns', 'name', 'unique']],
+  ] as const;
+  for (const [label, entry, expectedKeys] of entries) {
+    assert.ok(entry, `the ${label} is mapped`);
+    assert.equal(
+      Object.hasOwn(entry, 'comment'),
+      false,
+      `an uncommented ${label} carries no comment key`,
+    );
+    assert.deepEqual(Object.keys(entry).sort(), expectedKeys, `the ${label} key set is exact`);
+  }
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('preserves constraint comments through conventional-name canonicalization', () => {
+  const accounts: TableIdentity = { schema: 'public', name: 'accounts' };
+  const canonical = canonicalizeConstraintNames(accounts, {
+    primaryKey: { name: 'accounts_pkey', columns: ['id'], comment: 'primary key comment' },
+    uniqueConstraints: [
+      { name: 'accounts_email_key', columns: ['email'], comment: 'unique comment' },
+      { name: 'accounts_handle_unique', columns: ['handle'], comment: 'kept name comment' },
+    ],
+    checkConstraints: [],
+    foreignKeys: [],
+  });
+  assert.deepEqual(canonical.primaryKey, { columns: ['id'], comment: 'primary key comment' });
+  assert.deepEqual(canonical.uniqueConstraints, [
+    { columns: ['email'], comment: 'unique comment' },
+    { name: 'accounts_handle_unique', columns: ['handle'], comment: 'kept name comment' },
+  ]);
+
+  const orders: TableIdentity = { schema: 'public', name: 'orders' };
+  const canonicalOrders = canonicalizeConstraintNames(orders, {
+    uniqueConstraints: [],
+    checkConstraints: [],
+    foreignKeys: [
+      {
+        name: 'orders_account_id_fkey',
+        columns: ['account_id'],
+        referencedTable: { schema: 'public', name: 'accounts' },
+        referencedColumns: ['id'],
+        comment: 'foreign key comment',
+      },
+      {
+        name: 'orders_billing_fk',
+        columns: ['billing_id'],
+        referencedTable: { schema: 'public', name: 'accounts' },
+        referencedColumns: ['id'],
+        comment: 'kept foreign key comment',
+      },
+    ],
+  });
+  assert.deepEqual(canonicalOrders.foreignKeys, [
+    {
+      columns: ['account_id'],
+      referencedTable: { schema: 'public', name: 'accounts' },
+      referencedColumns: ['id'],
+      comment: 'foreign key comment',
+    },
+    {
+      name: 'orders_billing_fk',
+      columns: ['billing_id'],
+      referencedTable: { schema: 'public', name: 'accounts' },
+      referencedColumns: ['id'],
+      comment: 'kept foreign key comment',
+    },
+  ]);
+});
+
+test('keeps a tablespace index comment and drops comments on skipped rows without diagnostics', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a')],
+      constraints: [{ ...exclusionConstraint('public', 't', 't_excl'), comment: 'excluded rows' }],
+      indexes: [
+        index('public', 't', 't_a_idx', definition('public', 't', 't_a_idx', 'a'), {
+          tablespace: 'fastspace',
+          comment: 'kept on the tablespace index',
+        }),
+        index('public', 't', 't_invalid_idx', definition('public', 't', 't_invalid_idx', 'a'), {
+          valid: false,
+          comment: 'invalid index comment',
+        }),
+        index('public', 't', 't_notready_idx', definition('public', 't', 't_notready_idx', 'a'), {
+          ready: false,
+          comment: 'not-ready index comment',
+        }),
+      ],
+    }),
+  );
+
+  const mappedIndex = read.model.tables[0]?.indexes[0];
+  assert.deepEqual(mappedIndex, {
+    unique: false,
+    columns: ['a'],
+    comment: 'kept on the tablespace index',
+  });
+  assert.equal(
+    Object.hasOwn(mappedIndex, 'name'),
+    false,
+    'the conventional tablespace index name strips while the comment stays',
+  );
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t_excl',
+      message: 'skipped exclusion constraint public.t_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message:
+        'index public.t_a_idx is on tablespace fastspace; tablespaces are not represented yet',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t_invalid_idx',
+      message:
+        'index public.t_invalid_idx is not valid and ready; invalid indexes are not represented yet',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t_notready_idx',
+      message:
+        'index public.t_notready_idx is not valid and ready; invalid indexes are not represented yet',
+    },
+  ]);
 });
 
 test('reads defaults whitespace-normalized, only with atthasdef and an attrdef row', async () => {
@@ -3143,6 +3503,7 @@ test('rejects primary-key rows that disagree on their attributes', async () => {
     ['deferrability', key('public', 't', 't_pkey', 2, 'b', { deferrable: true })],
     ['deferred', key('public', 't', 't_pkey', 2, 'b', { deferred: true })],
     ['period', key('public', 't', 't_pkey', 2, 'b', { period: true })],
+    ['comment', key('public', 't', 't_pkey', 2, 'b', { comment: 'commented' })],
   ] as const) {
     await assert.rejects(
       () =>
@@ -3158,7 +3519,7 @@ test('rejects primary-key rows that disagree on their attributes', async () => {
   }
 });
 
-test('rejects malformed constraint and not-null rows', async () => {
+test('rejects malformed constraint, primary-key, index, and not-null rows', async () => {
   const base = {
     tables: [table('public', 't')],
     columns: [column('public', 't', 1, 'a', { attnotnull: true })],
@@ -3213,6 +3574,62 @@ test('rejects malformed constraint and not-null rows', async () => {
         ],
       }),
       /catalog payload\.primaryKeys\[0\]\.deferrable must be a boolean/,
+    ],
+    [
+      'a primary-key row missing its comment',
+      payload({
+        ...base,
+        primaryKeys: [withoutComment(key('public', 't', 't_pkey', 1, 'a'))],
+      }),
+      /catalog payload\.primaryKeys\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a wrong-typed primary-key comment',
+      payload({
+        ...base,
+        primaryKeys: [key('public', 't', 't_pkey', 1, 'a', { comment: 7 })],
+      }),
+      /catalog payload\.primaryKeys\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a constraint row missing its comment',
+      payload({
+        ...base,
+        constraints: [withoutComment(uniqueConstraint('public', 't', 'u', ['a']))],
+      }),
+      /catalog payload\.constraints\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a wrong-typed constraint comment',
+      payload({
+        ...base,
+        constraints: [uniqueConstraint('public', 't', 'u', ['a'], { comment: [] })],
+      }),
+      /catalog payload\.constraints\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'an index row missing its comment',
+      payload({
+        ...base,
+        indexes: [
+          withoutComment(
+            index('public', 't', 't_a_idx', definition('public', 't', 't_a_idx', 'a')),
+          ),
+        ],
+      }),
+      /catalog payload\.indexes\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a wrong-typed index comment',
+      payload({
+        ...base,
+        indexes: [
+          index('public', 't', 't_a_idx', definition('public', 't', 't_a_idx', 'a'), {
+            comment: false,
+          }),
+        ],
+      }),
+      /catalog payload\.indexes\[0\]\.comment must be a string or null/,
     ],
   ];
   for (const [label, malformed, pattern] of cases) {

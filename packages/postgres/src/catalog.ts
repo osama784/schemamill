@@ -230,7 +230,8 @@ SELECT json_build_object(
         key_attribute.attname AS attname,
         key_constraint.condeferrable AS deferrable,
         key_constraint.condeferred AS deferred,
-        COALESCE((to_jsonb(key_constraint) ->> 'conperiod')::boolean, false) AS period
+        COALESCE((to_jsonb(key_constraint) ->> 'conperiod')::boolean, false) AS period,
+        pg_catalog.obj_description(key_constraint.oid, 'pg_constraint') AS comment
       FROM pg_catalog.pg_constraint AS key_constraint
       CROSS JOIN LATERAL unnest(key_constraint.conkey) WITH ORDINALITY
         AS key_column(attnum, ordinality)
@@ -340,7 +341,8 @@ SELECT json_build_object(
         CASE
           WHEN c.contype IN ('u', 'f')
           THEN COALESCE((to_jsonb(c) ->> 'conperiod')::boolean, false)
-        END AS period
+        END AS period,
+        pg_catalog.obj_description(c.oid, 'pg_constraint') AS comment
       FROM pg_catalog.pg_constraint AS c
       JOIN pg_catalog.pg_class AS relation ON relation.oid = c.conrelid
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -399,7 +401,8 @@ SELECT json_build_object(
         pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
         index.indisvalid AS valid,
         index.indisready AS ready,
-        tablespace.spcname AS tablespace
+        tablespace.spcname AS tablespace,
+        pg_catalog.obj_description(index_relation.oid, 'pg_class') AS comment
       FROM pg_catalog.pg_index AS index
       JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index.indexrelid
       JOIN pg_catalog.pg_class AS relation ON relation.oid = index.indrelid
@@ -582,6 +585,7 @@ interface PrimaryKeyRow {
   readonly deferrable: boolean;
   readonly deferred: boolean;
   readonly period: boolean;
+  readonly comment: string | null;
 }
 
 /** The `constraints` row kinds, one per `pg_constraint.contype` letter the read selects. */
@@ -614,6 +618,7 @@ interface ConstraintRow {
   readonly nullsNotDistinct: boolean | null;
   readonly including: boolean | null;
   readonly period: boolean | null;
+  readonly comment: string | null;
 }
 
 /** One `notNullConstraints` row of the payload, after validation. */
@@ -640,6 +645,7 @@ interface IndexRow {
   readonly ready: boolean;
   readonly tablespace: string | null;
   readonly create: IndexStmt;
+  readonly comment: string | null;
 }
 
 /**
@@ -826,7 +832,8 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         (existing) =>
           existing.deferrable !== keyRow.deferrable ||
           existing.deferred !== keyRow.deferred ||
-          existing.period !== keyRow.period,
+          existing.period !== keyRow.period ||
+          existing.comment !== keyRow.comment,
       )
     ) {
       throw new Error(
@@ -1065,7 +1072,11 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       }
       namedIndexes.push({
         indexName: indexRow.indexName,
-        index: { unique: envelope.unique, columns: envelope.columns },
+        index: {
+          unique: envelope.unique,
+          columns: envelope.columns,
+          ...(indexRow.comment === null ? {} : { comment: indexRow.comment }),
+        },
       });
     }
 
@@ -1530,6 +1541,7 @@ function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMa
     columns: ordered.map((row) => row.attname),
   };
   applyRowDeferrability(first, primaryKey);
+  if (first.comment !== null) primaryKey.comment = first.comment;
   return { conname: first.conname, primaryKey, period: first.period };
 }
 
@@ -1654,6 +1666,7 @@ function uniqueConstraintFromRow(row: ConstraintRow): UniqueConstraint {
     columns: [...row.columns!],
   };
   applyRowDeferrability(row, uniqueConstraint);
+  if (row.comment !== null) uniqueConstraint.comment = row.comment;
   return uniqueConstraint;
 }
 
@@ -1677,6 +1690,7 @@ function checkConstraintFromRow(row: ConstraintRow): CheckConstraint {
   };
   const enforcement = constraintEnforcementFromRow(row);
   if (enforcement !== undefined) checkConstraint.enforcement = enforcement;
+  if (row.comment !== null) checkConstraint.comment = row.comment;
   return checkConstraint;
 }
 
@@ -1705,6 +1719,7 @@ function foreignKeyFromRow(row: ConstraintRow): ForeignKey {
   const enforcement = constraintEnforcementFromRow(row);
   if (enforcement !== undefined) foreignKey.enforcement = enforcement;
   applyRowDeferrability(row, foreignKey);
+  if (row.comment !== null) foreignKey.comment = row.comment;
   return foreignKey;
 }
 
@@ -1795,9 +1810,15 @@ export function canonicalizeIndexNames(
   const seen = new Set<string>();
   const indexes: Index[] = [];
   for (const row of rows) {
-    const structure: { name?: string; unique: boolean; columns: string[] } = {
+    const structure: {
+      name?: string;
+      unique: boolean;
+      columns: string[];
+      comment?: string;
+    } = {
       unique: row.index.unique,
       columns: [...row.index.columns],
+      ...(row.index.comment === undefined ? {} : { comment: row.index.comment }),
     };
     const key = indexStructureKey(structure);
     if (row.indexName === synthesizedIndexName(identity, structure) && !seen.has(key)) {
@@ -2154,6 +2175,7 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     'deferrable',
     'deferred',
     'period',
+    'comment',
   ]);
   return {
     schema: expectString(row, path, 'schema'),
@@ -2164,6 +2186,7 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     deferrable: expectBoolean(row, path, 'deferrable'),
     deferred: expectBoolean(row, path, 'deferred'),
     period: expectBoolean(row, path, 'period'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2192,6 +2215,7 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     'nullsNotDistinct',
     'including',
     'period',
+    'comment',
   ]);
   const kind = expectString(row, path, 'kind');
   if (kind !== 'unique' && kind !== 'check' && kind !== 'foreign-key' && kind !== 'exclusion') {
@@ -2219,6 +2243,7 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     nullsNotDistinct: expectNullableBoolean(row, path, 'nullsNotDistinct'),
     including: expectNullableBoolean(row, path, 'including'),
     period: expectNullableBoolean(row, path, 'period'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2254,6 +2279,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     'valid',
     'ready',
     'tablespace',
+    'comment',
   ]);
   const definition = expectString(row, path, 'definition');
   return {
@@ -2264,6 +2290,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     ready: expectBoolean(row, path, 'ready'),
     tablespace: expectNullableString(row, path, 'tablespace'),
     create: await parseIndexDefinition(definition, path),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
