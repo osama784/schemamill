@@ -151,10 +151,9 @@ import { renderSql } from './render.ts';
  * structure is otherwise identical, so the plan carries comment steps only. `matches-import`
  * compares the catalog read with the applied dump's import, the catalog checks pin the stored
  * text and the `check_option=local` reloption on both sides, and the plan check proves a
- * comment-only change never rebuilds a view. `comment-round-trip` still declares no
- * `introspection` assertion: its target also carries constraint and index comments, which
- * catalog introspection does not read until slice 2 (#146 follow-up), so a comment-carrying
- * model is intentionally not what it returns.
+ * comment-only change never rebuilds a view. `comment-round-trip` declares the same
+ * `matches-import` assertion now that slice 2 (#146 follow-up) reads constraint and index
+ * comments too, so the whole comment-carrying model must come back from the catalog.
  *
  * The comment scene carries `comment` through every modeled family: the table (with a changed
  * special-character comment), columns (changed, removed, added), sequences (changed, removed),
@@ -6036,10 +6035,9 @@ interface ReassertedComment {
  * compare every entity's imported comment, keyed by its model identity, against the target model,
  * so a dump-import loss fails by object and text. The cross-import check then compares the two
  * server-derived imports — structure through `diff`, comments through the inventory — so a
- * comment mismatch fails by entity with both texts. There is no `introspection` assertion: the
- * target also carries constraint and index comments, and catalog introspection does not read
- * those until slice 2 (#146 follow-up), so a comment-carrying model is intentionally not what
- * it returns.
+ * comment mismatch fails by entity with both texts. It also declares `matches-import`: slice 2
+ * (#146 follow-up) completed the catalog's constraint and index comment reads, so the catalog
+ * read must return the whole comment-carrying model the applied dump imports.
  */
 const commentRoundTripScene = (): LiveScene => {
   const specialBaseline = "Owner's \\ draft\nline one — naïve ☃";
@@ -6660,6 +6658,7 @@ const commentRoundTripScene = (): LiveScene => {
         },
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 

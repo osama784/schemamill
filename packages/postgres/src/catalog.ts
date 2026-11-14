@@ -118,13 +118,15 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * explicit collation's `pg_dump` spelling (`format('%I.%I', …)` over `pg_collation` and its
  * namespace, null when the collation is the type's), and the `attstorage`/`typstorage`/
  * `attcompression` letters the explicit-only gates compare; primary-key rows carry the
- * constraint name, the key position, the column name, and the constraint's deferrability and
- * temporal flags; index rows are read for ordinary tables only, one row per index, carrying the
- * table identification, the stored name, the `pg_get_indexdef` definition, the valid and ready
- * flags, and the tablespace name (null for the default); `constraints` rows are uniform over
- * the unique, check, foreign-key, and exclusion kinds — every key is emitted and the keys a
- * kind does not use are null — and `notNullConstraints` rows carry PostgreSQL 18's named
- * not-null constraints (empty before 18). Constraint-backed indexes are excluded in SQL: a
+ * constraint name, the key position, the column name, the constraint's deferrability and
+ * temporal flags, and its `pg_constraint` object description; index rows are read for ordinary
+ * tables only, one row per index, carrying the table identification, the stored name, the
+ * `pg_get_indexdef` definition, the valid and ready flags, the tablespace name (null for the
+ * default), and the index relation's `pg_class` object description; `constraints` rows are
+ * uniform over the unique, check, foreign-key, and exclusion kinds — every key is emitted and
+ * the keys a kind does not use are null — with the constraint's `pg_constraint` object
+ * description; and `notNullConstraints` rows carry PostgreSQL 18's named not-null constraints
+ * (empty before 18). Constraint-backed indexes are excluded in SQL: a
  * primary-key, unique, or exclusion constraint consumes the index its `conindid` names,
  * mirroring the dump importer's `USING INDEX` rule. The `contype` filter is what keeps a
  * foreign key's `conindid` — the referenced table's index, possibly a standalone unique index
@@ -151,8 +153,10 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * materialized view cannot carry a check option; the mapper refuses one defensively.
  *
  * The comment columns are the PostgreSQL catalog's own: `obj_description` for a table,
- * sequence, or view (`pg_class`), and `col_description` for a column. Null means the object
- * carries no comment; a server comment is never empty (PostgreSQL deletes on empty).
+ * sequence, view, or index (`pg_class`), for a primary key or constraint (`pg_constraint`), and
+ * `col_description` for a column. Null means the object carries no comment; a server comment is
+ * never empty (PostgreSQL deletes on empty). A primary key's description repeats on every key
+ * row, and the mapper requires the rows to agree.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -633,9 +637,12 @@ interface NotNullConstraintRow {
 
 /**
  * One `indexes` row of the payload after validation: the table identification, the stored
- * index name, the state the mapper filters on, and the parsed definition the envelope
- * classification runs on. The definition parses during row validation, before any grouping, so
- * an unparseable one is a contract throw carrying the row's payload path.
+ * index name, the state the mapper filters on, the parsed definition the envelope
+ * classification runs on, and the index relation's object description (null when the index
+ * carries no comment). The definition parses during row validation, before any grouping, so
+ * an unparseable one is a contract throw carrying the row's payload path. The mapper attaches
+ * a non-null comment at the initial named-index push and `canonicalizeIndexNames` carries it
+ * through both the named and stripped branches, so the conventional-name strip never loses it.
  */
 interface IndexRow {
   readonly schema: string;
@@ -1528,9 +1535,9 @@ interface PrimaryKeyMapping {
 
 /**
  * The table's primary key from its key rows: columns in key order, the deferrability the rows
- * carry, and the stored name (the canonicalizer strips the conventional form). The grouping
- * pass already requires every row of one primary key to agree on `conname`, deferrability, and
- * the temporal flag.
+ * carry, the stored name (the canonicalizer strips the conventional form), and the comment,
+ * attached only when the row carries one. The grouping pass already requires every row of one
+ * primary key to agree on `conname`, deferrability, the temporal flag, and the comment.
  */
 function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMapping | undefined {
   if (rows === undefined || rows.length === 0) return undefined;
