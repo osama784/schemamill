@@ -118,13 +118,15 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * explicit collation's `pg_dump` spelling (`format('%I.%I', …)` over `pg_collation` and its
  * namespace, null when the collation is the type's), and the `attstorage`/`typstorage`/
  * `attcompression` letters the explicit-only gates compare; primary-key rows carry the
- * constraint name, the key position, the column name, and the constraint's deferrability and
- * temporal flags; index rows are read for ordinary tables only, one row per index, carrying the
- * table identification, the stored name, the `pg_get_indexdef` definition, the valid and ready
- * flags, and the tablespace name (null for the default); `constraints` rows are uniform over
- * the unique, check, foreign-key, and exclusion kinds — every key is emitted and the keys a
- * kind does not use are null — and `notNullConstraints` rows carry PostgreSQL 18's named
- * not-null constraints (empty before 18). Constraint-backed indexes are excluded in SQL: a
+ * constraint name, the key position, the column name, the constraint's deferrability and
+ * temporal flags, and its `pg_constraint` object description; index rows are read for ordinary
+ * tables only, one row per index, carrying the table identification, the stored name, the
+ * `pg_get_indexdef` definition, the valid and ready flags, the tablespace name (null for the
+ * default), and the index relation's `pg_class` object description; `constraints` rows are
+ * uniform over the unique, check, foreign-key, and exclusion kinds — every key is emitted and
+ * the keys a kind does not use are null — with the constraint's `pg_constraint` object
+ * description; and `notNullConstraints` rows carry PostgreSQL 18's named not-null constraints
+ * (empty before 18). Constraint-backed indexes are excluded in SQL: a
  * primary-key, unique, or exclusion constraint consumes the index its `conindid` names,
  * mirroring the dump importer's `USING INDEX` rule. The `contype` filter is what keeps a
  * foreign key's `conindid` — the referenced table's index, possibly a standalone unique index
@@ -151,8 +153,10 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * materialized view cannot carry a check option; the mapper refuses one defensively.
  *
  * The comment columns are the PostgreSQL catalog's own: `obj_description` for a table,
- * sequence, or view (`pg_class`), and `col_description` for a column. Null means the object
- * carries no comment; a server comment is never empty (PostgreSQL deletes on empty).
+ * sequence, view, or index (`pg_class`), for a primary key or constraint (`pg_constraint`), and
+ * `col_description` for a column. Null means the object carries no comment; a server comment is
+ * never empty (PostgreSQL deletes on empty). A primary key's description repeats on every key
+ * row, and the mapper requires the rows to agree.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -230,7 +234,8 @@ SELECT json_build_object(
         key_attribute.attname AS attname,
         key_constraint.condeferrable AS deferrable,
         key_constraint.condeferred AS deferred,
-        COALESCE((to_jsonb(key_constraint) ->> 'conperiod')::boolean, false) AS period
+        COALESCE((to_jsonb(key_constraint) ->> 'conperiod')::boolean, false) AS period,
+        pg_catalog.obj_description(key_constraint.oid, 'pg_constraint') AS comment
       FROM pg_catalog.pg_constraint AS key_constraint
       CROSS JOIN LATERAL unnest(key_constraint.conkey) WITH ORDINALITY
         AS key_column(attnum, ordinality)
@@ -340,7 +345,8 @@ SELECT json_build_object(
         CASE
           WHEN c.contype IN ('u', 'f')
           THEN COALESCE((to_jsonb(c) ->> 'conperiod')::boolean, false)
-        END AS period
+        END AS period,
+        pg_catalog.obj_description(c.oid, 'pg_constraint') AS comment
       FROM pg_catalog.pg_constraint AS c
       JOIN pg_catalog.pg_class AS relation ON relation.oid = c.conrelid
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -399,7 +405,8 @@ SELECT json_build_object(
         pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
         index.indisvalid AS valid,
         index.indisready AS ready,
-        tablespace.spcname AS tablespace
+        tablespace.spcname AS tablespace,
+        pg_catalog.obj_description(index_relation.oid, 'pg_class') AS comment
       FROM pg_catalog.pg_index AS index
       JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index.indexrelid
       JOIN pg_catalog.pg_class AS relation ON relation.oid = index.indrelid
@@ -582,6 +589,7 @@ interface PrimaryKeyRow {
   readonly deferrable: boolean;
   readonly deferred: boolean;
   readonly period: boolean;
+  readonly comment: string | null;
 }
 
 /** The `constraints` row kinds, one per `pg_constraint.contype` letter the read selects. */
@@ -614,6 +622,7 @@ interface ConstraintRow {
   readonly nullsNotDistinct: boolean | null;
   readonly including: boolean | null;
   readonly period: boolean | null;
+  readonly comment: string | null;
 }
 
 /** One `notNullConstraints` row of the payload, after validation. */
@@ -628,9 +637,12 @@ interface NotNullConstraintRow {
 
 /**
  * One `indexes` row of the payload after validation: the table identification, the stored
- * index name, the state the mapper filters on, and the parsed definition the envelope
- * classification runs on. The definition parses during row validation, before any grouping, so
- * an unparseable one is a contract throw carrying the row's payload path.
+ * index name, the state the mapper filters on, the parsed definition the envelope
+ * classification runs on, and the index relation's object description (null when the index
+ * carries no comment). The definition parses during row validation, before any grouping, so
+ * an unparseable one is a contract throw carrying the row's payload path. The mapper attaches
+ * a non-null comment at the initial named-index push and `canonicalizeIndexNames` carries it
+ * through both the named and stripped branches, so the conventional-name strip never loses it.
  */
 interface IndexRow {
   readonly schema: string;
@@ -640,6 +652,7 @@ interface IndexRow {
   readonly ready: boolean;
   readonly tablespace: string | null;
   readonly create: IndexStmt;
+  readonly comment: string | null;
 }
 
 /**
@@ -826,7 +839,8 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         (existing) =>
           existing.deferrable !== keyRow.deferrable ||
           existing.deferred !== keyRow.deferred ||
-          existing.period !== keyRow.period,
+          existing.period !== keyRow.period ||
+          existing.comment !== keyRow.comment,
       )
     ) {
       throw new Error(
@@ -1065,7 +1079,11 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       }
       namedIndexes.push({
         indexName: indexRow.indexName,
-        index: { unique: envelope.unique, columns: envelope.columns },
+        index: {
+          unique: envelope.unique,
+          columns: envelope.columns,
+          ...(indexRow.comment === null ? {} : { comment: indexRow.comment }),
+        },
       });
     }
 
@@ -1517,9 +1535,9 @@ interface PrimaryKeyMapping {
 
 /**
  * The table's primary key from its key rows: columns in key order, the deferrability the rows
- * carry, and the stored name (the canonicalizer strips the conventional form). The grouping
- * pass already requires every row of one primary key to agree on `conname`, deferrability, and
- * the temporal flag.
+ * carry, the stored name (the canonicalizer strips the conventional form), and the comment,
+ * attached only when the row carries one. The grouping pass already requires every row of one
+ * primary key to agree on `conname`, deferrability, the temporal flag, and the comment.
  */
 function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMapping | undefined {
   if (rows === undefined || rows.length === 0) return undefined;
@@ -1530,6 +1548,7 @@ function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMa
     columns: ordered.map((row) => row.attname),
   };
   applyRowDeferrability(first, primaryKey);
+  if (first.comment !== null) primaryKey.comment = first.comment;
   return { conname: first.conname, primaryKey, period: first.period };
 }
 
@@ -1654,6 +1673,7 @@ function uniqueConstraintFromRow(row: ConstraintRow): UniqueConstraint {
     columns: [...row.columns!],
   };
   applyRowDeferrability(row, uniqueConstraint);
+  if (row.comment !== null) uniqueConstraint.comment = row.comment;
   return uniqueConstraint;
 }
 
@@ -1677,6 +1697,7 @@ function checkConstraintFromRow(row: ConstraintRow): CheckConstraint {
   };
   const enforcement = constraintEnforcementFromRow(row);
   if (enforcement !== undefined) checkConstraint.enforcement = enforcement;
+  if (row.comment !== null) checkConstraint.comment = row.comment;
   return checkConstraint;
 }
 
@@ -1705,6 +1726,7 @@ function foreignKeyFromRow(row: ConstraintRow): ForeignKey {
   const enforcement = constraintEnforcementFromRow(row);
   if (enforcement !== undefined) foreignKey.enforcement = enforcement;
   applyRowDeferrability(row, foreignKey);
+  if (row.comment !== null) foreignKey.comment = row.comment;
   return foreignKey;
 }
 
@@ -1795,9 +1817,15 @@ export function canonicalizeIndexNames(
   const seen = new Set<string>();
   const indexes: Index[] = [];
   for (const row of rows) {
-    const structure: { name?: string; unique: boolean; columns: string[] } = {
+    const structure: {
+      name?: string;
+      unique: boolean;
+      columns: string[];
+      comment?: string;
+    } = {
       unique: row.index.unique,
       columns: [...row.index.columns],
+      ...(row.index.comment === undefined ? {} : { comment: row.index.comment }),
     };
     const key = indexStructureKey(structure);
     if (row.indexName === synthesizedIndexName(identity, structure) && !seen.has(key)) {
@@ -2154,6 +2182,7 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     'deferrable',
     'deferred',
     'period',
+    'comment',
   ]);
   return {
     schema: expectString(row, path, 'schema'),
@@ -2164,6 +2193,7 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     deferrable: expectBoolean(row, path, 'deferrable'),
     deferred: expectBoolean(row, path, 'deferred'),
     period: expectBoolean(row, path, 'period'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2192,6 +2222,7 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     'nullsNotDistinct',
     'including',
     'period',
+    'comment',
   ]);
   const kind = expectString(row, path, 'kind');
   if (kind !== 'unique' && kind !== 'check' && kind !== 'foreign-key' && kind !== 'exclusion') {
@@ -2219,6 +2250,7 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     nullsNotDistinct: expectNullableBoolean(row, path, 'nullsNotDistinct'),
     including: expectNullableBoolean(row, path, 'including'),
     period: expectNullableBoolean(row, path, 'period'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
@@ -2254,6 +2286,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     'valid',
     'ready',
     'tablespace',
+    'comment',
   ]);
   const definition = expectString(row, path, 'definition');
   return {
@@ -2264,6 +2297,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     ready: expectBoolean(row, path, 'ready'),
     tablespace: expectNullableString(row, path, 'tablespace'),
     create: await parseIndexDefinition(definition, path),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
