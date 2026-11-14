@@ -1068,7 +1068,7 @@ async function dropDatabase(baseUrl: string, database: string): Promise<void> {
 
 /** `pg_dump --schema-only --no-owner --no-privileges`, as text. */
 function dump(url: string): Promise<string> {
-  return run('pg_dump', ['--schema-only', '--no-owner', '--no-privileges', url]);
+  return run('pg_dump', ['--schema-only', '--no-owner', '--no-privileges', '-d', url]);
 }
 
 /** Applies a SQL file, ON_ERROR_STOP=1; the file may legitimately be empty. */
@@ -1083,7 +1083,7 @@ async function query(url: string, sql: string): Promise<string> {
 
 /** `psql` with client-local settings off and error stops on. */
 function psql(url: string, args: readonly string[]): Promise<string> {
-  return run('psql', [url, '-X', '-v', 'ON_ERROR_STOP=1', ...args]);
+  return run('psql', ['-d', url, '-X', '-v', 'ON_ERROR_STOP=1', ...args]);
 }
 
 /** Spawns a command and returns stdout, throwing with stderr and the exit code otherwise. */
