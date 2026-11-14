@@ -1066,9 +1066,14 @@ async function dropDatabase(baseUrl: string, database: string): Promise<void> {
   }
 }
 
-/** `pg_dump --schema-only --no-owner --no-privileges`, as text. */
-function dump(url: string): Promise<string> {
-  return run('pg_dump', ['--schema-only', '--no-owner', '--no-privileges', url]);
+/**
+ * `pg_dump --schema-only --no-owner --no-privileges`, as text. Windows `pg_dump` writes stdout
+ * in text mode like `psql`, so an embedded LF inside a comment literal arrives as CRLF; the
+ * server-side value is unchanged, so normalize it back before the dump is imported.
+ */
+async function dump(url: string): Promise<string> {
+  const text = await run('pg_dump', ['--schema-only', '--no-owner', '--no-privileges', '-d', url]);
+  return text.replace(/\r\n/g, '\n');
 }
 
 /** Applies a SQL file, ON_ERROR_STOP=1; the file may legitimately be empty. */
@@ -1076,14 +1081,18 @@ function applyFile(url: string, path: string): Promise<string> {
   return psql(url, ['-f', path]);
 }
 
-/** One scalar text value: `psql -tA` output, trimmed of its row terminator. */
+/**
+ * One scalar text value: `psql -tA` output, trimmed of its row terminator. Windows `psql`
+ * writes stdout in text mode, so an embedded LF arrives as CRLF; the server-side value is
+ * unchanged, so normalize it back before callers compare exact text.
+ */
 async function query(url: string, sql: string): Promise<string> {
-  return (await psql(url, ['-tA', '-c', sql])).trim();
+  return (await psql(url, ['-tA', '-c', sql])).replace(/\r\n/g, '\n').trim();
 }
 
 /** `psql` with client-local settings off and error stops on. */
 function psql(url: string, args: readonly string[]): Promise<string> {
-  return run('psql', [url, '-X', '-v', 'ON_ERROR_STOP=1', ...args]);
+  return run('psql', ['-d', url, '-X', '-v', 'ON_ERROR_STOP=1', ...args]);
 }
 
 /** Spawns a command and returns stdout, throwing with stderr and the exit code otherwise. */

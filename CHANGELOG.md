@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The gated live suite runs on Windows** — `@schemamill/postgres`'s live harness switched `psql` to `-d <connection string>`, because on Windows only `psql` ignored the flags after a positional `postgresql://…` connection string and hung at the first probe; `pg_dump` was switched to the same `-d` form for symmetry, since its positional invocation already worked, and both commands' captured output was normalized from the CRLF that Windows text mode inserts back to LF, so comment text with embedded newlines compared exactly as the server stored it ([#207](https://github.com/osama784/schemamill/issues/207)).
+
 ## [0.7.0] - 2026-11-07
 
 ### Added
