@@ -12,11 +12,17 @@
 // Usage: node .github/scripts/link-check.mjs
 
 import { readdir, readFile, stat } from 'node:fs/promises';
-import { posix } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
-const REPO_ROOT = posix.resolve(posix.dirname(SCRIPT_PATH), '../..');
+const REPO_ROOT = resolve(dirname(SCRIPT_PATH), '../..');
+
+/** Maps an absolute native path to the POSIX view used only for link arithmetic. */
+function toLinkPath(nativePath) {
+  const forward = resolve(nativePath).split(sep).join('/');
+  return forward.startsWith('/') ? forward : `/${forward}`;
+}
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
 const MARKDOWN_LINK = /!?\[[^\]]*\]\(([^)]*)\)/g;
@@ -132,17 +138,17 @@ async function listScopedFiles(repoRoot) {
       if (entry.name === 'node_modules' || entry.name === 'dist') continue;
       const relativePath = `${relativeDirectory}/${entry.name}`;
       if (entry.isDirectory()) {
-        await walk(posix.join(directory, entry.name), relativePath);
+        await walk(join(directory, entry.name), relativePath);
       } else if (entry.isFile() && entry.name.endsWith('.md')) {
         files.push(relativePath);
       }
     }
   }
 
-  await walk(posix.join(repoRoot, 'docs'), 'docs');
+  await walk(join(repoRoot, 'docs'), 'docs');
 
   try {
-    await stat(posix.join(repoRoot, 'README.md'));
+    await stat(join(repoRoot, 'README.md'));
     files.push('README.md');
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
@@ -180,18 +186,29 @@ async function resolveLink({ repoRoot, file, target, anchorCache }) {
   const decodedPath = decode(pathPart);
   if (decodedPath === null) return { reason: 'invalid percent-encoding' };
 
-  const sourcePath = posix.join(repoRoot, file);
+  const repoRootLink = toLinkPath(repoRoot);
+  const sourcePath = posix.join(repoRootLink, file);
   const resolved =
     decodedPath === '' ? sourcePath : posix.resolve(posix.dirname(sourcePath), decodedPath);
 
-  const relativePath = posix.relative(repoRoot, resolved);
+  const relativePath = posix.relative(repoRootLink, resolved);
   if (relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath)) {
+    return { reason: 'escapes the repository root' };
+  }
+
+  const nativePath = resolve(repoRoot, relativePath);
+  const nativeRelative = relative(repoRoot, nativePath);
+  if (
+    nativeRelative === '..' ||
+    nativeRelative.startsWith(`..${sep}`) ||
+    isAbsolute(nativeRelative)
+  ) {
     return { reason: 'escapes the repository root' };
   }
 
   let stats;
   try {
-    stats = await stat(resolved);
+    stats = await stat(nativePath);
   } catch (error) {
     if (error.code === 'ENOENT') return { reason: 'missing file or directory' };
     throw error;
@@ -203,7 +220,7 @@ async function resolveLink({ repoRoot, file, target, anchorCache }) {
   if (fragment !== undefined && fragment !== '' && resolved.endsWith('.md')) {
     const decodedFragment = decode(fragment);
     if (decodedFragment === null) return { reason: 'invalid percent-encoding' };
-    const slugs = await slugsFor(resolved, anchorCache);
+    const slugs = await slugsFor(nativePath, anchorCache);
     if (!slugs.has(decodedFragment)) return { reason: `missing anchor #${decodedFragment}` };
   }
 
@@ -218,7 +235,7 @@ export async function checkLinks({ repoRoot = REPO_ROOT, files } = {}) {
   let checked = 0;
 
   for (const file of scoped) {
-    const source = await readFile(posix.join(repoRoot, file), 'utf8');
+    const source = await readFile(join(repoRoot, file), 'utf8');
     for (const link of extractLinks(stripFencedCode(source))) {
       const result = await resolveLink({ repoRoot, file, target: link.target, anchorCache });
       if (result === null) continue;
@@ -232,7 +249,10 @@ export async function checkLinks({ repoRoot = REPO_ROOT, files } = {}) {
   return { checked, broken };
 }
 
-if (process.argv[1] !== undefined && posix.resolve(process.argv[1]) === SCRIPT_PATH) {
+if (
+  process.argv[1] !== undefined &&
+  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+) {
   try {
     const { checked, broken } = await checkLinks({ repoRoot: REPO_ROOT });
     for (const link of broken) {
