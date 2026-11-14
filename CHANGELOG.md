@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The gated live suite runs on Windows** — `@schemamill/postgres`'s live harness switched its `psql` and `pg_dump` invocations to `-d <connection string>`, so the Windows client no longer read `postgresql://…` as an options string and hung at the first probe, and normalized the CRLF that Windows text-mode stdout inserts in captured output back to LF, so comment text with embedded newlines compared exactly as the server stored it ([#207](https://github.com/osama784/schemamill/issues/207)).
+
 ## [0.7.0] - 2026-11-07
 
 ### Added
