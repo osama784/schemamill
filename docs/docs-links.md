@@ -17,7 +17,7 @@ Not checked: `CHANGELOG.md`, `AGENTS.md`, `CONTEXT.md`, `DESIGN.md`, `.agents/**
 - Fenced code blocks are skipped, so a link example inside one is never resolved.
 - Empty targets, targets with a scheme (`https:`, `mailto:`, …), and protocol-relative `//` targets are skipped.
 - A fragment-only target (`#section`) resolves against the source file.
-- Paths resolve POSIX-style against the source file's directory, and an exact file or a directory is accepted — directory links exist in the docs.
+- The checker keeps POSIX semantics for link text, anchors, and slugs — a link path resolves against the source file's directory, so links are written with forward slashes — while filesystem access is native, so on Windows a target containing a backslash is treated as a separator. An exact file or a directory is accepted; directory links exist in the docs.
 - A target that resolves outside the repository root is broken.
 - For a `.md` target, the fragment is checked against the target's heading slugs; a fragment on any other file type is ignored.
 
