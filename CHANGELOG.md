@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The relative-link check resolves paths natively** — the docs gate now computes its repository root and every filesystem target with the platform's own path API, keeping POSIX semantics only for link text, anchors, and slugs, and guards its entrypoint by comparing file URLs, so on Windows it no longer resolved every target under `/` and reported a vacuous pass over zero links; POSIX behavior is unchanged ([#207](https://github.com/osama784/schemamill/issues/207)).
+
 ## [0.7.0] - 2026-11-07
 
 ### Added
