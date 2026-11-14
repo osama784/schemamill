@@ -249,9 +249,11 @@ import type {
  * equal models in any insertion order therefore produce deep-equal plans.
  *
  * The plan assumes well-formed models: foreign keys point at tables the model contains, key
- * columns exist, a table's columns are unique by name, and a sequence's `ownedBy` names a
- * table and column the model contains. It validates nothing; import and introspection are
- * where well-formedness comes from. Every step carries an independent copy of the payloads it
+ * columns exist, and a table's columns are unique by name. It resolves every target sequence's
+ * `ownedBy` against the target model and throws `SequenceOwnershipError` when the owner table or
+ * column is absent, before any step is built; it validates nothing else. Import and introspection
+ * are where the rest of well-formedness comes from. Baseline owners are carried as `before`
+ * values only and are not validated. Every step carries an independent copy of the payloads it
  * embeds, so mutating a plan never affects the caller's models, and `plan` never mutates its
  * inputs.
  */
@@ -553,11 +555,69 @@ function schemaSteps(baseline: Model, target: Model): readonly Step[] {
 }
 
 /**
+ * Thrown by `plan` when a target sequence's `ownedBy` names a table or column the target model
+ * does not carry. The plan would otherwise emit an ownership attach PostgreSQL cannot execute,
+ * so the malformed target is refused before any step is built. Baseline owners are never
+ * validated: they only ever become `before` values.
+ *
+ * `sequence` and `owner` are independent copies of the model's objects; `missing` names which
+ * lookup failed, the owner table itself or the owner column once the table resolves.
+ */
+export class SequenceOwnershipError extends Error {
+  /** The target sequence whose `ownedBy` does not resolve, copied. */
+  readonly sequence: SequenceIdentity;
+  /** The unresolved owner, copied. */
+  readonly owner: SequenceOwner;
+  /** Which lookup failed: the owner table, or the owner column on the resolved table. */
+  readonly missing: 'table' | 'column';
+
+  constructor(sequence: SequenceIdentity, owner: SequenceOwner, missing: 'table' | 'column') {
+    const sequenceName = `${sequence.schema}.${sequence.name}`;
+    const ownerTable = `${owner.table.schema}.${owner.table.name}`;
+    super(
+      missing === 'table'
+        ? `sequence ${sequenceName} is owned by ${ownerTable}.${owner.column}, but the target model has no table ${ownerTable}`
+        : `sequence ${sequenceName} is owned by ${ownerTable}.${owner.column}, but the target model has no column ${owner.column} on table ${ownerTable}`,
+    );
+
+    this.name = 'SequenceOwnershipError';
+    this.sequence = copySequenceIdentity(sequence);
+    this.owner = copyOwner(owner);
+    this.missing = missing;
+  }
+}
+
+/**
+ * Throws `SequenceOwnershipError` unless every target sequence's `ownedBy` resolves against the
+ * target model: the owner table first, by schema and name, then the owner column on it. The
+ * sequences are walked in identity order, so the reported offender is the smallest dangling
+ * identity no matter how the model's array is ordered. Baseline owners are not validated: they
+ * only ever become `before` values.
+ */
+function assertTargetOwnership(target: Model): void {
+  const tables = new Map(target.tables.map((table) => [keyOf(table), table]));
+  const sequences = [...target.sequences].sort(compareIdentities);
+
+  for (const sequence of sequences) {
+    const owner = sequence.ownedBy;
+    if (owner === undefined) continue;
+
+    const table = tables.get(keyOf(owner.table));
+    if (table === undefined) throw new SequenceOwnershipError(sequence, owner, 'table');
+    if (!table.columns.some((column) => column.name === owner.column)) {
+      throw new SequenceOwnershipError(sequence, owner, 'column');
+    }
+  }
+}
+
+/**
  * The steps from `baseline` to `target`, in dependency-correct order. Returned payloads are
  * independent copies: mutating them never affects the caller's models, and neither input is
- * mutated.
+ * mutated. Every target sequence's `ownedBy` is validated against the target model before the
+ * diff runs; a dangling owner throws `SequenceOwnershipError`.
  */
 export function plan(baseline: Model, target: Model): Plan {
+  assertTargetOwnership(target);
   const changes = diff(baseline, target);
 
   const application = emptyChangeApplication();

@@ -8,6 +8,7 @@ import {
   effectiveIdentity,
   effectiveSequence,
   plan,
+  SequenceOwnershipError,
   sequenceTypeBounds,
   sequenceTypeChange,
 } from './index.ts';
@@ -4926,6 +4927,154 @@ test('a removed sequence whose owner survives is dropped explicitly, in identity
   );
 });
 
+/**
+ * Plans `baseline` to `target` and returns the `SequenceOwnershipError` it must throw, failing
+ * when planning succeeds or throws any other error.
+ */
+const ownershipError = (baseline: Model, target: Model): SequenceOwnershipError => {
+  try {
+    plan(baseline, target);
+  } catch (error) {
+    if (error instanceof SequenceOwnershipError) return error;
+    throw error;
+  }
+  assert.fail('plan must refuse the dangling target owner');
+};
+
+test('a target sequence owned by a missing table is refused', () => {
+  const error = ownershipError(
+    model(),
+    sequenceModel([sequence('s', { ownedBy: owner('absent', 'id') })]),
+  );
+
+  assert.equal(error.name, 'SequenceOwnershipError');
+  assert.equal(
+    error.message,
+    'sequence public.s is owned by public.absent.id, but the target model has no table public.absent',
+  );
+  assert.deepStrictEqual(error.sequence, identity('s'));
+  assert.deepStrictEqual(error.owner, owner('absent', 'id'));
+  assert.equal(error.missing, 'table');
+});
+
+test('a target sequence owned by a missing column is refused', () => {
+  const t = table('t', { columns: [column('a')] });
+  const error = ownershipError(
+    model(t),
+    sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], t),
+  );
+
+  assert.equal(
+    error.message,
+    'sequence public.s is owned by public.t.id, but the target model has no column id on table public.t',
+  );
+  assert.deepStrictEqual(error.sequence, identity('s'));
+  assert.deepStrictEqual(error.owner, owner('t', 'id'));
+  assert.equal(error.missing, 'column');
+});
+
+test('a target with no sequences, or only unowned sequences and no tables, still plans', () => {
+  assertPlan(model(), model(), []);
+  assertPlan(model(), sequenceModel([sequence('s')]), [
+    { kind: 'create-sequence', sequence: sequence('s') },
+  ]);
+});
+
+test('a dangling baseline owner with a valid target owner plans one attach, not a detach', () => {
+  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+
+  // The baseline owner table is absent too, but only target owners are validated. The sole
+  // ownership step attaches the target owner over the dangling baseline one; no detach runs.
+  assertPlan(
+    sequenceModel([sequence('s', { ownedBy: owner('gone', 'id') })], t),
+    sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], t),
+    [
+      {
+        kind: 'alter-sequence',
+        sequence: identity('s'),
+        fields: [{ field: 'ownedBy', before: owner('gone', 'id'), after: owner('t', 'id') }],
+      },
+    ],
+  );
+});
+
+test('SequenceOwnershipError is exported from the core barrel as a named Error subclass', () => {
+  const error = ownershipError(
+    model(),
+    sequenceModel([sequence('s', { ownedBy: owner('absent', 'id') })]),
+  );
+
+  assert.ok(error instanceof Error);
+  assert.ok(error instanceof SequenceOwnershipError);
+  assert.equal(error.name, 'SequenceOwnershipError');
+});
+
+test('owner lookup is schema-sensitive: a same-named table in another schema does not resolve', () => {
+  const publicT = table('t', { columns: [column('id', { type: 'bigint' })] });
+  const error = ownershipError(
+    model(publicT),
+    sequenceModel([sequence('s', { ownedBy: owner('t', 'id', 'other') })], publicT),
+  );
+
+  assert.equal(error.missing, 'table');
+  assert.deepStrictEqual(error.owner.table, identity('t', 'other'));
+  assert.equal(
+    error.message,
+    'sequence public.s is owned by other.t.id, but the target model has no table other.t',
+  );
+});
+
+test('an identical dangling owner on baseline and target is refused before the diff runs', () => {
+  const dangling = sequenceModel([sequence('s', { ownedBy: owner('absent', 'id') })]);
+  assert.deepStrictEqual(diff(dangling, dangling), []);
+
+  const error = ownershipError(dangling, dangling);
+
+  assert.equal(error.missing, 'table');
+  assert.deepStrictEqual(error.sequence, identity('s'));
+});
+
+test('an owner whose table and column are both missing reports the missing table', () => {
+  const error = ownershipError(
+    model(),
+    sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })]),
+  );
+
+  assert.equal(error.missing, 'table');
+  assert.equal(
+    error.message,
+    'sequence public.s is owned by public.t.id, but the target model has no table public.t',
+  );
+});
+
+test('a baseline owner column the baseline lacks still suppresses the explicit drop', () => {
+  const baselineTable = table('t', { columns: [column('a')] });
+
+  // The baseline is malformed: column `b` does not exist. Only target owners are validated, so
+  // planning succeeds; the removed table suppresses the explicit drop and the sequence is left
+  // behind, since PostgreSQL's cascade cannot reach a column that is not there (a known residual).
+  assertPlan(sequenceModel([sequence('s', { ownedBy: owner('t', 'b') })], baselineTable), model(), [
+    { kind: 'drop-table', table: identity('t') },
+  ]);
+});
+
+test('two dangling target sequences report the smaller identity whichever order they arrive in', () => {
+  const sequences = [
+    sequence('z_seq', { ownedBy: owner('absent_z', 'id') }),
+    sequence('a_seq', { ownedBy: owner('absent_a', 'id') }),
+  ];
+
+  const forward = ownershipError(model(), sequenceModel(sequences));
+  const reversed = ownershipError(model(), sequenceModel([...sequences].reverse()));
+
+  for (const error of [forward, reversed]) {
+    assert.deepStrictEqual(error.sequence, identity('a_seq'));
+    assert.deepStrictEqual(error.owner, owner('absent_a', 'id'));
+    assert.equal(error.missing, 'table');
+  }
+  assert.equal(reversed.message, forward.message);
+});
+
 test('ownership attaches, then option alters, then sequence drops', () => {
   const t = table('t', {
     columns: [column('id', { type: 'bigint', notNull: true }), column('x', { type: 'bigint' })],
@@ -5007,7 +5156,9 @@ test('a deep-frozen model with sequences can be planned, and steps are independe
 });
 
 test('a deep-frozen model with a changed sequence can be planned without mutation', () => {
-  const t = table('t', { columns: [column('id', { type: 'bigint', notNull: true })] });
+  const t = table('t', {
+    columns: [column('id', { type: 'bigint', notNull: true }), column('other', { type: 'bigint' })],
+  });
   const baseline = deepFreeze(sequenceModel([sequence('s', { ownedBy: owner('t', 'id') })], t));
   const target = deepFreeze(sequenceModel([sequence('s', { ownedBy: owner('t', 'other') })], t));
 

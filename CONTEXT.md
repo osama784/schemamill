@@ -111,7 +111,7 @@ A column's `DEFAULT` that calls `nextval()` on a sequence — what the `serial` 
 _Avoid_: serial column, autoincrement
 
 **Ownership**:
-The link from a sequence to the table column it serves, stated as `OWNED BY`. PostgreSQL drops an owned sequence together with its owning table or column, so the plan detaches before a removed owner and suppresses a redundant drop.
+The link from a sequence to the table column it serves, stated as `OWNED BY`. PostgreSQL drops an owned sequence together with its owning table or column, so the plan detaches before a removed owner and suppresses a redundant drop. The plan validates every target sequence's `ownedBy` against the target model and refuses a dangling owner with `SequenceOwnershipError` before building any step.
 _Avoid_: dependency, association
 
 **Identity column**:

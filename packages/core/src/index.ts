@@ -3,7 +3,7 @@ export const version = '0.7.0';
 
 export { diff } from './diff.ts';
 export { canonicalIntType, effectiveIdentity } from './identity.ts';
-export { assertNever, plan } from './plan.ts';
+export { assertNever, plan, SequenceOwnershipError } from './plan.ts';
 export type { TransactionGroup } from './plan.ts';
 export {
   defaultSequenceMax,
