@@ -254,6 +254,23 @@ const viewRow = (schema = 'public', name = 'v', rest: Record<string, unknown> = 
   ...rest,
 });
 
+/**
+ * An `extensions` row: an installed extension above the built-in OID boundary, with no comment
+ * unless overridden. The OID is the payload's exact decimal string, never a JSON number.
+ */
+const extensionRow = (
+  name: string,
+  schema: string,
+  oid: number,
+  rest: Record<string, unknown> = {},
+) => ({
+  oid: String(oid),
+  name,
+  schema,
+  comment: null,
+  ...rest,
+});
+
 /** The sections of a payload, with the empty array default for sections a test does not use. */
 const payload = (sections: {
   readonly tables?: readonly unknown[];
@@ -264,6 +281,7 @@ const payload = (sections: {
   readonly notNullConstraints?: readonly unknown[];
   readonly sequences?: readonly unknown[];
   readonly views?: readonly unknown[];
+  readonly extensions?: readonly unknown[];
 }) => ({
   tables: [],
   columns: [],
@@ -273,6 +291,7 @@ const payload = (sections: {
   notNullConstraints: [],
   sequences: [],
   views: [],
+  extensions: [],
   ...sections,
 });
 
@@ -1367,6 +1386,173 @@ test('sorts views by JavaScript schema-then-name order, ignoring payload order',
     ),
     ['Zebra.B', 'Zebra.a', 'apple.A', 'apple.a (materialized)'],
     'views sort by plain string comparison on schema then name; materialized interleaves',
+  );
+});
+
+test('maps extensions by name with their install schema and comment', async () => {
+  const extensions = [
+    extensionRow('b', 'a', 16385),
+    extensionRow('a', 'z', 16384, { comment: "a's comment" }),
+  ];
+  const forward = await mapCatalog(payload({ extensions }));
+  const shuffled = await mapCatalog(payload({ extensions: [...extensions].reverse() }));
+
+  assert.deepEqual(forward, shuffled, 'the mapper does not depend on extension payload order');
+  assert.deepEqual(forward, {
+    model: {
+      tables: [],
+      sequences: [],
+      views: [],
+      extensions: [
+        { name: 'a', schema: 'z', comment: "a's comment" },
+        { name: 'b', schema: 'a' },
+      ],
+    },
+    diagnostics: [],
+  });
+  assert.deepEqual(
+    forward.model.extensions.map((extension) => `${extension.name}.${extension.schema}`),
+    ['a.z', 'b.a'],
+    'extensions sort by name only, not by schema then name',
+  );
+  assert.equal(
+    Object.hasOwn(forward.model.extensions[1]!, 'comment'),
+    false,
+    'an extension without a comment carries no comment key',
+  );
+});
+
+test('excludes built-in extensions by the pg_dump OID boundary', async () => {
+  const read = await mapCatalog(
+    payload({
+      extensions: [
+        extensionRow('next', 'public', 16385),
+        extensionRow('plpgsql', 'pg_catalog', 16383),
+        extensionRow('first_normal', 'public', 16384),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    read.model.extensions.map((extension) => extension.name),
+    ['first_normal', 'next'],
+    'oid 16383 is built-in and excluded; 16384 and 16385 are read',
+  );
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('drops empty extension comments and refuses NUL', async () => {
+  const read = await mapCatalog(
+    payload({
+      extensions: [
+        extensionRow('absent', 'public', 16384),
+        extensionRow('empty', 'public', 16385, { comment: '' }),
+        extensionRow('kept', 'public', 16386, { comment: 'kept verbatim' }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.extensions, [
+    { name: 'absent', schema: 'public' },
+    { name: 'empty', schema: 'public' },
+    { name: 'kept', schema: 'public', comment: 'kept verbatim' },
+  ]);
+  for (const extension of read.model.extensions.slice(0, 2)) {
+    assert.deepEqual(
+      Object.keys(extension),
+      ['name', 'schema'],
+      'a null or empty comment leaves no comment key',
+    );
+  }
+
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          extensions: [extensionRow('nul', 'public', 16384, { comment: 'nul\u0000inside' })],
+        }),
+      ),
+    /catalog payload\.extensions\[0\]\.comment must not contain a NUL character/,
+    'a comment containing U+0000 is a contract throw',
+  );
+});
+
+test('rejects malformed extension rows', async () => {
+  const cases: readonly (readonly [string, unknown, RegExp])[] = [
+    [
+      'an unknown extension field',
+      payload({ extensions: [{ ...extensionRow('a', 'public', 16384), extra: true }] }),
+      /catalog payload\.extensions\[0\] carries an unknown field "extra"/,
+    ],
+    [
+      'a row missing its oid',
+      payload({ extensions: [{ name: 'a', schema: 'public', comment: null }] }),
+      /catalog payload\.extensions\[0\]\.oid must be a string/,
+    ],
+    [
+      'a row missing its name',
+      payload({ extensions: [{ oid: '16384', schema: 'public', comment: null }] }),
+      /catalog payload\.extensions\[0\]\.name must be a string/,
+    ],
+    [
+      'a row missing its schema',
+      payload({ extensions: [{ oid: '16384', name: 'a', comment: null }] }),
+      /catalog payload\.extensions\[0\]\.schema must be a string/,
+    ],
+    [
+      'a row missing its comment',
+      payload({ extensions: [{ oid: '16384', name: 'a', schema: 'public' }] }),
+      /catalog payload\.extensions\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a numeric oid',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { oid: 16384 })] }),
+      /catalog payload\.extensions\[0\]\.oid must be a string/,
+    ],
+    [
+      'a numeric name',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { name: 7 })] }),
+      /catalog payload\.extensions\[0\]\.name must be a string/,
+    ],
+    [
+      'a numeric schema',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { schema: 7 })] }),
+      /catalog payload\.extensions\[0\]\.schema must be a string/,
+    ],
+    [
+      'a numeric comment',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { comment: 7 })] }),
+      /catalog payload\.extensions\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a zero-padded oid',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { oid: '016384' })] }),
+      /catalog payload\.extensions\[0\]\.oid must be a canonical decimal string/,
+    ],
+    [
+      'a non-numeric oid',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { oid: 'abc' })] }),
+      /catalog payload\.extensions\[0\]\.oid must be a canonical decimal string/,
+    ],
+    [
+      'a negative oid',
+      payload({ extensions: [extensionRow('a', 'public', 16384, { oid: '-1' })] }),
+      /catalog payload\.extensions\[0\]\.oid must be a canonical decimal string/,
+    ],
+  ];
+  for (const [label, malformed, pattern] of cases) {
+    await assert.rejects(() => mapCatalog(malformed), pattern, label);
+  }
+
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          extensions: [extensionRow('dup', 'a', 16384), extensionRow('dup', 'b', 16385)],
+        }),
+      ),
+    /catalog payload: duplicate extension "dup"/,
+    'two extension rows with one name, different schemas included',
   );
 });
 
