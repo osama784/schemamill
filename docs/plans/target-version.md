@@ -1,8 +1,8 @@
 # Target version — plan rendering honors a declared PostgreSQL major
 
-**Status:** built · **Last updated:** 2026-11-06
+**Status:** built · **Last updated:** 2026-11-15
 
-Version handling is one of the [core domain's hard problems](../domain/core-domain.md): catalog shape, DDL support, and lock behavior differ across PostgreSQL majors, and offline work has to state the version it generates for. This slice ships the offline half of that statement: `renderSql` accepts a declared PostgreSQL major, `plan` exposes it as `--target-version`, and the two statements the renderer synthesizes above the documented floor refuse by name instead of emitting SQL the declared server rejects. Live detection, credentials, and transport stay with [#57](https://github.com/osama784/schemamill/issues/57). The durable decisions are recorded in [ADR 0024](../adr/0024-synthesized-forms-consult-the-target-version.md); the slice shipped in [#141](https://github.com/osama784/schemamill/issues/141).
+Version handling is one of the [core domain's hard problems](../domain/core-domain.md): catalog shape, DDL support, and lock behavior differ across PostgreSQL majors, and offline work has to state the version it generates for. This slice ships the offline half of that statement: `renderSql` accepts a declared PostgreSQL major, `plan` exposes it as `--target-version`, and the two statements the renderer synthesizes above the documented floor refuse by name instead of emitting SQL the declared server rejects. `export` accepts the same flag since [#178](https://github.com/osama784/schemamill/issues/178); its create-only projection is version-invariant today. Live detection, credentials, and transport stay with [#57](https://github.com/osama784/schemamill/issues/57). The durable decisions are recorded in [ADR 0024](../adr/0024-synthesized-forms-consult-the-target-version.md); the slice shipped in [#141](https://github.com/osama784/schemamill/issues/141).
 
 ## Goal
 
@@ -12,7 +12,7 @@ The offline half of [core-domain hard problem #5](../domain/core-domain.md): a d
 
 **In:** the `RenderOptions.targetVersion` render option, defaulting to `MIN_TARGET_VERSION` (13) and accepting any integer at or above it; the `plan --target-version <major>` flag, restricted to the declared 13–18 span and validated before any filesystem access as a usage error; the two synthesized consumers — `SET STORAGE DEFAULT` at PostgreSQL 16 and newer, `SET COMPRESSION default` at PostgreSQL 14 and newer — refused at the emitter with exact messages; the live harness rendering every scene for the server under test; and [ADR 0024](../adr/0024-synthesized-forms-consult-the-target-version.md), this plan, the `CONTEXT.md` term, the changelog, and the mutable-docs sweep.
 
-**Out, named — never silent:** live server detection, credentials, and transport ([#57](https://github.com/osama784/schemamill/issues/57)); declaration validation against the target (the per-form residual in D5); an `export --target-version` or `compare --target-version` flag (export renders creates only, compare renders nothing); multi-engine dialect selection; and the render-refusal guard's conventional-name arithmetic, which has no version branch and is not a form gate.
+**Out, named — never silent:** live server detection, credentials, and transport ([#57](https://github.com/osama784/schemamill/issues/57)); declaration validation against the target (the per-form residual in D5); an `export --target-version` flag (since shipped in [#178](https://github.com/osama784/schemamill/issues/178) as parity plumbing; the create-only projection is version-invariant today) or a `compare --target-version` flag (compare renders nothing); multi-engine dialect selection; and the render-refusal guard's conventional-name arithmetic, which has no version branch and is not a form gate.
 
 ## Decisions
 
@@ -64,7 +64,7 @@ The flag is documented in `plan --help`, the plan doc and [ADR 0024](../adr/0024
 Every item names its owner; nothing is silently dropped.
 
 - **A `Model` or workspace target field** (the issue's leaning) — rejected for v1; a `factory:proposed` follow-up at bookkeeping, to be decided with a workspace-format change.
-- **`export --target-version`** — gains the flag with its first version-sensitive form; owner: the declaration-validation follow-up.
+- **`export --target-version`** — shipped in [#178](https://github.com/osama784/schemamill/issues/178) (accepted, validated before any filesystem access, forwarded); export output is byte-invariant today because every step is a create, so the trigger for observable behaviour remains the first version-sensitive create form; owner: [#162](https://github.com/osama784/schemamill/issues/162), the declaration-validation gate. `docs/adr/0024-synthesized-forms-consult-the-target-version.md:11`'s v1 sentence — "export renders creates only and compare renders nothing, so neither takes a flag in v1" — is **superseded by [#178](https://github.com/osama784/schemamill/issues/178)**; ADR 0024 itself stays unedited.
 - **`compare --target-version`** — compare renders nothing; owner: [#133](https://github.com/osama784/schemamill/issues/133) or the hazard version-awareness slice.
 - **Declaration validation against the target** (named `NOT NULL`, `NOT ENFORCED`, explicit compression below 14) — re-litigates ADR 0012; a `factory:proposed` follow-up at bookkeeping with its own ADR, and D5's table is its body.
 - **Live server detection, credentials, and transport** — [#57](https://github.com/osama784/schemamill/issues/57).
