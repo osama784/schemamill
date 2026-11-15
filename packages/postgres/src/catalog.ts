@@ -4,8 +4,8 @@
  * The transport is the `psql` binary — the live harness's choice, so no client-library
  * dependency is added. One `-c` batch carries one `SELECT` returning one `json` document with
  * the `tables`, `columns`, `primaryKeys`, `indexes`, `constraints`, `notNullConstraints`,
- * `sequences`, and `views` sections; `psql` runs a single `-c` batch as one implicit
- * transaction, so the sections share one snapshot. The child
+ * `sequences`, `views`, and `extensions` sections; `psql` runs a single `-c` batch as one
+ * implicit transaction, so the sections share one snapshot. The child
  * environment's `PGOPTIONS` sets `search_path=''` — the congruence with `pg_dump`, which
  * reads the catalog under the same empty path, so `format_type`'s spelling matches the dumped
  * DDL — and `default_transaction_read_only=on` as read-only posture. The read itself is the
@@ -22,7 +22,8 @@
  * JSON output) and any violation of the `SELECT`'s own payload contract — a missing or
  * wrong-typed field, an unknown or duplicate relation, orphan column, primary-key, index,
  * constraint, not-null, or sequence rows, a duplicate `(schema, table, conname)` constraint
- * row, a duplicate not-null row for one column, a row-shape violation against its constraint
+ * row, a duplicate not-null row for one column, a duplicate extension row, a NUL in an
+ * extension comment, a row-shape violation against its constraint
  * kind, a primary key whose rows disagree, a not-null row whose column is not read or not
  * `NOT NULL`, an unknown storage or compression letter behind an explicit setting, an index
  * definition that does not parse to one `CREATE INDEX`, an owner column missing from an
@@ -59,6 +60,7 @@ import type {
   ColumnStorage,
   ConstraintEnforcement,
   Diagnostic,
+  Extension,
   ForeignKey,
   Identity,
   IdentityGeneration,
@@ -110,7 +112,8 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
 
 /**
  * The one read: a single `json` document with the tables, columns, primary keys, indexes,
- * constraints, sequences, and views sections of every user schema, system schemas excluded.
+ * constraints, sequences, and views sections of every user schema, system schemas excluded,
+ * and the `extensions` section of the whole database.
  * Tables carry what the deferred-states pass needs (`relkind`, `relispartition`,
  * `relpersistence`); columns are read
  * for ordinary tables only, in attribute order, with the type spelling `format_type` gives,
@@ -152,11 +155,18 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * `local`/`cascaded` spelling (null when absent), and the relation's object description. A
  * materialized view cannot carry a check option; the mapper refuses one defensively.
  *
+ * The `extensions` section reads every installed extension, built-ins included — the mapper
+ * owns that policy: like `pg_dump`'s `g_last_builtin_oid = FirstNormalObjectId - 1`, it keeps
+ * only rows above OID 16383. Each row carries `extension.oid::text` as canonical decimal text,
+ * the extension name, its install schema, and the extension's `pg_extension` object
+ * description. Extensions are not schema objects in the `pg_catalog`/`pg_%` sense, so the read
+ * applies no namespace exclusion; the mapper returns the rows in name-only order.
+ *
  * The comment columns are the PostgreSQL catalog's own: `obj_description` for a table,
- * sequence, view, or index (`pg_class`), for a primary key or constraint (`pg_constraint`), and
- * `col_description` for a column. Null means the object carries no comment; a server comment is
- * never empty (PostgreSQL deletes on empty). A primary key's description repeats on every key
- * row, and the mapper requires the rows to agree.
+ * sequence, view, or index (`pg_class`), for a primary key or constraint (`pg_constraint`),
+ * for an extension (`pg_extension`), and `col_description` for a column. Null means the object
+ * carries no comment; a server comment is never empty (PostgreSQL deletes on empty). A primary
+ * key's description repeats on every key row, and the mapper requires the rows to agree.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -493,6 +503,20 @@ SELECT json_build_object(
         AND namespace.nspname NOT LIKE 'pg\\_%'
       ORDER BY namespace.nspname, relation.relname
     ) AS view_row
+  ), '[]'::json),
+  -- Every installed extension, built-ins included: the mapper owns the built-in OID policy.
+  'extensions', COALESCE((
+    SELECT json_agg(row_to_json(extension_row))
+    FROM (
+      SELECT
+        extension.oid::text AS oid,
+        extension.extname AS name,
+        namespace.nspname AS schema,
+        pg_catalog.obj_description(extension.oid, 'pg_extension') AS comment
+      FROM pg_catalog.pg_extension AS extension
+      JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = extension.extnamespace
+      ORDER BY extension.extname
+    ) AS extension_row
   ), '[]'::json)
 ) AS document
 `.trim();
@@ -693,6 +717,26 @@ interface ViewRow {
   readonly comment: string | null;
 }
 
+/**
+ * pg_dump's built-in extension boundary: `g_last_builtin_oid = FirstNormalObjectId - 1`
+ * (`pg_dump.c`), and `FirstNormalObjectId` is 16384 (`transam.h`). An extension at or below
+ * this OID was created by initdb and is never dumped.
+ */
+const LAST_BUILT_IN_EXTENSION_OID = 16383n;
+
+/**
+ * One `extensions` row of the payload after validation: the extension's OID as canonical
+ * decimal text, its database-unique name, its install schema, and the extension's
+ * `pg_extension` object description. The OID never reaches the model; it only decides the
+ * built-in boundary.
+ */
+interface ExtensionRow {
+  readonly oid: string;
+  readonly name: string;
+  readonly schema: string;
+  readonly comment: string | null;
+}
+
 /** One identity sequence attached to its mapped table and column. */
 interface MappedIdentity {
   readonly row: SequenceRow;
@@ -714,7 +758,9 @@ interface SequenceMapping {
  * the model's ordering contract is the mapper's, not SQL's collation's. Sequences come back in
  * the same schema-then-name order as the importer; identity sequences attach to their columns
  * and never enter `Model.sequences`. Views and materialized views come back in the importer's
- * schema-then-name order, definitions normalized with the importer's canonicalizer. Contract
+ * schema-then-name order, definitions normalized with the importer's canonicalizer. Extensions
+ * come back in the importer's name-only order: pg_dump's built-in OID boundary drops the
+ * initdb-installed rows, and an empty comment reads as none. Contract
  * violations throw; only the deferred catalog
  * states become diagnostics, in canonical table order with table-level flags before a table's
  * column flags, columns in attribute order, not-null flags in the same attribute order,
@@ -722,7 +768,8 @@ interface SequenceMapping {
  * order, and sequence/identity findings last in their own schema-then-name order. Index
  * definitions parse through libpg-query, so the mapper is async; its output does not depend on
  * payload row order: index and constraint rows sort by stored name before the
- * conventional-name strip, and the entries stable-sort by `name ?? ''` exactly as
+ * conventional-name strip, extension rows sort by name, and the entries stable-sort
+ * by `name ?? ''` exactly as
  * `finalizeTable` sorts the importer's.
  */
 export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Diagnostic>> {
@@ -736,6 +783,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     'notNullConstraints',
     'sequences',
     'views',
+    'extensions',
   ]);
   const tables = expectArray(document, 'tables', 'catalog payload').map((row, index) =>
     parseTableRow(row, `catalog payload.tables[${index}]`),
@@ -762,6 +810,17 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   const viewRows = expectArray(document, 'views', 'catalog payload').map((row, index) =>
     parseViewRow(row, `catalog payload.views[${index}]`),
   );
+  const extensionRows = expectArray(document, 'extensions', 'catalog payload').map((row, index) =>
+    parseExtensionRow(row, `catalog payload.extensions[${index}]`),
+  );
+
+  const extensionNames = new Set<string>();
+  for (const row of extensionRows) {
+    if (extensionNames.has(row.name)) {
+      throw new Error(`catalog payload: duplicate extension "${row.name}"`);
+    }
+    extensionNames.add(row.name);
+  }
 
   const tablesByKey = new Map<string, TableRow>();
   for (const table of tables) {
@@ -923,6 +982,10 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
 
   const sequenceMapping = mapSequences(sequenceRows, tablesByKey, columnsByTable);
   const modelViews = [...viewRows].sort(compareViewRows).map(viewFromRow);
+  const modelExtensions = extensionRows
+    .filter((row) => BigInt(row.oid) > LAST_BUILT_IN_EXTENSION_OID)
+    .sort(compareExtensionRows)
+    .map(extensionFromRow);
 
   const diagnostics: Diagnostic[] = [];
   const modelTables: Table[] = [];
@@ -1125,7 +1188,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       tables: modelTables,
       sequences: sequenceMapping.sequences,
       views: modelViews,
-      extensions: [],
+      extensions: modelExtensions,
     },
     diagnostics,
   };
@@ -1348,6 +1411,19 @@ function viewFromRow(row: ViewRow): View {
 }
 
 /**
+ * One extension row as the model spells it: the name and install schema, with the comment
+ * present exactly when the catalog states a non-empty one. The OID and the built-in filter
+ * never travel.
+ */
+function extensionFromRow(row: ExtensionRow): Extension {
+  return {
+    name: row.name,
+    schema: row.schema,
+    ...(row.comment === null ? {} : { comment: row.comment }),
+  };
+}
+
+/**
  * The model's definition text for a `pg_get_viewdef` body: exactly one trailing statement
  * terminator drops, as `pg_dump` strips it, and then `normalizeSourceText` canonicalizes the
  * rest — the same forms the dump importer stores from the dumped DDL.
@@ -1434,6 +1510,11 @@ function compareSequenceRows(left: SequenceRow, right: SequenceRow): number {
 /** Canonical view order, mirroring the importer's `compareViews`: schema, then name. */
 function compareViewRows(left: ViewRow, right: ViewRow): number {
   return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** Canonical extension order, mirroring the importer's `compareExtensions`: name only. */
+function compareExtensionRows(left: ExtensionRow, right: ExtensionRow): number {
+  return compareStrings(left.name, right.name);
 }
 
 /** Sequence findings' order: the finding sequence's schema, then name. */
@@ -2383,6 +2464,30 @@ function parseViewRow(value: unknown, path: string): ViewRow {
     definition: expectString(row, path, 'definition'),
     checkOption,
     comment: expectNullableString(row, path, 'comment'),
+  };
+}
+
+/**
+ * An `extensions` row, validated field by field. The OID must be the canonical decimal text
+ * PostgreSQL's `oidout` emits, checked before any conversion; an empty comment is the model's
+ * absent state, and a NUL is a contract throw because PostgreSQL text never carries one.
+ */
+function parseExtensionRow(value: unknown, path: string): ExtensionRow {
+  const row = expectObject(value, path);
+  expectFields(row, path, ['oid', 'name', 'schema', 'comment']);
+  const oid = expectString(row, path, 'oid');
+  if (!/^(0|[1-9][0-9]*)$/.test(oid)) {
+    throw new Error(`${path}.oid must be a canonical decimal string`);
+  }
+  const comment = expectNullableString(row, path, 'comment');
+  if (comment !== null && comment.includes('\u0000')) {
+    throw new Error(`${path}.comment must not contain a NUL character`);
+  }
+  return {
+    oid,
+    name: expectString(row, path, 'name'),
+    schema: expectString(row, path, 'schema'),
+    comment: comment === '' ? null : comment,
   };
 }
 
