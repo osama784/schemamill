@@ -142,6 +142,10 @@ _Avoid_: check constraint, validation rule
 A PostgreSQL extension installed in the database, identified by its name alone: extension names are database-unique and never schema-qualified. Its install schema and comment are attributes, not identity, so moving the extension is an `ALTER EXTENSION … SET SCHEMA`, not a drop and create. The install schema is required because a dump always states it; a definition without one is skipped and named, never defaulted.
 _Avoid_: plugin, module, package
 
+**Built-in extension**:
+An extension created by `initdb` rather than installed by a user, identified by a `pg_extension.oid` below `FirstNormalObjectId` (16384). A dump never recreates one, so the model never carries one, and the catalog read excludes them by the same rule.
+_Avoid_: system extension, default extension
+
 ### Crossing the boundary
 
 **Import**:
