@@ -1,15 +1,10 @@
 import { plan } from '@schemamill/core';
-import {
-  hazardAnalyzer,
-  MAX_TARGET_VERSION,
-  MIN_TARGET_VERSION,
-  RenderRefusalError,
-  renderSql,
-} from '@schemamill/postgres';
+import { hazardAnalyzer, RenderRefusalError, renderSql } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
 import { formatHazards, formatPlan } from './format.ts';
 import { importPair, mapSides } from './run.ts';
+import { validateTargetVersion } from './target-version.ts';
 
 /**
  * The `plan` command: read two schema sides — DDL dumps, with the workspace model filling the
@@ -26,13 +21,6 @@ import { importPair, mapSides } from './run.ts';
  * refusing to render …` line on stderr and exit code 1; any other render failure is a bug and
  * crashes.
  */
-
-/** The accepted `--target-version` values: every declared major, as the flag's raw string. */
-const TARGET_VERSIONS: ReadonlySet<string> = new Set(
-  Array.from({ length: MAX_TARGET_VERSION - MIN_TARGET_VERSION + 1 }, (_, index) =>
-    String(MIN_TARGET_VERSION + index),
-  ),
-);
 
 interface PlanOptions {
   readonly verbose?: boolean;
@@ -60,11 +48,7 @@ export function registerPlan(program: Command): void {
         options: PlanOptions,
         command: Command,
       ) => {
-        if (!TARGET_VERSIONS.has(options.targetVersion)) {
-          command.error(
-            `error: --target-version must be a PostgreSQL major from ${MIN_TARGET_VERSION} to ${MAX_TARGET_VERSION}`,
-          );
-        }
+        validateTargetVersion(command, options.targetVersion);
         const sides = mapSides({
           baseline,
           target,
