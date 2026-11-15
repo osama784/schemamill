@@ -1621,10 +1621,11 @@ test("export --format without a value is Commander's usage error, exit 1", async
   assert.equal(result.code, 1);
 });
 
-test('an invalid export --target-version is a usage error before any filesystem access, exit 1', async (t) => {
-  // The directory is not a workspace: reaching `resolveWorkspace` would print a `no workspace`
-  // line instead, so the pinned usage error proves the flag is validated first. The explicit
-  // json case proves validation runs on both projections.
+test('an invalid export --target-version is a usage error that beats the workspace diagnostic, exit 1', async (t) => {
+  // The flag is validated before `resolveWorkspace` in code. The non-workspace cwd pins the
+  // observable precedence — the usage error, never a workspace line — while the call order
+  // itself is structural, not filesystem-spied. The explicit json case proves validation runs
+  // on both projections.
   const dir = await fixtureDir(t);
 
   for (const value of ['12', '19', '13.4', 'abc']) {
