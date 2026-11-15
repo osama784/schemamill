@@ -388,8 +388,9 @@ const EXPORT_HELP = [
   'Print the workspace model as DDL or canonical JSON.',
   '',
   'Options:',
-  '  --format <format>  output format: ddl or json (default: "ddl")',
-  '  -h, --help         display help for command',
+  '  --format <format>         output format: ddl or json (default: "ddl")',
+  '  --target-version <major>  PostgreSQL major (13-18) (default: "13")',
+  '  -h, --help                display help for command',
   '',
 ].join('\n');
 
@@ -1530,6 +1531,34 @@ test('export --format=json is the same artifact as --format json', async (t) => 
   assert.equal(equalsForm.code, 0);
 });
 
+test('export --target-version accepts every declared major with byte-identical DDL', async (t) => {
+  // Export plans `EMPTY_MODEL → model`, so every step is a create; no create form consults the
+  // target, and the forwarded value is output-invisible today. The four runs pin that honesty.
+  const root = await exportWorkspace(t);
+  const golden = testText('goldens/export.ddl.sql');
+
+  for (const value of ['13', '14', '16', '18']) {
+    const result = await runCli('export', '--target-version', value, { cwd: root });
+
+    assert.equal(result.stdout, golden);
+    assert.equal(result.stderr, '');
+    assert.equal(result.code, 0);
+  }
+});
+
+test('export --format json --target-version 18 prints the canonical bytes unchanged', async (t) => {
+  // The flag keys rendering only; `serializeModel` never sees it.
+  const root = await exportWorkspace(t);
+
+  const result = await runCli('export', '--format', 'json', '--target-version', '18', {
+    cwd: root,
+  });
+
+  assert.equal(result.stdout, testText('goldens/export.json.txt'));
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
 test('export of an empty workspace prints an empty DDL script and the empty model', async (t) => {
   const root = await fixtureDir(t);
   const created = await initWorkspace(root);
@@ -1592,6 +1621,53 @@ test("export --format without a value is Commander's usage error, exit 1", async
   assert.equal(result.code, 1);
 });
 
+test('an invalid export --target-version is a usage error before any filesystem access, exit 1', async (t) => {
+  // The directory is not a workspace: reaching `resolveWorkspace` would print a `no workspace`
+  // line instead, so the pinned usage error proves the flag is validated first. The explicit
+  // json case proves validation runs on both projections.
+  const dir = await fixtureDir(t);
+
+  for (const value of ['12', '19', '13.4', 'abc']) {
+    const result = await runCli('export', '--target-version', value, { cwd: dir });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'error: --target-version must be a PostgreSQL major from 13 to 18\n',
+    );
+    assert.equal(result.code, 1);
+  }
+
+  const json = await runCli('export', '--format', 'json', '--target-version', '12', {
+    cwd: dir,
+  });
+
+  assert.equal(json.stdout, '');
+  assert.equal(json.stderr, 'error: --target-version must be a PostgreSQL major from 13 to 18\n');
+  assert.equal(json.code, 1);
+});
+
+test("export --target-version without a value is Commander's usage error, exit 1", async () => {
+  const result = await runCli('export', '--target-version');
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, "error: option '--target-version <major>' argument missing\n");
+  assert.equal(result.code, 1);
+});
+
+test('export reports an invalid --format before an invalid --target-version, exit 1', async (t) => {
+  // Two invalid values: the pinned --format error proves the checks never swap order.
+  const dir = await fixtureDir(t);
+
+  const result = await runCli('export', '--format', 'text', '--target-version', '12', {
+    cwd: dir,
+  });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'error: --format must be "ddl" or "json"\n');
+  assert.equal(result.code, 1);
+});
+
 test('export with an extra argument is a usage error naming it, exit 1', async () => {
   const result = await runCli('export', 'extra');
 
@@ -1618,7 +1694,7 @@ test('export refuses a plan whose index creates share a name, with empty stdout,
   assert.equal(result.code, 1);
 });
 
-test('export --help documents --format, exit 0', async () => {
+test('export --help documents --format and --target-version, exit 0', async () => {
   const result = await runCli('export', '--help');
 
   assert.equal(result.stdout, EXPORT_HELP);
