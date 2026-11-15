@@ -174,9 +174,9 @@ import { renderSql } from './render.ts';
  * create the target-only `hs2` — so the scene needs no `setupSql`. Its plan check pins the
  * global phase order — the schema create, the extension create, then the two terminal comments,
  * then the move and the drop — and its catalog checks pin `extnamespace` through `pg_namespace`
- * and the comment through `obj_description(oid, 'pg_extension')`. It declares no `introspection`
- * assertion either: the catalog reader returns `extensions: []` until the follow-up, so a model
- * carrying extensions is intentionally not what it returns.
+ * and the comment through `obj_description(oid, 'pg_extension')`. Its `introspection` assertion is
+ * `matches-import`: the catalog read returns the target's extensions and excludes built-in
+ * `plpgsql` by the OID rule.
  *
  * The export scene is the apply-to-a-fresh-database probe: `export-round-trip` has an empty
  * baseline and no `setupSql` or `targetExtraSql`, so its baseline build is empty and both the
@@ -6672,9 +6672,8 @@ const commentRoundTripScene = (): LiveScene => {
  *
  * The catalog checks pin `extnamespace` through `pg_namespace` and the comment through
  * `obj_description(oid, 'pg_extension')`, so a write that updates the model but not the server
- * cannot pass. The scene declares no introspection assertion: the catalog reader returns
- * `extensions: []` until the follow-up, so `matches-import` cannot hold for a model carrying
- * extensions.
+ * cannot pass. Its `introspection` assertion is `matches-import`: the catalog read returns the
+ * target's extensions and excludes built-in `plpgsql` by the OID rule.
  */
 const extensionRoundTripScene = (): LiveScene => {
   const hstoreBaselineComment = 'Key-value pairs (baseline)';
@@ -6864,6 +6863,7 @@ const extensionRoundTripScene = (): LiveScene => {
         },
       },
     ],
+    introspection: { assert: 'matches-import' },
   };
 };
 
