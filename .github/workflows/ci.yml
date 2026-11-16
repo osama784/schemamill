@@ -88,10 +88,13 @@ jobs:
       # tools so they match the postgres:${{ matrix.postgres }} service. The service image,
       # client package, and PATH prefix move together per matrix entry; keep the two entries
       # aligned with MIN_TARGET_VERSION (13) and MAX_TARGET_VERSION (18).
+      # --retry alone does not cover a connection reset or partial transfer (curl exit 56);
+      # --retry-all-errors adds that class, bounded by the existing retry count, and
+      # --connect-timeout 10 --max-time 60 bound a stalled transfer instead of occupying the leg.
       - name: Install PostgreSQL ${{ matrix.postgres }} client tools
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl --retry 3 --retry-delay 2 --retry-connrefused -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo curl --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors --connect-timeout 10 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 -y install postgresql-client-${{ matrix.postgres }}
