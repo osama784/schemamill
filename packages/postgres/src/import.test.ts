@@ -2999,6 +2999,41 @@ test('skips a partition and flags a partitioned table', async () => {
   assert.match(diagnostics[1]?.message ?? '', /partition app\.events_2026/);
 });
 
+test('skips the parent-named ATTACH PARTITION on a pg_dump-form partition child', async () => {
+  const dump = [
+    `CREATE TABLE public.parent (id integer) PARTITION BY RANGE (id);`,
+    `CREATE TABLE public.child (id integer);`,
+    `ALTER TABLE ONLY public.parent ATTACH PARTITION public.child FOR VALUES FROM (0) TO (10);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(
+    model.tables.map((table) => `${table.schema}.${table.name}`),
+    ['public.child', 'public.parent'],
+  );
+  const child = model.tables.find((table) => table.name === 'child');
+  assert.ok(child, 'the partition child is imported');
+  assert.deepEqual(
+    child.columns.map((column) => column.name),
+    ['id'],
+  );
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.parent',
+      message: 'dropped partitioning clauses from public.parent',
+    },
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.parent',
+      message: 'skipped ALTER TABLE action AT_AttachPartition on public.parent',
+    },
+  ]);
+});
+
 test('flags and drops IF NOT EXISTS on a table, importing it', async () => {
   const dump = `CREATE TABLE IF NOT EXISTS public.t (a integer);`;
 
