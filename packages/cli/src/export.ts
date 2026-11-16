@@ -3,6 +3,7 @@ import type { Model } from '@schemamill/core';
 import { RenderRefusalError, renderSql } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
+import { planOrReport } from './run.ts';
 import { validateTargetVersion } from './target-version.ts';
 
 /**
@@ -24,10 +25,12 @@ import { validateTargetVersion } from './target-version.ts';
  * version.
  *
  * Failures never leave partial output. An invalid `--format` or `--target-version` is a usage
- * error before any filesystem access; a workspace failure or a render refusal writes one
- * `schemamill: …` line to stderr, sets the exit code to 1, and leaves stdout empty. Any other
- * render failure is a bug and crashes. An empty model exports `''` as DDL and the empty-model
- * bytes as JSON.
+ * error before any filesystem access; a workspace failure, a plan-time contract error (a target
+ * sequence whose `ownedBy` does not resolve), or a render refusal writes one `schemamill: …`
+ * line to stderr, sets the exit code to 1, and leaves stdout empty. The plan is built before
+ * the `--format` branch, so canonical JSON is a projection of a model that already passed the
+ * contract. Any other render failure is a bug and crashes. An empty model exports `''` as DDL
+ * and the empty-model bytes as JSON.
  */
 
 /** The empty baseline the DDL projection renders the workspace model against. */
@@ -57,13 +60,15 @@ export function registerExport(program: Command): void {
         process.exitCode = 1;
         return;
       }
+      const projectable = planOrReport(() => plan(EMPTY_MODEL, resolution.model));
+      if (projectable === undefined) return;
       if (format === 'json') {
         process.stdout.write(serializeModel(resolution.model));
         return;
       }
       let sql: string;
       try {
-        sql = renderSql(plan(EMPTY_MODEL, resolution.model), {
+        sql = renderSql(projectable, {
           targetVersion: Number(options.targetVersion),
         });
       } catch (error) {

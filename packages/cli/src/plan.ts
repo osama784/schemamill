@@ -3,7 +3,7 @@ import { hazardAnalyzer, RenderRefusalError, renderSql } from '@schemamill/postg
 import type { Command } from 'commander';
 
 import { formatHazards, formatPlan } from './format.ts';
-import { importPair, mapSides } from './run.ts';
+import { importPair, mapSides, planOrReport } from './run.ts';
 import { validateTargetVersion } from './target-version.ts';
 
 /**
@@ -17,9 +17,10 @@ import { validateTargetVersion } from './target-version.ts';
  * generated for; it is validated against the package's 13–18 span before any filesystem access,
  * and passed to the renderer. Usage errors are emitted through commander's error machinery
  * before any filesystem access. An `error` diagnostic makes the exit code 1, but the plan is
- * still printed. A plan the renderer refuses still prints its display, then one `schemamill:
- * refusing to render …` line on stderr and exit code 1; any other render failure is a bug and
- * crashes.
+ * still printed. A plan-time contract error — a target sequence whose `ownedBy` does not
+ * resolve — prints one `schemamill: …` line on stderr, no display, and exit code 1. A plan the
+ * renderer refuses still prints its display, then one `schemamill: refusing to render …` line on
+ * stderr and exit code 1; any other render failure is a bug and crashes.
  */
 
 interface PlanOptions {
@@ -63,7 +64,8 @@ export function registerPlan(program: Command): void {
           process.exitCode = 1;
           return;
         }
-        const planned = plan(imported.baseline, imported.target);
+        const planned = planOrReport(() => plan(imported.baseline, imported.target));
+        if (planned === undefined) return;
         const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
         const hazardsBlock = hazards.length > 0 ? `${formatHazards(hazards)}\n` : '';
         if (planned.steps.length === 0) {

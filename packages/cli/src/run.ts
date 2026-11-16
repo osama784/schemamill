@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
-import type { Diagnostic, Model, ReadResult } from '@schemamill/core';
-import { resolveWorkspace } from '@schemamill/core';
+import type { Diagnostic, Model, Plan, ReadResult } from '@schemamill/core';
+import { resolveWorkspace, SequenceOwnershipError } from '@schemamill/core';
 import { importDump } from '@schemamill/postgres';
 
 import { formatDiagnostics, hasErrors, type Side } from './diagnostics.ts';
@@ -15,9 +15,12 @@ import { formatDiagnostics, hasErrors, type Side } from './diagnostics.ts';
  * `schemamill: cannot read <path>: <reason>` line; a thrown import prints one
  * `schemamill: <message>` line; a workspace resolution failure prints one `schemamill:
  * <message>` line carrying core's diagnostic verbatim; a returned `null` means such a failure
- * was reported, so the command must print no artifact and exit 1. Otherwise each imported side's
- * diagnostics are written in order — baseline first, then target — and the returned exit code is
- * 1 when either side carried an `error` diagnostic; a workspace side contributes none.
+ * was reported, so the command must print no artifact and exit 1. A plan-time contract error —
+ * `plan()` refusing a target sequence whose `ownedBy` does not resolve — goes through
+ * `planOrReport`, which prints one `schemamill: <message>` line, sets the exit code to 1, and
+ * returns `undefined`; every other thrown error is a bug and propagates. Otherwise each imported
+ * side's diagnostics are written in order — baseline first, then target — and the returned exit
+ * code is 1 when either side carried an `error` diagnostic; a workspace side contributes none.
  *
  * The side rules, settled by the slice brief:
  * - R1. Two paths and no flags: today's two-dump behavior, byte-identical.
@@ -201,6 +204,24 @@ export async function importSide(ddl: string): Promise<ReadResult<Model, Diagnos
   } catch (error) {
     process.stderr.write(`schemamill: ${reason(error)}\n`);
     return null;
+  }
+}
+
+/**
+ * Runs `run` and returns its plan, or reports the one reachable plan-time contract error and
+ * returns `undefined`: a target sequence whose `ownedBy` names a table or column the target model
+ * does not carry makes core's `plan()` throw `SequenceOwnershipError`, which is written as
+ * exactly one `schemamill: <message>` stderr line with the exit code set to 1. Every other thrown
+ * error is a bug and is rethrown. A command must print no artifact after `undefined`.
+ */
+export function planOrReport(run: () => Plan): Plan | undefined {
+  try {
+    return run();
+  } catch (error) {
+    if (!(error instanceof SequenceOwnershipError)) throw error;
+    process.stderr.write(`schemamill: ${error.message}\n`);
+    process.exitCode = 1;
+    return undefined;
   }
 }
 
