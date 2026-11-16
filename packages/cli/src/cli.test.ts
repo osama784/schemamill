@@ -91,6 +91,56 @@ const REFUSAL_MODEL: Model = {
   extensions: [],
 };
 
+/**
+ * A workspace model whose only sequence is owned by `public.absent.id`, a table the model does
+ * not carry: core's `plan()` refuses it with `SequenceOwnershipError`, so every covered command
+ * must report one `schemamill:` line and no artifact. A hand-edited `ownedBy` is shape-valid;
+ * only `plan()` resolves it.
+ */
+const DANGLING_TABLE_MODEL = `{
+  "tables": [],
+  "sequences": [{ "schema": "public", "name": "s", "dataType": "bigint",
+    "increment": "1", "minValue": "1", "maxValue": "9223372036854775807",
+    "start": "1", "cache": "1", "cycle": false,
+    "ownedBy": { "table": { "schema": "public", "name": "absent" }, "column": "id" } }],
+  "views": [],
+  "extensions": []
+}
+`;
+
+/**
+ * The missing-column variant: `public.t` carries column `a`, but the sequence is owned by
+ * `public.t.id`, so the same refusal names the column instead of the table.
+ */
+const DANGLING_COLUMN_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "a", "type": "integer", "notNull": false }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": []
+    }
+  ],
+  "sequences": [{ "schema": "public", "name": "s", "dataType": "bigint",
+    "increment": "1", "minValue": "1", "maxValue": "9223372036854775807",
+    "start": "1", "cache": "1", "cycle": false,
+    "ownedBy": { "table": { "schema": "public", "name": "t" }, "column": "id" } }],
+  "views": [],
+  "extensions": []
+}
+`;
+
+/** The one stderr line a dangling owner table is reported as. */
+const DANGLING_TABLE_ERROR =
+  'schemamill: sequence public.s is owned by public.absent.id, but the target model has no table public.absent\n';
+
+/** The one stderr line a dangling owner column is reported as. */
+const DANGLING_COLUMN_ERROR =
+  'schemamill: sequence public.s is owned by public.t.id, but the target model has no column id on table public.t\n';
+
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
   '    id integer NOT NULL,',
@@ -1692,6 +1742,72 @@ test('export refuses a plan whose index creates share a name, with empty stdout,
     result.stderr,
     'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an unnamed index on (a)\n',
   );
+  assert.equal(result.code, 1);
+});
+
+/**
+ * The plan-time contract error channel: a hand-edited workspace whose target sequence owner does
+ * not resolve is refused by core's `plan()` before any step, and the CLI reports it as exactly
+ * one `schemamill:` line on stderr with empty stdout and exit 1 — never a stack trace.
+ */
+test('plan --target-workspace refuses a dangling target owner on one stderr line, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  const result = await runCli('plan', '--target-workspace', empty, { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_TABLE_ERROR);
+  assert.equal(result.code, 1);
+});
+
+test('compare --target-workspace refuses a dangling target owner on one stderr line, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  const result = await runCli('compare', '--target-workspace', empty, { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_TABLE_ERROR);
+  assert.equal(result.code, 1);
+});
+
+test('export refuses a dangling target owner on one stderr line, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+
+  const result = await runCli('export', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_TABLE_ERROR);
+  assert.equal(result.code, 1);
+});
+
+test('plan refuses a dangling target owner column on one stderr line, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_COLUMN_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  const result = await runCli('plan', '--target-workspace', empty, { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_COLUMN_ERROR);
+  assert.equal(result.code, 1);
+});
+
+test('export --format json refuses a dangling target owner on one stderr line, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+
+  const result = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_TABLE_ERROR);
   assert.equal(result.code, 1);
 });
 

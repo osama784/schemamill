@@ -3,7 +3,7 @@ import { hazardAnalyzer } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
 import { formatChanges, formatHazards } from './format.ts';
-import { importPair, mapSides } from './run.ts';
+import { importPair, mapSides, planOrReport } from './run.ts';
 
 /**
  * The `compare` command: read two schema sides — DDL dumps, with the workspace model filling
@@ -17,7 +17,8 @@ import { importPair, mapSides } from './run.ts';
  * `compare` prints no step list, so a line's `step <n>` refers to the step `schemamill plan`
  * would number `<n>`. Each hazard line also names the entity it belongs to, so compare lines
  * are self-attributing. An `error` diagnostic makes the exit code 1, but the diff is still
- * printed.
+ * printed. A plan-time contract error — a target sequence whose `ownedBy` does not resolve —
+ * prints one `schemamill: …` line on stderr, no diff, and exit code 1.
  */
 
 interface CompareOptions {
@@ -58,7 +59,8 @@ export function registerCompare(program: Command): void {
           process.exitCode = 1;
           return;
         }
-        const planned = plan(imported.baseline, imported.target);
+        const planned = planOrReport(() => plan(imported.baseline, imported.target));
+        if (planned === undefined) return;
         const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
         const hazardsBlock = hazards.length > 0 ? `\n${formatHazards(hazards)}` : '';
         process.stdout.write(
