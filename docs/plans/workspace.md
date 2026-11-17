@@ -28,6 +28,14 @@ A model lives in exactly one place on disk inside a workspace root; any command 
 - Vocabulary is law: "workspace" is the only term; no project/folder synonyms (CONTEXT.md §Workspace).
 - A resolved root is validated before use — a directory that matches the marker but carries no readable model reports which piece is missing, never a downstream parse failure.
 
+### Validation
+
+The reader is the workspace's validation seam: every identifier slot in `model.json` — table, sequence, and view schemas and names; column names and not-null names; sequence owners and foreign-key targets; identity sequence names; the optional primary-key, unique, check, foreign-key, and index names; and every column list — accepts only a non-empty string, because an empty string cannot name a PostgreSQL object. An empty identifier fails closed as `workspace-model-invalid` with the exact field path, and an unnamed optional object is expressed by omitting the key, never by writing `""`.
+
+The writer is not a validity gate by design: `writeWorkspaceModel` and `initWorkspace` deliberately skip the model read so a repair write can replace a corrupt or missing `model.json` ([ADR 0020](../adr/0020-model-persistence-writes-atomically.md)). A programmatic caller that persists an empty identifier is rejected on the next read, not at write time; import cannot create that state because PostgreSQL and the dump parser reject zero-length identifiers.
+
+The formatter is not a validity gate either: its `=== undefined` checks and their empty-string behavior stay as they are, and the reader rejects an empty identifier at the disk boundary, so it never reaches formatting or rendering. The CLI's `plan`, `compare`, and `export` therefore report the reader's diagnostic before any formatting or rendering.
+
 ## Done means
 
 - A workspace can be created with `init`, found from a nested working directory, and its model read back; unit tests pin resolution, `init` refusal, the not-found path, and the corrupt-root path.
