@@ -2469,7 +2469,7 @@ test('flags INCLUDE on a primary key and keeps the key', async () => {
   ]);
 });
 
-test('copies an index comment into a consumed unique constraint', async () => {
+test('flags an index comment on a consumed unique constraint', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
@@ -2481,15 +2481,21 @@ test('copies an index comment into a consumed unique constraint', async () => {
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The comment travels with the index onto the constraint it becomes; nothing is dropped.
-  assert.deepEqual(table.uniqueConstraints, [
-    { name: 't_a_unique', columns: ['a'], comment: 'backing index' },
-  ]);
+  // The model has no slot for the consumed index's own comment; the applied statement renames
+  // the index to the constraint's name, so that is the object the flag names.
+  assert.deepEqual(table.uniqueConstraints, [{ name: 't_a_unique', columns: ['a'] }]);
   assert.deepEqual(table.indexes, []);
-  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_unique',
+      message: 'dropped comment from public.t_a_unique',
+    },
+  ]);
 });
 
-test('copies an index comment into a consumed primary key', async () => {
+test('flags an index comment on a consumed primary key', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a);`,
@@ -2501,14 +2507,70 @@ test('copies an index comment into a consumed primary key', async () => {
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The key takes the consumed index's comment the same way a unique constraint does.
-  assert.deepEqual(table.primaryKey, {
-    name: 't_a_pk',
-    columns: ['a'],
-    comment: 'backing index',
-  });
+  // The key takes the same flag as a unique constraint: no comment copied, the post-rename name.
+  assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'] });
   assert.deepEqual(table.indexes, []);
-  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_pk',
+      message: 'dropped comment from public.t_a_pk',
+    },
+  ]);
+});
+
+test('names the constraint when an applied consumed unique index was renamed', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE UNIQUE INDEX t_source_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_source_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_renamed_key UNIQUE USING INDEX t_source_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // Applied consumption renames `t_source_idx` to the explicit `t_renamed_key`; the flag names
+  // the name the server keeps, not the source index name, and the model carries no comment.
+  assert.deepEqual(table.uniqueConstraints, [{ name: 't_renamed_key', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_renamed_key',
+      message: 'dropped comment from public.t_renamed_key',
+    },
+  ]);
+});
+
+test('names the source index when a consumed unique index dedupes instead of applying', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_renamed_key UNIQUE (a);`,
+    `CREATE UNIQUE INDEX t_source_idx ON public.t USING btree (a);`,
+    `COMMENT ON INDEX public.t_source_idx IS 'backing index';`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_renamed_key UNIQUE USING INDEX t_source_idx;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The deduplicated statement never applies, so no rename happens: the flag names the source
+  // index, which keeps `t_source_idx`. Same shape as the applied-consumption pin above.
+  assert.deepEqual(table.uniqueConstraints, [{ name: 't_renamed_key', columns: ['a'] }]);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_source_idx',
+      message: 'dropped comment from public.t_source_idx',
+    },
+  ]);
 });
 
 test('flags a dropped comment when a consumed unique index dedupes onto a commented constraint', async () => {
@@ -2599,7 +2661,7 @@ test('flags a dropped comment when a consumed unique index dedupes onto an uncom
   ]);
 });
 
-test('silences the comment flag when a consumed unique index and the retained constraint agree', async () => {
+test('flags the source index when a deduped consumed comment matches the retained text', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_unique UNIQUE (a);`,
@@ -2613,12 +2675,20 @@ test('silences the comment flag when a consumed unique index and the retained co
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The retained constraint already carries the consumed text, so no model fact is lost.
+  // Nothing is copied, so the consumed index's comment is dropped even when the retained
+  // constraint happens to carry the same text; the dedupe keeps the source index name.
   assert.deepEqual(table.uniqueConstraints, [
     { name: 't_a_unique', columns: ['a'], comment: 'same' },
   ]);
   assert.deepEqual(table.indexes, []);
-  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_idx',
+      message: 'dropped comment from public.t_a_idx',
+    },
+  ]);
 });
 
 test('flags a dropped comment when a consumed primary key is rejected as an additional key', async () => {
@@ -2655,7 +2725,7 @@ test('flags a dropped comment when a consumed primary key is rejected as an addi
   ]);
 });
 
-test('silences the comment flag when a rejected primary key matches the retained comment', async () => {
+test('flags the source index when a rejected primary key matches the retained comment', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);`,
@@ -2669,7 +2739,8 @@ test('silences the comment flag when a rejected primary key matches the retained
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // Only the rejected declaration is a dropped fact; its comment duplicates the retained text.
+  // The rejection keeps the first key; the consumed comment is dropped regardless of the
+  // retained key's text, and the rejected statement leaves the source index name in place.
   assert.deepEqual(table.primaryKey, { name: 't_a_pk', columns: ['a'], comment: 'same' });
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
@@ -2678,6 +2749,12 @@ test('silences the comment flag when a rejected primary key matches the retained
       code: 'unsupported-attribute',
       object: 'public.t',
       message: 'dropped additional primary key from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_b_idx',
+      message: 'dropped comment from public.t_b_idx',
     },
   ]);
 });
@@ -2779,7 +2856,7 @@ test('flags CONCURRENTLY on consumed primary-key and unique indexes', async () =
   ]);
 });
 
-test('copies the comment and flags CONCURRENTLY for a consumed commented concurrent primary key', async () => {
+test('flags the comment and CONCURRENTLY for a consumed commented concurrent primary key', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `CREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);`,
@@ -2791,9 +2868,9 @@ test('copies the comment and flags CONCURRENTLY for a consumed commented concurr
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // Two facts on one consumed index: the comment survives on the key, the apply metadata
-  // cannot and is named once.
-  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'], comment: 'kept' });
+  // Two facts on one consumed index: neither the apply metadata nor the index's own comment can
+  // ride on the key; both are named, the apply-metadata flag first.
+  assert.deepEqual(table.primaryKey, { name: 't_pk', columns: ['a'] });
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
@@ -2802,6 +2879,12 @@ test('copies the comment and flags CONCURRENTLY for a consumed commented concurr
       object: 'public.t',
       message:
         'dropped CONCURRENTLY on primary key t_pk (index t_a_idx; a constraint cannot carry it) from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_pk',
+      message: 'dropped comment from public.t_pk',
     },
   ]);
 });

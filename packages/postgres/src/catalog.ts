@@ -122,19 +122,24 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * namespace, null when the collation is the type's), and the `attstorage`/`typstorage`/
  * `attcompression` letters the explicit-only gates compare; primary-key rows carry the
  * constraint name, the key position, the column name, the constraint's deferrability and
- * temporal flags, and its `pg_constraint` object description; index rows are read for ordinary
+ * temporal flags, its `pg_constraint` object description, and the backing index relation's
+ * name and `pg_class` object description; index rows are read for ordinary
  * tables only, one row per index, carrying the table identification, the stored name, the
  * `pg_get_indexdef` definition, the valid and ready flags, the tablespace name (null for the
  * default), and the index relation's `pg_class` object description; `constraints` rows are
  * uniform over the unique, check, foreign-key, and exclusion kinds — every key is emitted and
  * the keys a kind does not use are null — with the constraint's `pg_constraint` object
- * description; and `notNullConstraints` rows carry PostgreSQL 18's named not-null constraints
- * (empty before 18). Constraint-backed indexes are excluded in SQL: a
- * primary-key, unique, or exclusion constraint consumes the index its `conindid` names,
- * mirroring the dump importer's `USING INDEX` rule. The `contype` filter is what keeps a
+ * description and, for a unique constraint, the backing index relation's name and its
+ * `pg_class` object description; and `notNullConstraints` rows carry PostgreSQL 18's named
+ * not-null constraints (empty before 18). Constraint-backed indexes are excluded from the
+ * `indexes` section in SQL: a primary-key, unique, or exclusion constraint consumes the index
+ * its `conindid` names, mirroring the dump importer's `USING INDEX` rule, and the model has no
+ * index slot for it, so its description is read through the constraint row and flagged
+ * instead of modeled. The `contype` filter is what keeps a
  * foreign key's `conindid` — the referenced table's index, possibly a standalone unique index
  * on the same table — from matching; the `conrelid` comparison beside it is a planner aid, not
- * the guard. The section predicates (`conrelid <> 0`, `conislocal`, `conparentid = 0`,
+ * the guard, and the `constraints` row's CASE guard keeps a non-unique row's join from naming
+ * that index. The section predicates (`conrelid <> 0`, `conislocal`, `conparentid = 0`,
  * `relkind = 'r'`, `NOT relispartition`, the tables block's namespace exclusions) keep domain
  * constraints, constraint triggers, inherited copies, and partitioned relations out. Catalog
  * columns newer than the 13 floor are read through the row's `jsonb` form with coalesced
@@ -163,10 +168,12 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  * applies no namespace exclusion; the mapper returns the rows in name-only order.
  *
  * The comment columns are the PostgreSQL catalog's own: `obj_description` for a table,
- * sequence, view, or index (`pg_class`), for a primary key or constraint (`pg_constraint`),
- * for an extension (`pg_extension`), and `col_description` for a column. Null means the object
- * carries no comment; a server comment is never empty (PostgreSQL deletes on empty). A primary
- * key's description repeats on every key row, and the mapper requires the rows to agree.
+ * sequence, view, or index (`pg_class`), for a primary key's or unique constraint's backing
+ * index (`pg_class`, read through the constraint row), for a primary key or constraint
+ * (`pg_constraint`), for an extension (`pg_extension`), and `col_description` for a column.
+ * Null means the object carries no comment; a server comment is never empty (PostgreSQL
+ * deletes on empty). A primary key's description and its backing index's name and description
+ * repeat on every key row, and the mapper requires the rows to agree.
  */
 const CATALOG_SQL = `
 SELECT json_build_object(
@@ -245,7 +252,9 @@ SELECT json_build_object(
         key_constraint.condeferrable AS deferrable,
         key_constraint.condeferred AS deferred,
         COALESCE((to_jsonb(key_constraint) ->> 'conperiod')::boolean, false) AS period,
-        pg_catalog.obj_description(key_constraint.oid, 'pg_constraint') AS comment
+        pg_catalog.obj_description(key_constraint.oid, 'pg_constraint') AS comment,
+        backing_relation.relname AS "backingIndexName",
+        pg_catalog.obj_description(backing_relation.oid, 'pg_class') AS "backingIndexComment"
       FROM pg_catalog.pg_constraint AS key_constraint
       CROSS JOIN LATERAL unnest(key_constraint.conkey) WITH ORDINALITY
         AS key_column(attnum, ordinality)
@@ -254,6 +263,8 @@ SELECT json_build_object(
       JOIN pg_catalog.pg_attribute AS key_attribute
         ON key_attribute.attrelid = relation.oid
        AND key_attribute.attnum = key_column.attnum
+      LEFT JOIN pg_catalog.pg_class AS backing_relation
+        ON backing_relation.oid = key_constraint.conindid
       WHERE key_constraint.contype = 'p'
         AND key_constraint.conparentid = 0
         AND relation.relkind = 'r'
@@ -356,7 +367,14 @@ SELECT json_build_object(
           WHEN c.contype IN ('u', 'f')
           THEN COALESCE((to_jsonb(c) ->> 'conperiod')::boolean, false)
         END AS period,
-        pg_catalog.obj_description(c.oid, 'pg_constraint') AS comment
+        pg_catalog.obj_description(c.oid, 'pg_constraint') AS comment,
+        CASE
+          WHEN c.contype = 'u' THEN backing_relation.relname
+        END AS "backingIndexName",
+        CASE
+          WHEN c.contype = 'u'
+          THEN pg_catalog.obj_description(backing_relation.oid, 'pg_class')
+        END AS "backingIndexComment"
       FROM pg_catalog.pg_constraint AS c
       JOIN pg_catalog.pg_class AS relation ON relation.oid = c.conrelid
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -366,6 +384,8 @@ SELECT json_build_object(
         ON referenced_namespace.oid = referenced_relation.relnamespace
       LEFT JOIN pg_catalog.pg_index AS backing_index
         ON backing_index.indexrelid = c.conindid
+      LEFT JOIN pg_catalog.pg_class AS backing_relation
+        ON backing_relation.oid = backing_index.indexrelid
       WHERE c.conrelid <> 0
         AND c.contype IN ('u', 'c', 'f', 'x')
         AND c.conislocal
@@ -603,7 +623,14 @@ interface ColumnRow {
   readonly comment: string | null;
 }
 
-/** One `primaryKeys` row of the payload, after validation. */
+/**
+ * One `primaryKeys` row of the payload, after validation: the key's identity and position, its
+ * deferrability and temporal flags, the constraint's `pg_constraint` description, and the
+ * backing index relation's name and `pg_class` description. The model has no index slot for a
+ * constraint-backed index, so the mapper flags a non-null backing index description instead of
+ * modeling it; every key row of one primary key repeats these values, and the grouping pass
+ * requires the rows to agree.
+ */
 interface PrimaryKeyRow {
   readonly schema: string;
   readonly tableName: string;
@@ -614,6 +641,8 @@ interface PrimaryKeyRow {
   readonly deferred: boolean;
   readonly period: boolean;
   readonly comment: string | null;
+  readonly backingIndexName: string;
+  readonly backingIndexComment: string | null;
 }
 
 /** The `constraints` row kinds, one per `pg_constraint.contype` letter the read selects. */
@@ -622,7 +651,9 @@ type ConstraintKind = 'unique' | 'check' | 'foreign-key' | 'exclusion';
 /**
  * One `constraints` row of the payload after validation, uniform over its kind: every key is
  * present, and the keys the row's kind does not use are null. The mapper's per-kind matrix
- * enforces which keys must be non-null and which must be null.
+ * enforces which keys must be non-null and which must be null. A unique row also carries its
+ * backing index relation's name and `pg_class` description; the SQL CASE guard keeps the other
+ * kinds — a foreign key's `conindid` names the referenced table's index — null there.
  */
 interface ConstraintRow {
   readonly schema: string;
@@ -647,6 +678,8 @@ interface ConstraintRow {
   readonly including: boolean | null;
   readonly period: boolean | null;
   readonly comment: string | null;
+  readonly backingIndexName: string | null;
+  readonly backingIndexComment: string | null;
 }
 
 /** One `notNullConstraints` row of the payload, after validation. */
@@ -764,8 +797,9 @@ interface SequenceMapping {
  * violations throw; only the deferred catalog
  * states become diagnostics, in canonical table order with table-level flags before a table's
  * column flags, columns in attribute order, not-null flags in the same attribute order,
- * constraint findings in stored `conname` order, index findings after them in stored-name
- * order, and sequence/identity findings last in their own schema-then-name order. Index
+ * constraint findings in stored `conname` order, index findings — standalone-index diagnostics
+ * and dropped comments on constraint-backed indexes — after them in stored-name order, and
+ * sequence/identity findings last in their own schema-then-name order. Index
  * definitions parse through libpg-query, so the mapper is async; its output does not depend on
  * payload row order: index and constraint rows sort by stored name before the
  * conventional-name strip, extension rows sort by name, and the entries stable-sort
@@ -899,7 +933,9 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           existing.deferrable !== keyRow.deferrable ||
           existing.deferred !== keyRow.deferred ||
           existing.period !== keyRow.period ||
-          existing.comment !== keyRow.comment,
+          existing.comment !== keyRow.comment ||
+          existing.backingIndexName !== keyRow.backingIndexName ||
+          existing.backingIndexComment !== keyRow.backingIndexComment,
       )
     ) {
       throw new Error(
@@ -1051,6 +1087,12 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
     const keys = keysByTable.get(tableKey(row.schema, row.name));
     const primaryKeyMapping = primaryKeyFor(keys);
     const findings: ConstraintFinding[] = [];
+    const consumedIndexComments: IndexFinding[] = [];
+    if (primaryKeyMapping !== undefined && primaryKeyMapping.backingIndexComment !== null) {
+      consumedIndexComments.push(
+        droppedIndexCommentFinding(row.schema, primaryKeyMapping.backingIndexName),
+      );
+    }
 
     const uniqueConstraints: UniqueConstraint[] = [];
     const checkConstraints: CheckConstraint[] = [];
@@ -1064,6 +1106,11 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         case 'unique':
           uniqueConstraints.push(uniqueConstraintFromRow(constraintRow));
           findings.push(...uniqueConstraintFindings(constraintRow, object));
+          if (constraintRow.backingIndexComment !== null) {
+            consumedIndexComments.push(
+              droppedIndexCommentFinding(constraintRow.schema, constraintRow.backingIndexName!),
+            );
+          }
           break;
         case 'check':
           checkConstraints.push(checkConstraintFromRow(constraintRow));
@@ -1111,33 +1158,43 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       compareIndexRowNames,
     );
     const namedIndexes: NamedIndex[] = [];
+    const indexFindings: IndexFinding[] = [];
     for (const indexRow of tableIndexRows) {
       const indexObject = `${indexRow.schema}.${indexRow.indexName}`;
       if (!indexRow.valid || !indexRow.ready) {
-        diagnostics.push({
-          kind: 'skip',
-          code: 'unsupported-statement',
-          object: indexObject,
-          message: `index ${indexObject} is not valid and ready; invalid indexes are not represented yet`,
+        indexFindings.push({
+          indexName: indexRow.indexName,
+          diagnostic: {
+            kind: 'skip',
+            code: 'unsupported-statement',
+            object: indexObject,
+            message: `index ${indexObject} is not valid and ready; invalid indexes are not represented yet`,
+          },
         });
         continue;
       }
       const envelope = classifyIndexEnvelope(indexRow.create);
       if (envelope.kind === 'skip') {
-        diagnostics.push({
-          kind: 'skip',
-          code: 'unsupported-statement',
-          object: indexObject,
-          message: `skipped CREATE INDEX ${indexObject} (${envelope.reason})`,
+        indexFindings.push({
+          indexName: indexRow.indexName,
+          diagnostic: {
+            kind: 'skip',
+            code: 'unsupported-statement',
+            object: indexObject,
+            message: `skipped CREATE INDEX ${indexObject} (${envelope.reason})`,
+          },
         });
         continue;
       }
       if (indexRow.tablespace !== null) {
-        diagnostics.push({
-          kind: 'flag',
-          code: 'unsupported-attribute',
-          object: indexObject,
-          message: `index ${indexObject} is on tablespace ${indexRow.tablespace}; tablespaces are not represented yet`,
+        indexFindings.push({
+          indexName: indexRow.indexName,
+          diagnostic: {
+            kind: 'flag',
+            code: 'unsupported-attribute',
+            object: indexObject,
+            message: `index ${indexObject} is on tablespace ${indexRow.tablespace}; tablespaces are not represented yet`,
+          },
         });
       }
       namedIndexes.push({
@@ -1149,6 +1206,9 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         },
       });
     }
+    indexFindings.push(...consumedIndexComments);
+    indexFindings.sort(compareIndexRowNames);
+    diagnostics.push(...indexFindings.map((finding) => finding.diagnostic));
 
     modelTables.push({
       schema: row.schema,
@@ -1612,13 +1672,17 @@ interface PrimaryKeyMapping {
   readonly conname: string;
   readonly primaryKey: PrimaryKey;
   readonly period: boolean;
+  readonly backingIndexName: string;
+  readonly backingIndexComment: string | null;
 }
 
 /**
  * The table's primary key from its key rows: columns in key order, the deferrability the rows
  * carry, the stored name (the canonicalizer strips the conventional form), and the comment,
- * attached only when the row carries one. The grouping pass already requires every row of one
- * primary key to agree on `conname`, deferrability, the temporal flag, and the comment.
+ * attached only when the row carries one. The backing index's name and description ride along
+ * for the index-phase comment flag; the model has no slot for either. The grouping pass
+ * already requires every row of one primary key to agree on `conname`, deferrability, the
+ * temporal flag, the comment, and both backing-index fields.
  */
 function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMapping | undefined {
   if (rows === undefined || rows.length === 0) return undefined;
@@ -1630,7 +1694,13 @@ function primaryKeyFor(rows: readonly PrimaryKeyRow[] | undefined): PrimaryKeyMa
   };
   applyRowDeferrability(first, primaryKey);
   if (first.comment !== null) primaryKey.comment = first.comment;
-  return { conname: first.conname, primaryKey, period: first.period };
+  return {
+    conname: first.conname,
+    primaryKey,
+    period: first.period,
+    backingIndexName: first.backingIndexName,
+    backingIndexComment: first.backingIndexComment,
+  };
 }
 
 /** Applies the catalog's deferrability pair to a constraint, `INITIALLY DEFERRED` implying it. */
@@ -1676,6 +1746,7 @@ function validateConstraintRow(row: ConstraintRow): void {
         'nullsNotDistinct',
         'including',
         'period',
+        'backingIndexName',
       ]);
       requireAbsent([
         'expression',
@@ -1704,6 +1775,8 @@ function validateConstraintRow(row: ConstraintRow): void {
         'nullsNotDistinct',
         'including',
         'period',
+        'backingIndexName',
+        'backingIndexComment',
       ]);
       return;
     case 'foreign-key':
@@ -1722,7 +1795,14 @@ function validateConstraintRow(row: ConstraintRow): void {
         'enforced',
         'period',
       ]);
-      requireAbsent(['expression', 'noInherit', 'nullsNotDistinct', 'including']);
+      requireAbsent([
+        'expression',
+        'noInherit',
+        'nullsNotDistinct',
+        'including',
+        'backingIndexName',
+        'backingIndexComment',
+      ]);
       return;
     case 'exclusion':
       requireAbsent([
@@ -1743,6 +1823,8 @@ function validateConstraintRow(row: ConstraintRow): void {
         'nullsNotDistinct',
         'including',
         'period',
+        'backingIndexName',
+        'backingIndexComment',
       ]);
   }
 }
@@ -1840,6 +1922,30 @@ function constraintEnforcementFromRow(row: ConstraintRow): ConstraintEnforcement
 interface ConstraintFinding {
   readonly conname: string;
   readonly diagnostic: Diagnostic;
+}
+
+/**
+ * One folded index finding: the stored index name orders it among the table's index-phase
+ * findings — standalone-index diagnostics and dropped comments on constraint-backed indexes
+ * alike. Index-phase names are unique per table (a consumed index never also appears as a
+ * standalone row), so the name alone is the whole order.
+ */
+interface IndexFinding {
+  readonly indexName: string;
+  readonly diagnostic: Diagnostic;
+}
+
+/**
+ * The dropped comment on a constraint-backed index, in the import's grammar: the model cannot
+ * carry an index comment on a primary-key or unique constraint's backing index, so the flag
+ * names the index relation and states the drop, with no `position`.
+ */
+function droppedIndexCommentFinding(schema: string, indexName: string): IndexFinding {
+  const object = `${schema}.${indexName}`;
+  return {
+    indexName,
+    diagnostic: flagDiagnostic(object, `dropped comment from ${object}`),
+  };
 }
 
 /** A constraint flag in the importer's grammar: `dropped <attribute> on <kind> <name> from <object>`. */
@@ -2017,8 +2123,14 @@ function compareTableRows(left: TableRow, right: TableRow): number {
   return 0;
 }
 
-/** Stored index-name order, the order the strip pass walks; plain string comparison. */
-function compareIndexRowNames(left: IndexRow, right: IndexRow): number {
+/**
+ * Stored index-name order, the order the strip pass walks and the index-phase findings sort;
+ * plain string comparison over the one field both row and finding carry.
+ */
+function compareIndexRowNames(
+  left: { readonly indexName: string },
+  right: { readonly indexName: string },
+): number {
   if (left.indexName !== right.indexName) return left.indexName < right.indexName ? -1 : 1;
   return 0;
 }
@@ -2264,6 +2376,8 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     'deferred',
     'period',
     'comment',
+    'backingIndexName',
+    'backingIndexComment',
   ]);
   return {
     schema: expectString(row, path, 'schema'),
@@ -2275,6 +2389,8 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
     deferred: expectBoolean(row, path, 'deferred'),
     period: expectBoolean(row, path, 'period'),
     comment: expectNullableString(row, path, 'comment'),
+    backingIndexName: expectString(row, path, 'backingIndexName'),
+    backingIndexComment: expectNullableString(row, path, 'backingIndexComment'),
   };
 }
 
@@ -2304,6 +2420,8 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     'including',
     'period',
     'comment',
+    'backingIndexName',
+    'backingIndexComment',
   ]);
   const kind = expectString(row, path, 'kind');
   if (kind !== 'unique' && kind !== 'check' && kind !== 'foreign-key' && kind !== 'exclusion') {
@@ -2332,6 +2450,8 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     including: expectNullableBoolean(row, path, 'including'),
     period: expectNullableBoolean(row, path, 'period'),
     comment: expectNullableString(row, path, 'comment'),
+    backingIndexName: expectNullableString(row, path, 'backingIndexName'),
+    backingIndexComment: expectNullableString(row, path, 'backingIndexComment'),
   };
 }
 

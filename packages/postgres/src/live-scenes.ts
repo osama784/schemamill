@@ -5104,6 +5104,147 @@ const partitionChildGuardsScene = (): LiveScene => ({
 });
 
 /**
+ * The constraint-backed index comment parity scene: the model has no slot for a comment on a
+ * primary-key or unique constraint's backing index, so both read paths must drop it and flag
+ * it in the same grammar. Raw setup SQL creates two unmodeled tables on both databases. `cbi`
+ * is declared with a primary key and a unique constraint, and both backing indexes are
+ * commented — the generated names are PostgreSQL's conventional `cbi_pkey` and `cbi_b_key`,
+ * so the flag exercises the primary-key and unique-constraint row paths. `cbu` is built the
+ * `USING INDEX` way: a unique index is created and commented first, then consumed by a named
+ * unique constraint, which PostgreSQL renames to the constraint's name (`cbu_a_idx` becomes
+ * `cbu_a_key`); pg_dump carries the renamed index and its `COMMENT ON INDEX`, never the
+ * `USING INDEX` clause, so this scene proves the catalog and the dump import agree on the
+ * post-rename object name. The models stay empty, so the diagnostics are the whole claim;
+ * `matches-import` cannot be used because the catalog now flags what the import flags, and
+ * the `flags` assertion pins the exact diagnostic list instead. pg_dump emits a late
+ * `COMMENT ON INDEX` for every one of the three, so both imports reach the generic late
+ * flag; the import checks sort before comparing, which keeps the pin independent of the
+ * dump's statement order.
+ */
+const constraintBackedIndexCommentsScene = (): LiveScene => {
+  /**
+   * The dropped-comment diagnostics of one import, one `kind|code|object|message` line each,
+   * sorted so the comparison pins the entries rather than the dump's statement order.
+   */
+  const droppedComments = (imported: ReadResult<Model, Diagnostic>): readonly string[] =>
+    imported.diagnostics
+      .filter((diagnostic) => diagnostic.message.startsWith('dropped comment from '))
+      .map((diagnostic) =>
+        diagnostic.kind === 'error'
+          ? `${diagnostic.kind}|${diagnostic.code}|${diagnostic.message}`
+          : `${diagnostic.kind}|${diagnostic.code}|${diagnostic.object}|${diagnostic.message}`,
+      )
+      .sort();
+
+  const expectedDroppedComments = [
+    'flag|unsupported-attribute|public.cbi_b_key|dropped comment from public.cbi_b_key',
+    'flag|unsupported-attribute|public.cbi_pkey|dropped comment from public.cbi_pkey',
+    'flag|unsupported-attribute|public.cbu_a_key|dropped comment from public.cbu_a_key',
+  ];
+
+  /** One exact `pg_description` row for an index comment, as a one-line text fact. */
+  const indexCommentCheck = (
+    description: string,
+    indexName: string,
+    expected: string,
+  ): SceneCheck => ({
+    description,
+    sql:
+      `select description from pg_description where objoid = 'public.${indexName}'::regclass` +
+      " and classoid = 'pg_class'::regclass and objsubid = 0",
+    expected,
+  });
+
+  const storedCommentChecks = (subject: string): readonly SceneCheck[] => [
+    indexCommentCheck(
+      `the ${subject} stored the primary-key backing-index comment`,
+      'cbi_pkey',
+      'pk index comment',
+    ),
+    indexCommentCheck(
+      `the ${subject} stored the unique backing-index comment`,
+      'cbi_b_key',
+      'unique index comment',
+    ),
+    indexCommentCheck(
+      `the ${subject} stored the USING INDEX comment on the renamed backing index`,
+      'cbu_a_key',
+      'using index comment',
+    ),
+  ];
+
+  return {
+    name: 'constraint-backed-index-comments',
+    setupSql: [
+      'CREATE TABLE public.cbi (a integer PRIMARY KEY, b integer UNIQUE);',
+      "COMMENT ON INDEX public.cbi_pkey IS 'pk index comment';",
+      "COMMENT ON INDEX public.cbi_b_key IS 'unique index comment';",
+      'CREATE TABLE public.cbu (a integer);',
+      'CREATE UNIQUE INDEX cbu_a_idx ON public.cbu (a);',
+      "COMMENT ON INDEX public.cbu_a_idx IS 'using index comment';",
+      'ALTER TABLE public.cbu ADD CONSTRAINT cbu_a_key UNIQUE USING INDEX cbu_a_idx;',
+    ].join('\n'),
+    baseline: model(),
+    target: model(),
+    baselineChecks: storedCommentChecks('baseline database'),
+    targetChecks: storedCommentChecks('target database'),
+    importChecks: [
+      {
+        description:
+          'the import reports no error and drops exactly the three constraint-backed index comments',
+        failure: (imported, source) => {
+          const errors = imported.diagnostics
+            .filter((diagnostic) => diagnostic.kind === 'error')
+            .map((diagnostic) => diagnostic.message);
+          if (errors.length > 0) {
+            return `${source}: the import reported errors: ${errors.join('; ')}`;
+          }
+          const dropped = droppedComments(imported);
+          return isDeepStrictEqual(dropped, expectedDroppedComments)
+            ? undefined
+            : `${source}: dropped comments: ${dropped.join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'both dumps drop the same constraint-backed index comments',
+        failure: (applied, target) => {
+          const left = droppedComments(applied);
+          const right = droppedComments(target);
+          return isDeepStrictEqual(left, right)
+            ? undefined
+            : `applied: ${left.join('; ')} — target: ${right.join('; ')}`;
+        },
+      },
+    ],
+    introspection: {
+      assert: 'flags',
+      expected: [
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.cbi_b_key',
+          message: 'dropped comment from public.cbi_b_key',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.cbi_pkey',
+          message: 'dropped comment from public.cbi_pkey',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.cbu_a_key',
+          message: 'dropped comment from public.cbu_a_key',
+        },
+      ],
+    },
+  };
+};
+
+/**
  * The truncated-name round trip: a table whose unnamed index, unique constraint, check
  * constraint, and foreign key all generate names longer than PostgreSQL's 63-byte identifier
  * limit, plus an unnamed baseline index the target drops. The sizes are qualified so the
@@ -7086,6 +7227,7 @@ export const scenes: readonly LiveScene[] = [
   introspectionFlagsConstraints15Scene(),
   introspectionFlagsConstraints18Scene(),
   partitionChildGuardsScene(),
+  constraintBackedIndexCommentsScene(),
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
