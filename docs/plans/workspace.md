@@ -34,7 +34,7 @@ The reader is the workspace's validation seam: every identifier slot in `model.j
 
 The writer is not a validity gate by design: `writeWorkspaceModel` and `initWorkspace` deliberately skip the model read so a repair write can replace a corrupt or missing `model.json` ([ADR 0020](../adr/0020-model-persistence-writes-atomically.md)). A programmatic caller that persists an empty identifier is rejected on the next read, not at write time; import cannot create that state because PostgreSQL and the dump parser reject zero-length identifiers.
 
-The formatter is not a validity gate either: its `=== undefined` checks and their empty-string behavior stay as they are, and the reader keeps an empty identifier from reaching disk in the first place. The CLI's `plan`, `compare`, and `export` therefore report the reader's diagnostic before any formatting or rendering.
+The formatter is not a validity gate either: its `=== undefined` checks and their empty-string behavior stay as they are, and the reader rejects an empty identifier at the disk boundary, so it never reaches formatting or rendering. The CLI's `plan`, `compare`, and `export` therefore report the reader's diagnostic before any formatting or rendering.
 
 ## Done means
 
