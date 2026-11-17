@@ -1911,7 +1911,7 @@ test('sorts dropped constraint-backed index comments into the index phase by ind
         }),
       ],
       indexes: [
-        index('public', 't', 'm_idx', definition('public', 't', 'm_idx', 'b'), {
+        index('public', 't', 'u_idx', definition('public', 't', 'u_idx', 'b'), {
           tablespace: 'fastspace',
         }),
       ],
@@ -1928,14 +1928,14 @@ test('sorts dropped constraint-backed index comments into the index phase by ind
     {
       kind: 'flag',
       code: 'unsupported-attribute',
-      object: 'public.m_idx',
-      message: 'index public.m_idx is on tablespace fastspace; tablespaces are not represented yet',
+      object: 'public.t_pkey',
+      message: 'dropped comment from public.t_pkey',
     },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
-      object: 'public.t_pkey',
-      message: 'dropped comment from public.t_pkey',
+      object: 'public.u_idx',
+      message: 'index public.u_idx is on tablespace fastspace; tablespaces are not represented yet',
     },
     {
       kind: 'flag',
