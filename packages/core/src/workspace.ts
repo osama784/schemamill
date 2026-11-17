@@ -761,8 +761,12 @@ function parseBoolean(value: unknown, path: string): Parsed<boolean> {
   return parsed(value);
 }
 
-function parseStringArray(value: unknown, path: string): Parsed<string[]> {
-  return parseArrayOf(value, path, parseString);
+function parseStringArray(
+  value: unknown,
+  path: string,
+  parse: (value: unknown, path: string) => Parsed<string> = parseString,
+): Parsed<string[]> {
+  return parseArrayOf(value, path, parse);
 }
 
 /** An exact 64-bit integer in canonical decimal form. */
@@ -810,9 +814,9 @@ function parseOptional<T>(
 
 function parseTable(value: unknown, path: string): Parsed<Table> {
   return parseObject(value, path, TABLE_KEYS, (object) => {
-    const schema = parseString(object.schema, fieldPath(path, 'schema'));
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
     if (!schema.ok) return schema;
-    const name = parseString(object.name, fieldPath(path, 'name'));
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
     const columns = parseArrayOf(object.columns, fieldPath(path, 'columns'), parseColumn);
     if (!columns.ok) return columns;
@@ -863,7 +867,7 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
 
 function parseColumn(value: unknown, path: string): Parsed<Column> {
   return parseObject(value, path, COLUMN_KEYS, (object) => {
-    const name = parseString(object.name, fieldPath(path, 'name'));
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
     const type = parseString(object.type, fieldPath(path, 'type'));
     if (!type.ok) return type;
@@ -872,7 +876,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
     const notNullName = parseOptional(
       object.notNullName,
       fieldPath(path, 'notNullName'),
-      parseString,
+      parseNonEmptyString,
     );
     if (!notNullName.ok) return notNullName;
     if (notNullName.value !== undefined && notNull.value !== true) {
@@ -969,9 +973,13 @@ function parseIdentity(value: unknown, path: string): Parsed<Identity> {
 /** A primary key or unique constraint; their shapes are identical. */
 function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
   return parseObject(value, path, KEY_KEYS, (object) => {
-    const name = parseOptional(object.name, fieldPath(path, 'name'), parseString);
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
-    const columns = parseStringArray(object.columns, fieldPath(path, 'columns'));
+    const columns = parseStringArray(
+      object.columns,
+      fieldPath(path, 'columns'),
+      parseNonEmptyString,
+    );
     if (!columns.ok) return columns;
     const deferrable = parseOptional(
       object.deferrable,
@@ -1001,7 +1009,7 @@ function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
 
 function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstraint> {
   return parseObject(value, path, CHECK_CONSTRAINT_KEYS, (object) => {
-    const name = parseOptional(object.name, fieldPath(path, 'name'), parseString);
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
     const expression = parseString(object.expression, fieldPath(path, 'expression'));
     if (!expression.ok) return expression;
@@ -1024,15 +1032,20 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
 
 function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
   return parseObject(value, path, FOREIGN_KEY_KEYS, (object) => {
-    const name = parseOptional(object.name, fieldPath(path, 'name'), parseString);
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
-    const columns = parseStringArray(object.columns, fieldPath(path, 'columns'));
+    const columns = parseStringArray(
+      object.columns,
+      fieldPath(path, 'columns'),
+      parseNonEmptyString,
+    );
     if (!columns.ok) return columns;
     const referencedTable = parseName(object.referencedTable, fieldPath(path, 'referencedTable'));
     if (!referencedTable.ok) return referencedTable;
     const referencedColumns = parseStringArray(
       object.referencedColumns,
       fieldPath(path, 'referencedColumns'),
+      parseNonEmptyString,
     );
     if (!referencedColumns.ok) return referencedColumns;
     const onUpdate = parseOptional(
@@ -1094,11 +1107,15 @@ function parseConstraintEnforcement(value: unknown, path: string): Parsed<Constr
 
 function parseIndex(value: unknown, path: string): Parsed<Index> {
   return parseObject(value, path, INDEX_KEYS, (object) => {
-    const name = parseOptional(object.name, fieldPath(path, 'name'), parseString);
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
     const unique = parseBoolean(object.unique, fieldPath(path, 'unique'));
     if (!unique.ok) return unique;
-    const columns = parseStringArray(object.columns, fieldPath(path, 'columns'));
+    const columns = parseStringArray(
+      object.columns,
+      fieldPath(path, 'columns'),
+      parseNonEmptyString,
+    );
     if (!columns.ok) return columns;
     const concurrently = parseOptional(
       object.concurrently,
@@ -1120,9 +1137,9 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
 
 function parseSequence(value: unknown, path: string): Parsed<Sequence> {
   return parseObject(value, path, SEQUENCE_KEYS, (object) => {
-    const schema = parseString(object.schema, fieldPath(path, 'schema'));
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
     if (!schema.ok) return schema;
-    const name = parseString(object.name, fieldPath(path, 'name'));
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
     const dataType = parseEnum(
       object.dataType,
@@ -1167,7 +1184,7 @@ function parseOwner(value: unknown, path: string): Parsed<SequenceOwner> {
   return parseObject(value, path, OWNER_KEYS, (object) => {
     const table = parseName(object.table, fieldPath(path, 'table'));
     if (!table.ok) return table;
-    const column = parseString(object.column, fieldPath(path, 'column'));
+    const column = parseNonEmptyString(object.column, fieldPath(path, 'column'));
     if (!column.ok) return column;
     return parsed({ table: table.value, column: column.value });
   });
@@ -1180,9 +1197,9 @@ function parseOwner(value: unknown, path: string): Parsed<SequenceOwner> {
  */
 function parseView(value: unknown, path: string): Parsed<View> {
   return parseObject(value, path, VIEW_KEYS, (object) => {
-    const schema = parseString(object.schema, fieldPath(path, 'schema'));
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
     if (!schema.ok) return schema;
-    const name = parseString(object.name, fieldPath(path, 'name'));
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
     const materialized = parseBoolean(object.materialized, fieldPath(path, 'materialized'));
     if (!materialized.ok) return materialized;
@@ -1241,9 +1258,9 @@ function parseExtension(value: unknown, path: string): Parsed<Extension> {
  */
 function parseName(value: unknown, path: string): Parsed<TableIdentity> {
   return parseObject(value, path, NAME_KEYS, (object) => {
-    const schema = parseString(object.schema, fieldPath(path, 'schema'));
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
     if (!schema.ok) return schema;
-    const name = parseString(object.name, fieldPath(path, 'name'));
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
     return parsed({ schema: schema.value, name: name.value });
   });

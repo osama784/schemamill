@@ -141,6 +141,28 @@ const DANGLING_TABLE_ERROR =
 const DANGLING_COLUMN_ERROR =
   'schemamill: sequence public.s is owned by public.t.id, but the target model has no column id on table public.t\n';
 
+/**
+ * A workspace model whose only index is named the empty string: the reader must reject it before
+ * any command formats or renders it, because `CREATE INDEX ""` cannot execute.
+ */
+const EMPTY_INDEX_NAME_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "a", "type": "integer", "notNull": false }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": [{ "name": "", "unique": false, "columns": ["a"] }]
+    }
+  ],
+  "sequences": [],
+  "views": [],
+  "extensions": []
+}
+`;
+
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
   '    id integer NOT NULL,',
@@ -1164,6 +1186,32 @@ test('an unknown model field reports workspace-model-invalid, exit 1', async (t)
 
     assert.equal(result.stdout, '');
     assert.equal(result.stderr, 'schemamill: invalid model: unknown field version\n');
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a workspace model with an empty index name is rejected before formatting, exit 1', async (t) => {
+  // The corrupt model sits on the workspace side the command reads. `plan` and `compare` take the
+  // empty baseline dump as their path and the workspace as the target, so the empty index name is
+  // rejected by the reader before any diff, plan, format, or render sees the model.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_INDEX_NAME_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['plan', '--target-workspace', empty],
+    ['compare', '--target-workspace', empty],
+    ['export'],
+  ];
+
+  for (const args of cases) {
+    const result = await runCli(...args, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'schemamill: invalid model: tables[0].indexes[0].name is not a non-empty string\n',
+    );
     assert.equal(result.code, 1);
   }
 });

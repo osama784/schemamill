@@ -215,6 +215,14 @@ async function resolvePayload(
   return resolveFail(dir);
 }
 
+/** Writes an otherwise valid model payload into a fresh root and returns the model it reads as. */
+async function resolvePayloadOk(context: TestContext, payload: unknown): Promise<Model> {
+  const dir = await fixtureDir(context);
+  await writeWorkspace(dir, JSON.stringify(payload));
+  const resolved = await resolveOk(dir);
+  return resolved.model;
+}
+
 /** A minimal canonical table with the given identity. */
 function minimalTable(schema: string, name: string): Table {
   return {
@@ -822,6 +830,282 @@ test('resolveWorkspace names the column attribute and persistence failures in fu
     const diagnostic = await resolvePayload(t, payload);
     assert.equal(diagnostic.message, message);
   }
+});
+
+/** One identifier rejection: an otherwise valid payload with exactly one empty identifier. */
+interface EmptyIdentifier {
+  readonly payload: unknown;
+  /** The only slot the payload corrupts, and the path the diagnostic must name. */
+  readonly path: string;
+}
+
+/** Asserts each row fails with the exact non-empty-string message naming its path. */
+async function assertEmptyIdentifiers(
+  context: TestContext,
+  rows: readonly EmptyIdentifier[],
+): Promise<void> {
+  for (const { payload, path } of rows) {
+    const diagnostic = await resolvePayload(context, payload);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, `invalid model: ${path} is not a non-empty string`);
+  }
+}
+
+test('resolveWorkspace rejects an empty table identifier at every slot', async (t) => {
+  await assertEmptyIdentifiers(t, [
+    {
+      payload: { tables: [tablePayload({ schema: '' })], sequences: [] },
+      path: 'tables[0].schema',
+    },
+    { payload: { tables: [tablePayload({ name: '' })], sequences: [] }, path: 'tables[0].name' },
+  ]);
+
+  const control = await resolvePayloadOk(t, { tables: [tablePayload()], sequences: [] });
+  assert.deepStrictEqual(control, {
+    tables: [minimalTable('public', 't')],
+    sequences: [],
+    views: [],
+    extensions: [],
+  });
+});
+
+test('resolveWorkspace rejects an empty column identifier at every slot', async (t) => {
+  await assertEmptyIdentifiers(t, [
+    {
+      payload: {
+        tables: [tablePayload({ columns: [{ name: '', type: 'text', notNull: false }] })],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].name',
+    },
+    {
+      payload: {
+        tables: [
+          tablePayload({ columns: [{ name: 'c', type: 'text', notNull: true, notNullName: '' }] }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].notNullName',
+    },
+  ]);
+
+  const control = await resolvePayloadOk(t, {
+    tables: [tablePayload({ columns: [{ name: 'c', type: 'text', notNull: true }] })],
+    sequences: [],
+  });
+  assert.deepStrictEqual(control.tables[0]!.columns, [{ name: 'c', type: 'text', notNull: true }]);
+  assert.equal('notNullName' in control.tables[0]!.columns[0]!, false);
+});
+
+test('resolveWorkspace rejects an empty index identifier at every slot', async (t) => {
+  await assertEmptyIdentifiers(t, [
+    {
+      payload: {
+        tables: [tablePayload({ indexes: [{ name: '', unique: false, columns: ['a'] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].indexes[0].name',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ indexes: [{ unique: false, columns: [''] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].indexes[0].columns[0]',
+    },
+  ]);
+
+  const control = await resolvePayloadOk(t, {
+    tables: [tablePayload({ indexes: [{ unique: false, columns: ['a'] }] })],
+    sequences: [],
+  });
+  assert.deepStrictEqual(control.tables[0]!.indexes, [{ unique: false, columns: ['a'] }]);
+});
+
+test('resolveWorkspace rejects an empty constraint identifier at every slot', async (t) => {
+  const foreignKey = {
+    columns: ['org_id'],
+    referencedTable: { schema: 'public', name: 'orgs' },
+    referencedColumns: ['id'],
+  };
+
+  await assertEmptyIdentifiers(t, [
+    {
+      payload: {
+        tables: [tablePayload({ primaryKey: { name: '', columns: ['id'] } })],
+        sequences: [],
+      },
+      path: 'tables[0].primaryKey.name',
+    },
+    {
+      payload: { tables: [tablePayload({ primaryKey: { columns: [''] } })], sequences: [] },
+      path: 'tables[0].primaryKey.columns[0]',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ uniqueConstraints: [{ name: '', columns: ['a'] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].uniqueConstraints[0].name',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ uniqueConstraints: [{ columns: [''] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].uniqueConstraints[0].columns[0]',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ checkConstraints: [{ name: '', expression: 'a > 0' }] })],
+        sequences: [],
+      },
+      path: 'tables[0].checkConstraints[0].name',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ foreignKeys: [{ ...foreignKey, name: '' }] })],
+        sequences: [],
+      },
+      path: 'tables[0].foreignKeys[0].name',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ foreignKeys: [{ ...foreignKey, columns: [''] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].foreignKeys[0].columns[0]',
+    },
+    {
+      payload: {
+        tables: [
+          tablePayload({
+            foreignKeys: [{ ...foreignKey, referencedTable: { schema: '', name: 'orgs' } }],
+          }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].foreignKeys[0].referencedTable.schema',
+    },
+    {
+      payload: {
+        tables: [
+          tablePayload({
+            foreignKeys: [{ ...foreignKey, referencedTable: { schema: 'public', name: '' } }],
+          }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].foreignKeys[0].referencedTable.name',
+    },
+    {
+      payload: {
+        tables: [tablePayload({ foreignKeys: [{ ...foreignKey, referencedColumns: [''] }] })],
+        sequences: [],
+      },
+      path: 'tables[0].foreignKeys[0].referencedColumns[0]',
+    },
+  ]);
+
+  const control = await resolvePayloadOk(t, {
+    tables: [
+      tablePayload({
+        primaryKey: { columns: ['id'] },
+        uniqueConstraints: [{ columns: ['a'] }],
+        checkConstraints: [{ expression: 'a > 0' }],
+        foreignKeys: [foreignKey],
+      }),
+    ],
+    sequences: [],
+  });
+  const table = control.tables[0]!;
+  assert.equal('name' in table.primaryKey!, false);
+  assert.equal('name' in table.uniqueConstraints[0]!, false);
+  assert.equal('name' in table.checkConstraints[0]!, false);
+  assert.equal('name' in table.foreignKeys[0]!, false);
+});
+
+test('resolveWorkspace rejects an empty identifier in every remaining slot', async (t) => {
+  await assertEmptyIdentifiers(t, [
+    {
+      payload: { tables: [], sequences: [sequencePayload({ schema: '' })] },
+      path: 'sequences[0].schema',
+    },
+    {
+      payload: { tables: [], sequences: [sequencePayload({ name: '' })] },
+      path: 'sequences[0].name',
+    },
+    {
+      payload: {
+        tables: [],
+        sequences: [
+          sequencePayload({ ownedBy: { table: { schema: '', name: 'users' }, column: 'id' } }),
+        ],
+      },
+      path: 'sequences[0].ownedBy.table.schema',
+    },
+    {
+      payload: {
+        tables: [],
+        sequences: [
+          sequencePayload({ ownedBy: { table: { schema: 'public', name: '' }, column: 'id' } }),
+        ],
+      },
+      path: 'sequences[0].ownedBy.table.name',
+    },
+    {
+      payload: {
+        tables: [],
+        sequences: [
+          sequencePayload({ ownedBy: { table: { schema: 'public', name: 'users' }, column: '' } }),
+        ],
+      },
+      path: 'sequences[0].ownedBy.column',
+    },
+    {
+      payload: { tables: [], sequences: [], views: [viewPayload({ schema: '' })] },
+      path: 'views[0].schema',
+    },
+    {
+      payload: { tables: [], sequences: [], views: [viewPayload({ name: '' })] },
+      path: 'views[0].name',
+    },
+    {
+      payload: {
+        tables: [
+          tablePayload({
+            columns: [columnWithIdentity({ sequenceName: { schema: '', name: 'users_id_seq' } })],
+          }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].identity.sequenceName.schema',
+    },
+    {
+      payload: {
+        tables: [
+          tablePayload({
+            columns: [columnWithIdentity({ sequenceName: { schema: 'public', name: '' } })],
+          }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].identity.sequenceName.name',
+    },
+  ]);
+
+  const control = await resolvePayloadOk(t, {
+    tables: [tablePayload({ columns: [columnWithIdentity({})] })],
+    sequences: [sequencePayload()],
+    views: [viewPayload()],
+  });
+  const identity = control.tables[0]!.columns[0]!.identity!;
+  assert.equal('sequenceName' in identity, false);
+  assert.equal('ownedBy' in control.sequences[0]!, false);
+  assert.deepStrictEqual(control.views, [
+    { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+  ]);
 });
 
 /** A populated canonical model, as a committed model file would hold it. */
