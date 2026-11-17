@@ -56,7 +56,10 @@ const column = (
   ...rest,
 });
 
-/** A `primaryKeys` row: not deferrable and not temporal unless overridden. */
+/**
+ * A `primaryKeys` row: not deferrable, not temporal, and backed by the conventionally named
+ * index unless overridden.
+ */
 const key = (
   schema: string,
   tableName: string,
@@ -74,6 +77,8 @@ const key = (
   deferred: false,
   period: false,
   comment: null,
+  backingIndexName: conname,
+  backingIndexComment: null,
   ...rest,
 });
 
@@ -107,6 +112,8 @@ const constraint = (
   including: null,
   period: null,
   comment: null,
+  backingIndexName: kind === 'unique' ? conname : null,
+  backingIndexComment: null,
   ...rest,
 });
 
@@ -1839,6 +1846,193 @@ test('preserves constraint comments through conventional-name canonicalization',
       comment: 'kept foreign key comment',
     },
   ]);
+});
+
+test('flags a comment on the primary key backing index without modeling it', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'account_id', { type: 'uuid', attnotnull: true })],
+      primaryKeys: [
+        key('public', 'accounts', 'accounts_pkey', 1, 'account_id', {
+          backingIndexComment: 'the primary key index comment',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.primaryKey, { columns: ['account_id'] });
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.accounts_pkey',
+      message: 'dropped comment from public.accounts_pkey',
+    },
+  ]);
+});
+
+test('flags a comment on a unique constraint backing index without modeling it', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 'accounts')],
+      columns: [column('public', 'accounts', 1, 'email', { attnotnull: true })],
+      constraints: [
+        uniqueConstraint('public', 'accounts', 'accounts_email_key', ['email'], {
+          backingIndexComment: 'the unique index comment',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.uniqueConstraints, [{ columns: ['email'] }]);
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.accounts_email_key',
+      message: 'dropped comment from public.accounts_email_key',
+    },
+  ]);
+});
+
+test('sorts dropped constraint-backed index comments into the index phase by index name', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a'), column('public', 't', 2, 'b')],
+      primaryKeys: [
+        key('public', 't', 't_pkey', 1, 'a', { backingIndexComment: 'pk index comment' }),
+      ],
+      constraints: [
+        checkConstraint('public', 't', 'c_inherit', 'a > 0', { noInherit: true }),
+        uniqueConstraint('public', 't', 'z_key', ['b'], {
+          backingIndexComment: 'unique index comment',
+        }),
+      ],
+      indexes: [
+        index('public', 't', 'm_idx', definition('public', 't', 'm_idx', 'b'), {
+          tablespace: 'fastspace',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped NO INHERIT on check constraint c_inherit from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.m_idx',
+      message: 'index public.m_idx is on tablespace fastspace; tablespaces are not represented yet',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_pkey',
+      message: 'dropped comment from public.t_pkey',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.z_key',
+      message: 'dropped comment from public.z_key',
+    },
+  ]);
+});
+
+test('rejects rows that misstate or disagree on the backing index contract', async () => {
+  const base = {
+    tables: [table('public', 't'), table('public', 'parent')],
+    columns: [
+      column('public', 't', 1, 'a'),
+      column('public', 't', 2, 'b'),
+      column('public', 'parent', 1, 'id'),
+    ],
+  };
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [uniqueConstraint('public', 't', 'u', ['a'], { backingIndexName: null })],
+        }),
+      ),
+    /catalog payload: unique constraint "public\.t\.u" is missing backingIndexName/,
+    'a unique row without its backing index name',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [
+            checkConstraint('public', 't', 'c', 'a > 0', { backingIndexName: 'c_idx' }),
+          ],
+        }),
+      ),
+    /catalog payload: check constraint "public\.t\.c" carries backingIndexName outside its kind/,
+    'a check row naming a backing index',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [
+            foreignKey('public', 't', 'f', ['a'], 'public', 'parent', ['id'], {
+              backingIndexComment: 'referenced index comment',
+            }),
+          ],
+        }),
+      ),
+    /catalog payload: foreign-key constraint "public\.t\.f" carries backingIndexComment outside its kind/,
+    'a foreign key row carrying the referenced index comment',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          constraints: [{ ...exclusionConstraint('public', 't', 'x'), backingIndexName: 'x_idx' }],
+        }),
+      ),
+    /catalog payload: exclusion constraint "public\.t\.x" carries backingIndexName outside its kind/,
+    'an exclusion row naming its backing index',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          primaryKeys: [
+            key('public', 't', 't_pkey', 1, 'a'),
+            key('public', 't', 't_pkey', 2, 'b', { backingIndexName: 'other_idx' }),
+          ],
+        }),
+      ),
+    /catalog payload: primary-key rows of "public\.t" disagree on their attributes/,
+    'primary-key rows disagreeing on the backing index name',
+  );
+  await assert.rejects(
+    () =>
+      mapCatalog(
+        payload({
+          ...base,
+          primaryKeys: [
+            key('public', 't', 't_pkey', 1, 'a'),
+            key('public', 't', 't_pkey', 2, 'b', { backingIndexComment: 'commented' }),
+          ],
+        }),
+      ),
+    /catalog payload: primary-key rows of "public\.t" disagree on their attributes/,
+    'primary-key rows disagreeing on the backing index comment',
+  );
 });
 
 test('keeps a tablespace index comment and drops comments on skipped rows without diagnostics', async () => {
