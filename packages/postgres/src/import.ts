@@ -3614,8 +3614,8 @@ function flagCheckConstraintAttributes(
 
 /**
  * Flags the one fact a consumed index cannot hand to the constraint it becomes: a constraint
- * carries no `CONCURRENTLY` apply metadata. The index's comment, by contrast, travels onto the
- * constraint in both splice functions.
+ * carries no `CONCURRENTLY` apply metadata. The index's own comment is likewise unplaceable and
+ * is flagged separately by `flagConsumedIndexComment`.
  */
 function flagConsumedIndexConcurrently(
   statement: ParsedStatement,
@@ -3635,22 +3635,22 @@ function flagConsumedIndexConcurrently(
 }
 
 /**
- * Flags a consumed index's comment when the constraint it becomes is deduplicated or rejected:
- * the comment travelled onto the built constraint, but the retained constraint keeps its own, so
- * the consumed declaration's comment is dropped. An equal retained comment loses no fact.
+ * Flags a consumed index's comment: the model carries no slot for a constraint-backed index's own
+ * description, and the comment is never copied onto the constraint. The caller names the object
+ * the server keeps after the statement — the built constraint's name when it applies (PostgreSQL
+ * renames the consumed index to it), the source index name when the statement is deduplicated or
+ * rejected and no rename happens.
  */
-function flagDroppedConsumedComment(
+function flagConsumedIndexComment(
   statement: ParsedStatement,
   schema: string,
-  indexname: string,
+  objectName: string,
   comment: string | undefined,
-  retained: { readonly comment?: string } | undefined,
   diagnostics: PositionedDiagnostic[],
 ): void {
-  if (retained === undefined) return;
-  if (comment === undefined || retained.comment === comment) return;
+  if (comment === undefined) return;
   diagnostics.push(
-    flagAttribute(statement, tableIdentityName({ schema, name: indexname }), 'comment'),
+    flagAttribute(statement, tableIdentityName({ schema, name: objectName }), 'comment'),
   );
 }
 
@@ -3658,8 +3658,9 @@ function flagDroppedConsumedComment(
  * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
  * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
  * column-list unique index; otherwise the whole constraint is skipped and named. The consumed
- * index's comment travels onto the constraint, its `CONCURRENTLY` apply metadata is flagged
- * because the constraint cannot carry it, and a dedupe flags the comment it cannot place.
+ * index's comment is dropped and flagged (the model has no slot for it), its `CONCURRENTLY`
+ * apply metadata is flagged because the constraint cannot carry it, and a dedupe flags the
+ * comment against the source index name it keeps.
  */
 function attachAlteredUniqueConstraint(
   statement: ParsedStatement,
@@ -3693,14 +3694,21 @@ function attachAlteredUniqueConstraint(
   const comment = index.comment;
   draft.indexes.splice(position, 1);
   const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
-  if (comment !== undefined) uniqueConstraint.comment = comment;
   const name = constraint.conname ?? index.name;
   if (name !== undefined) uniqueConstraint.name = name;
   applyConstraintDeferrability(constraint, uniqueConstraint);
   flagUniqueConstraintAttributes(statement, constraint, identity, diagnostics);
   flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
   const retained = attachUniqueConstraint(draft, uniqueConstraint);
-  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
+  // An applied consumption renames the index to the constraint's name; a deduplicated statement
+  // never applies, so the source index keeps the name it had.
+  flagConsumedIndexComment(
+    statement,
+    draft.schema,
+    retained === undefined ? (name ?? indexname) : indexname,
+    comment,
+    diagnostics,
+  );
 }
 
 /**
@@ -3708,8 +3716,9 @@ function attachAlteredUniqueConstraint(
  * `primaryKeyFromConstraint` — which owns the primary-key attribute flags — while a constraint
  * stated `USING INDEX` consumes the named standalone index when it is a plain column-list
  * unique index; otherwise the whole constraint is skipped and named. The consumed index's
- * comment travels onto the key, its `CONCURRENTLY` apply metadata is flagged because the
- * constraint cannot carry it, and a rejection flags the comment it cannot place.
+ * comment is dropped and flagged (the model has no slot for it), its `CONCURRENTLY` apply
+ * metadata is flagged because the constraint cannot carry it, and a rejection flags the comment
+ * against the source index name it keeps.
  */
 function attachAlteredPrimaryKey(
   statement: ParsedStatement,
@@ -3746,14 +3755,21 @@ function attachAlteredPrimaryKey(
   const comment = index.comment;
   draft.indexes.splice(position, 1);
   const primaryKey: Mutable<PrimaryKey> = { columns: [...index.columns] };
-  if (comment !== undefined) primaryKey.comment = comment;
   const name = constraint.conname ?? index.name;
   if (name !== undefined) primaryKey.name = name;
   applyConstraintDeferrability(constraint, primaryKey);
   flagPrimaryKeyAttributes(statement, constraint, identity, diagnostics);
   flagConsumedIndexConcurrently(statement, index, constraint, identity, diagnostics);
   const retained = attachPrimaryKey(statement, draft, primaryKey, identity, diagnostics);
-  flagDroppedConsumedComment(statement, draft.schema, indexname, comment, retained, diagnostics);
+  // An applied consumption renames the index to the key's name; a rejection never applies, so the
+  // source index keeps the name it had. The rejection flag above stays first.
+  flagConsumedIndexComment(
+    statement,
+    draft.schema,
+    retained === undefined ? (name ?? indexname) : indexname,
+    comment,
+    diagnostics,
+  );
 }
 
 /**
