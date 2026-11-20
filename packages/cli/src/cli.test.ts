@@ -865,9 +865,9 @@ test('skips print a counts line, and --verbose adds the skip line', async (t) =>
     verbose.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+      'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
       '',
     ].join('\n'),
   );
@@ -922,9 +922,9 @@ test('plan --verbose adds the skip line', async (t) => {
     result.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+      'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
       '',
     ].join('\n'),
   );
@@ -1266,7 +1266,7 @@ test('a workspace side contributes no import diagnostics, even with --verbose', 
   const dump = await writeDump(dumps, 'dump.sql', PARTIAL_INDEX_DUMP);
   const expectedStderr = [
     'target: 1 skipped',
-    'target: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)',
+    'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
     '',
   ].join('\n');
 
@@ -1461,7 +1461,7 @@ test('init --from writes a skip-only dump, and --verbose adds the skip line', as
   assert.equal(verbose.stdout, `Initialized workspace at ${verboseRoot}\n`);
   assert.equal(
     verbose.stderr,
-    'source: 1 skipped\nsource: [skip] skipped CREATE INDEX idx_users_email (partial WHERE) (5:1)\n',
+    'source: 1 skipped\nsource: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)\n',
   );
   assert.equal(verbose.code, 0);
 });

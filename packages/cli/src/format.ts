@@ -37,7 +37,9 @@ import type {
  * text, with no I/O, no dates, and no environment reads. Model values are emitted exactly as
  * stored — names unquoted, `type` and `default` text untouched, sequence option values as
  * their exact decimal strings, no colour and no TTY detection — and `(none)` stands in for a
- * field a payload omits. A bound the engine's type conversion produced prints as its exact
+ * field a payload omits; an empty string is never read as absence and prints as `""`, so
+ * `(none)` and a missing token stand only for an omitted field. A bound the engine's type
+ * conversion produced prints as its exact
  * decimal string with a `(converted)` mark, because the diff reports the value in effect
  * after the conversion, not the as-written baseline value.
  *
@@ -451,7 +453,7 @@ function formatStep(step: Step): string {
 
 /** `schema.name`, exactly as stored; no SQL quoting. */
 function formatIdentity(identity: TableIdentity): string {
-  return `${identity.schema}.${identity.name}`;
+  return `${formatPresent(identity.schema)}.${formatPresent(identity.name)}`;
 }
 
 /**
@@ -462,14 +464,16 @@ function formatIdentity(identity: TableIdentity): string {
  * identity options get their own `identity:` sub-lines.
  */
 function formatColumn(column: Column): string {
-  const nameAndType = [column.name, column.type].filter((part) => part !== '').join(' ');
+  const nameAndType = [column.name, formatPresent(column.type)]
+    .filter((part) => part !== '')
+    .join(' ');
   const clauses: string[] = [];
   if (column.collation !== undefined) clauses.push(`collation ${column.collation}`);
   if (column.storage !== undefined) clauses.push(`storage ${column.storage}`);
   if (column.compression !== undefined) clauses.push(`compression ${column.compression}`);
   if (column.notNull) clauses.push('NOT NULL');
-  if (column.default !== undefined && column.default !== '') {
-    clauses.push(`DEFAULT ${column.default}`);
+  if (column.default !== undefined) {
+    clauses.push(`DEFAULT ${formatPresent(column.default)}`);
   }
   if (column.identity !== undefined) {
     clauses.push(`identity: GENERATED ${formatGeneration(column.identity.generated)}`);
@@ -479,7 +483,7 @@ function formatColumn(column: Column): string {
 
 /** `<name> (<cols>)` when named, `(<cols>)` otherwise; how a changed pair prints one side. */
 function formatPrimaryKeySide(primaryKey: PrimaryKey): string {
-  const name = primaryKey.name === undefined ? '' : `${primaryKey.name} `;
+  const name = primaryKey.name === undefined ? '' : `${formatPresent(primaryKey.name)} `;
   return `${name}(${primaryKey.columns.join(', ')})`;
 }
 
@@ -490,7 +494,7 @@ function formatPrimaryKey(primaryKey: PrimaryKey): string {
 
 /** A foreign-key constraint line: name, referencing columns, target, referenced columns, actions. */
 function formatForeignKey(foreignKey: ForeignKey): string {
-  const name = foreignKey.name === undefined ? '' : `${foreignKey.name} `;
+  const name = foreignKey.name === undefined ? '' : `${formatPresent(foreignKey.name)} `;
   const columns = foreignKey.columns.join(', ');
   const referencedColumns =
     foreignKey.referencedColumns.length === 0
@@ -506,20 +510,21 @@ function formatForeignKey(foreignKey: ForeignKey): string {
 
 /** A unique-constraint line: its name when the payload names it, then its ordered columns. */
 function formatUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
-  const name = uniqueConstraint.name === undefined ? '' : `${uniqueConstraint.name} `;
+  const name =
+    uniqueConstraint.name === undefined ? '' : `${formatPresent(uniqueConstraint.name)} `;
   return `unique constraint ${name}(${uniqueConstraint.columns.join(', ')})`;
 }
 
 /** A check-constraint line: its name when the payload names it, then its opaque expression. */
 function formatCheckConstraint(checkConstraint: CheckConstraint): string {
-  const name = checkConstraint.name === undefined ? '' : `${checkConstraint.name} `;
+  const name = checkConstraint.name === undefined ? '' : `${formatPresent(checkConstraint.name)} `;
   return `check constraint ${name}CHECK (${checkConstraint.expression})`;
 }
 
 /** An index line: `unique` when it is, its name when present, then its ordered columns. */
 function formatIndex(index: Index): string {
   const unique = index.unique ? 'unique ' : '';
-  const name = index.name === undefined ? '' : `${index.name} `;
+  const name = index.name === undefined ? '' : `${formatPresent(index.name)} `;
   return `${unique}index ${name}(${index.columns.join(', ')})`;
 }
 
@@ -643,7 +648,7 @@ function formatCommentTarget(target: CommentTarget): string {
       return `extension ${target.extension.name}`;
     case 'index': {
       const unique = target.index.unique ? 'unique ' : '';
-      const name = target.index.name === undefined ? '' : ` — ${target.index.name}`;
+      const name = target.index.name === undefined ? '' : ` — ${formatPresent(target.index.name)}`;
       return `${unique}index ${formatIdentity(target.table)} (${target.index.columns.join(
         ', ',
       )})${name}`;
@@ -703,7 +708,7 @@ function formatColumnFields(fields: readonly ColumnFieldChange[]): string {
 function formatColumnField(field: ColumnFieldChange): string {
   switch (field.field) {
     case 'type':
-      return `type ${field.before} → ${field.after}`;
+      return `type ${formatPresent(field.before)} → ${formatPresent(field.after)}`;
     case 'notNull':
       return `not null ${String(field.before)} → ${String(field.after)}`;
     case 'notNullName':
@@ -832,9 +837,14 @@ function formatPersistence(persistence: TablePersistence | undefined): string {
   return persistence ?? 'logged';
 }
 
+/** An empty string prints as `""`; any other value passes through. Absence is a call-site concern. */
+function formatPresent(value: string): string {
+  return value === '' ? '""' : value;
+}
+
 /** The value when present, `(none)` when the payload omits it. */
 function formatOptional(value: string | undefined): string {
-  return value === undefined ? '(none)' : value;
+  return value === undefined ? '(none)' : formatPresent(value);
 }
 
 /** A boolean as stored, `(none)` when the payload omits it. */
