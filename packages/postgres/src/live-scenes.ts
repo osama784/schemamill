@@ -3826,8 +3826,8 @@ const indexCreateScene = (): LiveScene => {
             .filter((diagnostic) => diagnostic.kind === 'skip')
             .filter(
               (diagnostic) =>
-                diagnostic.object === 'accounts_partial_idx' ||
-                diagnostic.object === 'accounts_lower_name_idx',
+                diagnostic.object === 'public.accounts_partial_idx' ||
+                diagnostic.object === 'public.accounts_lower_name_idx',
             );
           if (source === 'applied') {
             return skips.length === 0
@@ -3836,12 +3836,14 @@ const indexCreateScene = (): LiveScene => {
                   .map((diagnostic) => diagnostic.object)
                   .join(',')}`;
           }
-          const partial = skips.find((diagnostic) => diagnostic.object === 'accounts_partial_idx');
+          const partial = skips.find(
+            (diagnostic) => diagnostic.object === 'public.accounts_partial_idx',
+          );
           if (partial === undefined || !partial.message.includes('(partial WHERE)')) {
             return 'the partial index was not skipped and named';
           }
           const expression = skips.find(
-            (diagnostic) => diagnostic.object === 'accounts_lower_name_idx',
+            (diagnostic) => diagnostic.object === 'public.accounts_lower_name_idx',
           );
           if (expression === undefined || !expression.message.includes('(expression element)')) {
             return 'the expression index was not skipped and named';
@@ -5744,12 +5746,13 @@ const viewRoundTripScene = (): LiveScene => {
               return `expected exactly one account_totals_id_idx diagnostic, got ${named.length}`;
             }
             const [diagnostic] = named;
-            const expected = 'skipped CREATE INDEX account_totals_id_idx (table not imported)';
+            const expected =
+              'skipped CREATE INDEX public.account_totals_id_idx (table not imported)';
             if (diagnostic?.kind !== 'skip' || diagnostic.message !== expected) {
               return `expected skip ${JSON.stringify(expected)}, got ${String(diagnostic?.kind)} ${JSON.stringify(diagnostic?.message)}`;
             }
-            if (diagnostic.object !== 'account_totals_id_idx') {
-              return `the skip names ${String(diagnostic.object)}, expected account_totals_id_idx`;
+            if (diagnostic.object !== 'public.account_totals_id_idx') {
+              return `the skip names ${String(diagnostic.object)}, expected public.account_totals_id_idx`;
             }
           } else if (named.length !== 0) {
             return `the applied import must not report the matview index skip: ${named

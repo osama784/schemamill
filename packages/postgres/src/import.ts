@@ -2362,11 +2362,7 @@ function translateAlterTableCommand(
       return;
     }
     diagnostics.push(
-      skipStatement(
-        statement,
-        `${constraintLabel(constraint)} on ${identity}`,
-        constraint.conname ?? identity,
-      ),
+      skipStatement(statement, `${constraintLabel(constraint)} on ${identity}`, identity),
     );
     return;
   }
@@ -2434,7 +2430,7 @@ function translateCreateIndex(
   const schema = create.relation?.schemaname ?? 'public';
   const name = create.relation?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
-  const object = create.idxname ?? identity;
+  const object = create.idxname === undefined ? identity : `${schema}.${create.idxname}`;
 
   const draft = tables.get(tableKey(schema, name));
   if (draft === undefined) {
@@ -3685,7 +3681,7 @@ function attachAlteredUniqueConstraint(
       skipStatement(
         statement,
         `${constraintLabel(constraint)} on ${identity} (USING INDEX ${indexname})`,
-        constraint.conname ?? indexname,
+        identity,
       ),
     );
     return;
@@ -3746,7 +3742,7 @@ function attachAlteredPrimaryKey(
       skipStatement(
         statement,
         `${constraintLabel(constraint)} on ${identity} (USING INDEX ${indexname})`,
-        constraint.conname ?? indexname,
+        identity,
       ),
     );
     return;

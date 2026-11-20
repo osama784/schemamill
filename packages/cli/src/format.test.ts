@@ -3,12 +3,19 @@ import { test } from 'node:test';
 
 import type {
   Change,
+  CheckConstraint,
   Column,
   CommentTarget,
+  ForeignKey,
   Hazard,
   Identity,
   IdentityChange,
+  Index,
   Plan,
+  PrimaryKey,
+  Step,
+  Table,
+  UniqueConstraint,
 } from '@schemamill/core';
 
 import { formatChanges, formatHazards, formatPlan } from './format.ts';
@@ -1336,4 +1343,303 @@ test('schema plan steps print the bare schema name', () => {
       '',
     ].join('\n'),
   );
+});
+
+/**
+ * The empty-string policy: `''` prints as `""`, while `(none)` or a missing token stands only
+ * for `undefined`. Optional sites are probed over absent / `''` / ordinary; required-string sites
+ * (column type, identity components) over ordinary / `''`, since they have no absent state.
+ * The reader rejects empty names, so name/identity coverage is defensive; type/default are the
+ * reader-reachable sites (#228). Ordinary and absent renderings are pinned so they cannot drift.
+ */
+const aTable = (overrides: Partial<Table> = {}): Table => ({
+  schema: 'public',
+  name: 't',
+  columns: [],
+  foreignKeys: [],
+  uniqueConstraints: [],
+  checkConstraints: [],
+  indexes: [],
+  ...overrides,
+});
+
+const aPlan = (step: Step): Plan => ({
+  steps: [step],
+  groups: [{ start: 0, end: 1, transactional: true }],
+});
+
+const anIndex = (name: string | undefined): Index => ({
+  unique: false,
+  columns: ['email'],
+  ...(name === undefined ? {} : { name }),
+});
+
+test('an empty column type prints as "" in a diff and a plan; an ordinary type is unchanged', () => {
+  const cases: readonly (readonly [string, string, string])[] = [
+    ['ordinary', 'integer', 'id integer'],
+    ['empty', '', 'id ""'],
+  ];
+  for (const [label, type, rendered] of cases) {
+    const column: Column = { name: 'id', type, notNull: false };
+    assert.equal(
+      formatChanges([{ kind: 'table-added', table: aTable({ columns: [column] }) }]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `column type / ${label} (diff)`,
+    );
+    assert.equal(
+      formatPlan(aPlan({ kind: 'add-column', table: { schema: 'public', name: 't' }, column })),
+      ['1 step in one transaction:', ` 1. add-column  public.t.${rendered}`, ''].join('\n'),
+      `column type / ${label} (plan)`,
+    );
+  }
+});
+
+test('an empty column default prints as DEFAULT ""; an absent default omits the clause', () => {
+  const cases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'id integer'],
+    ['empty', '', 'id integer DEFAULT ""'],
+    ['ordinary', '0', 'id integer DEFAULT 0'],
+  ];
+  for (const [label, defaultText, rendered] of cases) {
+    const column: Column = {
+      name: 'id',
+      type: 'integer',
+      notNull: false,
+      ...(defaultText === undefined ? {} : { default: defaultText }),
+    };
+    assert.equal(
+      formatChanges([{ kind: 'table-added', table: aTable({ columns: [column] }) }]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `column default / ${label} (diff)`,
+    );
+    assert.equal(
+      formatPlan(aPlan({ kind: 'add-column', table: { schema: 'public', name: 't' }, column })),
+      ['1 step in one transaction:', ` 1. add-column  public.t.${rendered}`, ''].join('\n'),
+      `column default / ${label} (plan)`,
+    );
+  }
+});
+
+test('an empty changed column type prints as "" on each side', () => {
+  const cases: readonly (readonly [string, string, string, string])[] = [
+    ['ordinary', 'integer', 'bigint', 'type integer → bigint'],
+    ['empty before', '', 'bigint', 'type "" → bigint'],
+    ['empty after', 'integer', '', 'type integer → ""'],
+    ['both empty', '', '', 'type "" → ""'],
+  ];
+  for (const [label, before, after, rendered] of cases) {
+    assert.equal(
+      formatChanges([
+        {
+          kind: 'table-changed',
+          table: { schema: 'public', name: 't' },
+          changes: [
+            { kind: 'column-changed', name: 'id', fields: [{ field: 'type', before, after }] },
+          ],
+        },
+      ]),
+      ['~ table public.t', `    ~ column id: ${rendered}`, ''].join('\n'),
+      `column field type / ${label} (diff)`,
+    );
+  }
+});
+
+test('an empty changed default prints as ""; an absent side prints (none)', () => {
+  const cases: readonly (readonly [string, string | undefined, string | undefined, string])[] = [
+    ['absent both', undefined, undefined, 'default (none) → (none)'],
+    ['empty before', '', undefined, 'default "" → (none)'],
+    ['empty after', undefined, '', 'default (none) → ""'],
+    ['empty vs ordinary', '', '0', 'default "" → 0'],
+    ['ordinary', '0', '1', 'default 0 → 1'],
+  ];
+  for (const [label, before, after, rendered] of cases) {
+    assert.equal(
+      formatChanges([
+        {
+          kind: 'table-changed',
+          table: { schema: 'public', name: 't' },
+          changes: [
+            {
+              kind: 'column-changed',
+              name: 'id',
+              fields: [{ field: 'default', before, after }],
+            },
+          ],
+        },
+      ]),
+      ['~ table public.t', `    ~ column id: ${rendered}`, ''].join('\n'),
+      `column field default / ${label} (diff)`,
+    );
+  }
+  assert.equal(
+    formatPlan(
+      aPlan({
+        kind: 'alter-column',
+        table: { schema: 'public', name: 't' },
+        name: 'id',
+        fields: [{ field: 'default', before: undefined, after: '' }],
+      }),
+    ),
+    ['1 step in one transaction:', ' 1. alter-column  public.t.id: default (none) → ""', ''].join(
+      '\n',
+    ),
+    'column field default / empty after (plan)',
+  );
+});
+
+test('an empty index name prints as ""; an absent name has no token', () => {
+  const cases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'index (email)'],
+    ['empty', '', 'index "" (email)'],
+    ['ordinary', 'idx_t_email', 'index idx_t_email (email)'],
+  ];
+  for (const [label, name, rendered] of cases) {
+    assert.equal(
+      formatChanges([
+        {
+          kind: 'table-changed',
+          table: { schema: 'public', name: 't' },
+          changes: [{ kind: 'index-added', index: anIndex(name) }],
+        },
+      ]),
+      ['~ table public.t', `    + ${rendered}`, ''].join('\n'),
+      `index name / ${label} (diff)`,
+    );
+    assert.equal(
+      formatPlan(
+        aPlan({
+          kind: 'create-index',
+          table: { schema: 'public', name: 't' },
+          index: anIndex(name),
+        }),
+      ),
+      ['1 step in one transaction:', ` 1. create-index  public.t: ${rendered}`, ''].join('\n'),
+      `index name / ${label} (plan)`,
+    );
+  }
+  assert.equal(
+    formatChanges([
+      {
+        kind: 'table-changed',
+        table: { schema: 'public', name: 't' },
+        changes: [{ kind: 'index-added', index: { ...anIndex(''), unique: true } }],
+      },
+    ]),
+    ['~ table public.t', '    + unique index "" (email)', ''].join('\n'),
+    'unique index name / empty',
+  );
+});
+
+test('an empty constraint name prints as ""; an absent name has no token', () => {
+  const primaryKeyCases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'primary key (id)'],
+    ['empty', '', 'primary key "" (id)'],
+    ['ordinary', 't_pkey', 'primary key t_pkey (id)'],
+  ];
+  for (const [label, name, rendered] of primaryKeyCases) {
+    const primaryKey: PrimaryKey = { columns: ['id'], ...(name === undefined ? {} : { name }) };
+    assert.equal(
+      formatChanges([{ kind: 'table-added', table: aTable({ primaryKey }) }]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `primary key name / ${label}`,
+    );
+  }
+
+  const foreignKeyCases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'foreign key (parent_id) → public.parent (id)'],
+    ['empty', '', 'foreign key "" (parent_id) → public.parent (id)'],
+    ['ordinary', 'fk_t', 'foreign key fk_t (parent_id) → public.parent (id)'],
+  ];
+  for (const [label, name, rendered] of foreignKeyCases) {
+    const foreignKey: ForeignKey = {
+      columns: ['parent_id'],
+      referencedTable: { schema: 'public', name: 'parent' },
+      referencedColumns: ['id'],
+      ...(name === undefined ? {} : { name }),
+    };
+    assert.equal(
+      formatChanges([{ kind: 'table-added', table: aTable({ foreignKeys: [foreignKey] }) }]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `foreign key name / ${label}`,
+    );
+  }
+
+  const uniqueCases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'unique constraint (email)'],
+    ['empty', '', 'unique constraint "" (email)'],
+    ['ordinary', 't_email_key', 'unique constraint t_email_key (email)'],
+  ];
+  for (const [label, name, rendered] of uniqueCases) {
+    const uniqueConstraint: UniqueConstraint = {
+      columns: ['email'],
+      ...(name === undefined ? {} : { name }),
+    };
+    assert.equal(
+      formatChanges([
+        { kind: 'table-added', table: aTable({ uniqueConstraints: [uniqueConstraint] }) },
+      ]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `unique constraint name / ${label}`,
+    );
+  }
+
+  const checkCases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'check constraint CHECK (x > 0)'],
+    ['empty', '', 'check constraint "" CHECK (x > 0)'],
+    ['ordinary', 't_x_check', 'check constraint t_x_check CHECK (x > 0)'],
+  ];
+  for (const [label, name, rendered] of checkCases) {
+    const checkConstraint: CheckConstraint = {
+      expression: 'x > 0',
+      ...(name === undefined ? {} : { name }),
+    };
+    assert.equal(
+      formatChanges([
+        { kind: 'table-added', table: aTable({ checkConstraints: [checkConstraint] }) },
+      ]),
+      ['+ table public.t', `    ${rendered}`, ''].join('\n'),
+      `check constraint name / ${label}`,
+    );
+  }
+});
+
+test('an empty comment-target index name prints as ""; an absent name has no suffix', () => {
+  const cases: readonly (readonly [string, string | undefined, string])[] = [
+    ['absent', undefined, 'index public.t (email)'],
+    ['empty', '', 'index public.t (email) — ""'],
+    ['ordinary', 'idx_t_email', 'index public.t (email) — idx_t_email'],
+  ];
+  for (const [label, name, rendered] of cases) {
+    const target: CommentTarget = {
+      kind: 'index',
+      table: { schema: 'public', name: 't' },
+      index: anIndex(name),
+    };
+    assert.equal(
+      formatChanges([{ kind: 'comment-changed', target, after: 'hello' }]),
+      `+ comment on ${rendered}: (none) → "hello"\n`,
+      `comment target index name / ${label} (diff)`,
+    );
+    assert.equal(
+      formatPlan(aPlan({ kind: 'comment', target, text: 'hello' })),
+      ['1 step in one transaction:', ` 1. comment  ${rendered}: "hello"`, ''].join('\n'),
+      `comment target index name / ${label} (plan)`,
+    );
+  }
+});
+
+test('empty identity components print as "" instead of a bare separator', () => {
+  const cases: readonly (readonly [string, string, string, string])[] = [
+    ['ordinary', 'public', 'users', 'public.users'],
+    ['empty schema', '', 'users', '"".users'],
+    ['empty name', 'public', '', 'public.""'],
+    ['both empty', '', '', '"".""'],
+  ];
+  for (const [label, schema, name, rendered] of cases) {
+    assert.equal(
+      formatChanges([{ kind: 'table-added', table: aTable({ schema, name }) }]),
+      `+ table ${rendered}\n`,
+      `identity / ${label}`,
+    );
+  }
 });
