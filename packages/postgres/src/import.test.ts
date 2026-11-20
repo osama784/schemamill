@@ -1951,32 +1951,51 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
   assert.deepEqual(
     diagnostics.map(summarize),
     [
-      't_expr_idx',
-      't_partial_idx',
-      't_include_idx',
-      't_hash_idx',
-      't_desc_idx',
-      't_nulls_idx',
-      't_opclass_idx',
-      't_collate_idx',
-      't_tablespace_idx',
-      't_storage_idx',
-      't_nd_idx',
+      'public.t_expr_idx',
+      'public.t_partial_idx',
+      'public.t_include_idx',
+      'public.t_hash_idx',
+      'public.t_desc_idx',
+      'public.t_nulls_idx',
+      'public.t_opclass_idx',
+      'public.t_collate_idx',
+      'public.t_tablespace_idx',
+      'public.t_storage_idx',
+      'public.t_nd_idx',
     ].map((object) => ({ kind: 'skip', code: 'unsupported-statement', object })),
   );
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX t_expr_idx \(expression element\)/);
-  assert.match(messages, /CREATE INDEX t_partial_idx \(partial WHERE\)/);
-  assert.match(messages, /CREATE INDEX t_include_idx \(INCLUDE\)/);
-  assert.match(messages, /CREATE INDEX t_hash_idx \(access method hash\)/);
-  assert.match(messages, /CREATE INDEX t_desc_idx \(non-default ordering\)/);
-  assert.match(messages, /CREATE INDEX t_nulls_idx \(non-default NULLS ordering\)/);
-  assert.match(messages, /CREATE INDEX t_opclass_idx \(operator class\)/);
-  assert.match(messages, /CREATE INDEX t_collate_idx \(collation\)/);
-  assert.match(messages, /CREATE INDEX t_tablespace_idx \(tablespace\)/);
-  assert.match(messages, /CREATE INDEX t_storage_idx \(storage parameters\)/);
-  assert.match(messages, /CREATE INDEX t_nd_idx \(NULLS NOT DISTINCT\)/);
+  assert.match(messages, /CREATE INDEX public\.t_expr_idx \(expression element\)/);
+  assert.match(messages, /CREATE INDEX public\.t_partial_idx \(partial WHERE\)/);
+  assert.match(messages, /CREATE INDEX public\.t_include_idx \(INCLUDE\)/);
+  assert.match(messages, /CREATE INDEX public\.t_hash_idx \(access method hash\)/);
+  assert.match(messages, /CREATE INDEX public\.t_desc_idx \(non-default ordering\)/);
+  assert.match(messages, /CREATE INDEX public\.t_nulls_idx \(non-default NULLS ordering\)/);
+  assert.match(messages, /CREATE INDEX public\.t_opclass_idx \(operator class\)/);
+  assert.match(messages, /CREATE INDEX public\.t_collate_idx \(collation\)/);
+  assert.match(messages, /CREATE INDEX public\.t_tablespace_idx \(tablespace\)/);
+  assert.match(messages, /CREATE INDEX public\.t_storage_idx \(storage parameters\)/);
+  assert.match(messages, /CREATE INDEX public\.t_nd_idx \(NULLS NOT DISTINCT\)/);
+});
+
+test('names an unnamed skipped index by its owning table identity', async () => {
+  const dump = [`CREATE TABLE app.t (a integer);`, `CREATE INDEX ON app.t ((a + 1));`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The source named no index, so the finding keeps the table identity rather than inventing one.
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.t',
+      message: 'skipped CREATE INDEX app.t (expression element)',
+    },
+  ]);
 });
 
 test('flags and drops IF NOT EXISTS on a named standalone index', async () => {
@@ -1990,14 +2009,14 @@ test('flags and drops IF NOT EXISTS on a named standalone index', async () => {
   assert.ok(table, 'the table is imported');
 
   // The conventional `t_a_idx` still canonicalizes to unnamed; the flag names the
-  // source-stated name, which the model no longer carries.
+  // schema-qualified source index, which the model no longer carries.
   assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
       kind: 'flag',
       code: 'unsupported-attribute',
-      object: 't_a_idx',
-      message: 'dropped IF NOT EXISTS from t_a_idx',
+      object: 'public.t_a_idx',
+      message: 'dropped IF NOT EXISTS from public.t_a_idx',
     },
   ]);
 });
@@ -2051,8 +2070,8 @@ test('flags IF NOT EXISTS on a unique concurrent named index', async () => {
     {
       kind: 'flag',
       code: 'unsupported-attribute',
-      object: 'custom_b_idx',
-      message: 'dropped IF NOT EXISTS from custom_b_idx',
+      object: 'public.custom_b_idx',
+      message: 'dropped IF NOT EXISTS from public.custom_b_idx',
     },
   ]);
 });
@@ -2074,8 +2093,8 @@ test('skips an IF NOT EXISTS index whole when INCLUDE falls outside the envelope
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 't_i_idx',
-      message: 'skipped CREATE INDEX t_i_idx (INCLUDE)',
+      object: 'public.t_i_idx',
+      message: 'skipped CREATE INDEX public.t_i_idx (INCLUDE)',
     },
   ]);
 });
@@ -2091,8 +2110,8 @@ test('skips an IF NOT EXISTS index whole when its table is not imported', async 
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'x_idx',
-      message: 'skipped CREATE INDEX x_idx (table not imported)',
+      object: 'public.x_idx',
+      message: 'skipped CREATE INDEX public.x_idx (table not imported)',
     },
   ]);
 });
@@ -2115,7 +2134,10 @@ test('flags IF NOT EXISTS once per statement, in statement order', async () => {
   ]);
   assert.deepEqual(
     diagnostics.map((diagnostic) => diagnostic.message),
-    ['dropped IF NOT EXISTS from custom_a_idx', 'dropped IF NOT EXISTS from custom_b_idx'],
+    [
+      'dropped IF NOT EXISTS from public.custom_a_idx',
+      'dropped IF NOT EXISTS from public.custom_b_idx',
+    ],
   );
 });
 
@@ -2179,7 +2201,7 @@ test('flags an exclusion constraint instead of modeling it', async () => {
   assert.deepEqual(table.checkConstraints, []);
   assert.deepEqual(diagnostics.map(summarize), [
     { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_excl' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
   assert.match(diagnostics[0]?.message ?? '', /dropped exclusion constraint from public\.t/);
   assert.match(diagnostics[1]?.message ?? '', /exclusion constraint t_excl on public\.t/);
@@ -2205,14 +2227,14 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   assert.deepEqual(table.uniqueConstraints, []);
   assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_a_key' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_b_key' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_missing_key' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t_b_idx' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX t_b_idx \(expression element\)/);
+  assert.match(messages, /CREATE INDEX public\.t_b_idx \(expression element\)/);
   assert.match(messages, /unique constraint t_a_key on public\.t \(USING INDEX t_a_idx\)/);
   assert.match(messages, /unique constraint t_b_key on public\.t \(USING INDEX t_b_idx\)/);
   assert.match(messages, /unique constraint t_missing_key on public\.t \(USING INDEX t_missing\)/);
@@ -2315,14 +2337,14 @@ test('skips a USING INDEX primary key whole when the index cannot back it', asyn
   assert.equal(table.primaryKey, undefined);
   assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 't_b_idx' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_a_pk' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_b_pk' },
-    { kind: 'skip', code: 'unsupported-statement', object: 't_missing_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t_b_idx' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX t_b_idx \(expression element\)/);
+  assert.match(messages, /CREATE INDEX public\.t_b_idx \(expression element\)/);
   assert.match(messages, /skipped primary key t_a_pk on public\.t \(USING INDEX t_a_idx\)/);
   assert.match(messages, /skipped primary key t_b_pk on public\.t \(USING INDEX t_b_idx\)/);
   assert.match(messages, /skipped primary key t_missing_pk on public\.t \(USING INDEX t_missing\)/);
@@ -2374,7 +2396,7 @@ test('keeps a USING INDEX primary key unresolved when the index statement comes 
   assert.equal(table.primaryKey, undefined);
   assert.deepEqual(table.indexes, [{ unique: true, columns: ['a'] }]);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 't_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
   assert.match(
     diagnostics[0]?.message ?? '',
@@ -2408,8 +2430,8 @@ test('keeps the first USING INDEX consumer and skips later references', async ()
   assert.deepEqual(u.uniqueConstraints, [{ name: 'u_key', columns: ['a'] }]);
   assert.deepEqual(u.indexes, []);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 't_pk2' },
-    { kind: 'skip', code: 'unsupported-statement', object: 'u_pk' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+    { kind: 'skip', code: 'unsupported-statement', object: 'public.u' },
   ]);
   assert.match(
     diagnostics[0]?.message ?? '',
@@ -2908,13 +2930,13 @@ test('keeps the existing skips for an INCLUDE index referenced by USING INDEX', 
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 't_a_idx',
-      message: 'skipped CREATE INDEX t_a_idx (INCLUDE)',
+      object: 'public.t_a_idx',
+      message: 'skipped CREATE INDEX public.t_a_idx (INCLUDE)',
     },
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 't_pk',
+      object: 'public.t',
       message: 'skipped primary key t_pk on public.t (USING INDEX t_a_idx)',
     },
   ]);
@@ -4911,8 +4933,8 @@ test('skips a materialized view index as a table that was not imported', async (
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'mv_a_idx',
-      message: 'skipped CREATE INDEX mv_a_idx (table not imported)',
+      object: 'app.mv_a_idx',
+      message: 'skipped CREATE INDEX app.mv_a_idx (table not imported)',
     },
   ]);
 });

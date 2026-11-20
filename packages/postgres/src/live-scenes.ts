@@ -3826,8 +3826,8 @@ const indexCreateScene = (): LiveScene => {
             .filter((diagnostic) => diagnostic.kind === 'skip')
             .filter(
               (diagnostic) =>
-                diagnostic.object === 'accounts_partial_idx' ||
-                diagnostic.object === 'accounts_lower_name_idx',
+                diagnostic.object === 'public.accounts_partial_idx' ||
+                diagnostic.object === 'public.accounts_lower_name_idx',
             );
           if (source === 'applied') {
             return skips.length === 0
@@ -3836,12 +3836,14 @@ const indexCreateScene = (): LiveScene => {
                   .map((diagnostic) => diagnostic.object)
                   .join(',')}`;
           }
-          const partial = skips.find((diagnostic) => diagnostic.object === 'accounts_partial_idx');
+          const partial = skips.find(
+            (diagnostic) => diagnostic.object === 'public.accounts_partial_idx',
+          );
           if (partial === undefined || !partial.message.includes('(partial WHERE)')) {
             return 'the partial index was not skipped and named';
           }
           const expression = skips.find(
-            (diagnostic) => diagnostic.object === 'accounts_lower_name_idx',
+            (diagnostic) => diagnostic.object === 'public.accounts_lower_name_idx',
           );
           if (expression === undefined || !expression.message.includes('(expression element)')) {
             return 'the expression index was not skipped and named';
