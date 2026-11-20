@@ -2364,3 +2364,118 @@ test('resolveWorkspace reads a pre-comment model as entities without a comment p
   ];
   for (const entity of entities) assert.equal('comment' in entity, false);
 });
+
+/** Asserts a payload fails with the exact non-empty-list message naming its path. */
+async function assertEmptyIdentifierList(
+  context: TestContext,
+  payload: unknown,
+  path: string,
+): Promise<void> {
+  const diagnostic = await resolvePayload(context, payload);
+
+  assert.equal(diagnostic.code, 'workspace-model-invalid');
+  assert.equal(diagnostic.message, `invalid model: ${path} is not a non-empty list`);
+}
+
+test('resolveWorkspace rejects an empty primary-key column list', async (t) => {
+  await assertEmptyIdentifierList(
+    t,
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'id', type: 'bigint', notNull: true }],
+          primaryKey: { columns: [] },
+        }),
+      ],
+      sequences: [],
+    },
+    'tables[0].primaryKey.columns',
+  );
+});
+
+test('resolveWorkspace rejects an empty unique-constraint column list', async (t) => {
+  await assertEmptyIdentifierList(
+    t,
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'id', type: 'bigint', notNull: true }],
+          uniqueConstraints: [{ columns: [] }],
+        }),
+      ],
+      sequences: [],
+    },
+    'tables[0].uniqueConstraints[0].columns',
+  );
+});
+
+test('resolveWorkspace rejects an empty foreign-key column list', async (t) => {
+  await assertEmptyIdentifierList(
+    t,
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'org_id', type: 'bigint', notNull: true }],
+          foreignKeys: [
+            {
+              columns: [],
+              referencedTable: { schema: 'public', name: 'orgs' },
+              referencedColumns: ['id'],
+            },
+          ],
+        }),
+      ],
+      sequences: [],
+    },
+    'tables[0].foreignKeys[0].columns',
+  );
+});
+
+test('resolveWorkspace rejects an empty index column list', async (t) => {
+  await assertEmptyIdentifierList(
+    t,
+    {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'id', type: 'bigint', notNull: true }],
+          indexes: [{ unique: false, columns: [] }],
+        }),
+      ],
+      sequences: [],
+    },
+    'tables[0].indexes[0].columns',
+  );
+});
+
+test('resolveWorkspace accepts and round-trips an empty foreign-key referencedColumns list', async (t) => {
+  const model: Model = {
+    tables: [
+      {
+        schema: 'public',
+        name: 'child',
+        columns: [{ name: 'org_id', type: 'bigint', notNull: true }],
+        foreignKeys: [
+          {
+            columns: ['org_id'],
+            referencedTable: { schema: 'public', name: 'orgs' },
+            referencedColumns: [],
+          },
+        ],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    ],
+    sequences: [],
+    views: [],
+    extensions: [],
+  };
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, model);
+  assert.deepStrictEqual(resolved.model.tables[0]!.foreignKeys[0]!.referencedColumns, []);
+});

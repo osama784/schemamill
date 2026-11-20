@@ -769,6 +769,22 @@ function parseStringArray(
   return parseArrayOf(value, path, parse);
 }
 
+/**
+ * A non-empty list of strings. `parseArrayOf` runs first so a non-array still reports
+ * `is not an array`; only a successfully parsed empty list is rejected here. The default
+ * element parser keeps empty strings out of the list.
+ */
+function parseNonEmptyStringArray(
+  value: unknown,
+  path: string,
+  parse: (value: unknown, path: string) => Parsed<string> = parseNonEmptyString,
+): Parsed<string[]> {
+  const array = parseArrayOf(value, path, parse);
+  if (!array.ok) return array;
+  if (array.value.length === 0) return invalid(`${path} is not a non-empty list`);
+  return array;
+}
+
 /** An exact 64-bit integer in canonical decimal form. */
 function parseInteger(value: unknown, path: string): Parsed<string> {
   const string = parseString(value, path);
@@ -975,7 +991,7 @@ function parseKey(value: unknown, path: string): Parsed<PrimaryKey> {
   return parseObject(value, path, KEY_KEYS, (object) => {
     const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
-    const columns = parseStringArray(
+    const columns = parseNonEmptyStringArray(
       object.columns,
       fieldPath(path, 'columns'),
       parseNonEmptyString,
@@ -1034,7 +1050,7 @@ function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
   return parseObject(value, path, FOREIGN_KEY_KEYS, (object) => {
     const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
-    const columns = parseStringArray(
+    const columns = parseNonEmptyStringArray(
       object.columns,
       fieldPath(path, 'columns'),
       parseNonEmptyString,
@@ -1111,7 +1127,7 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
     if (!name.ok) return name;
     const unique = parseBoolean(object.unique, fieldPath(path, 'unique'));
     if (!unique.ok) return unique;
-    const columns = parseStringArray(
+    const columns = parseNonEmptyStringArray(
       object.columns,
       fieldPath(path, 'columns'),
       parseNonEmptyString,
