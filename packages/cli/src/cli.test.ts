@@ -163,6 +163,49 @@ const EMPTY_INDEX_NAME_MODEL = `{
 }
 `;
 
+/**
+ * A workspace model whose only index has an empty column list: the reader must reject it before
+ * any command formats or renders it, because an empty index rendered `CREATE INDEX ""`-class
+ * invalid SQL — the #205 hole one level down. The index name and the table's column list are
+ * valid, so the empty identifier list is the only defect.
+ */
+const EMPTY_INDEX_COLUMNS_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "a", "type": "integer", "notNull": false }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": [{ "name": "t_a_idx", "unique": false, "columns": [] }]
+    }
+  ],
+  "sequences": [],
+  "views": [],
+  "extensions": []
+}
+`;
+
+/** The valid control for `EMPTY_INDEX_COLUMNS_MODEL`: the same model with a non-empty list. */
+const NON_EMPTY_INDEX_COLUMNS_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "a", "type": "integer", "notNull": false }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": [{ "name": "t_a_idx", "unique": false, "columns": ["a"] }]
+    }
+  ],
+  "sequences": [],
+  "views": [],
+  "extensions": []
+}
+`;
+
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
   '    id integer NOT NULL,',
@@ -1213,6 +1256,56 @@ test('a workspace model with an empty index name is rejected before formatting, 
       'schemamill: invalid model: tables[0].indexes[0].name is not a non-empty string\n',
     );
     assert.equal(result.code, 1);
+  }
+});
+
+test('a workspace model with an empty index column list is rejected before formatting, exit 1', async (t) => {
+  // The corrupt model sits on the workspace side the command reads. `plan` and `compare` take the
+  // empty baseline dump as their path and the workspace as the target, so the empty column list is
+  // rejected by the reader before any diff, plan, format, or render sees the model. `export` has
+  // two projections (ddl and json); both read the workspace model and must fail before either
+  // renders the invalid `USING btree ()` clause.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_INDEX_COLUMNS_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['plan', '--target-workspace', empty],
+    ['compare', '--target-workspace', empty],
+    ['export'],
+    ['export', '--format', 'json'],
+  ];
+
+  for (const args of cases) {
+    const result = await runCli(...args, { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'schemamill: invalid model: tables[0].indexes[0].columns is not a non-empty list\n',
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('a workspace model with a non-empty index column list is accepted, exit 0', async (t) => {
+  // Control: the same model with a non-empty identifier list still plans, compares, and exports.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, NON_EMPTY_INDEX_COLUMNS_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['plan', '--target-workspace', empty],
+    ['compare', '--target-workspace', empty],
+    ['export'],
+    ['export', '--format', 'json'],
+  ];
+
+  for (const args of cases) {
+    const result = await runCli(...args, { cwd: root });
+
+    assert.equal(result.stderr, '');
+    assert.notEqual(result.code, 1);
   }
 });
 
