@@ -1,14 +1,14 @@
 # Ubiquitous Language
 
-**Status:** drafted 2026-09-20 · living document
+**Status:** drafted 2026-09-20 · updated 2026-11-21 · living document
 
 The definitions live in the root [CONTEXT.md](../../CONTEXT.md) — that is the normative glossary. This page curates it: the clusters the language falls into, and why each contested word was resolved the way it was.
 
 ## Term clusters
 
-- **The model layer** — model, schema, table, column, comment, relationship, foreign key, sequence, sequence-backed default, ownership, identity column, identity sequence, view, materialized view, view definition, view check option, extension, snapshot, baseline, target, diff, data.
+- **The model layer** — model, schema, table, column, comment, relationship, foreign key, primary key, unique constraint, check constraint, index, concurrent index, constraint enforcement, constraint deferrability, not-null constraint name, column collation, column storage, column compression, table persistence, sequence, sequence-backed default, ownership, identity column, identity sequence, view, materialized view, view definition, view check option, extension, built-in extension, snapshot, baseline, target, diff, data.
 - **Crossing the boundary** — import, introspection, export, DDL dump, apply.
-- **The change engine** — migration plan, migration SQL, hazard, definite hazard, state-dependent hazard, certain-cost hazard, expand/contract, round-trip fidelity.
+- **The change engine** — change, migration plan, migration SQL, target version, transaction group, non-transactional step, hazard, definite hazard, state-dependent hazard, certain-cost hazard, expand/contract, round-trip fidelity.
 - **The product's shape** — safe-change loop, studio, canvas, workspace, and the two faces: studio for working visually, CLI for automation.
 
 ## Resolved conflicts
