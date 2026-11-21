@@ -206,6 +206,102 @@ const NON_EMPTY_INDEX_COLUMNS_MODEL = `{
 }
 `;
 
+/**
+ * The four non-identifier string slots in one otherwise-valid model. `default: ""`, `type: ""`,
+ * `expression: ""`, and `definition: ""` each render SQL that cannot apply, so the reader rejects
+ * them at the disk boundary. Each fixture below corrupts exactly one slot (first-failure-wins);
+ * the paths are the ones `parseNonEmptyString` reports.
+ */
+const VALID_NON_IDENTIFIER_STRINGS_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "c", "type": "integer", "notNull": false, "default": "0" }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [{ "expression": "c > 0" }],
+      "indexes": []
+    }
+  ],
+  "sequences": [],
+  "views": [{ "schema": "public", "name": "v", "materialized": false, "definition": "SELECT 1" }],
+  "extensions": []
+}
+`;
+
+const EMPTY_TYPE_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "c", "type": "", "notNull": false, "default": "0" }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [{ "expression": "c > 0" }],
+      "indexes": []
+    }
+  ],
+  "sequences": [],
+  "views": [{ "schema": "public", "name": "v", "materialized": false, "definition": "SELECT 1" }],
+  "extensions": []
+}
+`;
+
+const EMPTY_DEFAULT_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "c", "type": "integer", "notNull": false, "default": "" }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [{ "expression": "c > 0" }],
+      "indexes": []
+    }
+  ],
+  "sequences": [],
+  "views": [{ "schema": "public", "name": "v", "materialized": false, "definition": "SELECT 1" }],
+  "extensions": []
+}
+`;
+
+const EMPTY_EXPRESSION_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "c", "type": "integer", "notNull": false, "default": "0" }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [{ "expression": "" }],
+      "indexes": []
+    }
+  ],
+  "sequences": [],
+  "views": [{ "schema": "public", "name": "v", "materialized": false, "definition": "SELECT 1" }],
+  "extensions": []
+}
+`;
+
+const EMPTY_DEFINITION_MODEL = `{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "columns": [{ "name": "c", "type": "integer", "notNull": false, "default": "0" }],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [{ "expression": "c > 0" }],
+      "indexes": []
+    }
+  ],
+  "sequences": [],
+  "views": [{ "schema": "public", "name": "v", "materialized": false, "definition": "" }],
+  "extensions": []
+}
+`;
+
 const BASELINE_DUMP = [
   'CREATE TABLE public.accounts (',
   '    id integer NOT NULL,',
@@ -1306,6 +1402,94 @@ test('a workspace model with a non-empty index column list is accepted, exit 0',
 
     assert.equal(result.stderr, '');
     assert.notEqual(result.code, 1);
+  }
+});
+
+test('a workspace model with an empty column type is rejected before planning, exit 1', async (t) => {
+  // The workspace is the plan target; the reader rejects `type: ""` before any diff or render,
+  // because `"c"  NOT NULL` has no type and cannot execute.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_TYPE_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  const result = await runCli('plan', '--target-workspace', empty, { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'schemamill: invalid model: tables[0].columns[0].type is not a non-empty string\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a workspace model with an empty column default is rejected before comparing, exit 1', async (t) => {
+  // The workspace is the compare target; `DEFAULT ` would dangle, so the reader fails closed.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_DEFAULT_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  const result = await runCli('compare', '--target-workspace', empty, { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'schemamill: invalid model: tables[0].columns[0].default is not a non-empty string\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a workspace model with an empty check expression is rejected before exporting DDL, exit 1', async (t) => {
+  // `export` reads the workspace on cwd; `CHECK ()` cannot execute, so the DDL projection never renders.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_EXPRESSION_MODEL);
+
+  const result = await runCli('export', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'schemamill: invalid model: tables[0].checkConstraints[0].expression is not a non-empty string\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a workspace model with an empty view definition is rejected before exporting JSON, exit 1', async (t) => {
+  // `export --format json` plans before its format branch; `CREATE VIEW … AS ;` cannot execute, so
+  // neither projection runs and the same one-line reader diagnostic surfaces.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, EMPTY_DEFINITION_MODEL);
+
+  const result = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'schemamill: invalid model: views[0].definition is not a non-empty string\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('a workspace model with real non-identifier string values is accepted, exit 0', async (t) => {
+  // Control: a model with real type, default, expression, and definition values still plans,
+  // compares, and exports both projections — the four new rejections do not over-reject.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, VALID_NON_IDENTIFIER_STRINGS_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+  const cases: ReadonlyArray<readonly string[]> = [
+    ['plan', '--target-workspace', empty],
+    ['compare', '--target-workspace', empty],
+    ['export'],
+    ['export', '--format', 'json'],
+  ];
+
+  for (const args of cases) {
+    const result = await runCli(...args, { cwd: root });
+
+    assert.equal(result.stderr, '');
+    assert.equal(result.code, 0);
   }
 });
 

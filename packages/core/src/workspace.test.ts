@@ -2479,3 +2479,106 @@ test('resolveWorkspace accepts and round-trips an empty foreign-key referencedCo
   assert.deepStrictEqual(resolved.model, model);
   assert.deepStrictEqual(resolved.model.tables[0]!.foreignKeys[0]!.referencedColumns, []);
 });
+
+/** One rejection: an otherwise valid payload with exactly one empty non-identifier string. */
+interface EmptyNonIdentifierString {
+  readonly payload: unknown;
+  /** The only slot the payload corrupts, and the path the diagnostic must name. */
+  readonly path: string;
+}
+
+/** Asserts each row fails with the exact non-empty-string message naming its path. */
+async function assertEmptyNonIdentifierStrings(
+  context: TestContext,
+  rows: readonly EmptyNonIdentifierString[],
+): Promise<void> {
+  for (const { payload, path } of rows) {
+    const diagnostic = await resolvePayload(context, payload);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.equal(diagnostic.message, `invalid model: ${path} is not a non-empty string`);
+  }
+}
+
+test('resolveWorkspace rejects an empty column type', async (t) => {
+  await assertEmptyNonIdentifierStrings(t, [
+    {
+      payload: {
+        tables: [tablePayload({ columns: [{ name: 'c', type: '', notNull: false }] })],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].type',
+    },
+  ]);
+});
+
+test('resolveWorkspace rejects an empty column default', async (t) => {
+  await assertEmptyNonIdentifierStrings(t, [
+    {
+      payload: {
+        tables: [
+          tablePayload({ columns: [{ name: 'c', type: 'text', notNull: false, default: '' }] }),
+        ],
+        sequences: [],
+      },
+      path: 'tables[0].columns[0].default',
+    },
+  ]);
+});
+
+test('resolveWorkspace rejects an empty check-constraint expression', async (t) => {
+  await assertEmptyNonIdentifierStrings(t, [
+    {
+      payload: {
+        tables: [tablePayload({ checkConstraints: [{ expression: '' }] })],
+        sequences: [],
+      },
+      path: 'tables[0].checkConstraints[0].expression',
+    },
+  ]);
+});
+
+test('resolveWorkspace rejects an empty view definition', async (t) => {
+  await assertEmptyNonIdentifierStrings(t, [
+    {
+      payload: { tables: [], sequences: [], views: [viewPayload({ definition: '' })] },
+      path: 'views[0].definition',
+    },
+  ]);
+});
+
+test('resolveWorkspace accepts and round-trips real non-identifier string values', async (t) => {
+  const model: Model = {
+    tables: [
+      {
+        schema: 'public',
+        name: 't',
+        columns: [{ name: 'c', type: 'bigint', notNull: false, default: '0' }],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [{ expression: 'c > 0' }],
+        indexes: [],
+      },
+    ],
+    sequences: [],
+    views: [{ schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' }],
+    extensions: [],
+  };
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+
+  assert.deepStrictEqual(resolved.model, model);
+});
+
+test('resolveWorkspace accepts a column with the default key omitted', async (t) => {
+  const model = await resolvePayloadOk(t, {
+    tables: [tablePayload({ columns: [{ name: 'c', type: 'text', notNull: false }] })],
+    sequences: [],
+  });
+
+  assert.deepStrictEqual(model.tables[0]!.columns, [{ name: 'c', type: 'text', notNull: false }]);
+  assert.equal('default' in model.tables[0]!.columns[0]!, false);
+});

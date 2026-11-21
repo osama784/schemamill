@@ -738,7 +738,7 @@ function parseString(value: unknown, path: string): Parsed<string> {
   return parsed(value);
 }
 
-/** A non-empty string; an empty collation can never name a collation. */
+/** A non-empty string; every field using this parser rejects an empty value. */
 function parseNonEmptyString(value: unknown, path: string): Parsed<string> {
   const string = parseString(value, path);
   if (!string.ok) return string;
@@ -885,7 +885,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
   return parseObject(value, path, COLUMN_KEYS, (object) => {
     const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
     if (!name.ok) return name;
-    const type = parseString(object.type, fieldPath(path, 'type'));
+    const type = parseNonEmptyString(object.type, fieldPath(path, 'type'));
     if (!type.ok) return type;
     const notNull = parseBoolean(object.notNull, fieldPath(path, 'notNull'));
     if (!notNull.ok) return notNull;
@@ -898,7 +898,11 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
     if (notNullName.value !== undefined && notNull.value !== true) {
       return invalid(`${fieldPath(path, 'notNullName')} is only valid on a NOT NULL column`);
     }
-    const defaultValue = parseOptional(object.default, fieldPath(path, 'default'), parseString);
+    const defaultValue = parseOptional(
+      object.default,
+      fieldPath(path, 'default'),
+      parseNonEmptyString,
+    );
     if (!defaultValue.ok) return defaultValue;
     const identity = parseOptional(object.identity, fieldPath(path, 'identity'), parseIdentity);
     if (!identity.ok) return identity;
@@ -1027,7 +1031,7 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
   return parseObject(value, path, CHECK_CONSTRAINT_KEYS, (object) => {
     const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
     if (!name.ok) return name;
-    const expression = parseString(object.expression, fieldPath(path, 'expression'));
+    const expression = parseNonEmptyString(object.expression, fieldPath(path, 'expression'));
     if (!expression.ok) return expression;
     const enforcement = parseOptional(
       object.enforcement,
@@ -1219,7 +1223,7 @@ function parseView(value: unknown, path: string): Parsed<View> {
     if (!name.ok) return name;
     const materialized = parseBoolean(object.materialized, fieldPath(path, 'materialized'));
     if (!materialized.ok) return materialized;
-    const definition = parseString(object.definition, fieldPath(path, 'definition'));
+    const definition = parseNonEmptyString(object.definition, fieldPath(path, 'definition'));
     if (!definition.ok) return definition;
     const checkOption = parseOptional(
       object.checkOption,
