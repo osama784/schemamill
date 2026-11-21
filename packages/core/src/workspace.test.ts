@@ -1634,6 +1634,29 @@ test('initWorkspace allows a workspace that contains another', async (t) => {
   assert.equal(await readFile(modelPath(dir), 'utf8'), EMPTY_MODEL_BYTES);
 });
 
+test('initWorkspace removes the marker when the model write fails', async (t) => {
+  const dir = await fixtureDir(t);
+  const target = join(dir, 'workspace');
+  // Throwing getter: serializeModel throws before writeFile, so writeModelFile's temp-file rm arm is not exercised here (writer tests cover it).
+  const failingModel = {
+    get tables() {
+      throw new Error('boom');
+    },
+    sequences: [],
+    views: [],
+    extensions: [],
+  } as unknown as Model;
+
+  const result = await initWorkspace(target, failingModel);
+
+  assert.equal(result.ok, false);
+  if (result.ok) assert.fail('expected init to fail');
+  assert.equal(result.diagnostic.code, 'workspace-io');
+  assert.ok(result.diagnostic.message.startsWith(`cannot write ${modelPath(target)}: `));
+  assert.ok(result.diagnostic.message.includes('boom'));
+  await assert.rejects(stat(join(target, WORKSPACE_DIR_NAME)), { code: 'ENOENT' });
+});
+
 test('writeWorkspaceModel writes the canonical model bytes and returns the resolved root', async (t) => {
   const dir = await fixtureDir(t);
   await initWithModel(dir, POPULATED_MODEL);
