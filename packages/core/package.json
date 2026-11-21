@@ -24,7 +24,7 @@
     "typecheck": "tsc -b",
     "test": "node --test \"src/**/*.test.ts\"",
     "mutation": "stryker run",
-    "mutation:check": "node scripts/mutation-sanity.mjs"
+    "mutation:check": "node --test scripts/mutation-sanity.test.mjs && node scripts/mutation-sanity.mjs"
   },
   "devDependencies": {
     "@stryker-mutator/core": "10.0.0",
