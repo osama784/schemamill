@@ -41,7 +41,7 @@
  * diagnostic keeps the import module's grammar: `object` is `<schema>.<table>` — for an index
  * or sequence finding, `<schema>.<indexName>` or `<schema>.<sequenceName>`, for an
  * identity-persistence flag `<schema>.<table>`, and for an exclusion skip
- * `<schema>.<conname>` — and the column or object, when relevant, is named in `message`;
+ * `<schema>.<table>` (the owning table) — and the column or object, when relevant, is named in `message`;
  * `position` is never set.
  *
  * The pure half, `mapCatalog`, takes the parsed payload to the model and diagnostics; it is
@@ -1121,14 +1121,13 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           findings.push(...foreignKeyFindings(constraintRow, object));
           break;
         case 'exclusion': {
-          const exclusionObject = `${constraintRow.schema}.${constraintRow.conname}`;
           findings.push({
             conname: constraintRow.conname,
             diagnostic: {
               kind: 'skip',
               code: 'unsupported-statement',
-              object: exclusionObject,
-              message: `skipped exclusion constraint ${exclusionObject}`,
+              object,
+              message: `skipped exclusion constraint ${constraintRow.conname}`,
             },
           });
           break;
