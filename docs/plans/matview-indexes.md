@@ -1,6 +1,6 @@
 # Materialized-view indexes — model, import, diff, plan, render, round-trip
 
-**Status:** proposed (supply pass 2026-11-02) · **Last updated:** 2026-11-20
+**Status:** proposed (supply pass 2026-11-02) · **Last updated:** 2026-11-22
 
 **Size:** M. The brief may split into M1 (model + import + workspace) and M2 (diff/plan/render/CLI) if the index-owner refactor grows, but one brief is recommended: the same `IndexOwner` seam serves both halves, and a split would leave the importer able to store an index the plan cannot drop.
 
@@ -54,7 +54,7 @@ An index on a materialized view survives dump import → model → diff → plan
 
 - `pnpm build`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm format:check` pass from the repo root; the live suite passes on PostgreSQL 16.15 locally and on the CI's PostgreSQL 18.
 - The live scene round-trips a matview with all three index shapes and a rewrite, and its cross-import check is deep-equal.
-- The plan, the ADR, the changelog entry, and the tracker issue carry the ship note; the [views plan](./views.md) §Deferred marks matview indexes closed.
+- The plan, the ADR, the changelog entry, and the tracker issue carry the ship note; on completion this slice updates the [views plan](./views.md) §Deferred entry at `:66` (currently "skipped today as a table that was not imported; modeling them is a follow-up") to mark matview indexes closed.
 
 ## Deferred
 
