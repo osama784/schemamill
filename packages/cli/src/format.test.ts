@@ -218,13 +218,13 @@ test('a multi-group plan names each group and numbers its steps continuously', (
       { kind: 'drop-table', table: { schema: 'public', name: 'a' } },
       {
         kind: 'drop-index-concurrently',
-        table: { schema: 'public', name: 'a' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'a' } },
         index: { name: 'a_id_idx', unique: false, columns: ['id'] },
       },
       { kind: 'drop-table', table: { schema: 'public', name: 'b' } },
       {
         kind: 'create-index-concurrently',
-        table: { schema: 'public', name: 'b' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'b' } },
         index: { name: 'b_id_idx', unique: false, columns: ['id'] },
       },
     ],
@@ -439,12 +439,12 @@ test('constraint and index plan steps print the table and the constrained member
     steps: [
       {
         kind: 'drop-index',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_email_idx', unique: false, columns: ['email'] },
       },
       {
         kind: 'drop-index-concurrently',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_age_idx', unique: false, columns: ['age'] },
       },
       {
@@ -469,12 +469,12 @@ test('constraint and index plan steps print the table and the constrained member
       },
       {
         kind: 'create-index',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_name_idx', unique: false, columns: ['name'] },
       },
       {
         kind: 'create-index-concurrently',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_name_idx_v2', unique: true, columns: ['name'] },
       },
     ],
@@ -502,6 +502,92 @@ test('constraint and index plan steps print the table and the constrained member
       '    7. create-index               public.users: index users_name_idx (name)',
       '  group 4 of 4 (standalone):',
       '    8. create-index-concurrently  public.users: unique index users_name_idx_v2 (name)',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('materialized-view index change lines print the owning matview identity', () => {
+  const owner = {
+    kind: 'materialized-view' as const,
+    view: { schema: 'app', name: 'account_totals' },
+  };
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-index-removed',
+      owner,
+      index: { name: 'totals_old_idx', unique: false, columns: ['id'] },
+    },
+    {
+      kind: 'view-index-added',
+      owner,
+      index: { name: 'totals_new_idx', unique: true, columns: ['email'] },
+    },
+    {
+      kind: 'view-index-changed',
+      owner,
+      before: { name: 'totals_changed_idx', unique: false, columns: ['id'] },
+      after: { name: 'totals_changed_idx', unique: true, columns: ['email'] },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '- index app.account_totals: index totals_old_idx (id)',
+      '',
+      '+ index app.account_totals: unique index totals_new_idx (email)',
+      '',
+      '~ index app.account_totals totals_changed_idx: unique false → true, columns (id) → (email)',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('materialized-view index plan steps print the owning matview identity', () => {
+  const owner = {
+    kind: 'materialized-view' as const,
+    view: { schema: 'app', name: 'account_totals' },
+  };
+  const plan: Plan = {
+    steps: [
+      {
+        kind: 'drop-index',
+        owner,
+        index: { name: 'totals_old_idx', unique: false, columns: ['id'] },
+      },
+      {
+        kind: 'drop-index-concurrently',
+        owner,
+        index: { name: 'totals_old_c_idx', unique: false, columns: ['id'] },
+      },
+      {
+        kind: 'create-index',
+        owner,
+        index: { name: 'totals_new_idx', unique: true, columns: ['email'] },
+      },
+      {
+        kind: 'create-index-concurrently',
+        owner,
+        index: { name: 'totals_new_c_idx', unique: false, columns: ['email'] },
+      },
+    ],
+    groups: [
+      { start: 0, end: 2, transactional: true },
+      { start: 2, end: 4, transactional: false },
+    ],
+  };
+
+  assert.equal(
+    formatPlan(plan),
+    [
+      '4 steps in 2 groups:',
+      '  group 1 of 2:',
+      '    1. drop-index                 app.account_totals: index totals_old_idx (id)',
+      '    2. drop-index-concurrently    app.account_totals: index totals_old_c_idx (id)',
+      '  group 2 of 2 (standalone):',
+      '    3. create-index               app.account_totals: unique index totals_new_idx (email)',
+      '    4. create-index-concurrently  app.account_totals: index totals_new_c_idx (email)',
       '',
     ].join('\n'),
   );
@@ -1509,7 +1595,7 @@ test('an empty index name prints as ""; an absent name has no token', () => {
       formatPlan(
         aPlan({
           kind: 'create-index',
-          table: { schema: 'public', name: 't' },
+          owner: { kind: 'table', table: { schema: 'public', name: 't' } },
           index: anIndex(name),
         }),
       ),

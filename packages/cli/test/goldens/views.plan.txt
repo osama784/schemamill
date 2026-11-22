@@ -1,16 +1,24 @@
-10 steps in one transaction:
-  1. drop-view     public.account_totals
-  2. drop-view     public.obsolete_accounts
-  3. drop-view     public.obsolete_totals
-  4. drop-view     public.promote_me
-  5. create-view   public.account_totals
-  6. create-view   public.positive_accounts
-  7. create-view   public.promote_me
-  8. create-view   public.recent_accounts
-  9. replace-view  public.active_accounts
- 10. replace-view  public.checked_accounts
+16 steps in one transaction:
+  1. drop-index    public.kept_totals: index kept_totals_legacy_idx (balance)
+  2. drop-index    public.kept_totals: index kept_totals_shift_idx (id)
+  3. drop-view     public.account_totals
+  4. drop-view     public.obsolete_accounts
+  5. drop-view     public.obsolete_totals
+  6. drop-view     public.promote_me
+  7. create-view   public.account_totals
+  8. create-view   public.positive_accounts
+  9. create-view   public.promote_me
+ 10. create-view   public.recent_accounts
+ 11. replace-view  public.active_accounts
+ 12. replace-view  public.checked_accounts
+ 13. create-index  public.account_totals: unique index account_totals_balance_uq (balance)
+ 14. create-index  public.recent_accounts: index recent_totals_lookup (id)
+ 15. create-index  public.kept_totals: index kept_totals_fresh_idx (balance)
+ 16. create-index  public.kept_totals: index kept_totals_shift_idx (email)
 
 BEGIN;
+DROP INDEX public.kept_totals_legacy_idx;
+DROP INDEX public.kept_totals_shift_idx;
 DROP MATERIALIZED VIEW public.account_totals;
 DROP VIEW public.obsolete_accounts;
 DROP MATERIALIZED VIEW public.obsolete_totals;
@@ -21,4 +29,8 @@ CREATE MATERIALIZED VIEW public.promote_me AS SELECT id FROM public.accounts WIT
 CREATE MATERIALIZED VIEW public.recent_accounts AS SELECT id FROM public.accounts WHERE active WITH NO DATA;
 CREATE OR REPLACE VIEW public.active_accounts AS SELECT id,email,active FROM public.accounts WHERE active AND email IS NOT NULL;
 CREATE OR REPLACE VIEW public.checked_accounts AS SELECT id FROM public.accounts WHERE balance > 0 WITH CASCADED CHECK OPTION;
+CREATE UNIQUE INDEX account_totals_balance_uq ON public.account_totals USING btree (balance);
+CREATE INDEX recent_totals_lookup ON public.recent_accounts USING btree (id);
+CREATE INDEX kept_totals_fresh_idx ON public.kept_totals USING btree (balance);
+CREATE INDEX kept_totals_shift_idx ON public.kept_totals USING btree (email);
 COMMIT;

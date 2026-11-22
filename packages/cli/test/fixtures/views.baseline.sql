@@ -19,4 +19,10 @@ CREATE VIEW public.obsolete_accounts AS SELECT id FROM public.accounts;
 
 CREATE MATERIALIZED VIEW public.obsolete_totals AS SELECT count(*) AS n FROM public.accounts WITH NO DATA;
 
+CREATE MATERIALIZED VIEW public.kept_totals AS SELECT id, email, balance FROM public.accounts WHERE active WITH NO DATA;
+
 CREATE VIEW public.promote_me AS SELECT id FROM public.accounts;
+
+CREATE INDEX kept_totals_legacy_idx ON public.kept_totals (balance);
+
+CREATE INDEX kept_totals_shift_idx ON public.kept_totals (id);

@@ -540,6 +540,9 @@ function serializeView(view: View): object {
     name: view.name,
     materialized: view.materialized,
     definition: view.definition,
+    ...(view.indexes === undefined || view.indexes.length === 0
+      ? {}
+      : { indexes: view.indexes.map(serializeIndex) }),
     ...(view.checkOption === undefined ? {} : { checkOption: view.checkOption }),
     ...(view.comment === undefined ? {} : { comment: view.comment }),
   };
@@ -641,6 +644,7 @@ const VIEW_KEYS = [
   'name',
   'materialized',
   'definition',
+  'indexes',
   'checkOption',
   'comment',
 ] as const;
@@ -1212,8 +1216,9 @@ function parseOwner(value: unknown, path: string): Parsed<SequenceOwner> {
 
 /**
  * A view or materialized view: the identity, the `materialized` discriminator, the opaque
- * definition, and the optional check option. A materialized view cannot carry a check option,
- * so the pair fails closed rather than reaching a plan that would drop it silently.
+ * definition, the matview-only `indexes`, and the optional check option. A materialized view
+ * cannot carry a check option and a plain view cannot carry a non-empty `indexes`, so both pairs
+ * fail closed rather than reaching a plan that would drop a real object silently.
  */
 function parseView(value: unknown, path: string): Parsed<View> {
   return parseObject(value, path, VIEW_KEYS, (object) => {
@@ -1225,6 +1230,13 @@ function parseView(value: unknown, path: string): Parsed<View> {
     if (!materialized.ok) return materialized;
     const definition = parseNonEmptyString(object.definition, fieldPath(path, 'definition'));
     if (!definition.ok) return definition;
+    const indexes = parseOptional(object.indexes, fieldPath(path, 'indexes'), (value, at) =>
+      parseArrayOf(value, at, parseIndex),
+    );
+    if (!indexes.ok) return indexes;
+    if (indexes.value !== undefined && indexes.value.length > 0 && !materialized.value) {
+      return invalid(`${fieldPath(path, 'indexes')} is not valid on a plain view`);
+    }
     const checkOption = parseOptional(
       object.checkOption,
       fieldPath(path, 'checkOption'),
@@ -1241,6 +1253,9 @@ function parseView(value: unknown, path: string): Parsed<View> {
       name: name.value,
       materialized: materialized.value,
       definition: definition.value,
+      ...(indexes.value === undefined || indexes.value.length === 0
+        ? {}
+        : { indexes: indexes.value }),
       ...(checkOption.value === undefined ? {} : { checkOption: checkOption.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });

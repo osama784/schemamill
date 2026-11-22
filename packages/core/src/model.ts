@@ -400,6 +400,12 @@ export interface View extends ViewIdentity {
    */
   readonly definition: string;
   /**
+   * Standalone indexes on a materialized view, in source order; absent means none. Matviews
+   * only: an ordinary view cannot own an index. An empty array normalizes to absence in a
+   * workspace file, and every reader treats absence as no indexes.
+   */
+  readonly indexes?: readonly Index[];
+  /**
    * The view's check option when it declares one; absent means none. Views only: a
    * materialized view cannot carry one.
    */
@@ -410,6 +416,15 @@ export interface View extends ViewIdentity {
    */
   readonly comment?: string;
 }
+
+/**
+ * The relation an index belongs to: a table or a materialized view. The discriminant travels
+ * with index changes and steps so the same `Index` shape and the same step kinds serve both
+ * families; an ordinary view cannot own an index.
+ */
+export type IndexOwner =
+  | { readonly kind: 'table'; readonly table: TableIdentity }
+  | { readonly kind: 'materialized-view'; readonly view: ViewIdentity };
 
 /**
  * Identifies an extension in the model: its name. Extension names are database-unique and are

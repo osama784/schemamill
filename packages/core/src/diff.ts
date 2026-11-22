@@ -10,6 +10,7 @@ import type {
   ExtensionIdentity,
   ForeignKey,
   Index,
+  IndexOwner,
   Model,
   PrimaryKey,
   Sequence,
@@ -208,6 +209,12 @@ export type Change =
       before: View;
       after: View;
     }
+  /** An index only the target has on a kept materialized view. */
+  | { kind: 'view-index-added'; owner: IndexOwner; index: Index }
+  /** An index only the baseline has on a kept materialized view. */
+  | { kind: 'view-index-removed'; owner: IndexOwner; index: Index }
+  /** A matched index pair on a kept materialized view with any structural difference. */
+  | { kind: 'view-index-changed'; owner: IndexOwner; before: Index; after: Index }
   /** The target has an extension the baseline does not. */
   | { kind: 'extension-added'; extension: Extension }
   /** The baseline has an extension the target does not. */
@@ -426,6 +433,7 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     ...changes,
     ...diffSequences(baseline, target),
     ...diffViews(baseline, target),
+    ...diffViewIndexesFor(baseline, target),
     ...diffExtensions(baseline, target),
     ...diffComments(baseline, target),
   ];
@@ -1039,9 +1047,12 @@ function copySequence(sequence: Sequence): Sequence {
   };
 }
 
-/** A copy of `view`, independent of the caller's model. */
+/** A copy of `view`, independent of the caller's model, including its index array. */
 function copyView(view: View): View {
-  return { ...view };
+  return {
+    ...view,
+    ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
+  };
 }
 
 /** A copy of `extension`, independent of the caller's model. */
@@ -1547,7 +1558,14 @@ function diffCheckConstraints(
  * `columns`; every unnamed index groups by absence and pairs by structure (`unique`, then
  * columns). `concurrently` is apply metadata and never makes a difference.
  */
-function diffIndexes(baseline: readonly Index[], target: readonly Index[]): TableChange[] {
+interface IndexPairs {
+  readonly removed: readonly Index[];
+  readonly added: readonly Index[];
+  readonly changed: readonly IndexPair[];
+}
+
+/** The canonical pairing of two index arrays, shared by table and materialized-view owners. */
+function pairIndexes(baseline: readonly Index[], target: readonly Index[]): IndexPairs {
   const baselineGroups = groupIndexes(baseline);
   const targetGroups = groupIndexes(target);
 
@@ -1581,7 +1599,11 @@ function diffIndexes(baseline: readonly Index[], target: readonly Index[]): Tabl
   removed.sort(compareIndexes);
   added.sort(compareIndexes);
   changed.sort(compareIndexChanges);
+  return { removed, added, changed };
+}
 
+function diffIndexes(baseline: readonly Index[], target: readonly Index[]): TableChange[] {
+  const { removed, added, changed } = pairIndexes(baseline, target);
   return [
     ...removed.map((index): TableChange => ({
       kind: 'index-removed',
@@ -1597,6 +1619,63 @@ function diffIndexes(baseline: readonly Index[], target: readonly Index[]): Tabl
       after: copyIndex(pair.after),
     })),
   ];
+}
+
+/** A fresh owner payload for every index change, so no two changes share a mutable object. */
+function viewIndexOwner(view: View): IndexOwner {
+  return { kind: 'materialized-view', view: { schema: view.schema, name: view.name } };
+}
+
+/**
+ * The index group of a view both sides hold, in the shared index pairing order. An added or
+ * removed view contributes no group: its create or drop carries the whole view, and the plan
+ * decomposes that payload into index steps. A view the plan recreates still reports its index
+ * changes here; the plan suppresses them for that identity and emits the target's indexes
+ * after the recreate instead.
+ */
+function diffViewIndexes(before: View, after: View): readonly Change[] {
+  const { removed, added, changed } = pairIndexes(before.indexes ?? [], after.indexes ?? []);
+  return [
+    ...removed.map((index): Change => ({
+      kind: 'view-index-removed',
+      owner: viewIndexOwner(before),
+      index: copyIndex(index),
+    })),
+    ...added.map((index): Change => ({
+      kind: 'view-index-added',
+      owner: viewIndexOwner(after),
+      index: copyIndex(index),
+    })),
+    ...changed.map((pair): Change => ({
+      kind: 'view-index-changed',
+      owner: viewIndexOwner(after),
+      before: copyIndex(pair.before),
+      after: copyIndex(pair.after),
+    })),
+  ];
+}
+
+/** View index changes, in view identity order, for the views both models hold. */
+function diffViewIndexesFor(baseline: Model, target: Model): readonly Change[] {
+  const baselineViews = [...baseline.views].sort(compareViews);
+  const targetViews = [...target.views].sort(compareViews);
+  const changes: Change[] = [];
+  let baselineIndex = 0;
+  let targetIndex = 0;
+
+  while (baselineIndex < baselineViews.length && targetIndex < targetViews.length) {
+    const before = baselineViews[baselineIndex]!;
+    const after = targetViews[targetIndex]!;
+    const comparison = compareViews(before, after);
+    if (comparison < 0) baselineIndex += 1;
+    else if (comparison > 0) targetIndex += 1;
+    else {
+      changes.push(...diffViewIndexes(before, after));
+      baselineIndex += 1;
+      targetIndex += 1;
+    }
+  }
+  return changes;
 }
 
 function indexColumns(columns: readonly Column[]): Map<string, Column> {

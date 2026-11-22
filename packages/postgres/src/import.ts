@@ -244,7 +244,8 @@ type SequenceDraft = Mutable<Sequence>;
 
 /**
  * A view being assembled. Views need no incremental mutation: a repeated definition of one
- * identity replaces the draft wholesale, so the last definition wins.
+ * identity replaces the draft wholesale, so the last definition wins — including any indexes a
+ * materialized view has gathered.
  */
 type ViewDraft = Mutable<View>;
 
@@ -335,7 +336,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
-      views: [...views.values()].sort(compareViews),
+      views: [...views.values()].map(finalizeView).sort(compareViews),
       extensions: [...extensions.values()].sort(compareExtensions),
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
@@ -477,7 +478,7 @@ function translateStatement(
     return;
   }
   if ('IndexStmt' in node) {
-    translateCreateIndex(statement, node.IndexStmt, tables, diagnostics);
+    translateCreateIndex(statement, node.IndexStmt, tables, views, diagnostics);
     return;
   }
   if ('ViewStmt' in node) {
@@ -2417,14 +2418,17 @@ function translateAlterTableCommand(
 }
 
 /**
- * Imports a standalone `CREATE [UNIQUE] INDEX` onto an already imported table, or skips and
- * names the whole statement when any part of it falls outside the minimal envelope. An index
- * is never partially imported.
+ * Imports a standalone `CREATE [UNIQUE] INDEX` onto an already imported table or materialized
+ * view, or skips and names the whole statement when any part of it falls outside the minimal
+ * envelope. An index is never partially imported. The owner resolves in table drafts first,
+ * then view drafts: a plain view cannot own an index and is skipped by name, while an unknown
+ * owner keeps the original missing-table skip.
  */
 function translateCreateIndex(
   statement: ParsedStatement,
   create: IndexStmt,
   tables: Map<string, TableDraft>,
+  views: Map<string, ViewDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const schema = create.relation?.schemaname ?? 'public';
@@ -2432,10 +2436,23 @@ function translateCreateIndex(
   const identity = tableIdentityName({ schema, name });
   const object = create.idxname === undefined ? identity : `${schema}.${create.idxname}`;
 
-  const draft = tables.get(tableKey(schema, name));
-  if (draft === undefined) {
+  const key = tableKey(schema, name);
+  const draft = tables.get(key);
+  const view = draft === undefined ? views.get(key) : undefined;
+  const owner: TableDraft | ViewDraft | undefined = draft ?? view;
+  if (owner === undefined) {
     diagnostics.push(
       skipStatement(statement, `CREATE INDEX ${object} (table not imported)`, object),
+    );
+    return;
+  }
+  if ('materialized' in owner && owner.materialized !== true) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `CREATE INDEX ${object} (indexes are not supported on a plain view)`,
+        object,
+      ),
     );
     return;
   }
@@ -2454,7 +2471,7 @@ function translateCreateIndex(
   if (create.if_not_exists === true) {
     diagnostics.push(flagAttribute(statement, object, 'IF NOT EXISTS'));
   }
-  attachIndex(draft, index);
+  attachIndex(owner, index);
 }
 
 /**
@@ -2692,6 +2709,8 @@ function translateCreateMaterializedView(
     diagnostics.push(flagAttribute(statement, identity, 'implicit populated state'));
   }
 
+  // A repeated CREATE MATERIALIZED VIEW replaces the draft wholesale, clearing any indexes the
+  // earlier definition gathered; the last definition wins, as for a repeated CREATE TABLE.
   views.set(tableKey(schema, name), {
     schema,
     name,
@@ -3346,9 +3365,16 @@ function attachCheckConstraint(draft: TableDraft, checkConstraint: CheckConstrai
   draft.checkConstraints.push(checkConstraint);
 }
 
-function attachIndex(draft: TableDraft, index: Index): void {
-  if (draft.indexes.some((existing) => sameIndex(existing, index))) return;
-  draft.indexes.push(index);
+/** Attaches an index to a table or materialized-view draft, deduping by full identity. */
+function attachIndex(draft: TableDraft | ViewDraft, index: Index): void {
+  // Both drafts hold a mutable `Index[]`; the shared `View` field is declared readonly.
+  const indexes = draft.indexes as Index[] | undefined;
+  if (indexes === undefined) {
+    (draft as ViewDraft).indexes = [index];
+    return;
+  }
+  if (indexes.some((existing) => sameIndex(existing, index))) return;
+  indexes.push(index);
 }
 
 function primaryKeyFromConstraint(
@@ -4091,9 +4117,10 @@ export function foreignKeyStructureKey(foreignKey: ForeignKey): string {
 }
 
 /**
- * Canonicalizes server-generated index names back to unnamed: a `CREATE INDEX ON t (c)`
- * applies unnamed and PostgreSQL names the index `t_c_idx`, so a dump import would otherwise
- * store the generated name and diff as remove + add against the model's unnamed declaration.
+ * Canonicalizes server-generated index names back to unnamed on table and materialized-view
+ * drafts: a `CREATE INDEX ON t (c)` applies unnamed and PostgreSQL names the index `t_c_idx`,
+ * so a dump import would otherwise store the generated name and diff as remove + add against
+ * the model's unnamed declaration.
  * An index whose name equals `synthesizedIndexName` — the server form, PostgreSQL's 63-byte
  * truncation included — is stripped, unless its structural key is already covered by an
  * unnamed entry — present in the draft or stripped earlier — in which case the name is kept;
@@ -4101,13 +4128,19 @@ export function foreignKeyStructureKey(foreignKey: ForeignKey): string {
  * order. Runs in import order before the canonical sort, and names outside the server form
  * stay named: collision suffixes are not predictable offline.
  */
-function canonicalizeIndexNames(draft: TableDraft): void {
+function canonicalizeIndexNames(draft: {
+  readonly schema: string;
+  readonly name: string;
+  readonly indexes?: readonly Index[] | undefined;
+}): void {
+  const indexes = draft.indexes;
+  if (indexes === undefined) return;
   const identity: TableIdentity = { schema: draft.schema, name: draft.name };
   const seen = new Set<string>();
-  for (const index of draft.indexes) {
+  for (const index of indexes) {
     if (index.name === undefined) seen.add(indexStructureKey(index));
   }
-  for (const index of draft.indexes) {
+  for (const index of indexes) {
     const name = index.name;
     if (name === undefined || name !== synthesizedIndexName(identity, index)) continue;
     const key = indexStructureKey(index);
@@ -4205,6 +4238,27 @@ function finalizeTable(draft: TableDraft): Table {
   if (draft.persistence !== undefined) table.persistence = draft.persistence;
   if (draft.comment !== undefined) table.comment = draft.comment;
   return table;
+}
+
+/**
+ * Finalizes a view draft: canonicalizes a materialized view's index names and sorts the indexes
+ * exactly as for a table, omitting the `indexes` field when there are none so ordinary views and
+ * index-less matviews keep their existing shape.
+ */
+function finalizeView(draft: ViewDraft): View {
+  const indexes =
+    draft.indexes !== undefined && draft.indexes.length > 0 ? draft.indexes : undefined;
+  if (indexes !== undefined) canonicalizeIndexNames(draft);
+  const view: Mutable<View> = {
+    schema: draft.schema,
+    name: draft.name,
+    materialized: draft.materialized,
+    definition: draft.definition,
+  };
+  if (indexes !== undefined) view.indexes = [...indexes].sort(compareIndexes);
+  if (draft.checkOption !== undefined) view.checkOption = draft.checkOption;
+  if (draft.comment !== undefined) view.comment = draft.comment;
+  return view;
 }
 
 /**

@@ -4158,6 +4158,73 @@ test('added, removed, and changed views are independent copies', () => {
   assert.notEqual(changedChange.after, after);
 });
 
+const matviewOwner = { kind: 'materialized-view' as const, view: identity('m') };
+
+test('a kept materialized view reports index removals, additions, and changes without a view-changed', () => {
+  const before = view('m', {
+    materialized: true,
+    indexes: [index(['a'], { name: 'm_idx' }), index(['b'], { name: 'm_b_idx' })],
+  });
+  const after = view('m', {
+    materialized: true,
+    indexes: [index(['a2'], { name: 'm_idx' }), index(['c'], { name: 'm_c_idx' })],
+  });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    { kind: 'view-index-removed', owner: matviewOwner, index: index(['b'], { name: 'm_b_idx' }) },
+    { kind: 'view-index-added', owner: matviewOwner, index: index(['c'], { name: 'm_c_idx' }) },
+    {
+      kind: 'view-index-changed',
+      owner: matviewOwner,
+      before: index(['a'], { name: 'm_idx' }),
+      after: index(['a2'], { name: 'm_idx' }),
+    },
+  ]);
+});
+
+test("a recreated materialized view's index changes are reported for the plan to suppress", () => {
+  const before = view('m', {
+    materialized: true,
+    definition: 'SELECT 1',
+    indexes: [index(['a'], { name: 'm_a_idx' })],
+  });
+  const after = view('m', {
+    materialized: true,
+    definition: 'SELECT 2',
+    indexes: [index(['b'], { name: 'm_b_idx' })],
+  });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    {
+      kind: 'view-changed',
+      view: identity('m'),
+      changes: [{ field: 'definition', before: 'SELECT 1', after: 'SELECT 2' }],
+      before,
+      after,
+    },
+    {
+      kind: 'view-index-removed',
+      owner: matviewOwner,
+      index: index(['a'], { name: 'm_a_idx' }),
+    },
+    {
+      kind: 'view-index-added',
+      owner: matviewOwner,
+      index: index(['b'], { name: 'm_b_idx' }),
+    },
+  ]);
+});
+
+test('an added or removed materialized view emits no separate index changes', () => {
+  const mat = view('m', {
+    materialized: true,
+    indexes: [index(['a'], { name: 'm_a_idx' })],
+  });
+
+  assertDiff(model(), viewModel([mat]), [{ kind: 'view-added', view: mat }]);
+  assertDiff(viewModel([mat]), model(), [{ kind: 'view-removed', view: mat }]);
+});
+
 test('a table comment appears, changes, and disappears as one comment change', () => {
   const bare = table('users', { columns: [column('id')] });
   const commented = table('users', { columns: [column('id')], comment: 'accounts' });

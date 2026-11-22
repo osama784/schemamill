@@ -233,6 +233,21 @@ function formatChange(change: Change): string {
       return formatView('-', change.view);
     case 'view-changed':
       return formatViewChange(change.view, change.changes);
+    case 'view-index-added': {
+      const owner = change.owner.kind === 'table' ? change.owner.table : change.owner.view;
+      return `+ index ${formatIdentity(owner)}: ${formatIndex(change.index)}`;
+    }
+    case 'view-index-removed': {
+      const owner = change.owner.kind === 'table' ? change.owner.table : change.owner.view;
+      return `- index ${formatIdentity(owner)}: ${formatIndex(change.index)}`;
+    }
+    case 'view-index-changed': {
+      const owner = change.owner.kind === 'table' ? change.owner.table : change.owner.view;
+      return `~ index ${formatIdentity(owner)} ${formatOptional(change.before.name)}: ${formatIndexChanges(
+        change.before,
+        change.after,
+      )}`;
+    }
     case 'extension-added':
       return formatExtension('+', change.extension);
     case 'extension-removed':
@@ -430,8 +445,10 @@ function formatStep(step: Step): string {
     case 'create-index':
     case 'drop-index':
     case 'create-index-concurrently':
-    case 'drop-index-concurrently':
-      return `${formatIdentity(step.table)}: ${formatIndex(step.index)}`;
+    case 'drop-index-concurrently': {
+      const owner = step.owner.kind === 'table' ? step.owner.table : step.owner.view;
+      return `${formatIdentity(owner)}: ${formatIndex(step.index)}`;
+    }
     case 'create-sequence':
     case 'drop-sequence':
       return formatIdentity(step.sequence);

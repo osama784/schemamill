@@ -35,8 +35,12 @@ A table constraint requiring every row to satisfy an expression, stored as opaqu
 _Avoid_: validation rule, predicate
 
 **Index**:
-A standalone access path over a table's columns. A named index is identified by its name; an unnamed index by its structure — `unique` and ordered columns, with a missing name itself distinct in a diff. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
+A standalone access path over a table's or a materialized view's columns. A named index is identified by its name; an unnamed index by its structure — `unique` and ordered columns, with a missing name itself distinct in a diff. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
 _Avoid_: key, access method
+
+**Index owner**:
+The relation an index belongs to: a table or a materialized view, carried as a discriminated payload on index changes and steps so one `Index` shape and one set of index steps serve both. An ordinary view cannot own an index; an index on one is skipped by name on import. A table-owned index keeps its identity, ordering, canonicalization, and plan placement unchanged.
+_Avoid_: index parent, owning relation
 
 **Concurrent index**:
 An index declared `CONCURRENTLY`: apply metadata that steers how its create or drop applies, excluded from structural identity, and stood outside any transaction. The target's declaration drives a create; the baseline's drives a drop.

@@ -949,7 +949,7 @@ test('a concurrent index between the halves keeps a pure enforcement flip as dro
   );
   const concurrent: Step = {
     kind: 'create-index-concurrently',
-    table: identity('log'),
+    owner: { kind: 'table', table: identity('log') },
     index: tableIndex(['at'], { name: 'log_at_idx' }),
   };
   const sql = renderSql(
@@ -1653,27 +1653,27 @@ test('renders index creates and drops, named or unnamed, unique or not', () => {
       planOf(
         {
           kind: 'create-index',
-          table: identity('t'),
+          owner: { kind: 'table', table: identity('t') },
           index: tableIndex(['a'], { name: 't_a_idx' }),
         },
         {
           kind: 'create-index',
-          table: identity('t'),
+          owner: { kind: 'table', table: identity('t') },
           index: tableIndex(['a', 'b'], { unique: true }),
         },
         {
           kind: 'drop-index',
-          table: identity('t'),
+          owner: { kind: 'table', table: identity('t') },
           index: tableIndex(['a'], { name: 't_a_idx' }),
         },
         {
           kind: 'drop-index',
-          table: identity('t'),
+          owner: { kind: 'table', table: identity('t') },
           index: tableIndex(['a', 'b']),
         },
         {
           kind: 'create-index',
-          table: { schema: 'app', name: 'Order' },
+          owner: { kind: 'table', table: { schema: 'app', name: 'Order' } },
           index: tableIndex(['Mixed Case'], { name: 'we"ird' }),
         },
       ),
@@ -1691,6 +1691,92 @@ test('renders index creates and drops, named or unnamed, unique or not', () => {
   );
 });
 
+test('renders index statements on a materialized view using its schema and name', () => {
+  const viewOwner = { kind: 'materialized-view' as const, view: { schema: 'app', name: 'mv' } };
+
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'create-index',
+          owner: viewOwner,
+          index: tableIndex(['a'], { name: 'mv_a_idx' }),
+        },
+        {
+          kind: 'create-index',
+          owner: viewOwner,
+          index: tableIndex(['b'], { unique: true }),
+        },
+        {
+          kind: 'drop-index',
+          owner: viewOwner,
+          index: tableIndex(['a'], { name: 'mv_a_idx' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE INDEX mv_a_idx ON app.mv USING btree (a);',
+      'CREATE UNIQUE INDEX ON app.mv USING btree (b);',
+      'DROP INDEX app.mv_a_idx;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('the duplicate-name guard keys on the owner, not the relation text alone', () => {
+  // A table and a materialized view under one name are different owners; the schema-wide
+  // guard is #102. Both statements render against public.t here, which pins that the guard
+  // distinguishes them by owner kind rather than by rendered relation text.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'create-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+        {
+          kind: 'create-index',
+          owner: { kind: 'materialized-view', view: identity('t') },
+          index: tableIndex(['b'], { name: 't_a_idx' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (a);',
+      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('refuses two index creates on one materialized view that resolve to one name', () => {
+  const viewOwner = { kind: 'materialized-view' as const, view: identity('m') };
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner: viewOwner,
+            index: tableIndex(['a'], { name: 'm_a_idx' }),
+          },
+          {
+            kind: 'create-index',
+            owner: viewOwner,
+            index: tableIndex(['b'], { name: 'm_a_idx' }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.m would share the name "m_a_idx": an index named "m_a_idx" on (a) and an index named "m_a_idx" on (b)',
+  );
+});
+
 test('index drops are schema-qualified, named or synthesized, both kinds', () => {
   // A bare `DROP INDEX` name resolves through `search_path`, so an index on a non-public
   // table must be dropped as `<schema>.<name>`; the name is synthesized when absent, exactly
@@ -1700,12 +1786,12 @@ test('index drops are schema-qualified, named or synthesized, both kinds', () =>
       planOf(
         {
           kind: 'drop-index',
-          table: { schema: 'app', name: 'probe' },
+          owner: { kind: 'table', table: { schema: 'app', name: 'probe' } },
           index: tableIndex(['c'], { name: 'probe_new_idx' }),
         },
         {
           kind: 'drop-index',
-          table: { schema: 'app', name: 'probe' },
+          owner: { kind: 'table', table: { schema: 'app', name: 'probe' } },
           index: tableIndex(['a', 'b']),
         },
       ),
@@ -1726,7 +1812,7 @@ test('index drops are schema-qualified, named or synthesized, both kinds', () =>
       steps: [
         {
           kind: 'drop-index-concurrently',
-          table: { schema: 'App', name: 'Probe' },
+          owner: { kind: 'table', table: { schema: 'App', name: 'Probe' } },
           index: tableIndex(['c'], { name: 'we"ird', concurrently: true }),
         },
       ],
@@ -1743,7 +1829,11 @@ test('renders long unnamed drops in their server forms, index and constraints', 
   assert.equal(
     renderSql(
       planOf(
-        { kind: 'drop-index', table: identity(long), index: tableIndex(['a']) },
+        {
+          kind: 'drop-index',
+          owner: { kind: 'table', table: identity(long) },
+          index: tableIndex(['a']),
+        },
         { kind: 'drop-primary-key', table: identity(long), primaryKey: { columns: ['id'] } },
         {
           kind: 'drop-unique-constraint',
@@ -1783,7 +1873,7 @@ test('renders an explicit index drop name exactly as written, even over 63 bytes
     renderSql(
       planOf({
         kind: 'drop-index',
-        table: identity('t'),
+        owner: { kind: 'table', table: identity('t') },
         index: tableIndex(['a'], { name: explicit }),
       }),
     ),
@@ -1794,12 +1884,12 @@ test('renders an explicit index drop name exactly as written, even over 63 bytes
 test('renders concurrent index kinds bare, one standalone group each', () => {
   const concurrentDrop: Step = {
     kind: 'drop-index-concurrently',
-    table: identity('t'),
+    owner: { kind: 'table', table: identity('t') },
     index: tableIndex(['a'], { name: 't_old_idx', concurrently: true }),
   };
   const concurrentCreate: Step = {
     kind: 'create-index-concurrently',
-    table: identity('t'),
+    owner: { kind: 'table', table: identity('t') },
     index: tableIndex(['a', 'b'], { unique: true, name: 't_new_idx', concurrently: true }),
   };
 
@@ -2059,12 +2149,12 @@ test('refuses two explicit index creates sharing one name', () => {
         planOf(
           {
             kind: 'create-index',
-            table: identity('t'),
+            owner: { kind: 'table', table: identity('t') },
             index: tableIndex(['a'], { name: 't_a_idx' }),
           },
           {
             kind: 'create-index',
-            table: identity('t'),
+            owner: { kind: 'table', table: identity('t') },
             index: tableIndex(['b'], { name: 't_a_idx' }),
           },
         ),
@@ -2080,8 +2170,16 @@ test('refuses unnamed indexes whose synthesized names collide within one table',
     () =>
       renderSql(
         planOf(
-          { kind: 'create-index', table: identity('t'), index: tableIndex(['a_b']) },
-          { kind: 'create-index', table: identity('t'), index: tableIndex(['a', 'b']) },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['a_b']),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['a', 'b']),
+          },
         ),
       ),
     'refusing to render: index creates on public.t would share the name "t_a_b_idx": an unnamed index on (a_b) and an unnamed index on (a, b)',
@@ -2181,8 +2279,16 @@ test('refuses unnamed index predictions that collapse under truncation', () => {
     () =>
       renderSql(
         planOf(
-          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
-          { kind: 'create-index', table: identity('t'), index: tableIndex([hundredOne]) },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex([hundred]),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex([hundredOne]),
+          },
         ),
       ),
     `refusing to render: index creates on public.t would share the name "${server}": ` +
@@ -2201,10 +2307,14 @@ test('refuses an unnamed prediction against an explicit name equal to its server
     () =>
       renderSql(
         planOf(
-          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
           {
             kind: 'create-index',
-            table: identity('t'),
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex([hundred]),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
             index: tableIndex(['a'], { name: server }),
           },
         ),
@@ -2227,10 +2337,14 @@ test('refuses an explicit name longer than 63 bytes that clips onto a prediction
     () =>
       renderSql(
         planOf(
-          { kind: 'create-index', table: identity('t'), index: tableIndex([hundred]) },
           {
             kind: 'create-index',
-            table: identity('t'),
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex([hundred]),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
             index: tableIndex(['a'], { name: explicit }),
           },
         ),
@@ -2249,8 +2363,16 @@ test('renders long unnamed names that do not collapse', () => {
   assert.equal(
     renderSql(
       planOf(
-        { kind: 'drop-index', table: identity('t'), index: tableIndex([x]) },
-        { kind: 'drop-index', table: identity('t'), index: tableIndex([y]) },
+        {
+          kind: 'drop-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex([x]),
+        },
+        {
+          kind: 'drop-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex([y]),
+        },
       ),
     ),
     [
@@ -2270,10 +2392,14 @@ test('partition violations stay plain Error, never RenderRefusalError', () => {
   try {
     renderSql({
       steps: [
-        { kind: 'create-index', table: identity('t'), index: tableIndex(['a']) },
         {
           kind: 'create-index',
-          table: identity('t'),
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['a']),
+        },
+        {
+          kind: 'create-index',
+          owner: { kind: 'table', table: identity('t') },
           index: tableIndex(['a'], { name: 't_a_idx' }),
         },
       ],

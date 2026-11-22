@@ -1484,6 +1484,74 @@ test('serializeModel emits a column identity before its attributes, and persiste
   assert.equal(payload.tables[0]!.persistence, 'unlogged');
 });
 
+/** A materialized view with two indexes, one named and one unnamed and concurrent. */
+const MATVIEW_INDEX_MODEL: Model = {
+  tables: [],
+  sequences: [],
+  views: [
+    {
+      schema: 'public',
+      name: 'm',
+      materialized: true,
+      definition: 'SELECT 1',
+      indexes: [
+        { name: 'm_a_idx', unique: false, columns: ['a'] },
+        { unique: true, columns: ['b'], concurrently: true },
+      ],
+    },
+  ],
+  extensions: [],
+};
+
+test('resolveWorkspace accepts an explicit empty indexes array on a materialized view', async (t) => {
+  const model = await resolvePayloadOk(t, {
+    tables: [],
+    sequences: [],
+    views: [viewPayload({ materialized: true, indexes: [] })],
+  });
+
+  // An empty array normalizes to absence, so a view without indexes stays byte-identical.
+  assert.deepStrictEqual(model.views, [
+    { schema: 'public', name: 'v', materialized: true, definition: 'SELECT 1' },
+  ]);
+});
+
+test('resolveWorkspace rejects a non-empty indexes array on a plain view', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [],
+    sequences: [],
+    views: [viewPayload({ indexes: [{ name: 'v_a_idx', unique: false, columns: ['a'] }] })],
+  });
+
+  assert.equal(diagnostic.message, 'invalid model: views[0].indexes is not valid on a plain view');
+});
+
+test('serializeModel round-trips materialized-view indexes and leaves absent views unchanged', async (t) => {
+  const bytes = serializeModel(MATVIEW_INDEX_MODEL);
+  const payload = JSON.parse(bytes) as {
+    views: Array<{ name: string; indexes?: readonly unknown[] }>;
+  };
+
+  assert.deepStrictEqual(payload.views[0]!.indexes, [
+    { name: 'm_a_idx', unique: false, columns: ['a'] },
+    { unique: true, columns: ['b'], concurrently: true },
+  ]);
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+  assert.deepStrictEqual((await resolveOk(dir)).model, MATVIEW_INDEX_MODEL);
+
+  const bare = await resolvePayloadOk(t, {
+    tables: [],
+    sequences: [],
+    views: [viewPayload({ materialized: true })],
+  });
+  assert.deepStrictEqual(bare.views, [
+    { schema: 'public', name: 'v', materialized: true, definition: 'SELECT 1' },
+  ]);
+  assert.equal(serializeModel(bare).includes('"indexes"'), false);
+});
+
 test('resolveWorkspace walks up from a nested directory to the nearest root', async (t) => {
   const dir = await fixtureDir(t);
   await initOk(dir);

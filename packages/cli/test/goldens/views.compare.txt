@@ -17,3 +17,11 @@
     materialized false → true
 
 + view public.recent_accounts
+
++ index public.account_totals: unique index account_totals_balance_uq (balance)
+
+- index public.kept_totals: index kept_totals_legacy_idx (balance)
+
++ index public.kept_totals: index kept_totals_fresh_idx (balance)
+
+~ index public.kept_totals kept_totals_shift_idx: columns (id) → (email)
