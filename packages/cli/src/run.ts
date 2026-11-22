@@ -102,20 +102,52 @@ export function mapSides(args: SideArguments): SideMapping {
     : { ok: true, baseline: workspace, target: path };
 }
 
+/**
+ * The provenance the JSON document needs for one side: how it was sourced, its dump path or
+ * workspace root, and every import diagnostic in dump order. A workspace side contributes none.
+ */
+export type ImportedSideMetadata =
+  | {
+      readonly source: 'dump';
+      readonly path: string;
+      readonly diagnostics: readonly Diagnostic[];
+    }
+  | {
+      readonly source: 'workspace';
+      readonly root: string;
+      readonly diagnostics: readonly Diagnostic[];
+    };
+
 /** Both imported sides, with the exit code their diagnostics call for. */
 export interface ImportedPair {
   readonly baseline: Model;
   readonly target: Model;
   /** 1 when either side reported an `error` diagnostic; 0 otherwise. */
   readonly exitCode: 0 | 1;
+  /** Per-side provenance and diagnostics, baseline before target. */
+  readonly sides: {
+    readonly baseline: ImportedSideMetadata;
+    readonly target: ImportedSideMetadata;
+  };
 }
 
-/** One side turned into a model, beside the dump import result when it had one. */
-interface SidedModel {
-  readonly model: Model;
-  /** The path side's import result; `null` for a workspace side, which carries no diagnostics. */
-  readonly result: ReadResult<Model, Diagnostic> | null;
-}
+/**
+ * One side turned into a model, with its source and the dump import result when it had one. The
+ * two variants keep the workspace root and the path result unambiguous, with no non-null
+ * assertion at the mapping site.
+ */
+type SidedModel =
+  | {
+      readonly kind: 'dump';
+      readonly model: Model;
+      readonly result: ReadResult<Model, Diagnostic>;
+      readonly path: string;
+    }
+  | {
+      readonly kind: 'workspace';
+      readonly model: Model;
+      readonly root: string;
+    };
 
 /**
  * Resolves, reads, and imports both sides of a comparison. Returns `null` when a side could not
@@ -137,7 +169,7 @@ export async function importPair(
     ['target', target],
   ];
   for (const [side, imported] of sides) {
-    if (imported.result !== null) {
+    if (imported.kind === 'dump') {
       process.stderr.write(formatDiagnostics(side, imported.result.diagnostics, verbose));
     }
   }
@@ -146,6 +178,10 @@ export async function importPair(
     baseline: baseline.model,
     target: target.model,
     exitCode: sides.some(([, imported]) => carriesError(imported)) ? 1 : 0,
+    sides: {
+      baseline: sideMetadata(baseline),
+      target: sideMetadata(target),
+    },
   };
 }
 
@@ -157,14 +193,14 @@ async function sideModel(source: SideSource): Promise<SidedModel | null> {
       process.stderr.write(`schemamill: ${resolution.diagnostic.message}\n`);
       return null;
     }
-    return { model: resolution.model, result: null };
+    return { kind: 'workspace', model: resolution.model, root: resolution.root };
   }
 
   const dump = await readDump(source.path);
   if (dump === null) return null;
   const result = await importSide(dump);
   if (result === null) return null;
-  return { model: result.model, result };
+  return { kind: 'dump', model: result.model, result, path: source.path };
 }
 
 /** The dump text, or `null` after one stderr line naming the path and the reason. */
@@ -227,7 +263,17 @@ export function planOrReport(run: () => Plan): Plan | undefined {
 
 /** Whether an imported side carried an `error` diagnostic; a workspace side never does. */
 function carriesError(imported: SidedModel): boolean {
-  return imported.result !== null && hasErrors(imported.result.diagnostics);
+  return imported.kind === 'dump' && hasErrors(imported.result.diagnostics);
+}
+
+/**
+ * The side's provenance and diagnostics, surfaced for the JSON mapper. This reads the import
+ * results already in hand — it writes nothing, so the human path's stderr stays byte-identical.
+ */
+function sideMetadata(imported: SidedModel): ImportedSideMetadata {
+  return imported.kind === 'dump'
+    ? { source: 'dump', path: imported.path, diagnostics: imported.result.diagnostics }
+    : { source: 'workspace', root: imported.root, diagnostics: [] };
 }
 
 /** The message of a thrown value, stringified when it is not an `Error`. */
