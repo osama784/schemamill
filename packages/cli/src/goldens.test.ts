@@ -9,8 +9,9 @@ import { promisify } from 'node:util';
  * Golden tests for the `compare` and `plan` artifact stdout.
  *
  * Each scene is a dump pair under `test/fixtures`; `<scene>.compare.txt` and `<scene>.plan.txt`
- * under `test/goldens` hold the command's exact stdout, and every scene's pair exercises the
- * full change vocabulary. Only stdout and the exit code are pinned: diagnostics belong on
+ * under `test/goldens` hold the human command's exact stdout, and every scene's pair exercises the
+ * full change vocabulary. JSON scenes instead pin `<scene>.<command>.json.txt` after the D4
+ * path/version normalization. Only stdout and the exit code are pinned: diagnostics belong on
  * stderr, and a fixture may legitimately carry a skippable statement, so stderr is not
  * asserted here.
  */
@@ -20,10 +21,14 @@ const execFileAsync = promisify(execFile);
 /** The built entry point; the package's test script builds first. */
 const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
-/** One golden scene: the fixture base name and any extra arguments only `plan` receives. */
+/** One golden scene: the fixture base name, optional extra arguments, and artifact format. */
 interface GoldenScene {
   readonly name: string;
   readonly planArgs?: readonly string[];
+  /** Extra arguments passed to both commands (e.g. `--json`). */
+  readonly args?: readonly string[];
+  /** Golden artifact format; the human text artifact is the default. */
+  readonly format?: 'text' | 'json';
 }
 
 /** Every golden scene, by fixture base name. */
@@ -40,7 +45,14 @@ const SCENES: readonly GoldenScene[] = [
   { name: 'schema-edges' },
   { name: 'sequences' },
   { name: 'views' },
+  { name: 'json-rich', args: ['--json'], format: 'json' },
 ];
+
+/** The 12 human scenes: their stdout assertions and goldens are unchanged by the JSON scenes. */
+const TEXT_SCENES = SCENES.filter((scene) => scene.format !== 'json');
+
+/** Structured-JSON scenes: rich DTO payloads with a multi-group plan. */
+const JSON_SCENES = SCENES.filter((scene) => scene.format === 'json');
 
 /** Every command whose stdout a golden pins. */
 const COMMANDS = ['compare', 'plan'] as const;
@@ -85,7 +97,7 @@ function hazardsBlock(golden: string): string | null {
   return `${block.join('\n')}\n`;
 }
 
-for (const scene of SCENES) {
+for (const scene of TEXT_SCENES) {
   for (const command of COMMANDS) {
     test(`${command} prints exactly the ${scene.name} golden`, async () => {
       const baseline = fixturePath(`../test/fixtures/${scene.name}.baseline.sql`);
@@ -122,5 +134,75 @@ test('compare and plan pin the same hazards block for the hazards and identity s
       `${scene}.plan.txt carries no hazards`,
     );
     assert.equal(compareBlock, planBlock, `${scene}: compare and plan hazards blocks differ`);
+  }
+});
+
+/** The minimal shape `normalizeJson` touches; the parsed document carries many more keys. */
+interface NormalizedJson {
+  schemamill: { version: string };
+  workspace: { root: string } | null;
+  sides: {
+    baseline: { source: string; path?: string };
+    target: { source: string; path?: string };
+  };
+}
+
+/**
+ * D4 determinism: replace the three machine-specific values — workspace root, dump path, and
+ * schemamill version — with fixed placeholders so a golden is invariant across checkouts and
+ * releases. `json.ts` deliberately exposes no normalization option, so production keeps its real
+ * values and only this golden comparison translates them.
+ */
+function normalizeJson(stdout: string): string {
+  const document = JSON.parse(stdout) as NormalizedJson;
+  document.schemamill.version = '<VERSION>';
+  if (document.workspace !== null) document.workspace.root = '<WORKSPACE_ROOT>';
+  for (const side of [document.sides.baseline, document.sides.target]) {
+    if (side.source === 'dump' && side.path !== undefined) side.path = '<DUMP_PATH>';
+  }
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+/** A structured-JSON golden's file, after the D4 normalization. */
+const readJsonGolden = (scene: GoldenScene, command: string): string =>
+  readText(`../test/goldens/${scene.name}.${command}.json.txt`);
+
+for (const scene of JSON_SCENES) {
+  for (const command of COMMANDS) {
+    test(`${command} prints exactly the ${scene.name} JSON golden`, async () => {
+      const baseline = fixturePath(`../test/fixtures/${scene.name}.baseline.sql`);
+      const target = fixturePath(`../test/fixtures/${scene.name}.target.sql`);
+
+      const result = await runCli(
+        command,
+        baseline,
+        target,
+        ...(scene.args ?? []),
+        ...(command === 'plan' ? (scene.planArgs ?? []) : []),
+      );
+
+      assert.equal(
+        result.code,
+        0,
+        `schemamill ${command} exited ${String(result.code)}; stderr:\n${result.stderr}`,
+      );
+      assert.equal(normalizeJson(result.stdout), readJsonGolden(scene, command));
+    });
+  }
+}
+
+test('JSON goldens are byte-stable across repeated renders', async () => {
+  const baseline = fixturePath(`../test/fixtures/json-rich.baseline.sql`);
+  const target = fixturePath(`../test/fixtures/json-rich.target.sql`);
+
+  for (const command of COMMANDS) {
+    const first = await runCli(command, baseline, target, '--json');
+    const second = await runCli(command, baseline, target, '--json');
+
+    assert.equal(first.code, 0, `schemamill ${command} exited ${String(first.code)}`);
+    assert.equal(second.code, 0, `schemamill ${command} exited ${String(second.code)}`);
+    // Raw bytes must not drift between renders: no timestamps, random IDs, or locale sorts.
+    assert.equal(second.stdout, first.stdout, `${command}: a second render changed the bytes`);
+    assert.equal(normalizeJson(first.stdout), readJsonGolden(JSON_SCENES[0]!, command));
   }
 });
