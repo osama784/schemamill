@@ -3,6 +3,7 @@ import { hazardAnalyzer, RenderRefusalError, renderSql } from '@schemamill/postg
 import type { Command } from 'commander';
 
 import { formatHazards, formatPlan } from './format.ts';
+import { buildJsonDocument, stringifyJsonDocument } from './json.ts';
 import { importPair, mapSides, planOrReport } from './run.ts';
 import { validateTargetVersion } from './target-version.ts';
 
@@ -28,6 +29,7 @@ interface PlanOptions {
   readonly baselineWorkspace?: boolean;
   readonly targetWorkspace?: boolean;
   readonly targetVersion: string;
+  readonly json?: boolean;
 }
 
 /** Registers `schemamill plan` on `program`. */
@@ -41,6 +43,7 @@ export function registerPlan(program: Command): void {
     .option('--target-workspace', 'resolve the target from the workspace')
     .option('--verbose', 'list every import diagnostic')
     .option('--target-version <major>', 'PostgreSQL major (13-18)', '13')
+    .option('--json', 'emit a structured JSON document')
     .addHelpText('after', '\nA single path is the target; the workspace fills the baseline.')
     .action(
       async (
@@ -58,6 +61,47 @@ export function registerPlan(program: Command): void {
         });
         if (!sides.ok) {
           command.error(sides.message);
+        }
+        if (options.json === true) {
+          // One document, written only after both sides import, core's plan accepts the pair, and
+          // the renderer has validated the SQL the document deliberately does not embed. A read
+          // failure or a contract error has already written its one stderr line and leaves stdout
+          // empty; a refusal keeps its stderr wording but emits the document too. The human path
+          // below stays byte-for-byte unchanged.
+          const imported = await importPair(sides.baseline, sides.target, options.verbose === true);
+          if (imported === null) {
+            process.exitCode = 1;
+            return;
+          }
+          const planned = planOrReport(() => plan(imported.baseline, imported.target));
+          if (planned === undefined) return;
+          const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+          let refusal: string | undefined;
+          if (planned.steps.length > 0) {
+            try {
+              renderSql(planned, { targetVersion: Number(options.targetVersion) });
+            } catch (error) {
+              if (!(error instanceof RenderRefusalError)) throw error;
+              refusal = error.message;
+            }
+          }
+          const document = buildJsonDocument({
+            command: 'plan',
+            baseline: { ...imported.sides.baseline, model: imported.baseline },
+            target: { ...imported.sides.target, model: imported.target },
+            targetVersion: Number(options.targetVersion),
+            steps: planned.steps,
+            groups: planned.groups,
+            hazards,
+          });
+          process.stdout.write(stringifyJsonDocument(document));
+          if (refusal !== undefined) {
+            process.stderr.write(`schemamill: ${refusal}\n`);
+            process.exitCode = 1;
+            return;
+          }
+          process.exitCode = imported.exitCode;
+          return;
         }
         const imported = await importPair(sides.baseline, sides.target, options.verbose === true);
         if (imported === null) {

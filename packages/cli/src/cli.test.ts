@@ -586,6 +586,7 @@ const COMPARE_HELP = [
   '  --baseline-workspace  resolve the baseline from the workspace',
   '  --target-workspace    resolve the target from the workspace',
   '  --verbose             list every import diagnostic',
+  '  --json                emit a structured JSON document',
   '  -h, --help            display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
@@ -620,6 +621,7 @@ const PLAN_HELP = [
   '  --target-workspace        resolve the target from the workspace',
   '  --verbose                 list every import diagnostic',
   '  --target-version <major>  PostgreSQL major (13-18) (default: "13")',
+  '  --json                    emit a structured JSON document',
   '  -h, --help                display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
@@ -2292,4 +2294,513 @@ test('a permission-denied file is a read failure naming EACCES, exit 1', async (
     `schemamill: cannot read ${locked}: EACCES: permission denied, open '${locked}'\n`,
   );
   assert.equal(result.code, 1);
+});
+
+// ---------------------------------------------------------------------------
+// --json: command-level document, stream, and exit contract. The pure mapper's recursive key sets
+// are pinned in json.test.ts; these scenes prove the commands feed it the right values and that
+// the human path stays byte-identical without the flag.
+// ---------------------------------------------------------------------------
+
+/** A pair spanning tables, a column, an index, a sequence, a view, an extension, and comments. */
+const JSON_BASE_DUMP = [
+  'CREATE TABLE public.widgets (',
+  '    id integer NOT NULL,',
+  '    label text,',
+  '    CONSTRAINT widgets_pkey PRIMARY KEY (id)',
+  ');',
+  '',
+  'CREATE TABLE public.retired (',
+  '    id integer NOT NULL',
+  ');',
+  '',
+  'CREATE VIEW public.widget_names AS SELECT id,label FROM public.widgets;',
+  '',
+  "COMMENT ON TABLE public.widgets IS 'old label';",
+  '',
+].join('\n');
+
+const JSON_TARGET_DUMP = [
+  'CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;',
+  '',
+  'CREATE SEQUENCE public.widget_seq',
+  '    AS bigint',
+  '    INCREMENT BY 0',
+  '    NO MINVALUE',
+  '    NO MAXVALUE',
+  '    CACHE 1;',
+  '',
+  'CREATE TABLE public.widgets (',
+  '    id integer NOT NULL,',
+  '    label text NOT NULL,',
+  '    score integer,',
+  '    CONSTRAINT widgets_pkey PRIMARY KEY (id)',
+  ');',
+  '',
+  'CREATE TABLE public.gadgets (',
+  '    id integer NOT NULL,',
+  '    widget_id integer,',
+  '    CONSTRAINT gadgets_pkey PRIMARY KEY (id)',
+  ');',
+  '',
+  'CREATE INDEX widgets_score_idx ON public.widgets USING btree (score);',
+  '',
+  'CREATE VIEW public.widget_names AS SELECT id,label,score FROM public.widgets;',
+  '',
+  'CREATE MATERIALIZED VIEW public.widget_scores AS SELECT id,score FROM public.widgets WITH NO DATA;',
+  '',
+  'CREATE INDEX CONCURRENTLY widget_scores_score_idx ON public.widget_scores USING btree (score);',
+  '',
+  "COMMENT ON TABLE public.widgets IS 'new label';",
+  '',
+  "COMMENT ON EXTENSION pgcrypto IS 'crypto helpers';",
+  '',
+].join('\n');
+
+/** A dump with one flag and one skip on each side, both complete in the document. */
+const JSON_DIAGNOSTICS_DUMP = [
+  'CREATE TABLE public.users (',
+  '    id integer NOT NULL,',
+  '    email text,',
+  '    CONSTRAINT users_email_key UNIQUE NULLS NOT DISTINCT (email)',
+  ');',
+  '',
+  'CREATE INDEX idx_users_partial ON public.users (id) WHERE id > 0;',
+  '',
+].join('\n');
+
+interface JsonCounts {
+  readonly tables: number;
+  readonly sequences: number;
+  readonly views: number;
+  readonly extensions: number;
+}
+
+/** A typed view over the parsed document for assertions that do not need the whole envelope. */
+interface JsonEnvelopeProbe {
+  readonly command: string;
+  readonly diagnostics: {
+    readonly baseline: readonly object[];
+    readonly target: readonly object[];
+  };
+  readonly result: {
+    readonly changes?: readonly object[];
+    readonly targetVersion?: number;
+    readonly steps?: readonly object[];
+    readonly groups?: readonly object[];
+    readonly hazards?: readonly object[];
+  };
+}
+
+const RICH_BASELINE_COUNTS: JsonCounts = {
+  tables: 2,
+  sequences: 0,
+  views: 1,
+  extensions: 0,
+};
+const RICH_TARGET_COUNTS: JsonCounts = {
+  tables: 2,
+  sequences: 1,
+  views: 2,
+  extensions: 1,
+};
+
+/** The documented envelope with the resolved dump paths and the command-specific result. */
+function expectedJsonEnvelope(
+  command: 'compare' | 'plan',
+  baseline: string,
+  target: string,
+  result: object,
+  baselineCounts: JsonCounts = RICH_BASELINE_COUNTS,
+  targetCounts: JsonCounts = RICH_TARGET_COUNTS,
+): object {
+  return {
+    schemaVersion: 1,
+    command,
+    schemamill: { version },
+    workspace: null,
+    sides: {
+      baseline: { source: 'dump', path: baseline, model: baselineCounts },
+      target: { source: 'dump', path: target, model: targetCounts },
+    },
+    diagnostics: { baseline: [], target: [] },
+    result,
+  };
+}
+
+// Shared payloads keep the two expected result literals readable without weakening the comparison.
+const JSON_WIDGETS_ID = { schema: 'public', name: 'widgets' };
+const JSON_GADGETS_TABLE = {
+  schema: 'public',
+  name: 'gadgets',
+  columns: [
+    { name: 'id', type: 'integer', notNull: true },
+    { name: 'widget_id', type: 'integer', notNull: false },
+  ],
+  primaryKey: { columns: ['id'] },
+  foreignKeys: [],
+  uniqueConstraints: [],
+  checkConstraints: [],
+  indexes: [],
+};
+const JSON_RETIRED_TABLE = {
+  schema: 'public',
+  name: 'retired',
+  columns: [{ name: 'id', type: 'integer', notNull: true }],
+  foreignKeys: [],
+  uniqueConstraints: [],
+  checkConstraints: [],
+  indexes: [],
+};
+const JSON_WIDGET_SEQ = {
+  schema: 'public',
+  name: 'widget_seq',
+  dataType: 'bigint',
+  increment: '0',
+  minValue: '-9223372036854775808',
+  maxValue: '-1',
+  start: '-1',
+  cache: '1',
+  cycle: false,
+};
+const JSON_SCORE_INDEX = { unique: false, columns: ['score'] };
+const JSON_CONCURRENT_SCORE_INDEX = { unique: false, columns: ['score'], concurrently: true };
+const JSON_WIDGET_NAMES_BEFORE = {
+  schema: 'public',
+  name: 'widget_names',
+  materialized: false,
+  definition: 'SELECT id,label FROM public.widgets',
+};
+const JSON_WIDGET_NAMES_AFTER = {
+  schema: 'public',
+  name: 'widget_names',
+  materialized: false,
+  definition: 'SELECT id,label,score FROM public.widgets',
+};
+const JSON_WIDGET_SCORES_VIEW = {
+  schema: 'public',
+  name: 'widget_scores',
+  materialized: true,
+  definition: 'SELECT id,score FROM public.widgets',
+  indexes: [JSON_CONCURRENT_SCORE_INDEX],
+};
+const JSON_PGCRYPTO = { schema: 'public', name: 'pgcrypto', comment: 'crypto helpers' };
+
+const EXPECTED_JSON_CHANGES: readonly object[] = [
+  { kind: 'table-added', table: JSON_GADGETS_TABLE },
+  { kind: 'table-removed', table: JSON_RETIRED_TABLE },
+  {
+    kind: 'table-changed',
+    table: JSON_WIDGETS_ID,
+    changes: [
+      {
+        kind: 'column-added',
+        column: { name: 'score', type: 'integer', notNull: false },
+      },
+      {
+        kind: 'column-changed',
+        name: 'label',
+        fields: [{ field: 'notNull', before: false, after: true }],
+      },
+      { kind: 'index-added', index: JSON_SCORE_INDEX },
+    ],
+  },
+  { kind: 'sequence-added', sequence: JSON_WIDGET_SEQ },
+  {
+    kind: 'view-changed',
+    view: { schema: 'public', name: 'widget_names' },
+    changes: [
+      {
+        field: 'definition',
+        before: 'SELECT id,label FROM public.widgets',
+        after: 'SELECT id,label,score FROM public.widgets',
+      },
+    ],
+    before: JSON_WIDGET_NAMES_BEFORE,
+    after: JSON_WIDGET_NAMES_AFTER,
+  },
+  { kind: 'view-added', view: JSON_WIDGET_SCORES_VIEW },
+  { kind: 'extension-added', extension: JSON_PGCRYPTO },
+  {
+    kind: 'comment-changed',
+    target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+    after: 'crypto helpers',
+  },
+  {
+    kind: 'comment-changed',
+    target: { kind: 'table', table: JSON_WIDGETS_ID },
+    before: 'old label',
+    after: 'new label',
+  },
+];
+
+const EXPECTED_JSON_PLAN_RESULT = {
+  targetVersion: 13,
+  steps: [
+    { kind: 'create-extension', extension: JSON_PGCRYPTO },
+    { kind: 'create-sequence', sequence: JSON_WIDGET_SEQ },
+    { kind: 'drop-table', table: { schema: 'public', name: 'retired' } },
+    { kind: 'create-table', table: JSON_GADGETS_TABLE },
+    {
+      kind: 'add-column',
+      table: JSON_WIDGETS_ID,
+      column: { name: 'score', type: 'integer', notNull: false },
+    },
+    {
+      kind: 'alter-column',
+      table: JSON_WIDGETS_ID,
+      name: 'label',
+      fields: [{ field: 'notNull', before: false, after: true }],
+    },
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: JSON_WIDGETS_ID },
+      index: JSON_SCORE_INDEX,
+    },
+    { kind: 'create-view', view: JSON_WIDGET_SCORES_VIEW },
+    { kind: 'replace-view', view: JSON_WIDGET_NAMES_AFTER },
+    {
+      kind: 'create-index-concurrently',
+      owner: { kind: 'materialized-view', view: { schema: 'public', name: 'widget_scores' } },
+      index: JSON_CONCURRENT_SCORE_INDEX,
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'extension', extension: { name: 'pgcrypto' } },
+      text: 'crypto helpers',
+    },
+    {
+      kind: 'comment',
+      target: { kind: 'table', table: JSON_WIDGETS_ID },
+      text: 'new label',
+    },
+  ],
+  groups: [
+    { start: 0, end: 9, transactional: true },
+    { start: 9, end: 10, transactional: false },
+    { start: 10, end: 12, transactional: true },
+  ],
+  hazards: [
+    {
+      kind: 'increment-zero',
+      step: 1,
+      entity: {
+        kind: 'sequence',
+        sequence: { schema: 'public', name: 'widget_seq' },
+      },
+      increment: '0',
+    },
+  ],
+};
+
+test('compare --json emits one document with the rich change DTOs, exit 0', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', JSON_BASE_DUMP);
+  const target = await writeDump(dir, 'target.sql', JSON_TARGET_DUMP);
+
+  const result = await runCli('compare', baseline, target, '--json');
+
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  const document = JSON.parse(result.stdout) as unknown;
+  assert.deepEqual(
+    document,
+    expectedJsonEnvelope('compare', baseline, target, { changes: EXPECTED_JSON_CHANGES }),
+  );
+  assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
+});
+
+test('plan --json emits one document with multi-group steps and hazards, exit 0', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', JSON_BASE_DUMP);
+  const target = await writeDump(dir, 'target.sql', JSON_TARGET_DUMP);
+
+  const result = await runCli('plan', baseline, target, '--json');
+
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  const document = JSON.parse(result.stdout) as unknown;
+  assert.deepEqual(
+    document,
+    expectedJsonEnvelope('plan', baseline, target, EXPECTED_JSON_PLAN_RESULT),
+  );
+  assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
+});
+
+test('compare --json and plan --json emit empty arrays for identical sides, exit 0', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'dump.sql', JSON_BASE_DUMP);
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, dump, dump, '--json');
+
+    assert.equal(result.stderr, '');
+    assert.equal(result.code, 0);
+    const expectedResult =
+      command === 'compare'
+        ? { changes: [] }
+        : { targetVersion: 13, steps: [], groups: [], hazards: [] };
+    assert.deepEqual(
+      JSON.parse(result.stdout) as unknown,
+      expectedJsonEnvelope(
+        command,
+        dump,
+        dump,
+        expectedResult,
+        RICH_BASELINE_COUNTS,
+        RICH_BASELINE_COUNTS,
+      ),
+    );
+  }
+});
+
+test('--json --verbose leaves the document byte-identical and diagnostics complete', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'dump.sql', JSON_DIAGNOSTICS_DUMP);
+  const flag = {
+    kind: 'flag',
+    code: 'unsupported-attribute',
+    object: 'public.users',
+    message: 'dropped NULLS NOT DISTINCT on unique constraint users_email_key from public.users',
+    position: { line: 1, column: 1, offset: 0 },
+  };
+  const skip = {
+    kind: 'skip',
+    code: 'unsupported-statement',
+    object: 'public.idx_users_partial',
+    message: 'skipped CREATE INDEX public.idx_users_partial (partial WHERE)',
+    position: { line: 7, column: 1, offset: 138 },
+  };
+  const expectedDiagnostics = { baseline: [flag, skip], target: [flag, skip] };
+
+  for (const command of ['compare', 'plan'] as const) {
+    const human = await runCli(command, dump, dump);
+    const humanVerbose = await runCli(command, dump, dump, '--verbose');
+    const quiet = await runCli(command, dump, dump, '--json');
+    const verbose = await runCli(command, dump, dump, '--json', '--verbose');
+
+    assert.equal(quiet.stdout, verbose.stdout, `${command}: --verbose changed the document`);
+    assert.equal(quiet.stderr, human.stderr, `${command}: quiet stderr differs from human`);
+    assert.equal(
+      verbose.stderr,
+      humanVerbose.stderr,
+      `${command}: verbose stderr differs from human`,
+    );
+    assert.equal(quiet.code, 0);
+    assert.equal(verbose.code, 0);
+    const document = JSON.parse(quiet.stdout) as JsonEnvelopeProbe;
+    assert.deepEqual(document.diagnostics, expectedDiagnostics);
+    assert.equal(quiet.stdout, `${JSON.stringify(document, null, 2)}\n`);
+  }
+});
+
+test('compare --json and plan --json leave stdout empty on a read failure, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', JSON_BASE_DUMP);
+  const missing = join(dir, 'missing.sql');
+  const expected = `schemamill: cannot read ${missing}: ENOENT: no such file or directory, open '${missing}'\n`;
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, baseline, missing, '--json');
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, expected);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('compare --json and plan --json emit no document on a dangling sequence owner, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, '--target-workspace', empty, '--json', { cwd: root });
+
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, DANGLING_TABLE_ERROR);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('compare --json and plan --json carry import error diagnostics and exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', JSON_BASE_DUMP);
+  const target = await writeDump(dir, 'target.sql', PARSE_FAILURE_TARGET);
+  const expectedDiagnostic = {
+    kind: 'error',
+    code: 'parse-failure',
+    message: 'syntax error at or near ")"',
+    position: { line: 7, column: 2, offset: 100 },
+  };
+
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, baseline, target, '--json');
+
+    assert.equal(
+      result.stderr,
+      'target: 1 failed\ntarget: [error] syntax error at or near ")" (7:2)\n',
+    );
+    assert.equal(result.code, 1);
+    const document = JSON.parse(result.stdout) as JsonEnvelopeProbe;
+    assert.equal(document.command, command);
+    assert.deepEqual(document.diagnostics.baseline, []);
+    assert.deepEqual(document.diagnostics.target, [expectedDiagnostic]);
+    if (command === 'compare') {
+      assert.ok(document.result.changes !== undefined && document.result.changes.length > 0);
+    } else {
+      assert.ok(document.result.steps !== undefined);
+      assert.ok(document.result.groups !== undefined);
+      assert.ok(document.result.hazards !== undefined);
+    }
+    assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
+  }
+});
+
+test('plan --json emits the document and the existing refusal line on render refusal, exit 1', async () => {
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('plan', baseline, target, '--json');
+
+  assert.equal(
+    result.stderr,
+    'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)\n',
+  );
+  assert.equal(result.code, 1);
+  const document = JSON.parse(result.stdout) as JsonEnvelopeProbe;
+  assert.equal(document.command, 'plan');
+  assert.deepEqual(document.result.groups, [{ start: 0, end: 2, transactional: true }]);
+  assert.equal(document.result.steps?.length, 2);
+  assert.equal(result.stdout.includes('BEGIN;'), false, 'the document carries no rendered SQL');
+  assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
+});
+
+test('a --json usage error leaves stdout empty and prints the usage line, exit 1', async () => {
+  for (const command of ['compare', 'plan'] as const) {
+    const result = await runCli(command, '--json');
+
+    assert.equal(result.stdout, '');
+    assert.equal(
+      result.stderr,
+      'error: name at least one dump path (the workspace can fill the other side)\n',
+    );
+    assert.equal(result.code, 1);
+  }
+});
+
+test('human compare and plan output without --json stays byte-identical to the goldens with empty stderr', async () => {
+  for (const scene of ['all-changes', 'views'] as const) {
+    for (const command of ['compare', 'plan'] as const) {
+      const baseline = fixturePath(`${scene}.baseline.sql`);
+      const target = fixturePath(`${scene}.target.sql`);
+
+      const result = await runCli(command, baseline, target);
+
+      assert.equal(result.stdout, testText(`goldens/${scene}.${command}.txt`));
+      assert.equal(result.stderr, '');
+      assert.equal(result.code, 0);
+    }
+  }
 });
