@@ -2073,8 +2073,8 @@ test('keeps a tablespace index comment and drops comments on skipped rows withou
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_excl',
-      message: 'skipped exclusion constraint public.t_excl',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_excl',
     },
     {
       kind: 'flag',
@@ -3471,8 +3471,8 @@ test('reports every constraint diagnostic with the exact line, object, and order
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.ex_skip',
-      message: 'skipped exclusion constraint public.ex_skip',
+      object: 'public.t',
+      message: 'skipped exclusion constraint ex_skip',
     },
     {
       kind: 'flag',

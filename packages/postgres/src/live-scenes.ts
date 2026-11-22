@@ -4868,7 +4868,7 @@ const introspectionFlagsNullsNotDistinctScene = (): LiveScene => ({
 /**
  * The constraint flags scene: the constraint states the model cannot carry stay flagged, one
  * per table so the canonical table order is part of the pin. Raw setup SQL creates an
- * exclusion constraint (no model shape, skipped whole and named by its constraint object), a
+ * exclusion constraint (no model shape, skipped whole and named by its owning table), a
  * check marked `NO INHERIT`, a unique constraint with an `INCLUDE` column list, and a foreign
  * key with `MATCH FULL`; the model and target are empty, so the diagnostics are the whole
  * claim. The generated names are PostgreSQL 16.15's conventional ones, pinned exactly.
@@ -4897,8 +4897,8 @@ const introspectionFlagsConstraintsScene = (): LiveScene => ({
       {
         kind: 'skip',
         code: 'unsupported-statement',
-        object: 'public.flag_excl_during_excl',
-        message: 'skipped exclusion constraint public.flag_excl_during_excl',
+        object: 'public.flag_excl',
+        message: 'skipped exclusion constraint flag_excl_during_excl',
       },
       {
         kind: 'flag',
