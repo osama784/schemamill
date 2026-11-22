@@ -4915,7 +4915,7 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
   assert.deepEqual(diagnostics, []);
 });
 
-test('skips a materialized view index as a table that was not imported', async () => {
+test('imports a materialized view index, canonicalized to unnamed', async () => {
   const dump = [
     `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a WITH NO DATA;`,
     `CREATE UNIQUE INDEX mv_a_idx ON app.mv USING btree (a);`,
@@ -4923,18 +4923,172 @@ test('skips a materialized view index as a table that was not imported', async (
 
   const { model, diagnostics } = await importDump(dump);
 
-  // Matview indexes are not modeled in this slice and the matview is not a table draft, so the
-  // existing missing-table skip names it without manufacturing a phantom table.
+  // The matview owns the index now. `mv_a_idx` is the server form for an unnamed unique index,
+  // so canonicalization strips it exactly as it does on a table, with no diagnostic.
   assert.deepEqual(model.tables, []);
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a' },
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 1 AS a',
+      indexes: [{ unique: true, columns: ['a'] }],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports plain, unique, unnamed, and concurrent materialized view indexes', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a, 2 AS b WITH NO DATA;`,
+    `CREATE INDEX plain_b ON app.mv USING btree (b);`,
+    `CREATE UNIQUE INDEX uniq_a ON app.mv USING btree (a);`,
+    `CREATE INDEX mv_a_b_idx ON app.mv USING btree (a, b);`,
+    `CREATE INDEX CONCURRENTLY conc_ab ON app.mv USING btree (a, b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The generated `mv_a_b_idx` strips to unnamed and sorts first; a named index keeps its name,
+  // and `concurrently` is stored only for the statement that states it.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 1 AS a,2 AS b',
+      indexes: [
+        { unique: false, columns: ['a', 'b'] },
+        { name: 'conc_ab', unique: false, columns: ['a', 'b'], concurrently: true },
+        { name: 'plain_b', unique: false, columns: ['b'] },
+        { name: 'uniq_a', unique: true, columns: ['a'] },
+      ],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips an index on a plain view with the exact plain-view diagnostic', async () => {
+  const dump = [
+    `CREATE VIEW app.v AS SELECT 1 AS a;`,
+    `CREATE INDEX v_a_idx ON app.v USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'v', materialized: false, definition: 'SELECT 1 AS a' },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
       kind: 'skip',
       code: 'unsupported-statement',
+      object: 'app.v_a_idx',
+      message: 'skipped CREATE INDEX app.v_a_idx (indexes are not supported on a plain view)',
+    },
+  ]);
+});
+
+test('keeps the table-not-imported skip for an index whose owner is unknown', async () => {
+  const dump = [`CREATE INDEX ghost_a_idx ON app.ghost USING btree (a);`].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables, []);
+  assert.deepEqual(model.views, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.ghost_a_idx',
+      message: 'skipped CREATE INDEX app.ghost_a_idx (table not imported)',
+    },
+  ]);
+});
+
+test('clears materialized view indexes on a repeated CREATE MATERIALIZED VIEW', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a WITH NO DATA;`,
+    `CREATE INDEX mv_a_idx ON app.mv USING btree (a);`,
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 2 AS b WITH NO DATA;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // The second definition replaces the whole draft, dropping the earlier index with it.
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 2 AS b' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('keeps table indexes byte-identical alongside a materialized view index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS a WITH NO DATA;`,
+    `CREATE INDEX t_b_idx ON public.t USING btree (b);`,
+    `CREATE UNIQUE INDEX ON public.t (b);`,
+    `CREATE INDEX CONCURRENTLY t_ab_idx ON public.t USING btree (a, b);`,
+    `CREATE INDEX mv_a_idx ON public.mv USING btree (a);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]!.indexes, [
+    { unique: false, columns: ['b'] },
+    { unique: true, columns: ['b'] },
+    { name: 't_ab_idx', unique: false, columns: ['a', 'b'], concurrently: true },
+  ]);
+  assert.deepEqual(model.views[0]!.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips a materialized view index outside the minimal envelope', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a, 2 AS b WITH NO DATA;`,
+    `CREATE INDEX mv_ab_idx ON app.mv USING btree (a) INCLUDE (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a,2 AS b' },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'app.mv_ab_idx',
+      message: 'skipped CREATE INDEX app.mv_ab_idx (INCLUDE)',
+    },
+  ]);
+});
+
+test('leaves a comment on a materialized view index flagged and deferred', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a WITH NO DATA;`,
+    `CREATE INDEX mv_a_idx ON app.mv USING btree (a);`,
+    `COMMENT ON INDEX app.mv_a_idx IS 'note';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  // `findCommentedIndex` reaches table drafts only (#146): the index imports, the comment drops.
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 1 AS a',
+      indexes: [{ unique: false, columns: ['a'] }],
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
       object: 'app.mv_a_idx',
-      message: 'skipped CREATE INDEX app.mv_a_idx (table not imported)',
+      message: 'dropped comment from app.mv_a_idx',
     },
   ]);
 });
