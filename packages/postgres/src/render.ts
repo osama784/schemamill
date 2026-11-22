@@ -14,6 +14,7 @@ import type {
   Identity,
   IdentityFieldChange,
   Index,
+  IndexOwner,
   Plan,
   PrimaryKey,
   Sequence,
@@ -406,7 +407,7 @@ function assertGroupsTileSteps(plan: Plan): void {
 }
 
 /**
- * Refuses a plan that renders two index statements of one polarity on one table under one
+ * Refuses a plan that renders two index statements of one polarity on one owner under one
  * server-form name — an explicit name clipped by PostgreSQL's 63-byte identifier limit, the
  * conventional prediction for an unnamed one. Two creates would collide at apply time, and
  * two drops would drop one name twice, so the SQL cannot satisfy the plan;
@@ -421,15 +422,18 @@ function assertIndexNamesUnique(plan: Plan): void {
   for (const step of plan.steps) {
     const statement = indexStatement(step);
     if (statement === undefined) continue;
-    const { table, index, polarity } = statement;
-    const name = serverIndexName(table, index);
-    const key = JSON.stringify([table.schema, table.name, polarity, name]);
+    const { owner, index, polarity } = statement;
+    const relation = owner.kind === 'table' ? owner.table : owner.view;
+    const name = serverIndexName(relation, index);
+    const key = JSON.stringify([owner.kind, relation.schema, relation.name, polarity, name]);
     const previous = claimed.get(key);
     if (previous !== undefined) {
+      const previousRelation =
+        previous.owner.kind === 'table' ? previous.owner.table : previous.owner.view;
       throw new RenderRefusalError(
-        `refusing to render: index ${polarity} on ${renderTable(table)} would share the name ` +
-          `${JSON.stringify(name)}: ${describeIndex(previous.table, previous.index, name)} and ` +
-          `${describeIndex(table, index, name)}`,
+        `refusing to render: index ${polarity} on ${renderTable(relation)} would share the name ` +
+          `${JSON.stringify(name)}: ${describeIndex(previousRelation, previous.index, name)} and ` +
+          `${describeIndex(relation, index, name)}`,
       );
     }
     claimed.set(key, statement);
@@ -446,9 +450,9 @@ function serverIndexName(table: TableIdentity, index: Index): string {
     : truncateIdentifier(index.name);
 }
 
-/** One index statement's table, index, and polarity, for the duplicate-name guard. */
+/** One index statement's owner, index, and polarity, for the duplicate-name guard. */
 interface IndexStatement {
-  readonly table: TableIdentity;
+  readonly owner: IndexOwner;
   readonly index: Index;
   readonly polarity: 'creates' | 'drops';
 }
@@ -458,10 +462,10 @@ function indexStatement(step: Step): IndexStatement | undefined {
   switch (step.kind) {
     case 'create-index':
     case 'create-index-concurrently':
-      return { table: step.table, index: step.index, polarity: 'creates' };
+      return { owner: step.owner, index: step.index, polarity: 'creates' };
     case 'drop-index':
     case 'drop-index-concurrently':
-      return { table: step.table, index: step.index, polarity: 'drops' };
+      return { owner: step.owner, index: step.index, polarity: 'drops' };
     case 'create-schema':
     case 'create-table':
     case 'drop-table':
@@ -738,8 +742,9 @@ function stepGroupIndices(plan: Plan): number[] {
  * persistence, identity, primary-key, foreign-key, unique-constraint, check-constraint, and
  * index — answers with its `table`; schema, sequence, extension, view, and comment steps answer
  * `undefined`, because a `referencedTable`, an `ownedBy`, or a view body is never a step's
- * principal table. The switch is exhaustive over `Step`, so a new kind cannot quietly acquire
- * an accidental answer.
+ * principal table. A materialized-view-owned index also answers `undefined`: it alters a view,
+ * not a table. The switch is exhaustive over `Step`, so a new kind cannot quietly acquire an
+ * accidental answer.
  */
 function stepPrincipalTable(step: Step): TableIdentity | undefined {
   switch (step.kind) {
@@ -762,11 +767,12 @@ function stepPrincipalTable(step: Step): TableIdentity | undefined {
     case 'drop-unique-constraint':
     case 'add-check-constraint':
     case 'drop-check-constraint':
+      return step.table;
     case 'create-index':
     case 'drop-index':
     case 'create-index-concurrently':
     case 'drop-index-concurrently':
-      return step.table;
+      return step.owner.kind === 'table' ? step.owner.table : undefined;
     case 'create-schema':
     case 'create-sequence':
     case 'drop-sequence':
@@ -863,13 +869,13 @@ function renderStep(step: Step, targetVersion: number): string {
           synthesizedCheckConstraintName(step.table, step.checkConstraint),
       )};`;
     case 'create-index':
-      return renderCreateIndex(step.table, step.index, false);
+      return renderCreateIndex(step.owner, step.index, false);
     case 'create-index-concurrently':
-      return renderCreateIndex(step.table, step.index, true);
+      return renderCreateIndex(step.owner, step.index, true);
     case 'drop-index':
-      return renderDropIndex(step.table, step.index, false);
+      return renderDropIndex(step.owner, step.index, false);
     case 'drop-index-concurrently':
-      return renderDropIndex(step.table, step.index, true);
+      return renderDropIndex(step.owner, step.index, true);
     case 'create-sequence':
       return renderCreateSequence(step.sequence);
     case 'drop-sequence':
@@ -1209,27 +1215,29 @@ function renderCheckConstraint(checkConstraint: CheckConstraint): string {
   )}`;
 }
 
-/** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <table> USING btree (cols)`. */
-function renderCreateIndex(table: TableIdentity, index: Index, concurrently: boolean): string {
+/** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <owner> USING btree (cols)`. */
+function renderCreateIndex(owner: IndexOwner, index: Index, concurrently: boolean): string {
+  const relation = owner.kind === 'table' ? owner.table : owner.view;
   const unique = index.unique ? 'UNIQUE ' : '';
   const concurrent = concurrently ? 'CONCURRENTLY ' : '';
   const name = index.name === undefined ? '' : `${quoteIdentifier(index.name)} `;
   const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
   return `CREATE ${unique}INDEX ${concurrent}${name}ON ${renderTable(
-    table,
+    relation,
   )} USING btree (${columns});`;
 }
 
 /**
  * `DROP INDEX [CONCURRENTLY] <schema>.<name>`, synthesizing the conventional name when
- * absent. Unlike `CREATE INDEX`, whose name lands in the table's schema, a `DROP INDEX` with
+ * absent. Unlike `CREATE INDEX`, whose name lands in the owner's schema, a `DROP INDEX` with
  * a bare name resolves through `search_path`, so the index must be qualified with the schema
- * of the table it belongs to.
+ * of the relation it belongs to.
  */
-function renderDropIndex(table: TableIdentity, index: Index, concurrently: boolean): string {
+function renderDropIndex(owner: IndexOwner, index: Index, concurrently: boolean): string {
+  const relation = owner.kind === 'table' ? owner.table : owner.view;
   const concurrent = concurrently ? 'CONCURRENTLY ' : '';
-  const name = index.name ?? synthesizedIndexName(table, index);
-  return `DROP INDEX ${concurrent}${quoteIdentifier(table.schema)}.${quoteIdentifier(name)};`;
+  const name = index.name ?? synthesizedIndexName(relation, index);
+  return `DROP INDEX ${concurrent}${quoteIdentifier(relation.schema)}.${quoteIdentifier(name)};`;
 }
 
 /**

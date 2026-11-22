@@ -15,6 +15,7 @@ import type {
   ExtensionIdentity,
   ForeignKey,
   Index,
+  IndexOwner,
   Model,
   PrimaryKey,
   Sequence,
@@ -94,7 +95,11 @@ import type {
  * VIEW` keeps grants, ownership, and dependent views, but PostgreSQL requires compatible output
  * columns. A changed materialized view, or any change between plain and materialized, becomes a
  * drop-view and a create-view; a materialized view cannot be replaced, and the recreate states
- * `WITH NO DATA`. View steps carry no column or table payloads.
+ * `WITH NO DATA`. View steps carry no column or table payloads. A materialized view's indexes
+ * travel as separate create steps: an added view contributes one per target index, and a
+ * recreated one contributes drops for its baseline indexes and creates for all target indexes;
+ * the per-index changes the diff reports for that recreated identity are suppressed so the
+ * recreate owns them. A removed view emits no index drops — PostgreSQL drops them with it.
  *
  * An extension addition becomes a create-extension step carrying the extension as stored,
  * comment included; its comment still travels through the terminal comment phase as the single
@@ -128,17 +133,22 @@ import type {
  *    baseline owner table or column the plan removes and whose ownership the target changes.
  *    The detach (`OWNED BY NONE`) must run before the owner's drop, or the drop would cascade
  *    the sequence away;
- * 5. drop-view — every removed view and the drop half of every rewritten one, in view identity
- *    order. View drops precede the table phases so a removed view cannot block a table or
- *    column drop; a dependency between views is not modeled, so a dependent view may still
- *    fail the drop at apply. Extension removal carries the same class: `DROP EXTENSION`
- *    defaults to RESTRICT, so a kept object that depends on a removed extension fails at apply
- *    (phase 13);
+ * 5. view-owned index drops, then drop-view — every dropped index of a kept or recreated
+ *    materialized view, in view identity order, ahead of every removed view and the drop half of
+ *    every rewritten one, also in view identity order. An index goes before the view that owns
+ *    it; a removed view contributes no index steps because its drop takes its indexes with it.
+ *    View drops precede the table phases so a removed view cannot block a table or column drop;
+ *    a dependency between views is not modeled, so a dependent view may still fail the drop at
+ *    apply. Extension removal carries the same class: `DROP EXTENSION` defaults to RESTRICT,
+ *    so a kept object that depends on a removed extension fails at apply (phase 13);
  * 6. table operations — the eighteen table phases listed below, in their exact order;
- * 7. create-view, then replace-view — every added view and the create half of every rewritten
- *    one, then the changed plain views, each bucket in view identity order. Views come after
- *    every table phase so a view can reference a newly created table or column; a kept view
- *    whose definition references a dropped object still fails at apply;
+ * 7. create-view, then replace-view, then view-owned index creates — every added view and the
+ *    create half of every rewritten one, then the changed plain views, then one create step per
+ *    target index of every added or recreated matview and of every kept matview's added or
+ *    changed index, each bucket in view identity order. A concurrent matview index keeps its
+ *    non-transactional classification and stands alone. Views come after every table phase so a
+ *    view can reference a newly created table or column; a kept view whose definition references
+ *    a dropped object still fails at apply;
  * 8. ownership attaches/re-owns — an ownership alter-sequence step for every kept sequence
  *    whose target ownership differs from its baseline one and whose baseline owner is not
  *    removed in phase 4: a new owner after a phase-4 detach, a new owner over a surviving
@@ -387,14 +397,14 @@ export type Step =
   | { kind: 'add-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
   /** The baseline has a check constraint the target does not. */
   | { kind: 'drop-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
-  /** The target has a standalone index the baseline does not. */
-  | { kind: 'create-index'; table: TableIdentity; index: Index }
-  /** The baseline has a standalone index the target does not. */
-  | { kind: 'drop-index'; table: TableIdentity; index: Index }
+  /** The target has a standalone index the baseline does not, on the named owner. */
+  | { kind: 'create-index'; owner: IndexOwner; index: Index }
+  /** The baseline has a standalone index the target does not, on the named owner. */
+  | { kind: 'drop-index'; owner: IndexOwner; index: Index }
   /** Like `create-index`, applied `CONCURRENTLY`, outside a transaction. */
-  | { kind: 'create-index-concurrently'; table: TableIdentity; index: Index }
+  | { kind: 'create-index-concurrently'; owner: IndexOwner; index: Index }
   /** Like `drop-index`, applied `CONCURRENTLY`, outside a transaction. */
-  | { kind: 'drop-index-concurrently'; table: TableIdentity; index: Index }
+  | { kind: 'drop-index-concurrently'; owner: IndexOwner; index: Index }
   /** The target has a sequence the baseline does not; a copy without its ownership. */
   | { kind: 'create-sequence'; sequence: Sequence }
   /** The baseline has a sequence the target does not. */
@@ -620,8 +630,37 @@ export function plan(baseline: Model, target: Model): Plan {
   assertTargetOwnership(target);
   const changes = diff(baseline, target);
 
+  // A recreated matview owns every index of its identity: the drop destroys the baseline ones
+  // and the create must re-create all target ones, including indexes the diff left untouched.
+  // Suppress the diff's per-index changes here rather than in `applyChange`, so that seam keeps
+  // its signature and its direct callers stay untouched.
+  const recreatedViews = new Set(
+    changes
+      .filter(
+        (change): change is Extract<Change, { kind: 'view-changed' }> =>
+          change.kind === 'view-changed' &&
+          (change.before.materialized || change.after.materialized),
+      )
+      .map((change) => JSON.stringify([change.view.schema, change.view.name])),
+  );
+  const changesToApply =
+    recreatedViews.size === 0
+      ? changes
+      : changes.filter((change) => {
+          if (
+            change.kind !== 'view-index-added' &&
+            change.kind !== 'view-index-removed' &&
+            change.kind !== 'view-index-changed'
+          ) {
+            return true;
+          }
+          const owner = change.owner;
+          if (owner.kind !== 'materialized-view') return true;
+          return !recreatedViews.has(JSON.stringify([owner.view.schema, owner.view.name]));
+        });
+
   const application = emptyChangeApplication();
-  for (const change of changes) applyChange(application, change);
+  for (const change of changesToApply) applyChange(application, change);
 
   const { drops: tableDrops, breaks } = orderTableDrops(application.removedTables);
   const { drops: dependentKeyDrops, adds: dependentKeyAdds } = dependentForeignKeySteps(
@@ -693,6 +732,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.identityDrops,
     ...application.sequenceCreates,
     ...ownershipDetaches,
+    ...application.viewIndexDrops,
     ...application.viewDrops,
     ...application.foreignKeyDrops,
     ...dependentKeyDrops,
@@ -717,6 +757,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...dependentKeyAdds,
     ...application.viewCreates,
     ...application.viewReplaces,
+    ...application.viewIndexCreates,
     ...ownershipAttaches,
     ...application.optionAlters,
     ...sequenceDrops,
@@ -773,10 +814,14 @@ export interface ChangeApplication {
   readonly extensionAlters: Step[];
   /** Removed extensions, last in the plan. */
   readonly extensionDrops: Step[];
+  /** Dropped indexes of kept or recreated matviews, ahead of the view drops in phase 5. */
+  readonly viewIndexDrops: Step[];
   /** Removed views and the drop half of rewritten ones, before the table phases. */
   readonly viewDrops: Step[];
   /** Added views and the create half of rewritten ones, after the table phases. */
   readonly viewCreates: Step[];
+  /** Created indexes of added, recreated, or kept matviews, after the view creates in phase 7. */
+  readonly viewIndexCreates: Step[];
   /** Changed plain views, applied with `CREATE OR REPLACE VIEW` after the table phases. */
   readonly viewReplaces: Step[];
   /**
@@ -827,8 +872,10 @@ export function emptyChangeApplication(): ChangeApplication {
     extensionCreates: [],
     extensionAlters: [],
     extensionDrops: [],
+    viewIndexDrops: [],
     viewDrops: [],
     viewCreates: [],
+    viewIndexCreates: [],
     viewReplaces: [],
     comments: [],
     ownershipChanges: [],
@@ -880,7 +927,7 @@ export function applyChange(application: ChangeApplication, change: Change): voi
         });
       }
       for (const index of change.table.indexes) {
-        application.indexCreates.push(indexCreateStep(copyIdentity(change.table), index));
+        application.indexCreates.push(indexCreateStep(tableOwner(change.table), index));
       }
       for (const column of change.table.columns) {
         if (column.identity === undefined) continue;
@@ -1169,23 +1216,21 @@ export function applyChange(application: ChangeApplication, change: Change): voi
             break;
           }
           case 'index-removed': {
-            application.indexDrops.push(
-              indexDropStep(copyIdentity(change.table), tableChange.index),
-            );
+            application.indexDrops.push(indexDropStep(tableOwner(change.table), tableChange.index));
             break;
           }
           case 'index-added': {
             application.indexCreates.push(
-              indexCreateStep(copyIdentity(change.table), tableChange.index),
+              indexCreateStep(tableOwner(change.table), tableChange.index),
             );
             break;
           }
           case 'index-changed': {
             application.indexDrops.push(
-              indexDropStep(copyIdentity(change.table), tableChange.before),
+              indexDropStep(tableOwner(change.table), tableChange.before),
             );
             application.indexCreates.push(
-              indexCreateStep(copyIdentity(change.table), tableChange.after),
+              indexCreateStep(tableOwner(change.table), tableChange.after),
             );
             pushRecreateComment(
               application,
@@ -1266,6 +1311,11 @@ export function applyChange(application: ChangeApplication, change: Change): voi
     }
     case 'view-added': {
       application.viewCreates.push({ kind: 'create-view', view: copyView(change.view) });
+      // CREATE MATERIALIZED VIEW never creates its indexes; each target index is its own
+      // step, assembled after the view create rather than in the table index phase.
+      for (const index of change.view.indexes ?? []) {
+        application.viewIndexCreates.push(indexCreateStep(viewOwner(change.view), index));
+      }
       break;
     }
     case 'view-removed': {
@@ -1290,7 +1340,16 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           view: copyViewIdentity(change.before),
           materialized: change.before.materialized,
         });
+        // The recreate owns every index: drop the baseline ones ahead of the view drop and
+        // create every target one after the view create. The diff's per-index changes for this
+        // identity are filtered out in `plan()` before this seam is called.
+        for (const index of change.before.indexes ?? []) {
+          application.viewIndexDrops.push(indexDropStep(viewOwner(change.before), index));
+        }
         application.viewCreates.push({ kind: 'create-view', view: copyView(change.after) });
+        for (const index of change.after.indexes ?? []) {
+          application.viewIndexCreates.push(indexCreateStep(viewOwner(change.after), index));
+        }
         pushRecreateComment(
           application,
           {
@@ -1301,6 +1360,23 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           change.after.comment,
         );
       }
+      break;
+    }
+    case 'view-index-removed': {
+      application.viewIndexDrops.push(indexDropStep(copyIndexOwner(change.owner), change.index));
+      break;
+    }
+    case 'view-index-added': {
+      application.viewIndexCreates.push(
+        indexCreateStep(copyIndexOwner(change.owner), change.index),
+      );
+      break;
+    }
+    case 'view-index-changed': {
+      application.viewIndexDrops.push(indexDropStep(copyIndexOwner(change.owner), change.before));
+      application.viewIndexCreates.push(
+        indexCreateStep(copyIndexOwner(change.owner), change.after),
+      );
       break;
     }
     case 'extension-added': {
@@ -1347,9 +1423,12 @@ export function applyChange(application: ChangeApplication, change: Change): voi
   }
 }
 
-/** A copy of `view`, independent of the diff's change. */
+/** A copy of `view`, independent of the diff's change, including its index array. */
 function copyView(view: View): View {
-  return { ...view };
+  return {
+    ...view,
+    ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
+  };
 }
 
 /** A copy of a view identity, independent of the diff's change. */
@@ -1520,20 +1599,35 @@ function copyIndex(index: Index): Index {
   return copyStepPayload(index);
 }
 
+/** An independent owner payload for a table-owned index step. */
+function tableOwner(table: TableIdentity): IndexOwner {
+  return { kind: 'table', table: copyIdentity(table) };
+}
+
+/** An independent owner payload for a materialized-view-owned index step. */
+function viewOwner(view: ViewIdentity): IndexOwner {
+  return { kind: 'materialized-view', view: copyViewIdentity(view) };
+}
+
+/** An independent copy of an index change's owner discriminant. */
+function copyIndexOwner(owner: IndexOwner): IndexOwner {
+  return owner.kind === 'table' ? tableOwner(owner.table) : viewOwner(owner.view);
+}
+
 /** The create step for `index`: concurrent exactly when the index states `concurrently`. */
-function indexCreateStep(table: TableIdentity, index: Index): Step {
+function indexCreateStep(owner: IndexOwner, index: Index): Step {
   return {
     kind: index.concurrently === true ? 'create-index-concurrently' : 'create-index',
-    table,
+    owner,
     index: copyIndex(index),
   };
 }
 
 /** The drop step for `index`: concurrent exactly when the index states `concurrently`. */
-function indexDropStep(table: TableIdentity, index: Index): Step {
+function indexDropStep(owner: IndexOwner, index: Index): Step {
   return {
     kind: index.concurrently === true ? 'drop-index-concurrently' : 'drop-index',
-    table,
+    owner,
     index: copyIndex(index),
   };
 }

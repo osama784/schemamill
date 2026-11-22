@@ -931,7 +931,21 @@ const applyStep = (state: SimulatedState, step: Step): void => {
     }
     case 'create-index':
     case 'create-index-concurrently': {
-      const key = keyOf(step.table);
+      if (step.owner.kind === 'materialized-view') {
+        const key = keyOf(step.owner.view);
+        const view = state.views.get(key);
+        assert.ok(view !== undefined, `${step.kind} on missing view ${key}`);
+        assert.equal(view.materialized, true, `${step.kind} on plain view ${key}`);
+        const entryKey = indexKey(step.index);
+        const indexes = view.indexes ?? [];
+        assert.ok(
+          !indexes.some((entry) => indexKey(entry) === entryKey),
+          `${step.kind} of live ${entryKey} on ${key}`,
+        );
+        view.indexes = [...indexes, copyIndex(step.index)];
+        return;
+      }
+      const key = keyOf(step.owner.table);
       const table = state.tables.get(key);
       assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
       for (const name of step.index.columns) {
@@ -950,7 +964,19 @@ const applyStep = (state: SimulatedState, step: Step): void => {
     }
     case 'drop-index':
     case 'drop-index-concurrently': {
-      const key = keyOf(step.table);
+      if (step.owner.kind === 'materialized-view') {
+        const key = keyOf(step.owner.view);
+        const view = state.views.get(key);
+        assert.ok(view !== undefined, `${step.kind} on missing view ${key}`);
+        const indexes = [...(view.indexes ?? [])];
+        const found = indexes.findIndex((entry) => indexKey(entry) === indexKey(step.index));
+        assert.notEqual(found, -1, `${step.kind} of missing ${indexKey(step.index)} on ${key}`);
+        indexes.splice(found, 1);
+        if (indexes.length === 0) delete view.indexes;
+        else view.indexes = indexes;
+        return;
+      }
+      const key = keyOf(step.owner.table);
       const table = state.tables.get(key);
       assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
       const found = table.indexes.findIndex((entry) => indexKey(entry) === indexKey(step.index));
@@ -1033,7 +1059,12 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         assert.ok(live !== undefined, `replace-view of missing view ${key}`);
         assert.equal(live.materialized, step.view.materialized, `replace-view of ${key} kind`);
       }
-      state.views.set(key, { ...step.view });
+      // CREATE MATERIALIZED VIEW never creates its indexes; separate index steps populate
+      // the simulated array so a view's final state matches the target model.
+      state.views.set(key, {
+        ...step.view,
+        ...(step.view.indexes === undefined ? {} : { indexes: [] }),
+      });
       return;
     }
     case 'drop-view': {
@@ -3504,7 +3535,7 @@ test('an added table attaches its constraints and indexes in phase order', () =>
     },
     { kind: 'add-unique-constraint', table: identity('users'), uniqueConstraint: unique },
     { kind: 'add-check-constraint', table: identity('users'), checkConstraint: check },
-    { kind: 'create-index', table: identity('users'), index: entry },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('users') }, index: entry },
   ]);
   simulate(model(), model(users));
 });
@@ -3608,10 +3639,10 @@ test('an index add or drop becomes its own step', () => {
   const withIndex = table('users', { columns, indexes: [entry] });
 
   assertPlan(model(without), model(withIndex), [
-    { kind: 'create-index', table: identity('users'), index: entry },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('users') }, index: entry },
   ]);
   assertPlan(model(withIndex), model(without), [
-    { kind: 'drop-index', table: identity('users'), index: entry },
+    { kind: 'drop-index', owner: { kind: 'table', table: identity('users') }, index: entry },
   ]);
   simulate(model(without), model(withIndex));
   simulate(model(withIndex), model(without));
@@ -3625,8 +3656,8 @@ test('a changed index decomposes into a drop and a create', () => {
   const target = table('t', { columns, indexes: [after] });
 
   assertPlan(model(baseline), model(target), [
-    { kind: 'drop-index', table: identity('t'), index: before },
-    { kind: 'create-index', table: identity('t'), index: after },
+    { kind: 'drop-index', owner: { kind: 'table', table: identity('t') }, index: before },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('t') }, index: after },
   ]);
   simulate(model(baseline), model(target));
 });
@@ -3650,7 +3681,11 @@ test('an added concurrent index stands alone after the transactional steps', () 
         indexes: [],
       },
     },
-    { kind: 'create-index-concurrently', table: identity('users'), index: entry },
+    {
+      kind: 'create-index-concurrently',
+      owner: { kind: 'table', table: identity('users') },
+      index: entry,
+    },
   ]);
   assert.deepStrictEqual(groups, [
     { start: 0, end: 1, transactional: true },
@@ -3666,7 +3701,11 @@ test('a dropped concurrent index is a standalone step', () => {
 
   const { steps, groups } = plan(model(users), model(table('users', { columns })));
   assert.deepStrictEqual(steps, [
-    { kind: 'drop-index-concurrently', table: identity('users'), index: entry },
+    {
+      kind: 'drop-index-concurrently',
+      owner: { kind: 'table', table: identity('users') },
+      index: entry,
+    },
   ]);
   assert.deepStrictEqual(groups, [{ start: 0, end: 1, transactional: false }]);
   simulate(model(users), model(table('users', { columns })));
@@ -3686,8 +3725,12 @@ test('a changed index takes each flag from its own side', () => {
   // The baseline's flag drives the drop; the target's flag drives the create.
   const escalating = plan(model(lazySource), model(concurrentTarget));
   assert.deepStrictEqual(escalating.steps, [
-    { kind: 'drop-index', table: identity('t'), index: source },
-    { kind: 'create-index-concurrently', table: identity('t'), index: targetConcurrent },
+    { kind: 'drop-index', owner: { kind: 'table', table: identity('t') }, index: source },
+    {
+      kind: 'create-index-concurrently',
+      owner: { kind: 'table', table: identity('t') },
+      index: targetConcurrent,
+    },
   ]);
   assert.deepStrictEqual(escalating.groups, [
     { start: 0, end: 1, transactional: true },
@@ -3696,8 +3739,12 @@ test('a changed index takes each flag from its own side', () => {
 
   const settling = plan(model(concurrentSource), model(lazyTarget));
   assert.deepStrictEqual(settling.steps, [
-    { kind: 'drop-index-concurrently', table: identity('t'), index: sourceConcurrent },
-    { kind: 'create-index', table: identity('t'), index: target },
+    {
+      kind: 'drop-index-concurrently',
+      owner: { kind: 'table', table: identity('t') },
+      index: sourceConcurrent,
+    },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('t') }, index: target },
   ]);
   assert.deepStrictEqual(settling.groups, [
     { start: 0, end: 1, transactional: false },
@@ -3806,7 +3853,7 @@ test('a mixed migration pins the exact step sequence across all eighteen table p
     // Phase 1: drop-foreign-key.
     { kind: 'drop-foreign-key', table: identity('kept'), foreignKey: obsoleteForeignKey },
     // Phase 2: drop-index.
-    { kind: 'drop-index', table: identity('kept'), index: obsoleteIndex },
+    { kind: 'drop-index', owner: { kind: 'table', table: identity('kept') }, index: obsoleteIndex },
     // Phase 3: drop-check-constraint.
     { kind: 'drop-check-constraint', table: identity('kept'), checkConstraint: obsoleteCheck },
     // Phase 4: drop-unique-constraint.
@@ -3867,8 +3914,8 @@ test('a mixed migration pins the exact step sequence across all eighteen table p
     { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: freshCheck },
     { kind: 'add-check-constraint', table: identity('kept'), checkConstraint: liveCheck },
     // Phase 17: create-index.
-    { kind: 'create-index', table: identity('fresh'), index: freshIndex },
-    { kind: 'create-index', table: identity('kept'), index: liveIndex },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('fresh') }, index: freshIndex },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('kept') }, index: liveIndex },
     // Phase 18: add-foreign-key.
     { kind: 'add-foreign-key', table: identity('fresh'), foreignKey: freshForeignKey },
     { kind: 'add-foreign-key', table: identity('kept'), foreignKey: liveForeignKey },
@@ -4015,7 +4062,11 @@ test('a deep-frozen model with constraints and indexes can be planned, and steps
   assert.deepStrictEqual(steps, [
     { kind: 'add-unique-constraint', table: identity('users'), uniqueConstraint: sourceUnique },
     { kind: 'add-check-constraint', table: identity('users'), checkConstraint: sourceCheck },
-    { kind: 'create-index', table: identity('users'), index: sourceIndex },
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('users') },
+      index: sourceIndex,
+    },
   ]);
 
   const uniqueStep = steps[0];
@@ -5292,7 +5343,13 @@ test('applyChange writes each outer change kind into its buckets', () => {
         checkConstraintAdds: [
           { kind: 'add-check-constraint', table: identity('fresh'), checkConstraint: addedCheck },
         ],
-        indexCreates: [{ kind: 'create-index', table: identity('fresh'), index: addedIndex }],
+        indexCreates: [
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('fresh') },
+            index: addedIndex,
+          },
+        ],
         identityAdds: [
           {
             kind: 'add-identity',
@@ -5577,22 +5634,46 @@ test('applyChange writes each table change kind into its buckets', () => {
       name: 'index-added',
       change: tableChanged({ kind: 'index-added', index: afterIndex }),
       buckets: {
-        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+        indexCreates: [
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: afterIndex,
+          },
+        ],
       },
     },
     {
       name: 'index-removed',
       change: tableChanged({ kind: 'index-removed', index: beforeIndex }),
       buckets: {
-        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
+        indexDrops: [
+          {
+            kind: 'drop-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: beforeIndex,
+          },
+        ],
       },
     },
     {
       name: 'index-changed',
       change: tableChanged({ kind: 'index-changed', before: beforeIndex, after: afterIndex }),
       buckets: {
-        indexDrops: [{ kind: 'drop-index', table: identity('t'), index: beforeIndex }],
-        indexCreates: [{ kind: 'create-index', table: identity('t'), index: afterIndex }],
+        indexDrops: [
+          {
+            kind: 'drop-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: beforeIndex,
+          },
+        ],
+        indexCreates: [
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: afterIndex,
+          },
+        ],
       },
     },
   ];
@@ -5983,7 +6064,7 @@ test('seeded pairs keep diff and plan deterministic and order-independent', () =
   }
 });
 
-/** The 27 array buckets of a `ChangeApplication`, in interface order. */
+/** The array buckets of a `ChangeApplication`, in interface order. */
 const applicationArrays = [
   'foreignKeyDrops',
   'primaryKeyDrops',
@@ -6009,8 +6090,10 @@ const applicationArrays = [
   'extensionCreates',
   'extensionAlters',
   'extensionDrops',
+  'viewIndexDrops',
   'viewDrops',
   'viewCreates',
+  'viewIndexCreates',
   'viewReplaces',
   'comments',
   'ownershipChanges',
@@ -6059,8 +6142,10 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     extensionCreates: 0,
     extensionAlters: 0,
     extensionDrops: 0,
+    viewIndexDrops: 0,
     viewDrops: 0,
     viewCreates: 0,
+    viewIndexCreates: 0,
     viewReplaces: 0,
     comments: 0,
     ownershipChanges: 0,
@@ -6198,6 +6283,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
         break;
       case 'view-added':
         count('viewCreates');
+        counts.viewIndexCreates += change.view.indexes?.length ?? 0;
         break;
       case 'view-removed':
         count('viewDrops');
@@ -6208,8 +6294,20 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
         } else {
           count('viewDrops');
           count('viewCreates');
+          counts.viewIndexDrops += change.before.indexes?.length ?? 0;
+          counts.viewIndexCreates += change.after.indexes?.length ?? 0;
           if (change.after.comment !== undefined) count('comments');
         }
+        break;
+      case 'view-index-removed':
+        count('viewIndexDrops');
+        break;
+      case 'view-index-added':
+        count('viewIndexCreates');
+        break;
+      case 'view-index-changed':
+        count('viewIndexDrops');
+        count('viewIndexCreates');
         break;
       case 'extension-added':
         count('extensionCreates');
@@ -6260,8 +6358,10 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.extensionCreates.push(...source.extensionCreates);
   target.extensionAlters.push(...source.extensionAlters);
   target.extensionDrops.push(...source.extensionDrops);
+  target.viewIndexDrops.push(...source.viewIndexDrops);
   target.viewDrops.push(...source.viewDrops);
   target.viewCreates.push(...source.viewCreates);
+  target.viewIndexCreates.push(...source.viewIndexCreates);
   target.viewReplaces.push(...source.viewReplaces);
   target.comments.push(...source.comments);
   target.ownershipChanges.push(...source.ownershipChanges);
@@ -7083,6 +7183,99 @@ test('the change application routes view changes into the view buckets', () => {
   ]);
 });
 
+const matviewOwner = { kind: 'materialized-view' as const, view: identity('m') };
+
+test('a new materialized view emits its index creates after the create-view', () => {
+  const entry = index(['a'], { name: 'm_a_idx' });
+  const matview = view('m', { materialized: true, indexes: [entry] });
+  const target = viewModel([matview]);
+
+  assertPlan(model(), target, [
+    { kind: 'create-view', view: matview },
+    { kind: 'create-index', owner: matviewOwner, index: entry },
+  ]);
+  assertPlan(target, model(), [{ kind: 'drop-view', view: identity('m'), materialized: true }]);
+  simulate(model(), target);
+});
+
+test('matview index creates follow view creates, not the table index phase', () => {
+  const tableEntry = index(['x'], { name: 't_x_idx' });
+  const t = table('t', { columns: [column('x')], indexes: [tableEntry] });
+  const target = viewModel(
+    [view('m', { materialized: true, indexes: [index(['a'], { name: 'm_a_idx' })] })],
+    t,
+  );
+  const viewEntry = target.views[0]!.indexes![0]!;
+
+  assertPlan(model(), target, [
+    { kind: 'create-table', table: { ...t, indexes: [] } },
+    { kind: 'create-index', owner: { kind: 'table', table: identity('t') }, index: tableEntry },
+    { kind: 'create-view', view: target.views[0]! },
+    { kind: 'create-index', owner: matviewOwner, index: viewEntry },
+  ]);
+
+  const application = emptyChangeApplication();
+  for (const change of diff(model(), target)) applyChange(application, change);
+  assert.deepStrictEqual(application.indexCreates, [
+    { kind: 'create-index', owner: { kind: 'table', table: identity('t') }, index: tableEntry },
+  ]);
+  assert.deepStrictEqual(application.viewIndexCreates, [
+    { kind: 'create-index', owner: matviewOwner, index: viewEntry },
+  ]);
+});
+
+test('a recreated materialized view drops its old indexes and creates every target index', () => {
+  const oldEntry = index(['a'], { name: 'm_a_idx' });
+  const newEntry = index(['b'], { name: 'm_b_idx' });
+  const before = view('m', {
+    materialized: true,
+    definition: 'SELECT 1',
+    indexes: [oldEntry],
+  });
+  const after = view('m', {
+    materialized: true,
+    definition: 'SELECT 2',
+    indexes: [newEntry],
+  });
+
+  assertPlan(viewModel([before]), viewModel([after]), [
+    { kind: 'drop-index', owner: matviewOwner, index: oldEntry },
+    { kind: 'drop-view', view: identity('m'), materialized: true },
+    { kind: 'create-view', view: after },
+    { kind: 'create-index', owner: matviewOwner, index: newEntry },
+  ]);
+  simulate(viewModel([before]), viewModel([after]));
+});
+
+test('a concurrent materialized-view index stands alone after the view create', () => {
+  const entry = index(['a'], { name: 'm_a_idx', concurrently: true });
+  const matview = view('m', { materialized: true, indexes: [entry] });
+  const target = viewModel([matview]);
+  const planned = plan(model(), target);
+
+  assert.deepStrictEqual(planned.steps, [
+    { kind: 'create-view', view: matview },
+    { kind: 'create-index-concurrently', owner: matviewOwner, index: entry },
+  ]);
+  assert.deepStrictEqual(planned.groups, [
+    { start: 0, end: 1, transactional: true },
+    { start: 1, end: 2, transactional: false },
+  ]);
+  simulate(model(), target);
+});
+
+test('a kept materialized view index removal drops before the table phases', () => {
+  const kept = index(['a'], { name: 'm_a_idx' });
+  const gone = index(['b'], { name: 'm_b_idx' });
+  const before = view('m', { materialized: true, indexes: [kept, gone] });
+  const after = view('m', { materialized: true, indexes: [kept] });
+
+  assertPlan(viewModel([before]), viewModel([after]), [
+    { kind: 'drop-index', owner: matviewOwner, index: gone },
+  ]);
+  simulate(viewModel([before]), viewModel([after]));
+});
+
 test('view steps are classified transactional', () => {
   assert.equal(TRANSACTIONAL['drop-view'], true);
   assert.equal(TRANSACTIONAL['create-view'], true);
@@ -7192,12 +7385,12 @@ test('an index recreate re-asserts an unchanged comment after the create', () =>
   assertPlan(baseline, target, [
     {
       kind: 'drop-index',
-      table: identity('t'),
+      owner: { kind: 'table', table: identity('t') },
       index: index(['a'], { name: 't_idx', comment: 'keep' }),
     },
     {
       kind: 'create-index',
-      table: identity('t'),
+      owner: { kind: 'table', table: identity('t') },
       index: index(['b'], { name: 't_idx', comment: 'keep' }),
     },
     {
@@ -7647,12 +7840,12 @@ test('the terminal phase sorts diff changes and recreate re-assertions together'
   assertPlan(baseline, target, [
     {
       kind: 'drop-index',
-      table: identity('b'),
+      owner: { kind: 'table', table: identity('b') },
       index: index(['x'], { name: 'b_idx', comment: 'keep' }),
     },
     {
       kind: 'create-index',
-      table: identity('b'),
+      owner: { kind: 'table', table: identity('b') },
       index: index(['y'], { name: 'b_idx', comment: 'keep' }),
     },
     { kind: 'comment', target: { kind: 'table', table: identity('a') }, text: 'new' },

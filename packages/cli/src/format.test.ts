@@ -218,13 +218,13 @@ test('a multi-group plan names each group and numbers its steps continuously', (
       { kind: 'drop-table', table: { schema: 'public', name: 'a' } },
       {
         kind: 'drop-index-concurrently',
-        table: { schema: 'public', name: 'a' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'a' } },
         index: { name: 'a_id_idx', unique: false, columns: ['id'] },
       },
       { kind: 'drop-table', table: { schema: 'public', name: 'b' } },
       {
         kind: 'create-index-concurrently',
-        table: { schema: 'public', name: 'b' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'b' } },
         index: { name: 'b_id_idx', unique: false, columns: ['id'] },
       },
     ],
@@ -439,12 +439,12 @@ test('constraint and index plan steps print the table and the constrained member
     steps: [
       {
         kind: 'drop-index',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_email_idx', unique: false, columns: ['email'] },
       },
       {
         kind: 'drop-index-concurrently',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_age_idx', unique: false, columns: ['age'] },
       },
       {
@@ -469,12 +469,12 @@ test('constraint and index plan steps print the table and the constrained member
       },
       {
         kind: 'create-index',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_name_idx', unique: false, columns: ['name'] },
       },
       {
         kind: 'create-index-concurrently',
-        table: { schema: 'public', name: 'users' },
+        owner: { kind: 'table', table: { schema: 'public', name: 'users' } },
         index: { name: 'users_name_idx_v2', unique: true, columns: ['name'] },
       },
     ],
@@ -1509,7 +1509,7 @@ test('an empty index name prints as ""; an absent name has no token', () => {
       formatPlan(
         aPlan({
           kind: 'create-index',
-          table: { schema: 'public', name: 't' },
+          owner: { kind: 'table', table: { schema: 'public', name: 't' } },
           index: anIndex(name),
         }),
       ),
