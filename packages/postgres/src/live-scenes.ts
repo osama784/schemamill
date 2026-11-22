@@ -141,8 +141,8 @@ import { renderSql } from './render.ts';
  * materialized. Its `crossImportChecks` compare the applied database's import with the target
  * database's import — both produced by the same server from its own dumps — so no
  * `pg_get_viewdef` spelling is pinned and a PostgreSQL 16-authored definition cannot fail a
- * PostgreSQL 18 run. The target build adds a unique index on the materialized view through raw
- * SQL, which the import must skip by name because a materialized view is not a table.
+ * PostgreSQL 18 run. The target model carries a unique index on the materialized view, so the
+ * migration creates it with the matview as its owner and both dumps import it.
  *
  * `comment-introspection` is the five-family comment read's server-derived equality evidence:
  * the table (with a changed special-character comment), a column comment changed and another
@@ -5547,12 +5547,12 @@ const unnamedFkRoundTripScene = (): LiveScene => {
  * The view round trip: a view redefined in place, a materialized view rewritten, a view removed,
  * two views added (one with a local check option), and a view changed from plain to
  * materialized. The tables are identical on both sides, so every step in the plan is a view
- * step. The target build additionally carries a unique index on the materialized view through
- * `targetExtraSql`, an object the model cannot declare; the target dump's import must skip it
- * by name, and the applied database (which never had it) must not report that skip. Neither
- * dump pins `pg_get_viewdef` text: the anchor checks only ask that the server's own deparse
- * mentions the column and table the definition names, and the cross-import check compares the
- * two server-derived imports to each other.
+ * step. The target model additionally carries a unique index on the rewritten materialized
+ * view, so the migration creates it with the matview as its owner and both dumps import it;
+ * the import pin asserts the index is present and that no `table not imported` skip remains.
+ * Neither dump pins `pg_get_viewdef` text: the anchor checks only ask that the server's own
+ * deparse mentions the column and table the definition names, and the cross-import check
+ * compares the two server-derived imports to each other.
  */
 const viewRoundTripScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -5587,6 +5587,7 @@ const viewRoundTripScene = (): LiveScene => {
       view('account_totals', {
         materialized: true,
         definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance >= 0',
+        indexes: [{ name: 'account_totals_id_idx', unique: true, columns: ['id'] }],
       }),
       view('active_accounts', {
         definition: 'SELECT id, name, balance FROM accounts WHERE active AND balance > 0',
@@ -5625,7 +5626,6 @@ const viewRoundTripScene = (): LiveScene => {
     name: 'view-round-trip',
     baseline,
     target,
-    targetExtraSql: 'CREATE UNIQUE INDEX account_totals_id_idx ON public.account_totals (id);',
     baselineChecks: [
       {
         description: 'the baseline account_totals is a materialized view',
@@ -5736,38 +5736,30 @@ const viewRoundTripScene = (): LiveScene => {
         },
       },
       {
-        description: 'only the target dump reports the matview index skip, by name',
+        description: 'both dumps import the matview index with no table-not-imported skip',
         failure: (imported, source) => {
-          const named = imported.diagnostics.filter((diagnostic) =>
-            diagnostic.message.includes('account_totals_id_idx'),
-          );
-          if (source === 'target') {
-            if (named.length !== 1) {
-              return `expected exactly one account_totals_id_idx diagnostic, got ${named.length}`;
-            }
-            const [diagnostic] = named;
-            const expected =
-              'skipped CREATE INDEX public.account_totals_id_idx (table not imported)';
-            if (diagnostic?.kind !== 'skip' || diagnostic.message !== expected) {
-              return `expected skip ${JSON.stringify(expected)}, got ${String(diagnostic?.kind)} ${JSON.stringify(diagnostic?.message)}`;
-            }
-            if (diagnostic.object !== 'public.account_totals_id_idx') {
-              return `the skip names ${String(diagnostic.object)}, expected public.account_totals_id_idx`;
-            }
-          } else if (named.length !== 0) {
-            return `the applied import must not report the matview index skip: ${named
-              .map((diagnostic) => diagnostic.message)
-              .join('; ')}`;
+          const totals = findView(imported, 'account_totals');
+          if (totals === undefined) return `${source}: account_totals is not imported`;
+          const indexes = totals.indexes ?? [];
+          if (indexes.length !== 1) {
+            return `${source}: account_totals imported ${indexes.length} indexes, expected 1`;
           }
-          const otherViewSkips = imported.diagnostics.filter(
+          const [index] = indexes;
+          if (index?.name !== undefined) {
+            return `${source}: the generated index name survived as ${String(index.name)}`;
+          }
+          if (index?.unique !== true || index.columns.join(',') !== 'id') {
+            return `${source}: the imported index is ${JSON.stringify(index)}`;
+          }
+          const skips = imported.diagnostics.filter(
             (diagnostic) =>
               diagnostic.kind === 'skip' &&
-              diagnostic.message.toLowerCase().includes('view') &&
-              !diagnostic.message.includes('account_totals_id_idx'),
+              (diagnostic.message.includes('table not imported') ||
+                diagnostic.message.includes('account_totals_id_idx')),
           );
-          return otherViewSkips.length === 0
+          return skips.length === 0
             ? undefined
-            : `unexpected view skips: ${otherViewSkips
+            : `${source}: unexpected index skips: ${skips
                 .map((diagnostic) => diagnostic.message)
                 .join('; ')}`;
         },
@@ -5788,6 +5780,225 @@ const viewRoundTripScene = (): LiveScene => {
                 null,
                 2,
               )}`,
+      },
+    ],
+  };
+};
+
+/**
+ * The materialized-view index round trip: a definition rewrite that drops the old matview's
+ * indexes and re-creates all four target indexes — named plain, named unique, unnamed
+ * (canonicalized back from its server-generated name), and concurrent — on the owning matview.
+ * A second, distinctly named matview carries an index and is removed by the migration, so the
+ * post-migration `pg_indexes` read proves the index disappeared with its view under RESTRICT
+ * without confusing it with the rewrite target. Both dumps describe a database that ends in the
+ * target state, so `importChecks` pin the exact imported index inventory on each side and
+ * `crossImportChecks` compare the two server-derived imports rather than a catalog read, whose
+ * index coverage is table-scoped.
+ */
+const matviewIndexRoundTripScene = (): LiveScene => {
+  const baseline: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('mv_round_trip', {
+        materialized: true,
+        definition: "SELECT 1 AS id, 'a'::text AS label",
+        indexes: [
+          { name: 'mv_rt_old_plain', unique: false, columns: ['id'] },
+          { name: 'mv_rt_old_unique', unique: true, columns: ['label'] },
+        ],
+      }),
+      view('mv_drop_probe', {
+        materialized: true,
+        definition: 'SELECT 3 AS id',
+        indexes: [{ name: 'mv_drop_probe_idx', unique: false, columns: ['id'] }],
+      }),
+    ],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('mv_round_trip', {
+        materialized: true,
+        definition: "SELECT 2 AS id, 'b'::text AS label",
+        indexes: [
+          { name: 'mv_rt_plain', unique: false, columns: ['id'] },
+          { name: 'mv_rt_unique', unique: true, columns: ['label'] },
+          { unique: false, columns: ['id', 'label'] },
+          { name: 'mv_rt_concurrent', unique: false, columns: ['label'], concurrently: true },
+        ],
+      }),
+    ],
+    extensions: [],
+  };
+
+  /** The index inventory both dumps import, in the importer's name-first sort order. */
+  const importedIndexes: readonly Index[] = [
+    { unique: false, columns: ['id', 'label'] },
+    { name: 'mv_rt_concurrent', unique: false, columns: ['label'] },
+    { name: 'mv_rt_plain', unique: false, columns: ['id'] },
+    { name: 'mv_rt_unique', unique: true, columns: ['label'] },
+  ];
+  const roundTripIn = (imported: ReadResult<Model, Diagnostic>): View | undefined =>
+    imported.model.views.find(
+      (candidate) => candidate.schema === 'public' && candidate.name === 'mv_round_trip',
+    );
+  const indexesIn = (imported: ReadResult<Model, Diagnostic>): readonly Index[] | undefined =>
+    roundTripIn(imported)?.indexes;
+  const describeIndexes = (indexes: readonly Index[] | undefined): string =>
+    JSON.stringify(
+      indexes?.map((index) => ({
+        name: index.name ?? '<unnamed>',
+        unique: index.unique,
+        columns: index.columns,
+      })) ?? '<missing>',
+    );
+
+  return {
+    name: 'matview-index-round-trip',
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the baseline rewrite target is a materialized view',
+        sql: relKindOf('mv_round_trip'),
+        expected: 'm',
+      },
+      {
+        description: 'the separately named auto-drop probe is a materialized view',
+        sql: relKindOf('mv_drop_probe'),
+        expected: 'm',
+      },
+      {
+        description: 'the auto-drop probe carries its index before the migration',
+        sql: indexesOf('mv_drop_probe'),
+        expected: 'mv_drop_probe_idx',
+      },
+    ],
+    targetChecks: [
+      {
+        description: 'the target rebuild is a materialized view',
+        sql: relKindOf('mv_round_trip'),
+        expected: 'm',
+      },
+      {
+        description: 'the target build carries all four matview indexes',
+        sql: indexesOf('mv_round_trip'),
+        expected: 'mv_round_trip_id_label_idx,mv_rt_concurrent,mv_rt_plain,mv_rt_unique',
+      },
+      {
+        description: 'the target build has no auto-drop probe',
+        sql: relationExists('mv_drop_probe'),
+        expected: 'f',
+      },
+    ],
+    planChecks: [
+      {
+        description:
+          'the rewrite drops the old indexes, then creates all four target indexes on the matview',
+        failure: (steps, migration) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          const expectedKinds =
+            'drop-index,drop-index,drop-view,drop-view,create-view,' +
+            'create-index,create-index,create-index,create-index-concurrently';
+          if (kinds !== expectedKinds) return `unexpected steps: ${kinds}`;
+          const owner = {
+            kind: 'materialized-view',
+            view: { schema: 'public', name: 'mv_round_trip' },
+          };
+          for (const [position, step] of steps.entries()) {
+            if (!('owner' in step)) continue;
+            if (!isDeepStrictEqual(step.owner, owner)) {
+              return `step ${position + 1} owner: ${JSON.stringify(step.owner)}`;
+            }
+          }
+          const groups = migration.groups
+            .map(
+              (group) =>
+                `${group.transactional ? 'wrapped' : 'standalone'}[${group.start},${group.end})`,
+            )
+            .join(' ');
+          return groups === 'wrapped[0,8) standalone[8,9)'
+            ? undefined
+            : `unexpected groups: ${groups}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated rewrite target is still a materialized view',
+        sql: relKindOf('mv_round_trip'),
+        expected: 'm',
+      },
+      {
+        description: 'the migrated matview carries all four target indexes',
+        sql: indexesOf('mv_round_trip'),
+        expected: 'mv_round_trip_id_label_idx,mv_rt_concurrent,mv_rt_plain,mv_rt_unique',
+      },
+      {
+        description: 'the named target index is unique',
+        sql: indexIsUnique('mv_rt_unique'),
+        expected: 't',
+      },
+      {
+        description: 'the concurrent matview index applied as a valid index',
+        sql: indexIsValid('mv_rt_concurrent'),
+        expected: 't',
+      },
+      {
+        description: 'dropping the probe matview auto-dropped every index row',
+        sql: indexesOf('mv_drop_probe'),
+        expected: '',
+      },
+      {
+        description: 'the probe matview itself is gone',
+        sql: relationExists('mv_drop_probe'),
+        expected: 'f',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import all four matview indexes, unnamed one canonicalized',
+        failure: (imported, source) => {
+          const indexes = indexesIn(imported);
+          if (!isDeepStrictEqual(indexes, importedIndexes)) {
+            return `${source}: indexes: ${describeIndexes(indexes)}`;
+          }
+          const probe = imported.model.views.find(
+            (candidate) => candidate.name === 'mv_drop_probe',
+          );
+          if (probe !== undefined) return `${source}: the removed probe matview was imported`;
+          const skips = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' &&
+              (diagnostic.message.includes('table not imported') ||
+                diagnostic.message.includes('indexes are not supported')),
+          );
+          return skips.length === 0
+            ? undefined
+            : `${source}: index skips: ${skips.map((item) => item.message).join('; ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'the applied and target imports carry the same genuinely imported indexes',
+        failure: (applied, expected) => {
+          const appliedIndexes = indexesIn(applied);
+          const targetIndexes = indexesIn(expected);
+          if (!isDeepStrictEqual(appliedIndexes, importedIndexes)) {
+            return `applied: indexes: ${describeIndexes(appliedIndexes)}`;
+          }
+          if (!isDeepStrictEqual(targetIndexes, importedIndexes)) {
+            return `target: indexes: ${describeIndexes(targetIndexes)}`;
+          }
+          return isDeepStrictEqual(appliedIndexes, targetIndexes)
+            ? undefined
+            : `the two imports disagree: ${describeIndexes(appliedIndexes)} vs ${describeIndexes(targetIndexes)}`;
+        },
       },
     ],
   };
@@ -7234,6 +7445,7 @@ export const scenes: readonly LiveScene[] = [
   truncatedNameRoundTripScene(),
   unnamedFkRoundTripScene(),
   viewRoundTripScene(),
+  matviewIndexRoundTripScene(),
   commentIntrospectionScene(),
   commentRoundTripScene(),
   extensionRoundTripScene(),
