@@ -1,6 +1,6 @@
 # Structured JSON for compare and plan
 
-**Status:** proposed (supply pass 2026-11-02) · **Last updated:** 2026-11-02
+**Status:** built 2026-11-23 (supply pass 2026-11-02) · **Last updated:** 2026-11-23
 
 **Size:** M. The brief may split into J1 (the envelope and `compare --json`) and J2 (`plan --json`) if the DTO tables grow, but one brief is recommended: both commands share one envelope, one diagnostics shape, and one mapper, and a split would let the two documents drift before the versioning rule is settled.
 
