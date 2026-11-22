@@ -19,7 +19,7 @@ The scanner reads every Markdown file under `docs/` except `docs/adr/`, plus `RE
 | Postgres tests | line-anchored top-level `test(` calls across `packages/postgres/src/*.test.ts` |
 | Always-on live subtests | `t.test(` calls after the `for (const scene of scenes)` loop in `live-pg.test.ts` |
 
-The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this writing it is 450 + 54 + 3 = 507 on PostgreSQL 16.2: 503 pass and the four PostgreSQL 18 scenes skip there, and all 54 run on the CI's PostgreSQL 18 leg (the first authoritative run was 382 + 50 + 3 = 435 with three PostgreSQL 18 scenes).
+The **live-suite tests** figure is a repo convention, not a runner fact: it is the postgres package total under a live URL, `postgres tests + scenes + always-on live subtests`. The report prints the three components beside the total so the convention stays visible. At this writing it is 460 + 55 + 3 = 518 on PostgreSQL 16.2: 514 pass and the four PostgreSQL 18 scenes skip there, and all 55 run on the CI's PostgreSQL 18 leg (the first authoritative run was 382 + 50 + 3 = 435 with three PostgreSQL 18 scenes).
 
 `live-scenes.ts` resolves `@schemamill/core` through the workspace link to `packages/core/dist`, so run `pnpm build` first. A failed import or parse is reported as `docs-counts: error …`; report mode still exits 0.
 
