@@ -10,6 +10,8 @@
     ~ column s_remove: storage main → (none)
     ~ column comp_add: compression (none) → pglz
     ~ column comp_remove: compression pglz → (none)
+    ~ column st_add: statistics target (none) → 500
+    ~ column st_remove: statistics target 250 → (none)
     ~ column merged: type text → character varying(12), collation pg_catalog."C" → pg_catalog."POSIX"
 
 ~ table public.backed
@@ -19,5 +21,5 @@
     persistence logged → unlogged
 
 Hazards:
-  step 13 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
-  step 14 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 15 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 16 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.

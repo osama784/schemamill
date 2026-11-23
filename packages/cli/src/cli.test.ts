@@ -777,6 +777,37 @@ test('compare prints the diff, and only the diff, when there are no hazards', as
   assert.equal(result.code, 0);
 });
 
+/**
+ * D7 — a column statistics target prints as a plain number with `(none)` standing in for the
+ * absent side. The two dumps differ only in the `SET STATISTICS` clause, so both directions pin
+ * the one changed field and nothing else.
+ */
+test('compare prints a statistics target with (none) on the absent side, in both directions', async (t) => {
+  const dir = await fixtureDir(t);
+  const schema = 'CREATE TABLE public.measured (c integer);\n';
+  const stated = `${schema}ALTER TABLE ONLY public.measured ALTER COLUMN c SET STATISTICS 500;\n`;
+  const absent = await writeDump(dir, 'absent.sql', schema);
+  const present = await writeDump(dir, 'present.sql', stated);
+
+  const added = await runCli('compare', absent, present);
+
+  assert.equal(
+    added.stdout,
+    ['~ table public.measured', '    ~ column c: statistics target (none) → 500', ''].join('\n'),
+  );
+  assert.equal(added.stderr, '');
+  assert.equal(added.code, 0);
+
+  const reset = await runCli('compare', present, absent);
+
+  assert.equal(
+    reset.stdout,
+    ['~ table public.measured', '    ~ column c: statistics target 500 → (none)', ''].join('\n'),
+  );
+  assert.equal(reset.stderr, '');
+  assert.equal(reset.code, 0);
+});
+
 test('compare on identical dumps says there are no changes', async (t) => {
   const dir = await fixtureDir(t);
   const baseline = await writeDump(dir, 'baseline.sql', BASELINE_DUMP);

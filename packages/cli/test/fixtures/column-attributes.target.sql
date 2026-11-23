@@ -14,6 +14,8 @@ CREATE TABLE public.attrs (
     s_remove text,
     comp_add text,
     comp_remove text,
+    st_add integer,
+    st_remove integer,
     merged character varying(12) COLLATE pg_catalog."POSIX",
     fresh text COLLATE pg_catalog."C"
 );
@@ -25,6 +27,8 @@ ALTER TABLE ONLY public.attrs ALTER COLUMN comp_add SET COMPRESSION pglz;
 ALTER TABLE ONLY public.attrs ALTER COLUMN fresh SET STORAGE EXTENDED;
 
 ALTER TABLE ONLY public.attrs ALTER COLUMN fresh SET COMPRESSION lz4;
+
+ALTER TABLE ONLY public.attrs ALTER COLUMN st_add SET STATISTICS 500;
 
 CREATE TABLE public.backed (
     id integer NOT NULL
