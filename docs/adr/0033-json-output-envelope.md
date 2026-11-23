@@ -1,0 +1,27 @@
+# 0033 — Structured JSON envelope for compare and plan
+
+**Date/Status:** 2026-11-23 · accepted
+
+**Context:** `compare` and `plan` printed only human text, so a machine consumer had to parse terminal prose to learn what changed or what a migration would do. `export --format json` already printed canonical model bytes, but [ADR 0023](./0023-export-projects-the-model.md) deliberately keeps that artifact bare and unversioned; wrapping it would break its contract and give every export byte a schema-version meaning. This slice gives the two comparison commands their own documented document instead. The [structured-JSON plan](../plans/structured-json.md) (supply pass 2026-11-02) fixed the shape, and [#176](https://github.com/osama784/schemamill/issues/176) drove the implementation. Both commands must keep their human stdout, stderr wording, and exit codes byte-identical without the new flag, so the JSON path is a separate top-of-action branch that shares only the already-computed diff, plan, and hazard analysis.
+
+**Decision:** `--json` on `compare` and `plan` writes one document to stdout with this envelope, in key order:
+
+```
+{ schemaVersion: 1, command, schemamill: { version }, workspace: { root } | null,
+  sides: { baseline: { source, path?, model: { tables, sequences, views, extensions } },
+           target: { … } },
+  diagnostics: { baseline: [Diagnostic], target: [Diagnostic] },
+  result: { … } }
+```
+
+`schemaVersion` is the integer `1`; `command` is `"compare"` or `"plan"`; `schemamill.version` is the version exported by core and printed by `--version`, so no second version source exists. A side's `source` is `"dump"` or `"workspace"`, with `path` present exactly for a dump and the model carried as four family counts only. `workspace` is `{ root }` when either side resolved from a workspace and `null` when neither did; the resolved model path is deliberately not part of the envelope. Each side's diagnostics carry `kind`, `code`, `message`, optional `object` (skip and flag only), and optional `position` with `line`, `column`, and `offset`, so the document keeps the full source fidelity the human stderr drops. Every DTO is built explicitly in `packages/cli/src/json.ts` with an exhaustive discriminant dispatch; optional keys are omitted rather than emitted as `null`, embedded model values reuse `serializeModel`'s field names, and the recursive key sets are pinned by contract checks.
+
+Compare's `result` carries only `{ changes }`. Hazards remain in plan's `result` alone, beside `targetVersion`, `steps`, and `groups`: compare computes hazards for its human `Hazards:` block, but its document projection is the diff, and duplicating hazards there would give two documents the same annotation with no separate meaning. The plan document carries the semantic plan, not the rendered SQL; `plan` still calls `renderSql` for validation so a render refusal cannot vanish under `--json`. Both fields keep the order the human commands already produce.
+
+Rendering is canonical — two-space indentation and exactly one trailing newline — and the mapper reads no clock, filesystem, locale, or environment, so identical inputs yield identical bytes. Empty arrays serialize as `[]` and are never dropped. Goldens normalize only `schemamill.version`, a workspace `root`, and a dump `path` to placeholders; production always writes the real values.
+
+Versioning: bump `schemaVersion` when a field is removed or renamed, a field's type or meaning changes, an enumerated value's meaning changes, or the envelope's required shape changes. Adding an optional field or an additive new `command` value does not bump, and consumers must ignore unknown keys. This governs only the compare/plan documents; `export --format json` stays bare and unversioned under [ADR 0023](./0023-export-projects-the-model.md).
+
+Streams and status: the document always carries every `error`, `skip`, and `flag` finding regardless of `--verbose`; `--verbose` controls only the human stderr lines, so `--json --verbose` changes stderr and never stdout. A usage error, a read or workspace-resolution failure, or a plan-time `SequenceOwnershipError` writes no document (empty stdout, one relevant stderr line where applicable, exit 1). A model returned with an `error` finding emits the document and exits 1 from the imported pair; a render refusal emits the document, keeps its existing stderr line, and exits 1. The document is written once, after all validation, and the non-`--json` path is unchanged.
+
+**Consequences:** Machine consumers get a stable, documented contract in [docs/json-output.md](../json-output.md), with a versioned envelope they can branch on by `command` and extend compatibly by ignoring unknown keys; breaking changes are an explicit new integer rather than a silent reshape. Human output, stderr wording, and exit codes are untouched without `--json`, and export JSON is unaffected. Pinning the version to core's exported value and normalizing the three variable fields in goldens removes the drift risk the envelope would otherwise carry. The named follow-ups — rendered SQL in the document, JSON for other commands, CI-native diagnostic formats, a checked-in schema, and the rest — stay in the plan's Deferred section, and no new glossary headword is added to `CONTEXT.md`: the document uses existing vocabulary (Change, Step, Hazard, Migration plan, Transaction group, Diagnostic, Workspace, Export).

@@ -1,0 +1,235 @@
+{
+  "schemaVersion": 1,
+  "command": "plan",
+  "schemamill": {
+    "version": "<VERSION>"
+  },
+  "workspace": null,
+  "sides": {
+    "baseline": {
+      "source": "dump",
+      "path": "<DUMP_PATH>",
+      "model": {
+        "tables": 2,
+        "sequences": 0,
+        "views": 1,
+        "extensions": 0
+      }
+    },
+    "target": {
+      "source": "dump",
+      "path": "<DUMP_PATH>",
+      "model": {
+        "tables": 2,
+        "sequences": 1,
+        "views": 2,
+        "extensions": 1
+      }
+    }
+  },
+  "diagnostics": {
+    "baseline": [],
+    "target": []
+  },
+  "result": {
+    "targetVersion": 13,
+    "steps": [
+      {
+        "kind": "create-extension",
+        "extension": {
+          "schema": "public",
+          "name": "pgcrypto",
+          "comment": "crypto helpers"
+        }
+      },
+      {
+        "kind": "create-sequence",
+        "sequence": {
+          "schema": "public",
+          "name": "widget_seq",
+          "dataType": "bigint",
+          "increment": "0",
+          "minValue": "-9223372036854775808",
+          "maxValue": "-1",
+          "start": "-1",
+          "cache": "1",
+          "cycle": false
+        }
+      },
+      {
+        "kind": "drop-table",
+        "table": {
+          "schema": "public",
+          "name": "retired"
+        }
+      },
+      {
+        "kind": "create-table",
+        "table": {
+          "schema": "public",
+          "name": "gadgets",
+          "columns": [
+            {
+              "name": "id",
+              "type": "integer",
+              "notNull": true
+            },
+            {
+              "name": "widget_id",
+              "type": "integer",
+              "notNull": false
+            }
+          ],
+          "primaryKey": {
+            "columns": [
+              "id"
+            ]
+          },
+          "foreignKeys": [],
+          "uniqueConstraints": [],
+          "checkConstraints": [],
+          "indexes": []
+        }
+      },
+      {
+        "kind": "add-column",
+        "table": {
+          "schema": "public",
+          "name": "widgets"
+        },
+        "column": {
+          "name": "score",
+          "type": "integer",
+          "notNull": false
+        }
+      },
+      {
+        "kind": "alter-column",
+        "table": {
+          "schema": "public",
+          "name": "widgets"
+        },
+        "name": "label",
+        "fields": [
+          {
+            "field": "notNull",
+            "before": false,
+            "after": true
+          }
+        ]
+      },
+      {
+        "kind": "create-index",
+        "owner": {
+          "kind": "table",
+          "table": {
+            "schema": "public",
+            "name": "widgets"
+          }
+        },
+        "index": {
+          "unique": false,
+          "columns": [
+            "score"
+          ]
+        }
+      },
+      {
+        "kind": "create-view",
+        "view": {
+          "schema": "public",
+          "name": "widget_scores",
+          "materialized": true,
+          "definition": "SELECT id,score FROM public.widgets",
+          "indexes": [
+            {
+              "unique": false,
+              "columns": [
+                "score"
+              ],
+              "concurrently": true
+            }
+          ]
+        }
+      },
+      {
+        "kind": "replace-view",
+        "view": {
+          "schema": "public",
+          "name": "widget_names",
+          "materialized": false,
+          "definition": "SELECT id,label,score FROM public.widgets"
+        }
+      },
+      {
+        "kind": "create-index-concurrently",
+        "owner": {
+          "kind": "materialized-view",
+          "view": {
+            "schema": "public",
+            "name": "widget_scores"
+          }
+        },
+        "index": {
+          "unique": false,
+          "columns": [
+            "score"
+          ],
+          "concurrently": true
+        }
+      },
+      {
+        "kind": "comment",
+        "target": {
+          "kind": "extension",
+          "extension": {
+            "name": "pgcrypto"
+          }
+        },
+        "text": "crypto helpers"
+      },
+      {
+        "kind": "comment",
+        "target": {
+          "kind": "table",
+          "table": {
+            "schema": "public",
+            "name": "widgets"
+          }
+        },
+        "text": "new label"
+      }
+    ],
+    "groups": [
+      {
+        "start": 0,
+        "end": 9,
+        "transactional": true
+      },
+      {
+        "start": 9,
+        "end": 10,
+        "transactional": false
+      },
+      {
+        "start": 10,
+        "end": 12,
+        "transactional": true
+      }
+    ],
+    "hazards": [
+      {
+        "kind": "increment-zero",
+        "step": 1,
+        "entity": {
+          "kind": "sequence",
+          "sequence": {
+            "schema": "public",
+            "name": "widget_seq"
+          }
+        },
+        "increment": "0"
+      }
+    ]
+  }
+}

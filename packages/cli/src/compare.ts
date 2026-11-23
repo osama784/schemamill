@@ -3,6 +3,7 @@ import { hazardAnalyzer } from '@schemamill/postgres';
 import type { Command } from 'commander';
 
 import { formatChanges, formatHazards } from './format.ts';
+import { buildJsonDocument, stringifyJsonDocument } from './json.ts';
 import { importPair, mapSides, planOrReport } from './run.ts';
 
 /**
@@ -25,6 +26,7 @@ interface CompareOptions {
   readonly verbose?: boolean;
   readonly baselineWorkspace?: boolean;
   readonly targetWorkspace?: boolean;
+  readonly json?: boolean;
 }
 
 /** Registers `schemamill compare` on `program`. */
@@ -37,6 +39,7 @@ export function registerCompare(program: Command): void {
     .option('--baseline-workspace', 'resolve the baseline from the workspace')
     .option('--target-workspace', 'resolve the target from the workspace')
     .option('--verbose', 'list every import diagnostic')
+    .option('--json', 'emit a structured JSON document')
     .addHelpText('after', '\nA single path is the target; the workspace fills the baseline.')
     .action(
       async (
@@ -53,6 +56,26 @@ export function registerCompare(program: Command): void {
         });
         if (!sides.ok) {
           command.error(sides.message);
+        }
+        if (options.json === true) {
+          // One document, written only after both sides import and core's plan accepts the pair.
+          // A read/workspace failure or a contract error has already written its one stderr line;
+          // both leave stdout empty. The human path below stays byte-for-byte unchanged.
+          const imported = await importPair(sides.baseline, sides.target, options.verbose === true);
+          if (imported === null) {
+            process.exitCode = 1;
+            return;
+          }
+          if (planOrReport(() => plan(imported.baseline, imported.target)) === undefined) return;
+          const document = buildJsonDocument({
+            command: 'compare',
+            baseline: { ...imported.sides.baseline, model: imported.baseline },
+            target: { ...imported.sides.target, model: imported.target },
+            changes: diff(imported.baseline, imported.target),
+          });
+          process.stdout.write(stringifyJsonDocument(document));
+          process.exitCode = imported.exitCode;
+          return;
         }
         const imported = await importPair(sides.baseline, sides.target, options.verbose === true);
         if (imported === null) {
