@@ -31,6 +31,8 @@ Scope a gate to one package with `pnpm --filter @schemamill/<pkg> <script>`.
 
 `pnpm mutation:core` runs the core mutation-testing harness — `pnpm mutation:check` is its scoped sanity check — and is not one of the five gates; see `docs/mutation-testing.md`.
 
+`pnpm release:check` is the required pre-tag release-readiness gate: it verifies release/package version consistency, the docs checks, the gates, and a clean-clone install with CLI smokes, and is side-effect-free — it never tags, pushes, commits, creates a PR, or publishes. `pnpm release:check --dry-run` runs the same full checks and additionally prints the informational release runbook sequence (printed only, never executed).
+
 `@schemamill/postgres` carries a live-PostgreSQL harness (`src/live-pg.test.ts`, scenes in `src/live-scenes.ts`) gated on `SCHEMAMILL_TEST_PG_URL`: unset, the live tests skip with a reason; set but unreachable, they fail loudly. A local scratch cluster is available for gated runs — see the latest handoff notes or ask the user for its URL. CI runs Node 24 and 26, plus a `verify-postgres` matrix on Node 24 against `postgres:13` and `postgres:18` services, each with matching PostgreSQL client tools.
 
 ## Git rules
