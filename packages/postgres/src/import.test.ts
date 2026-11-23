@@ -3139,6 +3139,24 @@ test('skips the parent-named ATTACH PARTITION on a pg_dump-form partition child'
   ]);
 });
 
+test("skips AT_SetStatistics on a column, pinning today's diagnostic", async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 500;`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped ALTER TABLE action AT_SetStatistics on public.t',
+    },
+  ]);
+});
+
 test('flags and drops IF NOT EXISTS on a table, importing it', async () => {
   const dump = `CREATE TABLE IF NOT EXISTS public.t (a integer);`;
 
