@@ -52,6 +52,7 @@ const column = (
   attstorage: 'x',
   typstorage: 'x',
   attcompression: '',
+  attstattarget: -1,
   comment: null,
   ...rest,
 });
@@ -2273,6 +2274,40 @@ test('maps default, collation, storage, and compression together on one column',
     },
   ]);
   assert.deepEqual(read.diagnostics, []);
+});
+
+test('canonicalizes statistics targets: -1 and null are absent, 0 is preserved', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'pg13-default', { attstattarget: -1 }),
+        column('public', 't', 2, 'pg18-default', { attstattarget: null }),
+        column('public', 't', 3, 'zero', { attstattarget: 0 }),
+        column('public', 't', 4, 'stated', { attstattarget: 500 }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.columns, [
+    { name: 'pg13-default', type: 'text', notNull: false },
+    { name: 'pg18-default', type: 'text', notNull: false },
+    { name: 'zero', type: 'text', notNull: false, statisticsTarget: 0 },
+    { name: 'stated', type: 'text', notNull: false, statisticsTarget: 500 },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('rejects a non-integer statistics target from the catalog payload', async () => {
+  await assert.rejects(
+    mapCatalog(
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'c', { attstattarget: 1.5 })],
+      }),
+    ),
+    /catalog payload\.columns\[0\]\.attstattarget must be an integer or null/,
+  );
 });
 
 test('reads unlogged persistence, keeps temporary flagged, and skips partitioned relations', async () => {

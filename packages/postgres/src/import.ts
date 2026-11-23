@@ -886,6 +886,14 @@ function withColumnCompression(column: Column, compression: ColumnCompression | 
   return copy;
 }
 
+/** A copy of `column` with `statisticsTarget` set, or cleared for the default. */
+function withColumnStatisticsTarget(column: Column, statisticsTarget: number | undefined): Column {
+  const copy: Mutable<Column> = { ...column };
+  if (statisticsTarget === undefined) delete copy.statisticsTarget;
+  else copy.statisticsTarget = statisticsTarget;
+  return copy;
+}
+
 const COLLATE_KEYWORD = 'COLLATE';
 
 /**
@@ -2412,6 +2420,11 @@ function translateAlterTableCommand(
     return;
   }
 
+  if (command.subtype === 'AT_SetStatistics') {
+    applyStatisticsTarget(statement, command, identity, draft, diagnostics);
+    return;
+  }
+
   diagnostics.push(
     skipStatement(statement, alterTableActionDescription(command.subtype, identity), identity),
   );
@@ -3116,6 +3129,64 @@ function applyColumnMethod(
   }
   draft.columns = draft.columns.map((candidate) =>
     candidate === column ? withColumnCompression(candidate, compression ?? undefined) : candidate,
+  );
+}
+
+/**
+ * The largest statistics target the model carries. PostgreSQL clamps larger values with a
+ * WARNING; the model rejects them, so the importer drops the clause and names it instead of
+ * building a model a later validation would refuse.
+ */
+const MAX_STATISTICS_TARGET = 10000;
+
+/**
+ * Applies one post-data `ALTER COLUMN … SET STATISTICS` to its column. The parser carries the
+ * target in `command.def.Integer.ival` (there is no `num` field); `SET STATISTICS DEFAULT`
+ * omits `def` entirely and resets the column's target to absent, as does a negative value
+ * (PG's `-1` default). `0` is a stated target and is preserved, never treated as absent. An
+ * unknown column or an out-of-range target is reported by name, never silent.
+ */
+function applyStatisticsTarget(
+  statement: ParsedStatement,
+  command: AlterTableCmd,
+  identity: string,
+  draft: TableDraft,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const name = command.name;
+  const column =
+    name === undefined ? undefined : draft.columns.find((candidate) => candidate.name === name);
+  if (name === undefined || column === undefined) {
+    const place = name === undefined ? identity : `${identity}.${name}`;
+    diagnostics.push(skipStatement(statement, `SET STATISTICS for unknown column ${place}`, place));
+    return;
+  }
+  const place = `${identity}.${name}`;
+
+  if (command.def !== undefined && !('Integer' in command.def)) {
+    diagnostics.push(flagAttribute(statement, identity, `SET STATISTICS on ${place}`));
+    return;
+  }
+
+  // Protobuf drops a zero `ival`, so an empty `Integer` reads as 0. An absent `def` is `DEFAULT`.
+  const value =
+    command.def !== undefined && 'Integer' in command.def
+      ? (command.def.Integer.ival ?? 0)
+      : undefined;
+  if (value !== undefined && value > MAX_STATISTICS_TARGET) {
+    diagnostics.push(
+      flagAttribute(
+        statement,
+        identity,
+        `statistics target ${value} on ${place} (outside 0-${MAX_STATISTICS_TARGET})`,
+      ),
+    );
+    return;
+  }
+
+  const target = value === undefined || value < 0 ? undefined : value;
+  draft.columns = draft.columns.map((candidate) =>
+    candidate === column ? withColumnStatisticsTarget(candidate, target) : candidate,
   );
 }
 

@@ -120,25 +120,29 @@ import {
  * Column attributes render in PostgreSQL's grammar order. `renderColumn` states an explicit
  * collation inline, after the type and before the constraints: `name type COLLATE <collation>
  * [NOT NULL] [DEFAULT <x>]`. Inline `STORAGE` and `COMPRESSION` qualifiers are never rendered —
- * both are recent grammar — so a created or added column's explicit storage and compression
- * follow its statement as post-data `ALTER TABLE ONLY` statements, storage before compression,
- * each statement only when the column states it. `CREATE UNLOGGED TABLE` states an `unlogged`
- * table's persistence, and an `alter-persistence` step states the target persistence as
- * `ALTER TABLE <t> SET UNLOGGED;` or the absent `LOGGED` default as `SET LOGGED;`.
+ * both are recent grammar — so a created or added column's explicit storage, compression, and
+ * statistics target follow its statement as post-data `ALTER TABLE ONLY` statements, storage
+ * before compression before statistics, each statement only when the column states it.
+ * `CREATE UNLOGGED TABLE` states an `unlogged` table's persistence, and an `alter-persistence`
+ * step states the target persistence as `ALTER TABLE <t> SET UNLOGGED;` or the absent `LOGGED`
+ * default as `SET LOGGED;`.
  *
  * An `alter-column` step renders its statements in a fixed order: the merged `TYPE` statement
  * when the type or the collation differs, the per-field not-null and default statements, then
- * `SET STORAGE`, then `SET COMPRESSION`. The merged statement is exactly one
+ * `SET STORAGE`, then `SET COMPRESSION`, then `SET STATISTICS`. The merged statement is exactly one
  * `ALTER TABLE <t> ALTER COLUMN <c> TYPE <target.type>[ COLLATE <target.collation>];`, both
  * halves read from the step's target `attributes` carrier — a type change on a collated column
  * restates the unchanged collation, and a collation removal renders the bare target type —
  * because PostgreSQL rejects two `TYPE` clauses for one change. A `TYPE` statement resets the
  * column's storage and compression to the type's defaults, so the carrier's explicit values
- * are restated after it; a standalone storage or compression change states its `SET` statement
- * alone, `SET STORAGE DEFAULT` and `SET COMPRESSION default` restoring an absent target. Every
- * `SET STORAGE`/`SET COMPRESSION` statement — create tail, add tail, post-`TYPE` restatement,
- * or standalone — carries the dump's post-data `ONLY` form; only the merged `TYPE` statement
- * stays bare. The order is target-independent; the two synthesized reset forms alone consult
+ * are restated after it; TYPE preserves `attstattarget`, so a stated target is restated and a
+ * change to absent still emits `SET STATISTICS -1`. A standalone storage, compression, or
+ * statistics change states its `SET` statement alone, `SET STORAGE DEFAULT`, `SET COMPRESSION
+ * default`, and `SET STATISTICS -1` restoring an absent target. Every
+ * `SET STORAGE`/`SET COMPRESSION`/`SET STATISTICS` statement — create tail, add tail,
+ * post-`TYPE` restatement, or standalone — carries the dump's post-data `ONLY` form; only the
+ * merged `TYPE` statement stays bare. The order is target-independent; the two synthesized
+ * reset forms alone consult
  * the declared target, refusing below their floor. A plan that reaches the renderer malformed —
  * a `type` or `collation` field whose step carries no `attributes` carrier, or any attribute
  * field reaching the per-field renderer — throws rather than render a guess.
@@ -1050,11 +1054,12 @@ function renderColumn(column: Column): string {
 }
 
 /**
- * The post-data statements a created or added column's explicit storage and compression need:
- * `ALTER TABLE ONLY … ALTER COLUMN … SET STORAGE …` and `… SET COMPRESSION …`, in that order,
- * each only when the column states it. Inline `STORAGE`/`COMPRESSION` qualifiers are never
- * rendered; `ONLY` matches the dump's post-data form, and inheritance is out of scope. An
- * absent value emits nothing here — the reset forms exist only for an `alter-column` step.
+ * The post-data statements a created or added column's explicit storage, compression, and
+ * statistics target need: `ALTER TABLE ONLY … ALTER COLUMN … SET STORAGE …`, `… SET COMPRESSION
+ * …`, and `… SET STATISTICS …`, in that order, each only when the column states it. Inline
+ * `STORAGE`/`COMPRESSION` qualifiers are never rendered; `ONLY` matches the dump's post-data form,
+ * and inheritance is out of scope. An absent value emits nothing here — the reset forms exist
+ * only for an `alter-column` step.
  */
 function renderColumnAttributeStatements(
   table: TableIdentity,
@@ -1067,6 +1072,9 @@ function renderColumnAttributeStatements(
   }
   if (column.compression !== undefined) {
     statements.push(renderSetCompression(table, column.name, column.compression, targetVersion));
+  }
+  if (column.statisticsTarget !== undefined) {
+    statements.push(renderSetStatistics(table, column.name, column.statisticsTarget));
   }
   return statements;
 }
@@ -1127,6 +1135,20 @@ function renderSetCompression(
   }
   const target = compression === undefined ? 'default' : compression;
   return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET COMPRESSION ${target};`;
+}
+
+/**
+ * One `SET STATISTICS` statement for a column: the stated integer (including `0`), or `-1` for
+ * an absent target — the universal reset spelling accepted on PostgreSQL 13–18, which keeps
+ * this statement free of a version floor. The `ONLY` form matches the dump's post-data form.
+ */
+function renderSetStatistics(
+  table: TableIdentity,
+  name: string,
+  statisticsTarget: number | undefined,
+): string {
+  const value = statisticsTarget === undefined ? -1 : statisticsTarget;
+  return `ALTER TABLE ONLY ${renderTable(table)} ALTER COLUMN ${quoteIdentifier(name)} SET STATISTICS ${value};`;
 }
 
 /** A primary-key constraint clause, with its name and attributes when it has them. */
@@ -1243,14 +1265,16 @@ function renderDropIndex(owner: IndexOwner, index: Index, concurrently: boolean)
 /**
  * One `alter-column` step as its statements, joined `\n`, in the step's fixed order: the
  * merged `TYPE` statement when the type or the collation differs, the per-field not-null and
- * default statements, then `SET STORAGE`, then `SET COMPRESSION`. The merged statement reads
- * both halves from the step's target `attributes` carrier and states the target collation only
- * when it has one; a `TYPE` statement resets storage and compression to the type's defaults,
- * so the carrier's explicit values are restated after it. With no type or collation change, a
- * storage or compression field states its own `SET` statement, the absent target restoring the
- * default. Every `SET` statement carries the dump's post-data `ONLY` form; only the merged
- * `TYPE` statement stays bare. A `type` or `collation` field without its carrier is a
- * malformed plan and throws.
+ * default statements, then `SET STORAGE`, then `SET COMPRESSION`, then `SET STATISTICS`. The
+ * merged statement reads both halves from the step's target `attributes` carrier and states the
+ * target collation only when it has one; a `TYPE` statement resets storage and compression to
+ * the type's defaults, so the carrier's explicit values are restated after it. It preserves
+ * `attstattarget`, though: a reset to absent still needs an explicit `SET STATISTICS -1`, and a
+ * stated target is restated after `TYPE`. With no type or collation change, a storage,
+ * compression, or statistics field states its own `SET` statement, the absent target restoring
+ * the default (`-1` for statistics). Every `SET` statement carries the dump's post-data `ONLY`
+ * form; only the merged `TYPE` statement stays bare. A `type` or `collation` field without its
+ * carrier is a malformed plan and throws.
  */
 function renderAlterColumn(
   table: TableIdentity,
@@ -1273,13 +1297,21 @@ function renderAlterColumn(
     }
   }
   if (carrier !== undefined) {
-    // The TYPE statement's reset matches a target that states no value, so only the explicit
-    // ones restate.
+    // The TYPE statement's reset matches a target that states no storage or compression, so only
+    // the explicit ones restate. It does not reset attstattarget, so a target that states none
+    // still needs an explicit -1 when the step is a reset.
     if (carrier.storage !== undefined) {
       statements.push(renderSetStorage(table, name, carrier.storage, targetVersion));
     }
     if (carrier.compression !== undefined) {
       statements.push(renderSetCompression(table, name, carrier.compression, targetVersion));
+    }
+    if (carrier.statisticsTarget !== undefined) {
+      statements.push(renderSetStatistics(table, name, carrier.statisticsTarget));
+    } else if (
+      fields.some((field) => field.field === 'statisticsTarget' && field.after === undefined)
+    ) {
+      statements.push(renderSetStatistics(table, name, undefined));
     }
   } else {
     for (const field of fields) {
@@ -1287,6 +1319,8 @@ function renderAlterColumn(
         statements.push(renderSetStorage(table, name, field.after, targetVersion));
       } else if (field.field === 'compression') {
         statements.push(renderSetCompression(table, name, field.after, targetVersion));
+      } else if (field.field === 'statisticsTarget') {
+        statements.push(renderSetStatistics(table, name, field.after));
       }
     }
   }
@@ -1313,8 +1347,8 @@ function requiredAttributes(
 
 /**
  * One per-field `ALTER COLUMN` statement for a differing not-null or default value; every
- * other field belongs to the merged `TYPE` builder or the storage/compression statements, so
- * reaching here means the plan is malformed.
+ * other field belongs to the merged `TYPE` builder or the storage/compression/statistics
+ * statements, so reaching here means the plan is malformed.
  */
 function renderColumnAlteration(
   table: TableIdentity,
@@ -1335,10 +1369,11 @@ function renderColumnAlteration(
     case 'collation':
     case 'storage':
     case 'compression':
-      // The merged TYPE builder and the storage/compression statements own these fields — a
-      // TYPE statement restates the target collation and the SET statements state storage and
-      // compression — so they never reach the per-field renderer; reaching here means the
-      // plan is malformed.
+    case 'statisticsTarget':
+      // The merged TYPE builder and the storage/compression/statistics statements own these
+      // fields — a TYPE statement restates the target collation and the SET statements state
+      // storage, compression, and statistics — so they never reach the per-field renderer;
+      // reaching here means the plan is malformed.
       throw new Error(
         `alter-column on ${renderTable(table)}.${quoteIdentifier(name)} must not carry a ${field.field} change`,
       );
