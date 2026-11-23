@@ -233,6 +233,12 @@ interface TableDraft {
   readonly uniqueConstraints: UniqueConstraint[];
   readonly checkConstraints: CheckConstraint[];
   readonly indexes: Index[];
+  /**
+   * Names of exclusion constraints seen on this table. Draft-only bookkeeping: the exclusion's
+   * backing index is never modeled, but `pg_dump` comments it by the constraint's `conname`, so
+   * the name is kept to resolve a later `COMMENT ON INDEX` to the precise flag.
+   */
+  readonly exclusionBackingNames: Set<string>;
   /** `unlogged` while the source says so; `undefined` is `LOGGED`, the default. */
   persistence?: TablePersistence;
   /** The table's comment; a repeated `CREATE TABLE` replaces it wholesale. */
@@ -551,6 +557,7 @@ function translateCreateTable(
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
   draft.indexes.length = 0;
+  draft.exclusionBackingNames.clear();
   draft.persistence = undefined;
   delete draft.comment;
   // The draft sees the columns as they are collected, so a table-level not-null constraint —
@@ -564,7 +571,7 @@ function translateCreateTable(
         statement,
         element.ColumnDef,
         boundaries,
-        { schema, name },
+        draft,
         diagnostics,
       );
       columns.push(translated.column);
@@ -625,7 +632,7 @@ function translateColumn(
   statement: ParsedStatement,
   column: ColumnDef,
   boundaries: readonly number[],
-  table: TableIdentity,
+  table: TableDraft,
   diagnostics: PositionedDiagnostic[],
 ): TranslatedColumn {
   const schema = table.schema;
@@ -689,6 +696,8 @@ function translateColumn(
   let fold: InlineAttributeTarget | undefined;
 
   for (const constraint of constraints) {
+    // Record on sight, whatever flag path the declaration takes below.
+    recordExclusionConstraint(table, constraint);
     switch (constraint.contype) {
       case 'CONSTR_PRIMARY': {
         const primaryKey = primaryKeyFromConstraint(
@@ -1061,6 +1070,7 @@ function translateTableConstraint(
   draft: TableDraft,
   diagnostics: PositionedDiagnostic[],
 ): void {
+  recordExclusionConstraint(draft, constraint);
   switch (constraint.contype) {
     case 'CONSTR_PRIMARY':
       if (constraint.indexname !== undefined) {
@@ -1432,6 +1442,12 @@ function translateCommentStatement(
       const target = schemaQualifiedCommentTarget(parts);
       const found = target === undefined ? undefined : findCommentedIndex(tables, target);
       if (found === undefined) {
+        if (target !== undefined && isExclusionBackingIndex(tables, target)) {
+          // The model has no slot for a consumed backing index's comment. Name the index the
+          // dump comments, schema-qualified, with ADR 0030's exact flag — never store the text.
+          diagnostics.push(flagAttribute(statement, tableIdentityName(target), 'comment'));
+          return;
+        }
         flag();
         return;
       }
@@ -1570,6 +1586,17 @@ function findCommentedIndex(
     if (index !== undefined) return { draft, index };
   }
   return undefined;
+}
+
+/** Whether the target names a recorded exclusion constraint's backing index in its schema. */
+function isExclusionBackingIndex(
+  tables: Map<string, TableDraft>,
+  target: { readonly schema: string; readonly name: string },
+): boolean {
+  for (const draft of tables.values()) {
+    if (draft.schema === target.schema && draft.exclusionBackingNames.has(target.name)) return true;
+  }
+  return false;
 }
 
 /**
@@ -2328,6 +2355,8 @@ function translateAlterTableCommand(
     'Constraint' in command.def
   ) {
     const constraint = command.def.Constraint;
+    // Recorded even though the declaration is skipped whole below (ADR 0031 unchanged).
+    recordExclusionConstraint(draft, constraint);
     if (constraint.contype === 'CONSTR_FOREIGN') {
       attachForeignKey(
         draft,
@@ -3211,7 +3240,7 @@ function attachColumn(
     statement,
     element.ColumnDef,
     clauseBoundaries(element),
-    { schema: draft.schema, name: draft.name },
+    draft,
     diagnostics,
   );
   draft.columns = [...draft.columns, translated.column];
@@ -4127,6 +4156,7 @@ function getOrCreateTable(
     uniqueConstraints: [],
     checkConstraints: [],
     indexes: [],
+    exclusionBackingNames: new Set<string>(),
   };
   tables.set(key, draft);
   return draft;
@@ -4406,6 +4436,19 @@ function constraintOf(node: Node): Constraint | undefined {
 function constraintLabel(constraint: Constraint): string {
   const label = CONSTRAINT_LABELS[constraint.contype ?? ''] ?? constraint.contype ?? 'constraint';
   return constraint.conname === undefined ? label : `${label} ${constraint.conname}`;
+}
+
+/**
+ * Keeps an exclusion constraint's dumped `conname` on the table draft as its backing index's name.
+ * The constraint itself stays skipped and unmodeled (ADR 0031), but `pg_dump` comments the backing
+ * index by this exact name — including generated, constraint-style names — so a later
+ * `COMMENT ON INDEX` can take ADR 0030's precise flag. An unnamed inline `EXCLUDE` carries no name
+ * to record and keeps the generic flag (ADR 0035).
+ */
+function recordExclusionConstraint(draft: TableDraft, constraint: Constraint): void {
+  if (constraint.contype === 'CONSTR_EXCLUSION' && constraint.conname !== undefined) {
+    draft.exclusionBackingNames.add(constraint.conname);
+  }
 }
 
 function stringList(nodes: readonly Node[] | undefined): string[] {
