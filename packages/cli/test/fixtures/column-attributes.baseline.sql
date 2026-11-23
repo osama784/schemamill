@@ -14,12 +14,16 @@ CREATE TABLE public.attrs (
     s_remove text,
     comp_add text,
     comp_remove text,
+    st_add integer,
+    st_remove integer,
     merged text COLLATE pg_catalog."C"
 );
 
 ALTER TABLE ONLY public.attrs ALTER COLUMN s_remove SET STORAGE MAIN;
 
 ALTER TABLE ONLY public.attrs ALTER COLUMN comp_remove SET COMPRESSION pglz;
+
+ALTER TABLE ONLY public.attrs ALTER COLUMN st_remove SET STATISTICS 250;
 
 CREATE UNLOGGED TABLE public.backed (
     id integer NOT NULL

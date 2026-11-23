@@ -256,6 +256,9 @@ function mapColumnAttributes(attributes: ColumnAttributes): object {
     ...(attributes.collation === undefined ? {} : { collation: attributes.collation }),
     ...(attributes.storage === undefined ? {} : { storage: attributes.storage }),
     ...(attributes.compression === undefined ? {} : { compression: attributes.compression }),
+    ...(attributes.statisticsTarget === undefined
+      ? {}
+      : { statisticsTarget: attributes.statisticsTarget }),
   };
 }
 
@@ -285,6 +288,7 @@ function mapColumn(column: Column): object {
     ...(column.collation === undefined ? {} : { collation: column.collation }),
     ...(column.storage === undefined ? {} : { storage: column.storage }),
     ...(column.compression === undefined ? {} : { compression: column.compression }),
+    ...(column.statisticsTarget === undefined ? {} : { statisticsTarget: column.statisticsTarget }),
     ...(column.comment === undefined ? {} : { comment: column.comment }),
   };
 }

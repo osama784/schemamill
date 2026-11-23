@@ -1,4 +1,4 @@
-14 steps in one transaction:
+16 steps in one transaction:
   1. add-column         public.attrs.fresh text collation pg_catalog."C" storage extended compression lz4
   2. alter-column       public.attrs.d_add: default (none) → 1
   3. alter-column       public.attrs.d_change: default 1 → 2
@@ -10,13 +10,15 @@
   9. alter-column       public.attrs.s_remove: storage main → (none)
  10. alter-column       public.attrs.comp_add: compression (none) → pglz
  11. alter-column       public.attrs.comp_remove: compression pglz → (none)
- 12. alter-column       public.attrs.merged: type text → character varying(12), collation pg_catalog."C" → pg_catalog."POSIX"
- 13. alter-persistence  public.backed: persistence logged
- 14. alter-persistence  public.flipped: persistence unlogged
+ 12. alter-column       public.attrs.st_add: statistics target (none) → 500
+ 13. alter-column       public.attrs.st_remove: statistics target 250 → (none)
+ 14. alter-column       public.attrs.merged: type text → character varying(12), collation pg_catalog."C" → pg_catalog."POSIX"
+ 15. alter-persistence  public.backed: persistence logged
+ 16. alter-persistence  public.flipped: persistence unlogged
 
 Hazards:
-  step 13 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
-  step 14 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 15 table-rewrite public.backed: SET LOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
+  step 16 table-rewrite public.flipped: SET UNLOGGED rewrites the table under an ACCESS EXCLUSIVE lock.
 
 BEGIN;
 ALTER TABLE public.attrs ADD COLUMN fresh text COLLATE pg_catalog."C";
@@ -32,6 +34,8 @@ ALTER TABLE ONLY public.attrs ALTER COLUMN s_add SET STORAGE EXTERNAL;
 ALTER TABLE ONLY public.attrs ALTER COLUMN s_remove SET STORAGE DEFAULT;
 ALTER TABLE ONLY public.attrs ALTER COLUMN comp_add SET COMPRESSION pglz;
 ALTER TABLE ONLY public.attrs ALTER COLUMN comp_remove SET COMPRESSION default;
+ALTER TABLE ONLY public.attrs ALTER COLUMN st_add SET STATISTICS 500;
+ALTER TABLE ONLY public.attrs ALTER COLUMN st_remove SET STATISTICS -1;
 ALTER TABLE public.attrs ALTER COLUMN merged TYPE character varying(12) COLLATE pg_catalog."POSIX";
 ALTER TABLE public.backed SET LOGGED;
 ALTER TABLE public.flipped SET UNLOGGED;

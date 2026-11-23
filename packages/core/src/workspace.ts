@@ -446,6 +446,7 @@ function serializeColumn(column: Column): object {
     ...(column.collation === undefined ? {} : { collation: column.collation }),
     ...(column.storage === undefined ? {} : { storage: column.storage }),
     ...(column.compression === undefined ? {} : { compression: column.compression }),
+    ...(column.statisticsTarget === undefined ? {} : { statisticsTarget: column.statisticsTarget }),
     ...(column.comment === undefined ? {} : { comment: column.comment }),
   };
 }
@@ -598,6 +599,7 @@ const COLUMN_KEYS = [
   'collation',
   'storage',
   'compression',
+  'statisticsTarget',
   'comment',
 ] as const;
 const IDENTITY_KEYS = [
@@ -924,6 +926,12 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       parseColumnCompression,
     );
     if (!compression.ok) return compression;
+    const statisticsTarget = parseOptional(
+      object.statisticsTarget,
+      fieldPath(path, 'statisticsTarget'),
+      parseStatisticsTarget,
+    );
+    if (!statisticsTarget.ok) return statisticsTarget;
     const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
     if (!comment.ok) return comment;
     return parsed({
@@ -936,6 +944,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       ...(collation.value === undefined ? {} : { collation: collation.value }),
       ...(storage.value === undefined ? {} : { storage: storage.value }),
       ...(compression.value === undefined ? {} : { compression: compression.value }),
+      ...(statisticsTarget.value === undefined ? {} : { statisticsTarget: statisticsTarget.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });
@@ -952,6 +961,14 @@ function parseColumnStorage(value: unknown, path: string): Parsed<ColumnStorage>
 
 function parseColumnCompression(value: unknown, path: string): Parsed<ColumnCompression> {
   return parseEnum(value, path, COLUMN_COMPRESSIONS, 'column compression');
+}
+
+/** A column statistics target: an integer in the inclusive range 0–10000; `-1` is never stored. */
+function parseStatisticsTarget(value: unknown, path: string): Parsed<number> {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 10000) {
+    return invalid(`${path} is not an integer between 0 and 10000`);
+  }
+  return parsed(value);
 }
 
 function parseIdentity(value: unknown, path: string): Parsed<Identity> {

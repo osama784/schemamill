@@ -219,6 +219,7 @@ SELECT json_build_object(
         attribute.attstorage AS attstorage,
         attribute_type.typstorage AS typstorage,
         COALESCE(to_jsonb(attribute) ->> 'attcompression', '') AS attcompression,
+        attribute.attstattarget AS attstattarget,
         pg_catalog.col_description(attribute.attrelid, attribute.attnum) AS comment
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -620,6 +621,7 @@ interface ColumnRow {
   readonly attstorage: string;
   readonly typstorage: string;
   readonly attcompression: string;
+  readonly attstattarget: number | null;
   readonly comment: string | null;
 }
 
@@ -1603,16 +1605,18 @@ const COLUMN_COMPRESSION_LETTERS: Readonly<Record<string, ColumnCompression>> = 
  */
 function columnAttributes(
   row: ColumnRow,
-): Pick<Column, 'default' | 'collation' | 'storage' | 'compression'> {
+): Pick<Column, 'default' | 'collation' | 'storage' | 'compression' | 'statisticsTarget'> {
   const defaultText = columnDefault(row);
   const collation = explicitCollation(row);
   const storage = explicitStorage(row);
   const compression = explicitCompression(row);
+  const statisticsTarget = explicitStatisticsTarget(row);
   return {
     ...(defaultText === undefined ? {} : { default: defaultText }),
     ...(collation === undefined ? {} : { collation }),
     ...(storage === undefined ? {} : { storage }),
     ...(compression === undefined ? {} : { compression }),
+    ...(statisticsTarget === undefined ? {} : { statisticsTarget }),
   };
 }
 
@@ -1664,6 +1668,16 @@ function explicitCompression(row: ColumnRow): ColumnCompression | undefined {
     throw new Error(`catalog payload: unknown attcompression letter "${row.attcompression}"`);
   }
   return compression;
+}
+
+/**
+ * The statistics target the row states explicitly, or `undefined` for the server default.
+ * PostgreSQL 13–17 report the default as `-1` and PostgreSQL 18 as SQL null; both mean absent.
+ * A target of `0` is a stated value ("no statistics") and is carried verbatim.
+ */
+function explicitStatisticsTarget(row: ColumnRow): number | undefined {
+  if (row.attstattarget === null || row.attstattarget === -1) return undefined;
+  return row.attstattarget;
 }
 
 /** One table's primary key before conventional-name stripping. */
@@ -2290,6 +2304,17 @@ function expectInteger(
   return value;
 }
 
+/** The field as an integer or SQL null, or a contract throw. */
+function expectNullableInteger(
+  row: Record<string, unknown>,
+  path: string,
+  field: string,
+): number | null {
+  const value = row[field];
+  if (value === null || (typeof value === 'number' && Number.isInteger(value))) return value;
+  throw new Error(`${path}.${field} must be an integer or null`);
+}
+
 /** A `tables` row, validated field by field. */
 function parseTableRow(value: unknown, path: string): TableRow {
   const row = expectObject(value, path);
@@ -2339,6 +2364,7 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     'attstorage',
     'typstorage',
     'attcompression',
+    'attstattarget',
     'comment',
   ]);
   return {
@@ -2358,6 +2384,7 @@ function parseColumnRow(value: unknown, path: string): ColumnRow {
     attstorage: expectString(row, path, 'attstorage'),
     typstorage: expectString(row, path, 'typstorage'),
     attcompression: expectString(row, path, 'attcompression'),
+    attstattarget: expectNullableInteger(row, path, 'attstattarget'),
     comment: expectNullableString(row, path, 'comment'),
   };
 }

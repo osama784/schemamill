@@ -54,7 +54,10 @@ import type { Identity } from './identity.ts';
  * Column attributes and table persistence are explicit-only. A column carries `collation`
  * (opaque, whitespace-normalized text as written — a qualified or quoted name is not a column
  * name, so it is never identity), `storage`, or `compression` only when the source states the
- * attribute; absent means the type's default or no explicit method. A table carries
+ * attribute; absent means the type's default or no explicit method. A column's
+ * `statisticsTarget` is an integer 0–10000 stated explicitly by the source; absent means the
+ * server default. `0` is a stated target meaning no statistics and is distinct from absence,
+ * and `-1` is never stored. A table carries
  * `persistence` only when it is `UNLOGGED`; absent means `LOGGED`, PostgreSQL's default.
  * `ColumnAttributes` is the target-side carrier a `column-changed` entry and its `alter-column`
  * step use to restate a column's render-relevant values.
@@ -165,6 +168,12 @@ export interface Column {
   /** The column's explicit compression method; absent means the type's default. */
   readonly compression?: ColumnCompression;
   /**
+   * The column's PostgreSQL statistics target, an integer 0–10000 inclusive. Only a target the
+   * source states is stored; absent means the server default. `0` means no statistics and is
+   * distinct from absence, and `-1` is never stored.
+   */
+  readonly statisticsTarget?: number;
+  /**
    * The column's PostgreSQL comment, stored verbatim; absent means none. An empty string is not
    * a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
    */
@@ -173,10 +182,10 @@ export interface Column {
 
 /**
  * The target column's render-relevant values, carried by a `column-changed` entry and its
- * `alter-column` step whenever `type`, `collation`, `storage`, or `compression` differs: a
- * merged `TYPE` statement must restate an unchanged explicit collation, and it resets storage
- * and compression to the type's defaults. The type is always stated; the attributes are
- * present exactly when the target states them.
+ * `alter-column` step whenever `type`, `collation`, `storage`, `compression`, or
+ * `statisticsTarget` differs: a merged `TYPE` statement must restate an unchanged explicit
+ * collation, and it resets storage and compression to the type's defaults. The type is always
+ * stated; the attributes are present exactly when the target states them.
  */
 export interface ColumnAttributes {
   /** The type as written, whitespace-normalized; opaque to the model. */
@@ -187,6 +196,8 @@ export interface ColumnAttributes {
   readonly storage?: ColumnStorage;
   /** The explicit compression method; absent means the type's default. */
   readonly compression?: ColumnCompression;
+  /** The target's statistics target, an integer 0–10000; absent means the server default. */
+  readonly statisticsTarget?: number;
 }
 
 /**

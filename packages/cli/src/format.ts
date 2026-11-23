@@ -719,8 +719,8 @@ function formatColumnFields(fields: readonly ColumnFieldChange[]): string {
 }
 
 /**
- * One column field change; `default`, `notNullName`, `collation`, `storage`, and
- * `compression` name the absent side `(none)`.
+ * One column field change; `default`, `notNullName`, `collation`, `storage`, `compression`, and
+ * `statisticsTarget` name the absent side `(none)`.
  */
 function formatColumnField(field: ColumnFieldChange): string {
   switch (field.field) {
@@ -738,6 +738,11 @@ function formatColumnField(field: ColumnFieldChange): string {
       return `storage ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
     case 'compression':
       return `compression ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'statisticsTarget': {
+      const before = field.before === undefined ? undefined : String(field.before);
+      const after = field.after === undefined ? undefined : String(field.after);
+      return `statistics target ${formatOptional(before)} → ${formatOptional(after)}`;
+    }
   }
 }
 

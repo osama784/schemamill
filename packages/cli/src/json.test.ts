@@ -591,6 +591,7 @@ const ALLOWED_KEYS = new Set<string>([
   'collation',
   'storage',
   'compression',
+  'statisticsTarget',
   'generated',
   'sequenceName',
   'increment',
@@ -768,6 +769,68 @@ test('every documented kind maps with exact recursive keys and the fixtures cove
     [],
     'every key in both documents must be a documented field',
   );
+});
+
+/**
+ * D7 — the numeric statistics target travels through the JSON mapper unchanged, including 0,
+ * and the absent side is omitted rather than nulled. The model payload, the differing-field
+ * payload and the step's `attributes` payload each get their own exact recursive key set.
+ */
+test('a column statistics target maps with exact recursive keys on both sides', () => {
+  const document = buildJsonDocument(
+    compareInput([
+      {
+        kind: 'table-changed',
+        table: TABLE_ID,
+        changes: [
+          {
+            kind: 'column-added',
+            column: { name: 'measured', type: 'integer', notNull: false, statisticsTarget: 500 },
+          },
+          {
+            kind: 'column-changed',
+            name: 'measured',
+            fields: [
+              { field: 'statisticsTarget', after: 500 },
+              { field: 'statisticsTarget', before: 500 },
+              { field: 'statisticsTarget', after: 0 },
+            ],
+            attributes: { type: 'integer', statisticsTarget: 500 },
+          },
+        ],
+      },
+    ]),
+  );
+  assert.equal(document.command, 'compare');
+  const [tableChange] = document.result.changes;
+  assert.notEqual(tableChange, undefined);
+  const [addition, change] = fieldOf(tableChange!, 'changes') as object[];
+  assert.notEqual(addition, undefined);
+  assert.notEqual(change, undefined);
+
+  assertExactKeys(addition!, ['kind', 'column'], 'statistics target addition');
+  const column = fieldOf(addition!, 'column') as object;
+  assertExactKeys(
+    column,
+    ['name', 'type', 'notNull', 'statisticsTarget'],
+    'statistics target column',
+  );
+  assert.equal(fieldOf(column, 'statisticsTarget'), 500);
+
+  assertExactKeys(change!, ['kind', 'name', 'fields', 'attributes'], 'statistics target change');
+  const fields = fieldOf(change!, 'fields') as object[];
+  assert.deepEqual(fields, [
+    { field: 'statisticsTarget', after: 500 },
+    { field: 'statisticsTarget', before: 500 },
+    { field: 'statisticsTarget', after: 0 },
+  ]);
+  for (const field of fields) {
+    assertExactKeys(field, ['field', 'before?', 'after?'], 'statistics target field change');
+  }
+  const attributes = fieldOf(change!, 'attributes') as object;
+  assertExactKeys(attributes, ['type', 'statisticsTarget'], 'statistics target attributes');
+  assert.equal(fieldOf(attributes, 'statisticsTarget'), 500);
+  assert.deepEqual(assertNoInternalKeys(document), []);
 });
 
 test('diagnostics carry object and position.offset where present', () => {

@@ -1424,6 +1424,141 @@ test("states a created or added column's storage and compression as post-data ON
   );
 });
 
+test("states a created or added column's statistics target after storage and compression", () => {
+  assert.equal(
+    renderSql(
+      plan(
+        model(),
+        model(
+          table('t', {
+            columns: [
+              column('c', { storage: 'external', compression: 'pglz', statisticsTarget: 100 }),
+            ],
+          }),
+        ),
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE TABLE public.t (',
+      '    c text',
+      ');',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION pglz;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 100;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-column',
+        table: identity('t'),
+        column: column('c', { statisticsTarget: 0 }),
+      }),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD COLUMN c text;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 0;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders standalone statistics target changes with the reset spelled -1 at the floor', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('raised'),
+        column('lowered', { statisticsTarget: 500 }),
+        column('zeroed', { statisticsTarget: 500 }),
+        column('reset', { statisticsTarget: 100 }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('raised', { statisticsTarget: 500 }),
+        column('lowered', { statisticsTarget: 100 }),
+        column('zeroed', { statisticsTarget: 0 }),
+        column('reset'),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target), { targetVersion: 13 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN raised SET STATISTICS 500;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN lowered SET STATISTICS 100;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN zeroed SET STATISTICS 0;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN reset SET STATISTICS -1;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('places SET STATISTICS after SET STORAGE and SET COMPRESSION in an alter-column', () => {
+  const baseline = model(
+    table('t', { columns: [column('c', { storage: 'main', compression: 'pglz' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('c', { storage: 'external', compression: 'lz4', statisticsTarget: 500 })],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 500;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('restates a statistics target after the merged TYPE statement', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('changed', { statisticsTarget: 100 }),
+        column('reset', { statisticsTarget: 100 }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('changed', { type: 'bigint', statisticsTarget: 500 }),
+        column('reset', { type: 'bigint' }),
+      ],
+    }),
+  );
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ALTER COLUMN changed TYPE bigint;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN changed SET STATISTICS 500;',
+      'ALTER TABLE public.t ALTER COLUMN reset TYPE bigint;',
+      'ALTER TABLE ONLY public.t ALTER COLUMN reset SET STATISTICS -1;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('merges a type and collation change into exactly one TYPE statement', () => {
   // The pinned naive failure mode is two `TYPE` clauses for one change set; the merged
   // statement reads both halves from the step's target carrier, so a type change on a collated

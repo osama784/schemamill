@@ -3139,6 +3139,97 @@ test('skips the parent-named ATTACH PARTITION on a pg_dump-form partition child'
   ]);
 });
 
+test('imports AT_SetStatistics as a column statistics target', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 500;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [
+    { name: 'c', type: 'integer', notNull: false, statisticsTarget: 500 },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports SET STATISTICS -1 as an absent target', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS -1;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [{ name: 'c', type: 'integer', notNull: false }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports SET STATISTICS DEFAULT by resetting the target to absent', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 500;`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS DEFAULT;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [{ name: 'c', type: 'integer', notNull: false }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports SET STATISTICS 0 as a stated zero target', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 0;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [
+    { name: 'c', type: 'integer', notNull: false, statisticsTarget: 0 },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('skips SET STATISTICS on an unknown column, naming it', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN missing SET STATISTICS 500;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [{ name: 'c', type: 'integer', notNull: false }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t.missing',
+      message: 'skipped SET STATISTICS for unknown column public.t.missing',
+    },
+  ]);
+});
+
+test('reports an out-of-range SET STATISTICS target as a diagnostic', async () => {
+  const dump = [
+    `CREATE TABLE public.t (c integer);`,
+    `ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 20000;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.tables[0]?.columns, [{ name: 'c', type: 'integer', notNull: false }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped statistics target 20000 on public.t.c (outside 0-10000) from public.t',
+    },
+  ]);
+});
+
 test('flags and drops IF NOT EXISTS on a table, importing it', async () => {
   const dump = `CREATE TABLE IF NOT EXISTS public.t (a integer);`;
 

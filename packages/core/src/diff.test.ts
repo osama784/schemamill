@@ -600,6 +600,161 @@ test('a column change reports collation, storage, then compression after default
   ]);
 });
 
+test('a statistics-target-only change reports the target after compression and carries it', () => {
+  const baseline = model(table('t', { columns: [column('c', { statisticsTarget: 100 })] }));
+  const target = model(table('t', { columns: [column('c', { statisticsTarget: 500 })] }));
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'statisticsTarget', before: 100, after: 500 }],
+          attributes: { type: 'text', statisticsTarget: 500 },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a statistics-target reset to absent is representable and carries no target', () => {
+  const baseline = model(table('t', { columns: [column('c', { statisticsTarget: 500 })] }));
+  const target = model(table('t', { columns: [column('c')] }));
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'statisticsTarget', before: 500 }],
+          attributes: { type: 'text' },
+        },
+      ],
+    },
+  ]);
+  const change = diff(baseline, target)[0];
+  if (change?.kind !== 'table-changed') assert.fail('expected a table-changed');
+  const columnChange = change.changes[0];
+  if (columnChange?.kind !== 'column-changed') assert.fail('expected a column-changed');
+  const field = columnChange.fields[0] as { after?: number };
+  assert.equal(field.after, undefined);
+});
+
+test('an added statistics target of 0 is reported with before undefined, not treated as absent', () => {
+  const baseline = model(table('t', { columns: [column('c')] }));
+  const target = model(table('t', { columns: [column('c', { statisticsTarget: 0 })] }));
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [{ field: 'statisticsTarget', after: 0 }],
+          attributes: { type: 'text', statisticsTarget: 0 },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a statistics target follows compression in the fixed column field order', () => {
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'text',
+          default: '0',
+          collation: 'pg_catalog."C"',
+          storage: 'extended',
+          compression: 'lz4',
+          notNullName: 'c_nn',
+          notNull: true,
+          statisticsTarget: 100,
+        }),
+      ],
+    }),
+  );
+  const target = model(
+    table('t', {
+      columns: [
+        column('c', {
+          type: 'bigint',
+          notNull: false,
+          default: '1',
+          collation: 'pg_catalog."en_US"',
+          storage: 'main',
+          compression: 'pglz',
+          statisticsTarget: 200,
+        }),
+      ],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'bigint' },
+            { field: 'notNull', before: true, after: false },
+            { field: 'notNullName', before: 'c_nn' },
+            { field: 'default', before: '0', after: '1' },
+            { field: 'collation', before: 'pg_catalog."C"', after: 'pg_catalog."en_US"' },
+            { field: 'storage', before: 'extended', after: 'main' },
+            { field: 'compression', before: 'lz4', after: 'pglz' },
+            { field: 'statisticsTarget', before: 100, after: 200 },
+          ],
+          attributes: {
+            type: 'bigint',
+            collation: 'pg_catalog."en_US"',
+            storage: 'main',
+            compression: 'pglz',
+            statisticsTarget: 200,
+          },
+        },
+      ],
+    },
+  ]);
+});
+
+test('a type and statistics-target change carries both in the attributes carrier', () => {
+  const baseline = model(table('t', { columns: [column('c', { statisticsTarget: 100 })] }));
+  const target = model(
+    table('t', { columns: [column('c', { type: 'bigint', statisticsTarget: 900 })] }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'column-changed',
+          name: 'c',
+          fields: [
+            { field: 'type', before: 'text', after: 'bigint' },
+            { field: 'statisticsTarget', before: 100, after: 900 },
+          ],
+          attributes: { type: 'bigint', statisticsTarget: 900 },
+        },
+      ],
+    },
+  ]);
+});
+
 test('a notNull-only or default-only column change carries no attributes', () => {
   const base = column('c', {
     collation: 'pg_catalog."C"',
