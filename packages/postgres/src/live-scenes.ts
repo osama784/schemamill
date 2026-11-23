@@ -105,7 +105,11 @@ import { renderSql } from './render.ts';
  * `SEQUENCE NAME`; `column-attributes` is the
  * attribute round trip on PostgreSQL 16 or newer — defaults, a system and a user collation,
  * storage, compression, and persistence — with the physical catalog state pinned so a
- * renderer omission cannot hide behind the two dumps agreeing; `introspection-flags` pins the
+ * renderer omission cannot hide behind the two dumps agreeing; `statistics-targets` does the
+ * same for column statistics targets from PostgreSQL 13 up — a stated target, the server
+ * default, the `-1` reset, target `0`, and both type-change shapes — with the NULL default of
+ * PostgreSQL 18 normalized to `-1` in the physical check so one scene spans both server paths;
+ * `introspection-flags` pins the
  * exact deferred-state diagnostics the read still reports (generation, the partitioned-table
  * skip, and the invalid, expression, partial, and `INCLUDE` index skips)
  * while the covered states read back instead of flagging; and
@@ -553,6 +557,18 @@ const storageModesOf = (tableName: string, schema = 'public'): string =>
  */
 const compressionModesOf = (tableName: string, schema = 'public'): string =>
   `select string_agg(attribute.attname || '|' || (to_jsonb(attribute) ->> 'attcompression'), ' ' order by attribute.attnum)` +
+  ' from pg_catalog.pg_attribute AS attribute' +
+  ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
+  ' and attribute.attnum > 0 and not attribute.attisdropped';
+
+/**
+ * One table's physical statistics targets, in attribute order, each as `name|target`: the
+ * `pg_attribute.attstattarget` value, with PostgreSQL 18's SQL NULL normalized to `-1` so one
+ * expectation pins the default on every server from 13 through 18. A stated target — including
+ * `0` — is read verbatim, so this is the physical check a renderer omission cannot hide behind.
+ */
+const statisticsOf = (tableName: string, schema = 'public'): string =>
+  `select string_agg(attribute.attname || '|' || coalesce(attribute.attstattarget, -1)::text, ' ' order by attribute.attnum)` +
   ' from pg_catalog.pg_attribute AS attribute' +
   ` where attribute.attrelid = '${schema}.${tableName}'::regclass` +
   ' and attribute.attnum > 0 and not attribute.attisdropped';
@@ -4737,6 +4753,183 @@ const columnAttributesScene = (): LiveScene => {
 };
 
 /**
+ * Column statistics targets end to end, floored at PostgreSQL 13 so both the `-1` default of
+ * 13–17 and the SQL NULL default of 18 run in CI. Six tables carry the six congruence cases: a
+ * stated target, the server default, a reset to absent, target `0`, a type change that preserves
+ * a stated target, and a type change that also changes the target. Each case pins the physical
+ * `attstattarget` (NULL normalized to `-1` so one expectation covers every server), the rendered
+ * SQL golden, and the dump/catalog congruence through `matches-import` and the empty import diff.
+ */
+const statisticsTargetsScene = (): LiveScene => {
+  const stated = table('st_stated', { columns: [column('c', { type: 'integer' })] });
+  const statedTarget = table('st_stated', {
+    columns: [column('c', { type: 'integer', statisticsTarget: 500 })],
+  });
+  const defaulted = table('st_default', { columns: [column('c', { type: 'integer' })] });
+  const reset = table('st_reset', {
+    columns: [column('c', { type: 'integer', statisticsTarget: 250 })],
+  });
+  const resetTarget = table('st_reset', { columns: [column('c', { type: 'integer' })] });
+  const zero = table('st_zero', { columns: [column('c', { type: 'integer' })] });
+  const zeroTarget = table('st_zero', {
+    columns: [column('c', { type: 'integer', statisticsTarget: 0 })],
+  });
+  const typeOnly = table('st_type_only', {
+    columns: [column('c', { type: 'integer', statisticsTarget: 300 })],
+  });
+  const typeOnlyTarget = table('st_type_only', {
+    columns: [column('c', { type: 'bigint', statisticsTarget: 300 })],
+  });
+  const typeAndTarget = table('st_type_target', {
+    columns: [column('c', { type: 'integer' })],
+  });
+  const typeAndTargetTarget = table('st_type_target', {
+    columns: [column('c', { type: 'bigint', statisticsTarget: 600 })],
+  });
+
+  const baseline = model(stated, defaulted, reset, zero, typeOnly, typeAndTarget);
+  const target = model(
+    statedTarget,
+    defaulted,
+    resetTarget,
+    zeroTarget,
+    typeOnlyTarget,
+    typeAndTargetTarget,
+  );
+
+  return {
+    name: 'statistics-targets',
+    minServerMajor: 13,
+    baseline,
+    target,
+    planChecks: [
+      {
+        description: 'a stated target renders one post-data SET STATISTICS',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = 'ALTER TABLE ONLY public.st_stated ALTER COLUMN c SET STATISTICS 500;';
+          return sql.includes(expected) ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'an omitted target renders no SET STATISTICS',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          return sql.includes('public.st_default') ? `sql: ${JSON.stringify(sql)}` : undefined;
+        },
+      },
+      {
+        description: 'a reset to absent renders SET STATISTICS -1',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = 'ALTER TABLE ONLY public.st_reset ALTER COLUMN c SET STATISTICS -1;';
+          return sql.includes(expected) ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'target 0 renders SET STATISTICS 0 and is not treated as absent',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = 'ALTER TABLE ONLY public.st_zero ALTER COLUMN c SET STATISTICS 0;';
+          return sql.includes(expected) ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'a type-only change preserves the stated target with one restatement',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const type = 'ALTER TABLE public.st_type_only ALTER COLUMN c TYPE bigint;';
+          const target = 'ALTER TABLE ONLY public.st_type_only ALTER COLUMN c SET STATISTICS 300;';
+          return sql.includes(type) && sql.includes(target)
+            ? undefined
+            : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'a type-and-target change renders the merged TYPE and the new target',
+        failure: (_steps, migration, serverMajor) => {
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const type = 'ALTER TABLE public.st_type_target ALTER COLUMN c TYPE bigint;';
+          const target =
+            'ALTER TABLE ONLY public.st_type_target ALTER COLUMN c SET STATISTICS 600;';
+          return sql.includes(type) && sql.includes(target)
+            ? undefined
+            : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'stated: the physical target is 500',
+        sql: statisticsOf('st_stated'),
+        expected: 'c|500',
+      },
+      {
+        description: 'default: the physical target is the server default, -1 on every server',
+        sql: statisticsOf('st_default'),
+        expected: 'c|-1',
+      },
+      {
+        description: 'reset: the physical target is back to the server default',
+        sql: statisticsOf('st_reset'),
+        expected: 'c|-1',
+      },
+      {
+        description: 'zero: the physical target is 0, not the default',
+        sql: statisticsOf('st_zero'),
+        expected: 'c|0',
+      },
+      {
+        description: 'type-only: TYPE preserved the physical target at 300',
+        sql: statisticsOf('st_type_only'),
+        expected: 'c|300',
+      },
+      {
+        description: 'type-and-target: the new physical target is 600',
+        sql: statisticsOf('st_type_target'),
+        expected: 'c|600',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import every statistics target exactly',
+        failure: (imported, source) => {
+          const facts = (name: string): string => {
+            const found = imported.model.tables.find((candidate) => candidate.name === name);
+            if (found === undefined) return 'not imported';
+            return (found.columns[0]?.statisticsTarget ?? '(none)').toString();
+          };
+          const actual = [
+            'st_stated',
+            'st_default',
+            'st_reset',
+            'st_zero',
+            'st_type_only',
+            'st_type_target',
+          ]
+            .map((name) => `${name}|${facts(name)}`)
+            .join(' ');
+          const expected =
+            'st_stated|500 st_default|(none) st_reset|(none) st_zero|0' +
+            ' st_type_only|300 st_type_target|600';
+          return actual === expected ? undefined : `${source}: ${actual}`;
+        },
+      },
+      {
+        description: 'each dump imports to the authored target model, statistics targets and all',
+        failure: (imported, source) => {
+          const changes = diff(target, imported.model);
+          return changes.length === 0
+            ? undefined
+            : `${source}: the import diffs as ${changes.map((change) => change.kind).join(',')}`;
+        },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
  * The live-introspection flags scene: the covered column and table states now read back
  * instead of flagging, and the deferred states stay flagged, each asserted as an exact
  * diagnostic. The model declares `flag_covered` — a default, an explicit collation, storage,
@@ -7435,6 +7628,7 @@ export const scenes: readonly LiveScene[] = [
   introspectionIndexesScene(),
   introspectionSequencesIdentityScene(),
   columnAttributesScene(),
+  statisticsTargetsScene(),
   introspectionFlagsScene(),
   introspectionFlagsNullsNotDistinctScene(),
   introspectionFlagsConstraintsScene(),
