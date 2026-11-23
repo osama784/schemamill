@@ -247,7 +247,7 @@ export type TableChange =
   /**
    * A column both sides have with differing fields: the scalar fields, plus the identity
    * difference when the column's identity differs, plus the target-side attribute carrier
-   * when any of `type`, `collation`, `storage`, or `compression` differs.
+   * when any of `type`, `collation`, `storage`, `compression`, or `statisticsTarget` differs.
    */
   | {
       kind: 'column-changed';
@@ -299,9 +299,10 @@ export type TableChange =
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
  * the fixed order `type`, `notNull`, `notNullName`, `default`, `collation`, `storage`,
- * `compression`. A `default`, `notNullName`, `collation`, `storage`, or `compression` change
- * omits the side that states none. A column's identity is not a scalar field: it travels as
- * the `identity` part of the `column-changed` entry.
+ * `compression`, `statisticsTarget`. A `default`, `notNullName`, `collation`, `storage`,
+ * `compression`, or `statisticsTarget` change omits the side that states none: a target reset
+ * to the server default carries only `before`, so `after` is `undefined`. A column's identity
+ * is not a scalar field: it travels as the `identity` part of the `column-changed` entry.
  */
 export type ColumnFieldChange =
   | { field: 'type'; before: string; after: string }
@@ -310,7 +311,8 @@ export type ColumnFieldChange =
   | { field: 'default'; before?: string; after?: string }
   | { field: 'collation'; before?: string; after?: string }
   | { field: 'storage'; before?: ColumnStorage; after?: ColumnStorage }
-  | { field: 'compression'; before?: ColumnCompression; after?: ColumnCompression };
+  | { field: 'compression'; before?: ColumnCompression; after?: ColumnCompression }
+  | { field: 'statisticsTarget'; before?: number; after?: number };
 
 /**
  * One differing option of a changed identity; only options that differ are reported, in the
@@ -1154,18 +1156,20 @@ function diffColumns(baseline: readonly Column[], target: readonly Column[]): Ta
 }
 
 /**
- * The target-side attribute carrier of a changed column, or `undefined` when the four
+ * The target-side attribute carrier of a changed column, or `undefined` when the five
  * render-relevant values compare equal. The carrier restates the target's explicit
  * attributes even when only the type differed: the renderer merges a type and collation
  * change into one `TYPE` statement, which resets storage and compression to the type's
- * defaults.
+ * defaults. A statistics-target change alone also produces a carrier, so the reset can be
+ * rendered from the target side; a target that states no target carries none.
  */
 function columnAttributes(baseline: Column, target: Column): ColumnAttributes | undefined {
   if (
     baseline.type === target.type &&
     baseline.collation === target.collation &&
     baseline.storage === target.storage &&
-    baseline.compression === target.compression
+    baseline.compression === target.compression &&
+    baseline.statisticsTarget === target.statisticsTarget
   ) {
     return undefined;
   }
@@ -1174,6 +1178,7 @@ function columnAttributes(baseline: Column, target: Column): ColumnAttributes | 
     ...(target.collation === undefined ? {} : { collation: target.collation }),
     ...(target.storage === undefined ? {} : { storage: target.storage }),
     ...(target.compression === undefined ? {} : { compression: target.compression }),
+    ...(target.statisticsTarget === undefined ? {} : { statisticsTarget: target.statisticsTarget }),
   };
 }
 
@@ -1218,6 +1223,13 @@ function diffColumnFields(baseline: Column, target: Column): ColumnFieldChange[]
       field: 'compression',
       ...(baseline.compression === undefined ? {} : { before: baseline.compression }),
       ...(target.compression === undefined ? {} : { after: target.compression }),
+    });
+  }
+  if (baseline.statisticsTarget !== target.statisticsTarget) {
+    fields.push({
+      field: 'statisticsTarget',
+      ...(baseline.statisticsTarget === undefined ? {} : { before: baseline.statisticsTarget }),
+      ...(target.statisticsTarget === undefined ? {} : { after: target.statisticsTarget }),
     });
   }
   return fields;

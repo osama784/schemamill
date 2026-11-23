@@ -1466,6 +1466,106 @@ test('serializeModel round-trips a populated model through resolveWorkspace with
   assert.deepStrictEqual(resolved.model, ROUND_TRIP_MODEL);
 });
 
+/** A one-column model whose column optionally carries an explicit statistics target. */
+function statisticsTargetModel(target: number | undefined): Model {
+  return {
+    tables: [
+      {
+        schema: 'public',
+        name: 't',
+        columns: [
+          {
+            name: 'c',
+            type: 'text',
+            notNull: false,
+            ...(target === undefined ? {} : { statisticsTarget: target }),
+          },
+        ],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [],
+      },
+    ],
+    sequences: [],
+    views: [],
+    extensions: [],
+  };
+}
+
+test('serializeModel round-trips statistics targets 0, 500 and 10000 and omits absence', async (t) => {
+  for (const target of [0, 500, 10000]) {
+    const model = statisticsTargetModel(target);
+    const bytes = serializeModel(model);
+    assert.ok(bytes.includes(`"statisticsTarget": ${target}`));
+    const dir = await fixtureDir(t);
+    await writeWorkspace(dir, bytes);
+    assert.deepStrictEqual((await resolveOk(dir)).model, model);
+  }
+
+  const absent = statisticsTargetModel(undefined);
+  const bytes = serializeModel(absent);
+  assert.equal(bytes.includes('statisticsTarget'), false);
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+  assert.deepStrictEqual((await resolveOk(dir)).model, absent);
+});
+
+test('resolveWorkspace rejects invalid statistics targets with a named JSON path', async (t) => {
+  const valid = JSON.parse(serializeModel(statisticsTargetModel(undefined))) as Record<
+    string,
+    unknown
+  >;
+  const cases: ReadonlyArray<readonly [unknown, string]> = [
+    [-1, 'a negative target'],
+    [-5, 'another negative target'],
+    [10001, 'a target above the maximum'],
+    [1.5, 'a non-integer target'],
+    [null, 'a null target'],
+  ];
+  for (const [target, reason] of cases) {
+    const payload = {
+      ...valid,
+      tables: [
+        {
+          schema: 'public',
+          name: 't',
+          columns: [{ name: 'c', type: 'text', notNull: false, statisticsTarget: target }],
+          foreignKeys: [],
+          uniqueConstraints: [],
+          checkConstraints: [],
+          indexes: [],
+        },
+      ],
+    };
+    const dir = await fixtureDir(t);
+    await writeWorkspace(dir, JSON.stringify(payload));
+
+    const diagnostic = await resolveFail(dir);
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid', reason);
+    assert.equal(
+      diagnostic.message,
+      'invalid model: tables[0].columns[0].statisticsTarget is not an integer between 0 and 10000',
+      reason,
+    );
+  }
+});
+
+test('serializeModel keeps models without a statistics target byte-identical and readers accept them', async (t) => {
+  const model = statisticsTargetModel(undefined);
+  const bytes = serializeModel(model);
+  assert.equal(bytes.includes('statisticsTarget'), false);
+  const payload = JSON.parse(bytes) as { tables: Array<{ columns: object[] }> };
+  assert.deepStrictEqual(Object.keys(payload.tables[0]!.columns[0]!), ['name', 'type', 'notNull']);
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+  const resolved = await resolveOk(dir);
+  assert.equal('statisticsTarget' in resolved.model.tables[0]!.columns[0]!, false);
+  assert.equal(serializeModel(resolved.model), bytes);
+});
+
 test('serializeModel emits a column identity before its attributes, and persistence last', () => {
   const payload = JSON.parse(serializeModel(ROUND_TRIP_MODEL)) as {
     tables: Array<{ columns: object[]; persistence?: string }>;

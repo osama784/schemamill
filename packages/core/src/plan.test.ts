@@ -753,6 +753,10 @@ const applyStep = (state: SimulatedState, step: Step): void => {
             if (field.after === undefined) delete altered.compression;
             else altered.compression = field.after;
             break;
+          case 'statisticsTarget':
+            if (field.after === undefined) delete altered.statisticsTarget;
+            else altered.statisticsTarget = field.after;
+            break;
           default:
             // `case 'default':` above is the column field named 'default'; this `default:` is
             // the exhaustiveness guard and neither shadows the other.
@@ -4002,6 +4006,38 @@ test('an alter-column step keeps the diff order and carries the target attribute
         collation: 'pg_catalog."en_US"',
         storage: 'main',
       },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an alter-column step carries a statistics-target field and the target carrier value', () => {
+  const baseline = model(table('t', { columns: [column('c', { statisticsTarget: 100 })] }));
+  const target = model(table('t', { columns: [column('c', { statisticsTarget: 500 })] }));
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'statisticsTarget', before: 100, after: 500 }],
+      attributes: { type: 'text', statisticsTarget: 500 },
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('an alter-column step carries a statistics-target reset with no carrier value', () => {
+  const baseline = model(table('t', { columns: [column('c', { statisticsTarget: 500 })] }));
+  const target = model(table('t', { columns: [column('c')] }));
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'alter-column',
+      table: identity('t'),
+      name: 'c',
+      fields: [{ field: 'statisticsTarget', before: 500 }],
+      attributes: { type: 'text' },
     },
   ]);
   simulate(baseline, target);
