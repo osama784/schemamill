@@ -2,7 +2,7 @@
 
 **Status:** built 2026-10-24 · updated 2026-11-22 · living document
 
-Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the count figures from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. The command itself stays in report mode for browsing; the gate is `pnpm docs:counts --check`, which ends the root `pnpm test` chain. A stale claim or a claim/derivation error fails that same gate, and both `verify` legs — Node 24 and Node 26 — reach it through the identical chain.
+Counts repeated across the plans drift every time the plan or the live suite grows. `pnpm docs:counts` derives the count figures from code, scans the docs that state them with a small set of literal patterns, and prints every mismatch as `file:line claimed vs actual`. The command itself stays in report mode for browsing; the gate is `pnpm docs:counts --check`, which runs just before the relative-link check at the end of the root `pnpm test` chain. A stale claim or a claim/derivation error fails that same gate, and both `verify` legs — Node 24 and Node 26 — reach it through the identical chain.
 
 ## Coverage
 
@@ -64,7 +64,7 @@ pnpm docs:counts
 
 The report prints one line per actual component, one line per stale claim (`docs-counts: <file>:<line> <class> claimed <x> actual <y>`), any claim errors, and a summary (`docs-counts: <claims> claims checked, <stale> stale`). It exits 0 in report mode even when a claim is stale or a derivation fails.
 
-`pnpm docs:counts --check` is the gate: it exits 1 on any stale claim or claim/derivation error and 0 on a clean tree. It ends the root `pnpm test` chain, after the package tests and the docs-count unit tests. `pnpm test` builds core and postgres inline through the package test scripts, so the gate has what it needs; a standalone run needs `pnpm build` first. When check mode cannot derive — for example when `packages/core/dist` is absent — the error line appends a hint to run `pnpm build` first.
+`pnpm docs:counts --check` is the gate: it exits 1 on any stale claim or claim/derivation error and 0 on a clean tree. It runs before the link check (the final step of the root `pnpm test` chain), after the package tests and the docs-count unit tests. `pnpm test` builds core and postgres inline through the package test scripts, so the gate has what it needs; a standalone run needs `pnpm build` first. When check mode cannot derive — for example when `packages/core/dist` is absent — the error line appends a hint to run `pnpm build` first.
 
 The companion unit tests in `.github/scripts/docs-counts.test.mjs` pin the patterns against real doc lines copied verbatim, the number-word parser, the phase-list contiguity check, the total formula, the report format, and the `--check` exit codes.
 
