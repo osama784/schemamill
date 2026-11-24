@@ -1419,7 +1419,7 @@ function resolveSequenceOwner(
 ): ResolvedSequenceOwner {
   if (row.ownerSchema === null || row.ownerTable === null) {
     throw new Error(
-      `catalog payload: sequence "${row.schema}.${row.name}" is owned but carries no owner table`,
+      `catalog payload: sequence "${row.schema}.${row.name}" declares an owner but carries no owner schema or owner table`,
     );
   }
   const table = tablesByKey.get(tableKey(row.ownerSchema, row.ownerTable));

@@ -873,7 +873,7 @@ test('rejects identity and ownership contract violations', async () => {
   );
   await assert.rejects(
     () => mapCatalog(payload({ sequences: [sequence('public', 's', { ownerKind: 'owned' })] })),
-    /catalog payload: sequence "public\.s" is owned but carries no owner table/,
+    /catalog payload: sequence "public\.s" declares an owner but carries no owner schema or owner table/,
     'an owned row without an owner table',
   );
   await assert.rejects(
