@@ -75,7 +75,9 @@ The JSON report lists every mutant with an `id`, `mutatorName`, source `location
 
 ## Attribution
 
-The tap runner records one test per **file**: the report's `testFiles` array maps each id to a test file, and every entry holds exactly one test. A mutant's `killedBy` is therefore a list of test-file ids — a survivor tells you which file to look in, not which assertion missed it.
+The tap runner records one test per **file**: the report's `testFiles` object is keyed by test-file name; it maps each id to a test file, and every entry holds exactly one test. A mutant's `killedBy` is therefore a list of test-file ids — a survivor tells you which file to look in, not which assertion missed it.
+
+The pinned Stryker CLI also offers `--testFiles <glob>` — honored by the `tap` runner — which limits a run to the matching test files, giving you a CLI-level handle on the same file-granular attribution the report records.
 
 To attribute a kill to a specific test, replay the mutant in place:
 
