@@ -1,0 +1,11 @@
+skip unsupported-statement	app.z_v_idx	skipped CREATE INDEX app.z_v_idx (indexes are not supported on a plain view) (9:1)
+skip unsupported-statement	app.a_v_idx	skipped CREATE INDEX app.a_v_idx (indexes are not supported on a plain view) (11:1)
+
+skip psql-meta-command	\restrict	stripped the psql meta-command line (5:1)
+skip psql-meta-command	\unrestrict	stripped the psql meta-command line (21:1)
+
+skip copy-data	COPY public.users	consumed 1 data line through the terminating \. line (13:1)
+
+flag unsupported-attribute	app.like	dropped LIKE clause from app.like (17:1)
+
+error parse-failure	syntax error at or near "UNSIGNED" (19:39)
