@@ -2207,6 +2207,224 @@ test('flags an exclusion constraint instead of modeling it', async () => {
   assert.match(diagnostics[1]?.message ?? '', /exclusion constraint t_excl on public\.t/);
 });
 
+test('flags a comment on an exclusion backing index without changing the skip', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
+    `COMMENT ON INDEX public.t_a_excl IS 'idx note';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The exclusion constraint stays skipped whole with ADR 0031's object and message; the backing
+  // index's comment gets the ADR 0030 flag, naming the schema-qualified index the dump comments.
+  assert.deepEqual(table.uniqueConstraints, []);
+  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_a_excl on public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+  ]);
+});
+
+test('flags an unqualified comment on an exclusion backing index with the schema-qualified object', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_excl_name EXCLUDE USING gist (a WITH =);`,
+    `COMMENT ON INDEX custom_excl_name IS 'idx note';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // The recorded conname resolves against the draft's schema, so the flag is the exact ADR 0030
+  // message whether or not the dump qualified the index target. A generated, constraint-style
+  // name is taken verbatim — no `_idx` canonicalization is involved.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint custom_excl_name on public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.custom_excl_name',
+      message: 'dropped comment from public.custom_excl_name',
+    },
+  ]);
+});
+
+test('flags a comment on an inline exclusion backing index', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =));`,
+    `COMMENT ON INDEX public.t_a_excl IS 'idx note';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // The inline declaration is flagged, never modeled; its conname is still recorded for the
+  // later `COMMENT ON INDEX` so the backing-index comment takes the precise flag.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped exclusion constraint t_a_excl from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+  ]);
+});
+
+test('flags only the index comment when an exclusion also carries a constraint comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
+    `COMMENT ON INDEX public.t_a_excl IS 'idx note';`,
+    `COMMENT ON CONSTRAINT t_a_excl ON public.t IS 'constraint note';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // Only the backing index takes the new flag. The constraint's own comment keeps today's
+  // generic path — it stays deferred on #90 — so its object is the three-part comment target.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_a_excl on public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.t_a_excl',
+      message: 'dropped comment from public.t.t_a_excl',
+    },
+  ]);
+});
+
+test('keeps the generic flag for an unknown index beside an exclusion constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
+    `COMMENT ON INDEX public.unrelated_idx IS 'x';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // An unrelated index name must not be captured by the recorded exclusion names.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_a_excl on public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.unrelated_idx',
+      message: 'dropped comment from public.unrelated_idx',
+    },
+  ]);
+});
+
+test('keeps the generic flag for an unnamed inline exclusion', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, EXCLUDE USING gist (a WITH =));`,
+    `COMMENT ON INDEX public.t_a_excl IS 'idx note';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // The dump carries no conname for an unnamed inline EXCLUDE, so there is nothing to record;
+  // the comment keeps the generic flag rather than gaining a synthesized index name (ADR 0035).
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t',
+      message: 'dropped exclusion constraint from public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+  ]);
+});
+
+test('keeps diagnostic order stable across exclusion backing-index comments', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
+    `COMMENT ON INDEX public.t_a_excl IS 'first';`,
+    `COMMENT ON INDEX public.other_idx IS 'unrelated';`,
+    `COMMENT ON CONSTRAINT t_a_excl ON public.t IS 'constraint note';`,
+    `COMMENT ON INDEX public.t_a_excl IS 'second';`,
+  ].join('\n');
+
+  const { diagnostics } = await importDump(dump);
+
+  // The new flag is emitted in place at the comment statement; no existing diagnostic moves.
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_a_excl on public.t',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.other_idx',
+      message: 'dropped comment from public.other_idx',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t.t_a_excl',
+      message: 'dropped comment from public.t.t_a_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_a_excl',
+      message: 'dropped comment from public.t_a_excl',
+    },
+  ]);
+});
+
 test('skips a USING INDEX constraint whole when the index cannot back it', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,

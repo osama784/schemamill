@@ -1897,6 +1897,87 @@ test('flags a comment on a unique constraint backing index without modeling it',
   ]);
 });
 
+test('flags a comment on an exclusion backing index while leaving the constraint own comment unused', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a')],
+      constraints: [
+        {
+          ...exclusionConstraint('public', 't', 't_excl'),
+          comment: 'comment on the constraint itself',
+          backingIndexName: 't_excl',
+          backingIndexComment: 'comment on the backing index',
+        },
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.uniqueConstraints, []);
+  assert.deepEqual(read.model.tables[0]?.indexes, []);
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint t_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_excl',
+      message: 'dropped comment from public.t_excl',
+    },
+  ]);
+});
+
+test('sorts an exclusion backing-index comment with the p/u dropped comments by index name', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a'), column('public', 't', 2, 'b')],
+      primaryKeys: [key('public', 't', 't_pkey', 1, 'a', { backingIndexComment: 'pk comment' })],
+      constraints: [
+        uniqueConstraint('public', 't', 'z_key', ['b'], {
+          backingIndexComment: 'unique comment',
+        }),
+        {
+          ...exclusionConstraint('public', 't', 'a_excl'),
+          backingIndexName: 'a_excl',
+          backingIndexComment: 'exclusion comment',
+        },
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.diagnostics, [
+    {
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object: 'public.t',
+      message: 'skipped exclusion constraint a_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.a_excl',
+      message: 'dropped comment from public.a_excl',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_pkey',
+      message: 'dropped comment from public.t_pkey',
+    },
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.z_key',
+      message: 'dropped comment from public.z_key',
+    },
+  ]);
+});
+
 test('sorts dropped constraint-backed index comments into the index phase by index name', async () => {
   const read = await mapCatalog(
     payload({
@@ -1994,17 +2075,6 @@ test('rejects rows that misstate or disagree on the backing index contract', asy
       ),
     /catalog payload: foreign-key constraint "public\.t\.f" carries backingIndexComment outside its kind/,
     'a foreign key row carrying the referenced index comment',
-  );
-  await assert.rejects(
-    () =>
-      mapCatalog(
-        payload({
-          ...base,
-          constraints: [{ ...exclusionConstraint('public', 't', 'x'), backingIndexName: 'x_idx' }],
-        }),
-      ),
-    /catalog payload: exclusion constraint "public\.t\.x" carries backingIndexName outside its kind/,
-    'an exclusion row naming its backing index',
   );
   await assert.rejects(
     () =>

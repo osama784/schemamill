@@ -5309,12 +5309,15 @@ const partitionChildGuardsScene = (): LiveScene => ({
  * unique constraint, which PostgreSQL renames to the constraint's name (`cbu_a_idx` becomes
  * `cbu_a_key`); pg_dump carries the renamed index and its `COMMENT ON INDEX`, never the
  * `USING INDEX` clause, so this scene proves the catalog and the dump import agree on the
- * post-rename object name. The models stay empty, so the diagnostics are the whole claim;
- * `matches-import` cannot be used because the catalog now flags what the import flags, and
- * the `flags` assertion pins the exact diagnostic list instead. pg_dump emits a late
- * `COMMENT ON INDEX` for every one of the three, so both imports reach the generic late
- * flag; the import checks sort before comparing, which keeps the pin independent of the
- * dump's statement order.
+ * post-rename object name. `cbx` adds the exclusion-constraint leg: a gist exclusion constraint
+ * whose backing index is commented, with no extension needed because the range `&&` operator
+ * class is built in. Its backing index takes the constraint name, so the dump's
+ * `COMMENT ON INDEX public.cbx_a_excl` and the catalog's `conindid` join name the same object.
+ * The models stay empty, so the diagnostics are the whole claim; `matches-import` cannot be
+ * used because the catalog now flags what the import flags, and the `flags` assertion pins the
+ * exact diagnostic list instead. pg_dump emits a late `COMMENT ON INDEX` for every one of the
+ * four, so both imports reach the same flag; the import checks sort before comparing, which
+ * keeps the pin independent of the dump's statement order.
  */
 const constraintBackedIndexCommentsScene = (): LiveScene => {
   /**
@@ -5335,6 +5338,7 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
     'flag|unsupported-attribute|public.cbi_b_key|dropped comment from public.cbi_b_key',
     'flag|unsupported-attribute|public.cbi_pkey|dropped comment from public.cbi_pkey',
     'flag|unsupported-attribute|public.cbu_a_key|dropped comment from public.cbu_a_key',
+    'flag|unsupported-attribute|public.cbx_a_excl|dropped comment from public.cbx_a_excl',
   ];
 
   /** One exact `pg_description` row for an index comment, as a one-line text fact. */
@@ -5366,6 +5370,11 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
       'cbu_a_key',
       'using index comment',
     ),
+    indexCommentCheck(
+      `the ${subject} stored the exclusion backing-index comment`,
+      'cbx_a_excl',
+      'exclusion index comment',
+    ),
   ];
 
   return {
@@ -5378,6 +5387,8 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
       'CREATE UNIQUE INDEX cbu_a_idx ON public.cbu (a);',
       "COMMENT ON INDEX public.cbu_a_idx IS 'using index comment';",
       'ALTER TABLE public.cbu ADD CONSTRAINT cbu_a_key UNIQUE USING INDEX cbu_a_idx;',
+      'CREATE TABLE public.cbx (a int4range, CONSTRAINT cbx_a_excl EXCLUDE USING gist (a WITH &&));',
+      "COMMENT ON INDEX public.cbx_a_excl IS 'exclusion index comment';",
     ].join('\n'),
     baseline: model(),
     target: model(),
@@ -5386,7 +5397,7 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
     importChecks: [
       {
         description:
-          'the import reports no error and drops exactly the three constraint-backed index comments',
+          'the import reports no error and drops exactly the four constraint-backed index comments',
         failure: (imported, source) => {
           const errors = imported.diagnostics
             .filter((diagnostic) => diagnostic.kind === 'error')
@@ -5433,6 +5444,18 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
           code: 'unsupported-attribute',
           object: 'public.cbu_a_key',
           message: 'dropped comment from public.cbu_a_key',
+        },
+        {
+          kind: 'skip',
+          code: 'unsupported-statement',
+          object: 'public.cbx',
+          message: 'skipped exclusion constraint cbx_a_excl',
+        },
+        {
+          kind: 'flag',
+          code: 'unsupported-attribute',
+          object: 'public.cbx_a_excl',
+          message: 'dropped comment from public.cbx_a_excl',
         },
       ],
     },

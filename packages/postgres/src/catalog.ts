@@ -370,10 +370,10 @@ SELECT json_build_object(
         END AS period,
         pg_catalog.obj_description(c.oid, 'pg_constraint') AS comment,
         CASE
-          WHEN c.contype = 'u' THEN backing_relation.relname
+          WHEN c.contype IN ('u', 'x') THEN backing_relation.relname
         END AS "backingIndexName",
         CASE
-          WHEN c.contype = 'u'
+          WHEN c.contype IN ('u', 'x')
           THEN pg_catalog.obj_description(backing_relation.oid, 'pg_class')
         END AS "backingIndexComment"
       FROM pg_catalog.pg_constraint AS c
@@ -1132,6 +1132,11 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
               message: `skipped exclusion constraint ${constraintRow.conname}`,
             },
           });
+          if (constraintRow.backingIndexComment !== null) {
+            consumedIndexComments.push(
+              droppedIndexCommentFinding(constraintRow.schema, constraintRow.backingIndexName!),
+            );
+          }
           break;
         }
       }
@@ -1836,8 +1841,6 @@ function validateConstraintRow(row: ConstraintRow): void {
         'nullsNotDistinct',
         'including',
         'period',
-        'backingIndexName',
-        'backingIndexComment',
       ]);
   }
 }
