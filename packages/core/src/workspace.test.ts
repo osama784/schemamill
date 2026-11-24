@@ -9,6 +9,7 @@ import {
   readdir,
   rm,
   stat,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -260,6 +261,31 @@ test('resolveWorkspace reports a marker that is not a directory', async (t) => {
 
   assert.equal(diagnostic.code, 'workspace-marker-invalid');
   assert.equal(diagnostic.message, `${marker} is not a directory`);
+});
+
+test('resolveWorkspace accepts a symlinked marker and reports the lexical root', async (t) => {
+  const dir = await fixtureDir(t);
+  const realDir = join(dir, 'real');
+  await initWithModel(realDir, POPULATED_MODEL);
+  try {
+    await symlink(join(realDir, WORKSPACE_DIR_NAME), join(dir, WORKSPACE_DIR_NAME), 'dir');
+  } catch (error) {
+    const code =
+      error instanceof Error && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : undefined;
+    if (code === 'ENOSYS' || code === 'EPERM' || code === 'EACCES' || code === 'EXDEV') {
+      t.skip('symlinks are unsupported here');
+      return;
+    }
+    throw error;
+  }
+
+  const result = await resolveWorkspace(dir);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.root, dir);
+  assert.deepStrictEqual(result.model, POPULATED_MODEL);
 });
 
 test('resolveWorkspace reports an unreadable marker with the path and the reason', async (t) => {

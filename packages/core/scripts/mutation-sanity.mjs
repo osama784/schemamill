@@ -32,13 +32,21 @@ const reportPath = path.join(packageRoot, REPORT_RELATIVE_PATH);
 
 const anchorLabel = `${SOURCE_FILE}:${ANCHOR}`;
 
-/** Fail with the anchor and its maintenance contract, then exit non-zero. */
+/**
+ * Fail with the context, the anchor and its maintenance contract, and the other load-bearing
+ * guards, then exit non-zero. Not every failure means re-aim the anchor.
+ */
 function fail(context, message) {
   console.error(`mutation-sanity: FAIL — ${context}: ${message}`);
   console.error(`mutation-sanity: anchor: ${anchorLabel}`);
   console.error(
     'mutation-sanity: if the anchor function is renamed or moved, re-aim the ANCHOR constant ' +
       'in this script (contract documented in docs/mutation-testing.md).',
+  );
+  console.error(
+    'mutation-sanity: also asserts: the committed config (tap runner, pinned plugins, pnpm) ' +
+      'and the report (mutants present, none uncovered, a kill, the pinned mutator killed); ' +
+      'a failure there is not an anchor re-aim.',
   );
   process.exit(1);
 }
