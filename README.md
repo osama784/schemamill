@@ -116,7 +116,7 @@ node "$SCHEMAMILL" plan ../target.sql
 node "$SCHEMAMILL" export
 ```
 
-`plan` prints the same two-step migration, and `export` prints the workspace model as the DDL that builds it (pass `--format json` for the canonical JSON model).
+`plan` prints the same two-step migration, and `export` prints a projection of the workspace model: `--format ddl` (the default) prints the DDL that builds it, `--format json` prints the canonical JSON model, and `--format markdown` prints a readable Markdown projection.
 
 ## Scope and refusals
 
