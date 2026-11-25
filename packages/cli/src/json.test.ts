@@ -469,6 +469,7 @@ const HAZARD_KEYS: Record<Hazard['kind'], readonly string[]> = {
 const COMMENT_TARGET_KEYS: Record<CommentTarget['kind'], readonly string[]> = {
   table: ['kind', 'table'],
   column: ['kind', 'table', 'column'],
+  'not-null': ['kind', 'table', 'column'],
   sequence: ['kind', 'sequence'],
   view: ['kind', 'view', 'materialized'],
   extension: ['kind', 'extension'],

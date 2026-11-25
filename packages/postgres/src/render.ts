@@ -926,6 +926,10 @@ function renderCommentTarget(target: CommentTarget): string {
       return `TABLE ${renderTable(target.table)}`;
     case 'column':
       return `COLUMN ${renderTable(target.table)}.${quoteIdentifier(target.column)}`;
+    case 'not-null':
+      // ws3 replaces this with `COMMENT ON CONSTRAINT <name> ON <table>` using
+      // `target.column.notNullName ?? synthesizedNotNullName(target.table, target.column.name)`.
+      throw new Error('not-null comment rendering not implemented yet');
     case 'sequence':
       return `SEQUENCE ${renderSequence(target.sequence)}`;
     case 'view':

@@ -530,6 +530,25 @@ const commentTargetNode = (
       assert.ok(column !== undefined, `comment on missing column ${target.column} of ${key}`);
       return column;
     }
+    case 'not-null': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on not-null constraint of missing table ${key}`);
+      const column = table.columns.get(target.column.name);
+      assert.ok(
+        column !== undefined,
+        `comment on missing not-null constraint on ${key}.${target.column.name}`,
+      );
+      return {
+        get comment(): string | undefined {
+          return column.notNullComment;
+        },
+        set comment(value: string | undefined) {
+          if (value === undefined) delete column.notNullComment;
+          else column.notNullComment = value;
+        },
+      };
+    }
     case 'sequence': {
       const key = keyOf(target.sequence);
       const sequence = state.sequences.get(key);
@@ -8312,4 +8331,80 @@ test('an identity sequence name counts as a schema use', () => {
     { kind: 'add-identity', table: identity('t'), name: 'id', identity: descriptor },
   ]);
   simulate(model(), target);
+});
+
+test('a notNullComment-only change is one terminal comment step with the not-null target', () => {
+  const baseline = model(table('t', { columns: [column('c', { notNull: true })] }));
+  const target = model(
+    table('t', { columns: [column('c', { notNull: true, notNullComment: 'nn' })] }),
+  );
+
+  assertPlan(baseline, target, [
+    {
+      kind: 'comment',
+      target: {
+        kind: 'not-null',
+        table: identity('t'),
+        column: { name: 'c', type: 'text', notNull: true },
+      },
+      text: 'nn',
+    },
+  ]);
+  simulate(baseline, target);
+});
+
+test('column and not-null comment steps keep distinct keys in column-then-not-null order', () => {
+  const baseline = model(table('t', { columns: [column('c', { notNull: true })] }));
+  const target = model(
+    table('t', {
+      columns: [column('c', { notNull: true, comment: 'column', notNullComment: 'not-null' })],
+    }),
+  );
+
+  assert.deepStrictEqual(
+    plan(baseline, target).steps.filter((step) => step.kind === 'comment'),
+    [
+      {
+        kind: 'comment',
+        target: { kind: 'column', table: identity('t'), column: 'c' },
+        text: 'column',
+      },
+      {
+        kind: 'comment',
+        target: {
+          kind: 'not-null',
+          table: identity('t'),
+          column: { name: 'c', type: 'text', notNull: true },
+        },
+        text: 'not-null',
+      },
+    ],
+  );
+  simulate(baseline, target);
+});
+
+test('a name-involved not-null change re-asserts an unchanged notNullComment', () => {
+  const baseline = model(
+    table('t', { columns: [column('c', { notNull: true, notNullComment: 'nn' })] }),
+  );
+  const target = model(
+    table('t', {
+      columns: [column('c', { notNull: true, notNullName: 'c_not_null', notNullComment: 'nn' })],
+    }),
+  );
+
+  assertPlan(baseline, target, [
+    { kind: 'drop-not-null', table: identity('t'), column: 'c' },
+    { kind: 'add-not-null', table: identity('t'), column: 'c', name: 'c_not_null' },
+    {
+      kind: 'comment',
+      target: {
+        kind: 'not-null',
+        table: identity('t'),
+        column: { name: 'c', type: 'text', notNull: true, notNullName: 'c_not_null' },
+      },
+      text: 'nn',
+    },
+  ]);
+  simulate(baseline, target);
 });
