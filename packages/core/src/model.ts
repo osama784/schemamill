@@ -146,6 +146,14 @@ export interface Column {
    * column is nullable.
    */
   readonly notNullName?: string;
+  /**
+   * The comment on the column's not-null constraint (PostgreSQL 18), stored verbatim; absent
+   * means none. Valid whenever `notNull: true` — it is NOT gated on `notNullName`: a generated
+   * name is stripped at import, so the primary case has no name. An empty string is not a
+   * comment, text is never whitespace-normalized, and no NUL. This is not `COMMENT ON COLUMN`
+   * (that is `comment`) and does not make the not-null fact an entity.
+   */
+  readonly notNullComment?: string;
   /** The `DEFAULT` expression as written, whitespace-normalized; opaque to the model. */
   readonly default?: string;
   /**

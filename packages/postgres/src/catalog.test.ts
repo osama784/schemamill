@@ -187,14 +187,23 @@ const foreignKey = (
 const exclusionConstraint = (schema: string, tableName: string, conname: string) =>
   constraint(schema, tableName, conname, 'exclusion');
 
-/** A `notNullConstraints` row: validated, inheriting, and conventionally named unless overridden. */
+/** A `notNullConstraints` row: validated, inheriting, conventionally named, and uncommented unless overridden. */
 const notNull = (
   schema: string,
   tableName: string,
   columnName: string,
   conname: string,
   rest: Record<string, unknown> = {},
-) => ({ schema, tableName, columnName, conname, validated: true, noInherit: false, ...rest });
+) => ({
+  schema,
+  tableName,
+  columnName,
+  conname,
+  validated: true,
+  noInherit: false,
+  comment: null,
+  ...rest,
+});
 
 /** An `indexes` row: a valid, ready, default-tablespace index unless overridden. */
 const index = (
@@ -3187,6 +3196,39 @@ test('maps every constraint kind with its attributes and strips every convention
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('reads a not-null constraint comment onto its column', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'a', { attnotnull: true }),
+        column('public', 't', 2, 'b', { attnotnull: true }),
+        column('public', 't', 3, 'c', { attnotnull: true }),
+      ],
+      notNullConstraints: [
+        notNull('public', 't', 'a', 't_a_not_null', { comment: 'generated' }),
+        notNull('public', 't', 'b', 'custom_b_nn', { comment: 'explicit' }),
+        notNull('public', 't', 'c', 't_c_not_null', { comment: null }),
+      ],
+    }),
+  );
+
+  const t = read.model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(t, 'the table is mapped');
+  assert.deepEqual(t.columns, [
+    { name: 'a', type: 'text', notNull: true, notNullComment: 'generated' },
+    {
+      name: 'b',
+      type: 'text',
+      notNull: true,
+      notNullName: 'custom_b_nn',
+      notNullComment: 'explicit',
+    },
+    { name: 'c', type: 'text', notNull: true },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
 test('strips every conventional constraint formula, truncated server forms included', async () => {
   const long = 'w'.repeat(60);
   const read = await mapCatalog(
@@ -4091,6 +4133,22 @@ test('rejects malformed constraint, primary-key, index, and not-null rows', asyn
         constraints: [uniqueConstraint('public', 't', 'u', ['a'], { comment: [] })],
       }),
       /catalog payload\.constraints\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a not-null row missing its comment',
+      payload({
+        ...base,
+        notNullConstraints: [withoutComment(notNull('public', 't', 'a', 'nn'))],
+      }),
+      /catalog payload\.notNullConstraints\[0\]\.comment must be a string or null/,
+    ],
+    [
+      'a wrong-typed not-null comment',
+      payload({
+        ...base,
+        notNullConstraints: [notNull('public', 't', 'a', 'nn', { comment: 7 })],
+      }),
+      /catalog payload\.notNullConstraints\[0\]\.comment must be a string or null/,
     ],
     [
       'an index row missing its comment',

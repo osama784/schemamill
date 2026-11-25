@@ -657,6 +657,8 @@ function formatCommentTarget(target: CommentTarget): string {
       return `table ${formatIdentity(target.table)}`;
     case 'column':
       return `column ${formatIdentity(target.table)}.${target.column}`;
+    case 'not-null':
+      return `not-null constraint ${formatIdentity(target.table)}.${target.column.name}`;
     case 'sequence':
       return `sequence ${formatIdentity(target.sequence)}`;
     case 'view':

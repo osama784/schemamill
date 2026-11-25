@@ -57,7 +57,12 @@ const SEQUENCE_ID: SequenceIdentity = { schema: 'public', name: 'widget_seq' };
 const VIEW_ID: ViewIdentity = { schema: 'public', name: 'active_widgets' };
 const EXTENSION_ID: ExtensionIdentity = { name: 'pgcrypto' };
 
-const COLUMN: Column = { name: 'id', type: 'integer', notNull: true };
+const COLUMN: Column = {
+  name: 'id',
+  type: 'integer',
+  notNull: true,
+  notNullComment: 'not-null note',
+};
 const PRIMARY_KEY: PrimaryKey = { columns: ['id'] };
 const FOREIGN_KEY: ForeignKey = {
   columns: ['owner_id'],
@@ -110,6 +115,11 @@ const MATVIEW_OWNER: IndexOwner = { kind: 'materialized-view', view: VIEW_ID };
 const COMMENT_TARGETS: readonly CommentTarget[] = [
   { kind: 'table', table: TABLE_ID },
   { kind: 'column', table: TABLE_ID, column: 'id' },
+  {
+    kind: 'not-null',
+    table: TABLE_ID,
+    column: { name: 'id', type: 'integer', notNull: true },
+  },
   { kind: 'sequence', sequence: SEQUENCE_ID },
   { kind: 'view', view: VIEW_ID, materialized: false },
   { kind: 'extension', extension: EXTENSION_ID },
@@ -469,6 +479,7 @@ const HAZARD_KEYS: Record<Hazard['kind'], readonly string[]> = {
 const COMMENT_TARGET_KEYS: Record<CommentTarget['kind'], readonly string[]> = {
   table: ['kind', 'table'],
   column: ['kind', 'table', 'column'],
+  'not-null': ['kind', 'table', 'column'],
   sequence: ['kind', 'sequence'],
   view: ['kind', 'view', 'materialized'],
   extension: ['kind', 'extension'],
@@ -586,6 +597,7 @@ const ALLOWED_KEYS = new Set<string>([
   'type',
   'notNull',
   'notNullName',
+  'notNullComment',
   'default',
   'identity',
   'collation',

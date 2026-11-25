@@ -2799,3 +2799,57 @@ test('resolveWorkspace accepts a column with the default key omitted', async (t)
   assert.deepStrictEqual(model.tables[0]!.columns, [{ name: 'c', type: 'text', notNull: false }]);
   assert.equal('default' in model.tables[0]!.columns[0]!, false);
 });
+
+test('serializeModel round-trips notNullComment on an unnamed NOT NULL column', async (t) => {
+  const model: Model = {
+    tables: [
+      {
+        ...minimalTable('public', 't'),
+        columns: [{ name: 'c', type: 'text', notNull: true, notNullComment: 'not null note' }],
+      },
+    ],
+    sequences: [],
+    views: [],
+    extensions: [],
+  };
+
+  const bytes = serializeModel(model);
+  assert.ok(bytes.includes('"notNullComment": "not null note"'));
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+  assert.deepStrictEqual((await resolveOk(dir)).model, model);
+});
+
+test('resolveWorkspace rejects notNullComment on a nullable column', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [
+      tablePayload({
+        columns: [{ name: 'c', type: 'text', notNull: false, notNullComment: 'note' }],
+      }),
+    ],
+    sequences: [],
+  });
+
+  assert.equal(diagnostic.code, 'workspace-model-invalid');
+  assert.equal(
+    diagnostic.message,
+    'invalid model: tables[0].columns[0].notNullComment is only valid on a NOT NULL column',
+  );
+});
+
+test('resolveWorkspace rejects an empty or NUL notNullComment', async (t) => {
+  for (const value of ['', 'bad\u0000comment']) {
+    const diagnostic = await resolvePayload(t, {
+      tables: [
+        tablePayload({
+          columns: [{ name: 'c', type: 'text', notNull: true, notNullComment: value }],
+        }),
+      ],
+      sequences: [],
+    });
+
+    assert.equal(diagnostic.code, 'workspace-model-invalid');
+    assert.match(diagnostic.message, /^invalid model: tables\[0\]\.columns\[0\]\.notNullComment/);
+  }
+});

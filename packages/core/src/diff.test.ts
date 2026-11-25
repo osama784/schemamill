@@ -5056,3 +5056,24 @@ test('extension changes follow view changes and precede comment changes', () => 
     ],
   );
 });
+
+test('a notNullComment-only change is one comment change on the not-null target', () => {
+  const bare = table('users', { columns: [column('email', { notNull: true })] });
+  const commented = table('users', {
+    columns: [column('email', { notNull: true, notNullComment: 'login' })],
+  });
+  const changed = table('users', {
+    columns: [column('email', { notNull: true, notNullComment: 'sign-in' })],
+  });
+  const target = {
+    kind: 'not-null',
+    table: identity('users'),
+    column: { name: 'email', type: 'text', notNull: true },
+  } as const;
+
+  assertDiff(model(bare), model(commented), [{ kind: 'comment-changed', target, after: 'login' }]);
+  assertDiff(model(commented), model(bare), [{ kind: 'comment-changed', target, before: 'login' }]);
+  assertDiff(model(commented), model(changed), [
+    { kind: 'comment-changed', target, before: 'login', after: 'sign-in' },
+  ]);
+});

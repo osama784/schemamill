@@ -6111,7 +6111,7 @@ test('flags every comment target the import cannot resolve, keeping skips for un
   assert.deepEqual(table.columns, [{ name: 'a', type: 'integer', notNull: false }]);
 });
 
-test('flags not-null comments with the deferral wording, after the constraint slots', async () => {
+test('retains not-null constraint comments while keeping generated names stripped', async () => {
   const dump = [
     `CREATE TABLE public.t (`,
     `    a integer CONSTRAINT a_nn NOT NULL,`,
@@ -6119,27 +6119,72 @@ test('flags not-null comments with the deferral wording, after the constraint sl
     `    c integer NOT NULL,`,
     `    CONSTRAINT t_b_not_null CHECK (b > 0)`,
     `);`,
+    `COMMENT ON CONSTRAINT a_nn ON public.t IS 'explicit';`,
+    `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'generated';`,
+    `COMMENT ON CONSTRAINT t_b_not_null ON public.t IS 'check';`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  assert.deepEqual(diagnostics, [], 'comments on named not-null constraints are no longer flagged');
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // An explicit name keeps both name and comment; a generated name strips to unnamed but keeps
+  // its comment. The check slot still wins over column b's generated not-null name, so b has
+  // neither a check comment nor a not-null comment.
+  assert.deepEqual(table.columns, [
+    {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'a_nn',
+      notNullComment: 'explicit',
+    },
+    { name: 'b', type: 'integer', notNull: true },
+    { name: 'c', type: 'integer', notNull: true, notNullComment: 'generated' },
+  ]);
+  assert.deepEqual(table.checkConstraints, [
+    { name: 't_b_not_null', expression: 'b > 0', comment: 'check' },
+  ]);
+});
+
+test('stores no not-null comment when the constraint carries none', async () => {
+  const dump = `CREATE TABLE public.t (a integer CONSTRAINT a_nn NOT NULL, b integer NOT NULL);`;
+  const { model, diagnostics } = await importDump(dump);
+  assert.deepEqual(diagnostics, []);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+  assert.deepEqual(table.columns, [
+    { name: 'a', type: 'integer', notNull: true, notNullName: 'a_nn' },
+    { name: 'b', type: 'integer', notNull: true },
+  ]);
+  for (const column of table.columns) {
+    assert.equal('notNullComment' in column, false, 'an absent comment adds no field');
+  }
+});
+
+test('keeps the NO INHERIT flag beside a retained not-null comment', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, CONSTRAINT a_nn NOT NULL a NO INHERIT);`,
     `COMMENT ON CONSTRAINT a_nn ON public.t IS 'x';`,
-    `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'x';`,
-    `COMMENT ON CONSTRAINT t_b_not_null ON public.t IS 'x';`,
   ].join('\n');
 
   const { model, diagnostics } = await importDump(dump);
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
-
-  // The explicit check name wins over column b's generated not-null name: constraint slots are
-  // searched before the columns' not-null facts. The stored custom name and the generated name
-  // both take the deferral's wording.
-  assert.deepEqual(table.checkConstraints, [
-    { name: 't_b_not_null', expression: 'b > 0', comment: 'x' },
+  assert.deepEqual(table.columns, [
+    {
+      name: 'a',
+      type: 'integer',
+      notNull: true,
+      notNullName: 'a_nn',
+      notNullComment: 'x',
+    },
   ]);
   assert.deepEqual(
     diagnostics.map((diagnostic) => diagnostic.message),
-    [
-      'dropped comment on a not-null constraint from public.t.a_nn',
-      'dropped comment on a not-null constraint from public.t.t_c_not_null',
-    ],
+    ['dropped NO INHERIT on not-null constraint a_nn from public.t'],
+    'the NO INHERIT wording and order are unchanged',
   );
 });
 

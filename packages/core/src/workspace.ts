@@ -441,6 +441,7 @@ function serializeColumn(column: Column): object {
     type: column.type,
     notNull: column.notNull,
     ...(column.notNullName === undefined ? {} : { notNullName: column.notNullName }),
+    ...(column.notNullComment === undefined ? {} : { notNullComment: column.notNullComment }),
     ...(column.default === undefined ? {} : { default: column.default }),
     ...(column.identity === undefined ? {} : { identity: serializeIdentity(column.identity) }),
     ...(column.collation === undefined ? {} : { collation: column.collation }),
@@ -594,6 +595,7 @@ const COLUMN_KEYS = [
   'type',
   'notNull',
   'notNullName',
+  'notNullComment',
   'default',
   'identity',
   'collation',
@@ -904,6 +906,15 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
     if (notNullName.value !== undefined && notNull.value !== true) {
       return invalid(`${fieldPath(path, 'notNullName')} is only valid on a NOT NULL column`);
     }
+    const notNullComment = parseOptional(
+      object.notNullComment,
+      fieldPath(path, 'notNullComment'),
+      parseComment,
+    );
+    if (!notNullComment.ok) return notNullComment;
+    if (notNullComment.value !== undefined && notNull.value !== true) {
+      return invalid(`${fieldPath(path, 'notNullComment')} is only valid on a NOT NULL column`);
+    }
     const defaultValue = parseOptional(
       object.default,
       fieldPath(path, 'default'),
@@ -939,6 +950,7 @@ function parseColumn(value: unknown, path: string): Parsed<Column> {
       type: type.value,
       notNull: notNull.value,
       ...(notNullName.value === undefined ? {} : { notNullName: notNullName.value }),
+      ...(notNullComment.value === undefined ? {} : { notNullComment: notNullComment.value }),
       ...(defaultValue.value === undefined ? {} : { default: defaultValue.value }),
       ...(identity.value === undefined ? {} : { identity: identity.value }),
       ...(collation.value === undefined ? {} : { collation: collation.value }),

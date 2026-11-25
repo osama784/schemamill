@@ -299,11 +299,18 @@ export interface TransactionGroup {
  * value, and a copied target's nodes carry no `comment` of their own. The constraint and index
  * variants carry the whole node because an unnamed node's server name is synthesized at render
  * time, and `view` carries `materialized` because the rendered keyword differs and a
- * `ViewIdentity` alone does not say which kind it names.
+ * `ViewIdentity` alone does not say which kind it names. The not-null variant carries the whole
+ * column because the renderer resolves the constraint name at render time from `notNullName` or
+ * the synthesized formula, exactly as it does for the other constraint variants.
  */
 export type CommentTarget =
   | { readonly kind: 'table'; readonly table: TableIdentity }
   | { readonly kind: 'column'; readonly table: TableIdentity; readonly column: string }
+  | {
+      readonly kind: 'not-null';
+      readonly table: TableIdentity;
+      readonly column: Column;
+    }
   | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
   | { readonly kind: 'view'; readonly view: ViewIdentity; readonly materialized: boolean }
   | { readonly kind: 'extension'; readonly extension: ExtensionIdentity }
@@ -678,6 +685,27 @@ export function plan(baseline: Model, target: Model): Plan {
       application,
       { kind: 'foreign-key', table: step.table, foreignKey: step.foreignKey },
       step.foreignKey.comment,
+    );
+  }
+
+  // A name-involved column change drops and re-adds the not-null fact, taking its comment away.
+  // When the comment itself is unchanged the diff emits no `comment-changed`, so re-assert it
+  // against the name the target leaves behind. A comment that did change already has a step in
+  // `application.comments`; the terminal phase dedups the two by key, keeping the diff's text.
+  const targetColumns = new Map<string, Column>();
+  for (const table of target.tables) {
+    for (const column of table.columns) {
+      targetColumns.set(columnKey(table, column.name), column);
+    }
+  }
+  for (const step of application.notNullAdds) {
+    if (step.kind !== 'add-not-null') continue;
+    const column = targetColumns.get(columnKey(step.table, step.column));
+    if (column?.notNullComment === undefined) continue;
+    pushRecreateComment(
+      application,
+      { kind: 'not-null', table: step.table, column },
+      column.notNullComment,
     );
   }
 
@@ -1671,6 +1699,12 @@ function copyCommentTarget(target: CommentTarget): CommentTarget {
       return { kind: 'table', table: copyIdentity(target.table) };
     case 'column':
       return { kind: 'column', table: copyIdentity(target.table), column: target.column };
+    case 'not-null': {
+      const column: Mutable<Column> = copyColumn(target.column);
+      delete column.comment;
+      delete column.notNullComment;
+      return { kind: 'not-null', table: copyIdentity(target.table), column };
+    }
     case 'sequence':
       return { kind: 'sequence', sequence: copySequenceIdentity(target.sequence) };
     case 'view':
@@ -1729,6 +1763,13 @@ function commentTargetKey(target: CommentTarget): string {
       return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
     case 'column':
       return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'not-null':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'not-null',
+        target.column.name,
+      ]);
     case 'sequence':
       return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
     case 'view':

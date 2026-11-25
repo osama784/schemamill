@@ -283,6 +283,7 @@ function mapColumn(column: Column): object {
     type: column.type,
     notNull: column.notNull,
     ...(column.notNullName === undefined ? {} : { notNullName: column.notNullName }),
+    ...(column.notNullComment === undefined ? {} : { notNullComment: column.notNullComment }),
     ...(column.default === undefined ? {} : { default: column.default }),
     ...(column.identity === undefined ? {} : { identity: mapIdentity(column.identity) }),
     ...(column.collation === undefined ? {} : { collation: column.collation }),
@@ -470,6 +471,12 @@ function mapCommentTarget(target: CommentTarget): object {
       return { kind: 'table', table: mapTableIdentity(target.table) };
     case 'column':
       return { kind: 'column', table: mapTableIdentity(target.table), column: target.column };
+    case 'not-null':
+      return {
+        kind: 'not-null',
+        table: mapTableIdentity(target.table),
+        column: mapColumn(target.column),
+      };
     case 'sequence':
       return { kind: 'sequence', sequence: mapSequenceIdentity(target.sequence) };
     case 'view':

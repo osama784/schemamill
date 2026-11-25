@@ -108,6 +108,7 @@ An `identity` on `column-changed` is an IdentityChange: `added`, `removed`, and 
 | --- | --- |
 | `table` | `table` |
 | `column` | `table`, `column` |
+| `not-null` | `table`, `column` |
 | `sequence` | `sequence` |
 | `view` | `view`, `materialized` |
 | `extension` | `extension` |
@@ -116,6 +117,8 @@ An `identity` on `column-changed` is an IdentityChange: `added`, `removed`, and 
 | `unique-constraint` | `table`, `uniqueConstraint` |
 | `check-constraint` | `table`, `checkConstraint` |
 | `foreign-key` | `table`, `foreignKey` |
+
+An embedded `column` payload carries the optional `notNullComment` field beside `notNullName` when the column declares a not-null constraint comment ([ADR 0038](./adr/0038-not-null-constraint-comments-travel-the-model.md)); both keys are omitted when absent. The `not-null` target carries the whole column, not just its name, so a renderer can resolve the constraint by `notNullName ?? synthesizedNotNullName` when a generated name was stripped on import; its comment key is `[schema, table, 'not-null', column]`, distinct from the plain column target's key.
 
 A view-index change or index step names its owner with `kind: "table"` (`table`) or `kind: "materialized-view"` (`view`); an ordinary view cannot own an index.
 

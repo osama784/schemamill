@@ -1,0 +1,8 @@
+2 steps in one transaction:
+ 1. alter-column  public.t.c: not null false → true
+ 2. comment       not-null constraint public.t.c: "a generated not-null name with a comment"
+
+BEGIN;
+ALTER TABLE public.t ALTER COLUMN c SET NOT NULL;
+COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'a generated not-null name with a comment';
+COMMIT;

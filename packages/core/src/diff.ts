@@ -676,6 +676,11 @@ function diffComments(baseline: Model, target: Model): readonly CommentChange[] 
         beforeColumns.get(column.name)?.comment,
         column.comment,
       );
+      emit(
+        { kind: 'not-null', table, column },
+        beforeColumns.get(column.name)?.notNullComment,
+        column.notNullComment,
+      );
     }
 
     if (table.primaryKey !== undefined) {
@@ -792,6 +797,12 @@ function copyTarget(target: CommentTarget): CommentTarget {
         table: copyTargetIdentity(target.table),
         column: target.column,
       };
+    case 'not-null': {
+      const column: Mutable<Column> = copyColumn(target.column);
+      delete column.comment;
+      delete column.notNullComment;
+      return { kind: 'not-null', table: copyTargetIdentity(target.table), column };
+    }
     case 'sequence':
       return { kind: 'sequence', sequence: copyTargetIdentity(target.sequence) };
     case 'view':
@@ -857,6 +868,13 @@ function commentTargetKey(target: CommentTarget): string {
       return JSON.stringify([target.table.schema, target.table.name, 'table', '']);
     case 'column':
       return JSON.stringify([target.table.schema, target.table.name, 'column', target.column]);
+    case 'not-null':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'not-null',
+        target.column.name,
+      ]);
     case 'sequence':
       return JSON.stringify([target.sequence.schema, target.sequence.name, 'sequence', '']);
     case 'view':
