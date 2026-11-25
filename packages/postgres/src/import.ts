@@ -1570,6 +1570,17 @@ function withComment<Node extends { readonly comment?: string }>(
   return copy;
 }
 
+/** A copy of `column` carrying `notNullComment`, or without it when `text` is absent. */
+function withNotNullComment<ColumnShape extends { readonly notNullComment?: string }>(
+  column: ColumnShape,
+  text: string | undefined,
+): ColumnShape {
+  const copy: Mutable<ColumnShape> = { ...column };
+  if (text === undefined) delete copy.notNullComment;
+  else copy.notNullComment = text;
+  return copy;
+}
+
 /** The draft index a `COMMENT ON INDEX` names, in its schema, by stored or synthesized name. */
 function findCommentedIndex(
   tables: Map<string, TableDraft>,
@@ -1602,9 +1613,11 @@ function isExclusionBackingIndex(
 /**
  * Resolves a constraint comment by the fixed slot order: primary key, unique constraints,
  * check constraints, foreign keys — each by stored name, or by the conventional synthesized
- * name for a node the source left unnamed — then the columns' not-null facts, flagged with the
- * PG18 deferral's wording, then the generic flag. PostgreSQL keeps constraint names unique per
- * table, so the order is observable only for an invalid model.
+ * name for a node the source left unnamed — then the columns' not-null facts by stored or
+ * synthesized name, storing the text as `notNullComment`, then the generic flag. The draft
+ * still carries the synthesized name here; `finalizeTable` strips it unconditionally afterwards,
+ * so a comment survives on an otherwise unnamed not-null fact. PostgreSQL keeps constraint
+ * names unique per table, so the order is observable only for an invalid model.
  */
 function applyConstraintComment(
   statement: ParsedStatement,
@@ -1689,7 +1702,15 @@ function applyConstraintComment(
       matches(column.notNullName, synthesizedNotNullName(draft.name, column.name)),
   );
   if (notNull !== undefined) {
-    diagnostics.push(flagAttribute(statement, object, 'comment on a not-null constraint'));
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.columns[draft.columns.indexOf(notNull)] = withNotNullComment(notNull, value);
+      },
+      diagnostics,
+    );
     return;
   }
 

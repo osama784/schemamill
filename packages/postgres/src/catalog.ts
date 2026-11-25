@@ -407,7 +407,8 @@ SELECT json_build_object(
         attribute.attname AS "columnName",
         not_null_constraint.conname AS conname,
         not_null_constraint.convalidated AS validated,
-        not_null_constraint.connoinherit AS "noInherit"
+        not_null_constraint.connoinherit AS "noInherit",
+        pg_catalog.obj_description(not_null_constraint.oid, 'pg_constraint') AS comment
       FROM pg_catalog.pg_constraint AS not_null_constraint
       JOIN pg_catalog.pg_class AS relation ON relation.oid = not_null_constraint.conrelid
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -692,6 +693,7 @@ interface NotNullConstraintRow {
   readonly conname: string;
   readonly validated: boolean;
   readonly noInherit: boolean;
+  readonly comment: string | null;
 }
 
 /**
@@ -1226,12 +1228,14 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           notNullRow.conname === synthesizedNotNullName(row.name, column.name)
             ? undefined
             : notNullRow.conname;
+        const notNullComment = notNullRow?.comment ?? undefined;
         const identity = identityFor(row, column, sequenceMapping.identities);
         return {
           name: column.name,
           type: column.type,
           notNull: column.attnotnull,
           ...(notNullName === undefined ? {} : { notNullName }),
+          ...(notNullComment === undefined ? {} : { notNullComment }),
           ...(identity === undefined ? {} : { identity }),
           ...columnAttributes(column),
           ...(column.comment === null ? {} : { comment: column.comment }),
@@ -2494,6 +2498,7 @@ function parseNotNullConstraintRow(value: unknown, path: string): NotNullConstra
     'conname',
     'validated',
     'noInherit',
+    'comment',
   ]);
   return {
     schema: expectString(row, path, 'schema'),
@@ -2502,6 +2507,7 @@ function parseNotNullConstraintRow(value: unknown, path: string): NotNullConstra
     conname: expectString(row, path, 'conname'),
     validated: expectBoolean(row, path, 'validated'),
     noInherit: expectBoolean(row, path, 'noInherit'),
+    comment: expectNullableString(row, path, 'comment'),
   };
 }
 
