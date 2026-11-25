@@ -79,7 +79,7 @@ A column's explicit compression method: `pglz` or `lz4`. Absent means the type's
 _Avoid_: codec, encoding
 
 **Comment**:
-Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, index, or extension — carried verbatim as the entity's `comment`. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
+Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, index, or extension — carried verbatim as the entity's `comment`, plus the text on a column's named not-null constraint, carried as the same column's `notNullComment`. The not-null surface is the same **Comment**, not a new entity: it travels as a `not-null` `CommentTarget` variant and renders against the column's **Not-null constraint name** or the name synthesized when a generated one was stripped. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
 _Avoid_: description, annotation, docstring, metadata
 
 **Table persistence**:

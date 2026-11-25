@@ -3928,9 +3928,22 @@ test('an added not-null column carries its comment through the diff into SQL', (
       '',
     ].join('\n'),
   );
+  // A declaration the model carries renders as declared at every target (ADR 0024): a not-null
+  // comment at the PostgreSQL 13 floor still emits the statement, with no version refusal.
+  assert.equal(
+    renderSql(plan(baseline, target), { targetVersion: 13 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD COLUMN e text NOT NULL;',
+      "COMMENT ON CONSTRAINT t_e_not_null ON public.t IS 'on e';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+    'a notNullComment renders as declared at the PostgreSQL 13 floor',
+  );
   assert.ok(
-    !renderSql(plan(baseline, bare)).includes('COMMENT ON'),
-    'an absent notNullComment emits no comment step',
+    !renderSql(plan(baseline, bare), { targetVersion: 13 }).includes('COMMENT ON'),
+    'an absent notNullComment emits no comment step at any target',
   );
 });
 
