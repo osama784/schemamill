@@ -234,3 +234,17 @@ _Avoid_: diagram, board, graph
 **Workspace**:
 The container that organizes a user's work on disk; the unit the studio and the CLI work within.
 _Avoid_: project, folder
+
+### The context map
+
+**Bounded context**:
+A sphere of language and model with its own boundaries. Schemamill is one bounded context: it owns a single canonical model, into which Import and Introspection bring a schema from DDL text or a live database. PostgreSQL is external and not owned; it keeps its own vocabulary — catalog names, type and constraint semantics, lock modes — that schemamill never adopts into the model. See [context-map.md](./docs/domain/context-map.md), § Contexts (line 7).
+_Avoid_: context, boundary context, domain
+
+**Anti-Corruption Layer (ACL)**:
+The translation boundary between two bounded contexts. Inbound, Import and Introspection translate PostgreSQL's vocabulary into the canonical model, so no catalog or dialect words leak in. Outbound, a migration plan's Migration SQL renders into PostgreSQL's SQL. Schemamill never writes the database; the user carries every change across by Apply. See [context-map.md](./docs/domain/context-map.md), § Relationships (lines 19-20).
+_Avoid_: access-control list
+
+**Subdomain**:
+A part of a bounded context's problem space, one of three kinds: core — schema-change intelligence, where investment and craft go (the canonical model, import fidelity, semantic diff, and the hazard-annotated migration plan); supporting — presentation and projection (migration SQL rendering, export projections, import diagnostics); or generic — plumbing (CLI/server mechanics, packaging, parsing and catalog tooling). The source names the first kind "Core domain" (context-map.md:13), and the others "Supporting subdomain" and "Generic subdomain" (:14-15). See [context-map.md](./docs/domain/context-map.md), § Subdomains (lines 13-15).
+_Avoid_: subsystem, module
