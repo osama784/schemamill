@@ -161,7 +161,7 @@ Bringing a schema into the model by reading a live database's catalog, read-only
 _Avoid_: import, scan, sync
 
 **Export**:
-Projecting the canonical model into a reviewable artifact — migration-style DDL or canonical JSON — without changing the workspace. Read-only: schemamill never applies the SQL it prints.
+Projecting the canonical model into a reviewable artifact — migration-style DDL, Markdown, or canonical JSON — without changing the workspace. Read-only: schemamill never applies the SQL it prints.
 _Avoid_: dump, save, serialize
 
 **Report artifact**:

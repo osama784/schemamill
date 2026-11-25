@@ -565,7 +565,7 @@ const USAGE = [
   '',
   'Commands:',
   '  compare [options] [baseline] [target]  Print the diff and any hazards between a baseline and a target.',
-  '  export [options]                       Print the workspace model as DDL or canonical JSON.',
+  '  export [options]                       Print the workspace model as DDL, Markdown, or canonical JSON.',
   '  init [options] [path]                  Create a workspace in a directory.',
   '  plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.',
   '  report <dump>                          Report the import fidelity findings for one DDL dump.',
@@ -612,10 +612,10 @@ const REPORT_HELP = [
 const EXPORT_HELP = [
   'Usage: schemamill export [options]',
   '',
-  'Print the workspace model as DDL or canonical JSON.',
+  'Print the workspace model as DDL, Markdown, or canonical JSON.',
   '',
   'Options:',
-  '  --format <format>         output format: ddl or json (default: "ddl")',
+  '  --format <format>         output format: ddl, json, markdown (default: "ddl")',
   '  --target-version <major>  PostgreSQL major (13-18) (default: "13")',
   '  -h, --help                display help for command',
   '',
@@ -704,6 +704,17 @@ async function exportWorkspace(context: TestContext): Promise<string> {
   const root = await fixtureDir(context);
   const created = await initWorkspace(root, EXPORT_MODEL);
   assert.equal(created.ok, true);
+  return root;
+}
+
+/**
+ * A fresh temp workspace holding the rich Markdown fixture bytes verbatim. Writing the file
+ * directly (instead of going through `initWorkspace`/`serializeModel`) keeps nested collection
+ * order as authored, so the golden pins the renderer's own sorting rather than the serializer's.
+ */
+async function exportMarkdownWorkspace(context: TestContext): Promise<string> {
+  const root = await fixtureDir(context);
+  await writeWorkspaceModel(root, testText('fixtures/export-markdown-model.json'));
   return root;
 }
 
@@ -1982,6 +1993,31 @@ test('export --format json --target-version 18 prints the canonical bytes unchan
   assert.equal(result.code, 0);
 });
 
+test('export --format markdown prints exactly the export.markdown.txt golden, exit 0', async (t) => {
+  const root = await exportMarkdownWorkspace(t);
+
+  const result = await runCli('export', '--format', 'markdown', { cwd: root });
+
+  assert.equal(result.stdout, testText('goldens/export.markdown.txt'));
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('export --format markdown --target-version 18 prints the same bytes as plain markdown', async (t) => {
+  // The flag keys DDL rendering only; the Markdown projection never sees it.
+  const root = await exportMarkdownWorkspace(t);
+
+  const plain = await runCli('export', '--format', 'markdown', { cwd: root });
+  const withVersion = await runCli('export', '--format', 'markdown', '--target-version', '18', {
+    cwd: root,
+  });
+
+  assert.equal(withVersion.stdout, plain.stdout);
+  assert.equal(withVersion.stdout, testText('goldens/export.markdown.txt'));
+  assert.equal(withVersion.stderr, '');
+  assert.equal(withVersion.code, 0);
+});
+
 test('export of an empty workspace prints an empty DDL script and the empty model', async (t) => {
   const root = await fixtureDir(t);
   const created = await initWorkspace(root);
@@ -1998,6 +2034,18 @@ test('export of an empty workspace prints an empty DDL script and the empty mode
   assert.equal(json.stdout, EMPTY_MODEL);
   assert.equal(json.stderr, '');
   assert.equal(json.code, 0);
+});
+
+test('export --format markdown on an empty workspace prints only the Schema heading, exit 0', async (t) => {
+  const root = await fixtureDir(t);
+  const created = await initWorkspace(root);
+  assert.equal(created.ok, true);
+
+  const result = await runCli('export', '--format', 'markdown', { cwd: root });
+
+  assert.equal(result.stdout, '# Schema\n');
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
 });
 
 test('export outside any workspace is one stderr line, exit 1', async (t) => {
@@ -2032,7 +2080,18 @@ test('an invalid --format is a usage error before any filesystem access, exit 1'
   const result = await runCli('export', '--format', 'text', { cwd: dir });
 
   assert.equal(result.stdout, '');
-  assert.equal(result.stderr, 'error: --format must be "ddl" or "json"\n');
+  assert.equal(result.stderr, 'error: --format must be "ddl", "json", or "markdown"\n');
+  assert.equal(result.code, 1);
+});
+
+test('export rejects a near-miss --format value before any filesystem access, exit 1', async (t) => {
+  // `md` is not the new format's spelling: the allowed set is exactly the three pinned values.
+  const dir = await fixtureDir(t);
+
+  const result = await runCli('export', '--format', 'md', { cwd: dir });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'error: --format must be "ddl", "json", or "markdown"\n');
   assert.equal(result.code, 1);
 });
 
@@ -2088,7 +2147,7 @@ test('export reports an invalid --format before an invalid --target-version, exi
   });
 
   assert.equal(result.stdout, '');
-  assert.equal(result.stderr, 'error: --format must be "ddl" or "json"\n');
+  assert.equal(result.stderr, 'error: --format must be "ddl", "json", or "markdown"\n');
   assert.equal(result.code, 1);
 });
 
@@ -2178,6 +2237,19 @@ test('export --format json refuses a dangling target owner on one stderr line, e
   await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
 
   const result = await runCli('export', '--format', 'json', { cwd: root });
+
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, DANGLING_TABLE_ERROR);
+  assert.equal(result.code, 1);
+});
+
+test('export --format markdown refuses a dangling target owner on one stderr line, exit 1', async (t) => {
+  // Markdown, like JSON, plans the model before its format branch: the projection is only of a
+  // model that already passed the plan-time ownership contract.
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);
+
+  const result = await runCli('export', '--format', 'markdown', { cwd: root });
 
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, DANGLING_TABLE_ERROR);

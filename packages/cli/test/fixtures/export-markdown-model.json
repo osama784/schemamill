@@ -1,0 +1,200 @@
+{
+  "tables": [
+    {
+      "schema": "app",
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "notNull": true,
+          "notNullName": "users_id_nn",
+          "notNullComment": "identity key keeps its name",
+          "identity": {
+            "generated": "always",
+            "sequenceName": {
+              "schema": "app",
+              "name": "users_id_seq"
+            },
+            "increment": "1",
+            "minValue": "1",
+            "maxValue": "9223372036854775807",
+            "start": "1",
+            "cache": "1",
+            "cycle": false
+          },
+          "comment": "surrogate key"
+        },
+        {
+          "name": "email",
+          "type": "text",
+          "notNull": true,
+          "default": "'unknown'",
+          "collation": "\"C\"",
+          "storage": "extended",
+          "compression": "lz4",
+          "statisticsTarget": 0,
+          "comment": "unique address"
+        },
+        {
+          "name": "display_name",
+          "type": "text",
+          "notNull": false
+        },
+        {
+          "name": "org_id",
+          "type": "integer",
+          "notNull": false
+        }
+      ],
+      "primaryKey": {
+        "name": "users_pkey",
+        "columns": ["id"],
+        "deferrable": true,
+        "initiallyDeferred": true,
+        "comment": "primary key comment"
+      },
+      "foreignKeys": [
+        {
+          "name": "users_org_fkey",
+          "columns": ["org_id"],
+          "referencedTable": {
+            "schema": "app",
+            "name": "orgs"
+          },
+          "referencedColumns": ["id"],
+          "onUpdate": "CASCADE",
+          "onDelete": "RESTRICT",
+          "enforcement": "not-enforced",
+          "deferrable": true,
+          "initiallyDeferred": false,
+          "comment": "foreign key comment"
+        }
+      ],
+      "uniqueConstraints": [
+        {
+          "name": "users_email_key",
+          "columns": ["email"],
+          "deferrable": false,
+          "initiallyDeferred": false,
+          "comment": "unique constraint comment"
+        }
+      ],
+      "checkConstraints": [
+        {
+          "name": "users_id_check",
+          "expression": "id > 0",
+          "enforcement": "not-valid",
+          "comment": "check constraint comment"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "users_email_z_idx",
+          "unique": true,
+          "columns": ["email"],
+          "concurrently": true,
+          "comment": "second index comment"
+        },
+        {
+          "name": "users_email_a_idx",
+          "unique": false,
+          "columns": ["display_name"],
+          "comment": "first index comment"
+        }
+      ],
+      "persistence": "unlogged",
+      "comment": "table comment"
+    },
+    {
+      "schema": "app",
+      "name": "orgs",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": true
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "checkConstraints": [],
+      "indexes": []
+    }
+  ],
+  "sequences": [
+    {
+      "schema": "app",
+      "name": "users_id_seq",
+      "dataType": "bigint",
+      "increment": "1",
+      "minValue": "1",
+      "maxValue": "9223372036854775807",
+      "start": "1",
+      "cache": "1",
+      "cycle": false,
+      "ownedBy": {
+        "table": {
+          "schema": "app",
+          "name": "users"
+        },
+        "column": "id"
+      },
+      "comment": "sequence comment"
+    },
+    {
+      "schema": "app",
+      "name": "audit_seq",
+      "dataType": "integer",
+      "increment": "2",
+      "minValue": "-2147483648",
+      "maxValue": "2147483647",
+      "start": "10",
+      "cache": "5",
+      "cycle": true
+    }
+  ],
+  "views": [
+    {
+      "schema": "app",
+      "name": "active_users",
+      "materialized": false,
+      "definition": "SELECT id, email FROM app.users WHERE id > 0",
+      "checkOption": "local",
+      "comment": "view comment"
+    },
+    {
+      "schema": "app",
+      "name": "user_stats",
+      "materialized": true,
+      "definition": "SELECT count(*) AS count FROM app.users",
+      "indexes": [
+        {
+          "name": "user_stats_z_idx",
+          "unique": true,
+          "columns": ["count"],
+          "comment": "second matview index comment"
+        },
+        {
+          "name": "user_stats_a_idx",
+          "unique": false,
+          "columns": ["count"],
+          "concurrently": true,
+          "comment": "first matview index comment"
+        }
+      ],
+      "comment": "materialized view comment"
+    }
+  ],
+  "extensions": [
+    {
+      "name": "pgcrypto",
+      "schema": "public",
+      "comment": "extension comment"
+    },
+    {
+      "name": "citext",
+      "schema": "extensions"
+    }
+  ]
+}

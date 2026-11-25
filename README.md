@@ -40,7 +40,7 @@ Usage: schemamill [options] [command]
 
 Commands:
   compare [options] [baseline] [target]  Print the diff and any hazards between a baseline and a target.
-  export [options]                       Print the workspace model as DDL or canonical JSON.
+  export [options]                       Print the workspace model as DDL, Markdown, or canonical JSON.
   init [options] [path]                  Create a workspace in a directory.
   plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.
   report <dump>                          Report the import fidelity findings for one DDL dump.
@@ -116,7 +116,7 @@ node "$SCHEMAMILL" plan ../target.sql
 node "$SCHEMAMILL" export
 ```
 
-`plan` prints the same two-step migration, and `export` prints the workspace model as the DDL that builds it (pass `--format json` for the canonical JSON model).
+`plan` prints the same two-step migration, and `export` prints a projection of the workspace model: `--format ddl` (the default) prints the DDL that builds it, `--format json` prints the canonical JSON model, and `--format markdown` prints a readable Markdown projection.
 
 ## Scope and refusals
 

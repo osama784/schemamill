@@ -1,0 +1,97 @@
+# Schema
+
+## Tables
+
+### Table `app.orgs`
+
+#### Columns
+
+- Column `id`: type `integer`, not null, default (none), collation (none), storage (none), compression (none), statistics target (none), comment (none), not-null comment (none)
+
+### Table `app.users`
+
+- Comment: `table comment`
+- Persistence: `unlogged`
+
+#### Columns
+
+- Column `id`: type `bigint`, not null, default (none), collation (none), storage (none), compression (none), statistics target (none), comment `surrogate key`, not-null comment `identity key keeps its name`
+  - Not-null constraint name: `users_id_nn`
+  - Identity: generation `always`, sequence `app.users_id_seq`, increment `1`, min `1`, max `9223372036854775807`, start `1`, cache `1`, cycle no
+- Column `email`: type `text`, not null, default `'unknown'`, collation `"C"`, storage `extended`, compression `lz4`, statistics target 0, comment `unique address`, not-null comment (none)
+- Column `display_name`: type `text`, nullable, default (none), collation (none), storage (none), compression (none), statistics target (none), comment (none), not-null comment (none)
+- Column `org_id`: type `integer`, nullable, default (none), collation (none), storage (none), compression (none), statistics target (none), comment (none), not-null comment (none)
+
+#### Primary key
+
+- name: `users_pkey`, columns: (`id`), deferrable: yes, initially deferred: yes, comment: `primary key comment`
+
+#### Unique constraints
+
+- name: `users_email_key`, columns: (`email`), deferrable: no, initially deferred: no, comment: `unique constraint comment`
+
+#### Check constraints
+
+- name: `users_id_check`, expression: `id > 0`, enforcement: `not-valid`, comment: `check constraint comment`
+
+#### Foreign keys
+
+- name: `users_org_fkey`, columns: (`org_id`), referenced table: `app.orgs`, referenced columns: (`id`), on update: `CASCADE`, on delete: `RESTRICT`, enforcement: `not-enforced`, deferrable: yes, initially deferred: no, comment: `foreign key comment`
+
+#### Indexes
+
+- name: `users_email_a_idx`, unique: no, columns: (`display_name`), concurrently: (none), comment: `first index comment`
+- name: `users_email_z_idx`, unique: yes, columns: (`email`), concurrently: yes, comment: `second index comment`
+
+## Sequences
+
+### Sequence `app.audit_seq`
+
+- data type: `integer`
+- increment: `2`
+- min: `-2147483648`
+- max: `2147483647`
+- start: `10`
+- cache: `5`
+- cycle: yes
+
+### Sequence `app.users_id_seq`
+
+- data type: `bigint`
+- increment: `1`
+- min: `1`
+- max: `9223372036854775807`
+- start: `1`
+- cache: `1`
+- cycle: no
+- owned by: `app.users.id`
+- comment: `sequence comment`
+
+## Views
+
+### View `app.active_users`
+
+- definition: `SELECT id, email FROM app.users WHERE id > 0`
+- check option: `local`
+- comment: `view comment`
+
+### Materialized view `app.user_stats`
+
+- definition: `SELECT count(*) AS count FROM app.users`
+- comment: `materialized view comment`
+
+#### Indexes
+
+- name: `user_stats_a_idx`, unique: no, columns: (`count`), concurrently: yes, comment: `first matview index comment`
+- name: `user_stats_z_idx`, unique: yes, columns: (`count`), concurrently: (none), comment: `second matview index comment`
+
+## Extensions
+
+### Extension `citext`
+
+- schema: `extensions`
+
+### Extension `pgcrypto`
+
+- schema: `public`
+- comment: `extension comment`
