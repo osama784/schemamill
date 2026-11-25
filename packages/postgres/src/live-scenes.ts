@@ -3488,22 +3488,31 @@ const constraintAttributesScene = (): LiveScene => {
 /**
  * The generated-not-null-name round trip: a target adding a not-null fact to a previously
  * nullable column, so the migration's `SET NOT NULL` gives PostgreSQL 18 the generated name
- * `t_c_not_null`. Raw target SQL comments that constraint, which keeps the name in the target
- * dump — pg_dump suppresses a generated name only when the constraint carries no comment —
- * while the migrated database's dump suppresses it, so the empty diff is load-bearing on the
- * import's formula strip, which reads the generated name back as unnamed. The comment itself
- * cannot be attached to a not-null fact the model does not carry: its `COMMENT ON CONSTRAINT`
- * takes the named not-null deferral flag, which the target import pins while still stripping
- * the generated name. The probes pin the catalog behavior of `DROP NOT NULL` and `SET NOT NULL`
- * on the baseline-built not-null fact of `d`, and the catalog checks pin the generated names
- * and the not-null definition.
+ * `t_c_not_null`. The target carries the not-null comment on that column, so both the target
+ * build and the migration emit `COMMENT ON CONSTRAINT t_c_not_null` through the synthesized
+ * name. pg_dump keeps a generated name only when its constraint is commented, so both dumps
+ * carry the name; the importer still strips the formula to an unnamed not-null fact and stores
+ * the text as `notNullComment`. Both dumps therefore import the same model - the comment lives
+ * on the column, not on the retained name - and the empty diff is load-bearing on that strip.
+ * The plan checks pin the name-free `alter-column` step and its following `comment` step, the
+ * import checks pin retention without the old deferral flag on both sides, and `matches-import`
+ * proves the catalog read - now projecting `obj_description` for `contype='n'` - is congruent.
+ * Acceptance: all not-null-constraint comment coverage lives in this PostgreSQL 18 scene,
+ * because a generated not-null name is a PostgreSQL 18 shape and no per-case version gate
+ * exists; `comment-round-trip` stays PostgreSQL 13-floored and carries no not-null comment.
+ * The probes pin the catalog behavior of `DROP NOT NULL` and `SET NOT NULL` on the
+ * baseline-built not-null fact of `d`, and the catalog checks pin the generated names and the
+ * not-null definition.
  */
 const notNullConstraintNamesScene = (): LiveScene => {
+  // The comment is modeled on the target column, not added as raw SQL: only a modeled comment
+  // produces a `comment` step in the migration and a `notNullComment` in the imported dumps.
+  const notNullComment = 'a comment keeps the generated name in the dump';
   const baseline = table('t', {
     columns: [column('c'), column('d', { notNull: true })],
   });
   const target = table('t', {
-    columns: [column('c', { notNull: true }), column('d', { notNull: true })],
+    columns: [column('c', { notNull: true, notNullComment }), column('d', { notNull: true })],
   });
   // `DROP NOT NULL` must remove the column's `contype = 'n'` row (PostgreSQL 18 records
   // not-null constraints in `pg_constraint`); the row is looked up by the column's attnum, so
@@ -3544,19 +3553,31 @@ const notNullConstraintNamesScene = (): LiveScene => {
     minServerMajor: 18,
     baseline: model(baseline),
     target: model(target),
-    targetExtraSql:
-      "COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'a comment keeps the generated name in the dump';",
     planChecks: [
       {
         description: 'the added not-null fact is one name-free alter-column step',
         failure: (steps) => {
-          if (steps.length !== 1) return `steps: ${steps.map((step) => step.kind).join(',')}`;
+          if (steps.length !== 2) return `steps: ${steps.map((step) => step.kind).join(',')}`;
           const step = steps[0]!;
           if (step.kind !== 'alter-column') return `step kind: ${step.kind}`;
           const fields = step.fields
             .map((field) => `${field.field}:${String(field.before)}:${String(field.after)}`)
             .join(',');
           return fields === 'notNull:false:true' ? undefined : `fields: ${fields}`;
+        },
+      },
+      {
+        description: 'the not-null comment is one terminal step naming the synthesized constraint',
+        failure: (steps, migration, serverMajor) => {
+          const step = steps[1]!;
+          if (step.kind !== 'comment') return `step 2 kind: ${step.kind}`;
+          if (step.target.kind !== 'not-null') return `target kind: ${step.target.kind}`;
+          const identity = `${step.target.table.schema}.${step.target.table.name}.${step.target.column.name}`;
+          if (identity !== 'public.t.c') return `target: ${identity}`;
+          if (step.text !== notNullComment) return `text: ${String(step.text)}`;
+          const sql = renderSql(migration, { targetVersion: serverMajor });
+          const expected = `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS '${notNullComment}';`;
+          return sql.includes(expected) ? undefined : `sql: ${JSON.stringify(sql)}`;
         },
       },
     ],
@@ -3581,39 +3602,30 @@ const notNullConstraintNamesScene = (): LiveScene => {
     importChecks: [
       {
         description:
-          'both dumps import the columns as unnamed not-null facts; the target carries the comment flag',
+          'both dumps import unnamed not-null facts with the comment retained on c and no flag',
         failure: (imported, source) => {
           const t = imported.model.tables.find((candidate) => candidate.name === 't');
           if (t === undefined) return 't is not imported';
           const facts = t.columns
             .map(
-              (column) => `${column.name}:${String(column.notNull)}:${String(column.notNullName)}`,
+              (column) =>
+                `${column.name}:${String(column.notNull)}:${String(column.notNullName)}:${String(
+                  column.notNullComment,
+                )}`,
             )
             .join(' ');
-          if (facts !== 'c:true:undefined d:true:undefined') return `columns: ${facts}`;
+          const expected = `c:true:undefined:${notNullComment} d:true:undefined:undefined`;
+          if (facts !== expected) return `columns: ${facts}`;
           const comments = imported.diagnostics.filter(
             (diagnostic) =>
               diagnostic.message.startsWith('dropped comment') ||
               diagnostic.message.startsWith('skipped COMMENT ON'),
           );
-          if (source === 'applied') {
-            return comments.length === 0
-              ? undefined
-              : `the migrated database's dump carries comments: ${comments
-                  .map((diagnostic) => diagnostic.message)
-                  .join('; ')}`;
-          }
-          const shape = comments
-            .map((diagnostic) =>
-              diagnostic.kind === 'error'
-                ? `error:${diagnostic.code}:${diagnostic.message}`
-                : `${diagnostic.kind}:${diagnostic.code}:${diagnostic.object}:${diagnostic.message}`,
-            )
-            .join('; ');
-          const expected =
-            'flag:unsupported-attribute:public.t.t_c_not_null:' +
-            'dropped comment on a not-null constraint from public.t.t_c_not_null';
-          return shape === expected ? undefined : `comment diagnostics: ${shape}`;
+          return comments.length === 0
+            ? undefined
+            : `the ${source} dump carries comment diagnostics: ${comments
+                .map((diagnostic) => diagnostic.message)
+                .join('; ')}`;
         },
       },
     ],

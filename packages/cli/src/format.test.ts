@@ -1223,6 +1223,14 @@ const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
   ['table public.users', { kind: 'table', table: users }],
   ['column public.users.email', { kind: 'column', table: users, column: 'email' }],
   [
+    'not-null constraint public.users.email',
+    {
+      kind: 'not-null',
+      table: users,
+      column: { name: 'email', type: 'text', notNull: true },
+    },
+  ],
+  [
     'sequence public.invoice_seq',
     { kind: 'sequence', sequence: { schema: 'public', name: 'invoice_seq' } },
   ],

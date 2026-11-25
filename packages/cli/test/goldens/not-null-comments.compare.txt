@@ -1,0 +1,4 @@
+~ table public.t
+    ~ column c: not null false → true
+
++ comment on not-null constraint public.t.c: (none) → "a generated not-null name with a comment"

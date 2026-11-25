@@ -3862,6 +3862,78 @@ test('a comment removal renders IS NULL', () => {
   );
 });
 
+test('a not-null comment targets the stored name or the synthesized generated name', () => {
+  const explicit = table('t', {
+    columns: [column('c', { notNull: true, notNullName: 'a_nn' })],
+  });
+  const generated = table('t', { columns: [column('c', { notNull: true })] });
+  const suffixed = table('t', {
+    columns: [column('c', { notNull: true, notNullName: 't_c_not_null1' })],
+  });
+  const qualified = table('t', {
+    schema: 'app',
+    columns: [column('c', { notNull: true })],
+  });
+
+  const target = (owner: Table): CommentTarget => ({
+    kind: 'not-null',
+    table: owner,
+    column: owner.columns[0]!,
+  });
+
+  assert.equal(
+    commentStatement('explicit', target(explicit)),
+    "COMMENT ON CONSTRAINT a_nn ON public.t IS 'explicit';",
+  );
+  assert.equal(
+    commentStatement('generated', target(generated)),
+    "COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'generated';",
+  );
+  assert.equal(
+    commentStatement('suffixed', target(suffixed)),
+    "COMMENT ON CONSTRAINT t_c_not_null1 ON public.t IS 'suffixed';",
+  );
+  assert.equal(
+    commentStatement('qualified', target(qualified)),
+    "COMMENT ON CONSTRAINT t_c_not_null ON app.t IS 'qualified';",
+  );
+  assert.equal(
+    commentStatement(undefined, target(generated)),
+    'COMMENT ON CONSTRAINT t_c_not_null ON public.t IS NULL;',
+  );
+  assert.throws(
+    () => commentStatement('a\u0000b', target(generated)),
+    (error: unknown) =>
+      error instanceof RenderRefusalError &&
+      error.message === 'refusing to render: a comment cannot contain a NUL character',
+  );
+});
+
+test('an added not-null column carries its comment through the diff into SQL', () => {
+  const baseline = model(table('t', { columns: [column('c')] }));
+  const target = model(
+    table('t', {
+      columns: [column('c'), column('e', { notNull: true, notNullComment: 'on e' })],
+    }),
+  );
+  const bare = model(table('t', { columns: [column('c'), column('e', { notNull: true })] }));
+
+  assert.equal(
+    renderSql(plan(baseline, target)),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD COLUMN e text NOT NULL;',
+      "COMMENT ON CONSTRAINT t_e_not_null ON public.t IS 'on e';",
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+  assert.ok(
+    !renderSql(plan(baseline, bare)).includes('COMMENT ON'),
+    'an absent notNullComment emits no comment step',
+  );
+});
+
 test('comment text renders plainly when line-safe and escapes otherwise', () => {
   assert.equal(commentStatement("it's ready"), `COMMENT ON TABLE public.t IS 'it''s ready';`);
   assert.equal(commentStatement('a -- b; c'), `COMMENT ON TABLE public.t IS 'a -- b; c';`);

@@ -658,7 +658,6 @@ function formatCommentTarget(target: CommentTarget): string {
     case 'column':
       return `column ${formatIdentity(target.table)}.${target.column}`;
     case 'not-null':
-      // Placeholder spelling; ws3 refines the display form.
       return `not-null constraint ${formatIdentity(target.table)}.${target.column.name}`;
     case 'sequence':
       return `sequence ${formatIdentity(target.sequence)}`;

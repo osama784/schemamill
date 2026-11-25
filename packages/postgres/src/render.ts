@@ -32,6 +32,7 @@ import {
   synthesizedCheckConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
+  synthesizedNotNullName,
   synthesizedPrimaryKeyName,
   synthesizedUniqueConstraintName,
   truncateIdentifier,
@@ -918,7 +919,9 @@ function renderComment(target: CommentTarget, text: string | undefined): string 
 /**
  * The object clause of a `COMMENT ON` statement. An unnamed index or constraint is named by the
  * same conventional formula its drop uses, because PostgreSQL keeps the server-generated name;
- * an index is schema-qualified like a drop, while a constraint is scoped by `ON <table>`.
+ * an index is schema-qualified like a drop, while a constraint is scoped by `ON <table>`. A
+ * not-null fact names its stored `notNullName`, or the conventional formula the import stripped
+ * from a generated name, so the comment targets the constraint the server actually kept.
  */
 function renderCommentTarget(target: CommentTarget): string {
   switch (target.kind) {
@@ -926,10 +929,13 @@ function renderCommentTarget(target: CommentTarget): string {
       return `TABLE ${renderTable(target.table)}`;
     case 'column':
       return `COLUMN ${renderTable(target.table)}.${quoteIdentifier(target.column)}`;
-    case 'not-null':
-      // ws3 replaces this with `COMMENT ON CONSTRAINT <name> ON <table>` using
-      // `target.column.notNullName ?? synthesizedNotNullName(target.table, target.column.name)`.
-      throw new Error('not-null comment rendering not implemented yet');
+    case 'not-null': {
+      // An explicit name is modeled; a generated one was stripped on import, so synthesize the
+      // name the server keeps for the not-null fact on this column.
+      const name =
+        target.column.notNullName ?? synthesizedNotNullName(target.table.name, target.column.name);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
     case 'sequence':
       return `SEQUENCE ${renderSequence(target.sequence)}`;
     case 'view':

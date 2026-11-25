@@ -43,13 +43,14 @@ const SCENES: readonly GoldenScene[] = [
   { name: 'extensions' },
   { name: 'hazards' },
   { name: 'identity' },
+  { name: 'not-null-comments' },
   { name: 'schema-edges' },
   { name: 'sequences' },
   { name: 'views' },
   { name: 'json-rich', args: ['--json'], format: 'json' },
 ];
 
-/** The 12 human scenes: their stdout assertions and goldens are unchanged by the JSON scenes. */
+/** The 13 human scenes: their stdout assertions and goldens are unchanged by the JSON scenes. */
 const TEXT_SCENES = SCENES.filter((scene) => scene.format !== 'json');
 
 /** Structured-JSON scenes: rich DTO payloads with a multi-group plan. */
