@@ -33,7 +33,7 @@ pnpm build
 node packages/cli/dist/index.js --help
 ```
 
-The last command prints the usage and the four commands the CLI carries:
+The last command prints the usage and the five commands the CLI carries:
 
 ```text
 Usage: schemamill [options] [command]
@@ -43,6 +43,7 @@ Commands:
   export [options]                       Print the workspace model as DDL or canonical JSON.
   init [options] [path]                  Create a workspace in a directory.
   plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.
+  report <dump>                          Report the import fidelity findings for one DDL dump.
 ```
 
 ## Quickstart

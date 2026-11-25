@@ -568,6 +568,7 @@ const USAGE = [
   '  export [options]                       Print the workspace model as DDL or canonical JSON.',
   '  init [options] [path]                  Create a workspace in a directory.',
   '  plan [options] [baseline] [target]     Print the migration plan and its SQL between a baseline and a target.',
+  '  report <dump>                          Report the import fidelity findings for one DDL dump.',
   '  help [command]                         display help for command',
   '',
 ].join('\n');
@@ -590,6 +591,20 @@ const COMPARE_HELP = [
   '  -h, --help            display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
+  '',
+].join('\n');
+
+/** What `report --help` prints to stdout. */
+const REPORT_HELP = [
+  'Usage: schemamill report [options] <dump>',
+  '',
+  'Report the import fidelity findings for one DDL dump.',
+  '',
+  'Arguments:',
+  '  dump        path to the DDL dump (- for stdin)',
+  '',
+  'Options:',
+  '  -h, --help  display help for command',
   '',
 ].join('\n');
 
@@ -2834,4 +2849,85 @@ test('human compare and plan output without --json stays byte-identical to the g
       assert.equal(result.code, 0);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// report: the import fidelity document goes to stdout alone; read/import failures print one
+// `schemamill:` stderr line with no artifact, while a parse failure is a row in the document.
+// ---------------------------------------------------------------------------
+
+test('report --help documents its one positional, exit 0', async () => {
+  const result = await runCli('report', '--help');
+
+  assert.equal(result.stdout, REPORT_HELP);
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('report with a missing dump is one stderr line and empty stdout, exit 1', async (t) => {
+  const dir = await fixtureDir(t);
+  const missing = join(dir, 'missing.sql');
+
+  const result = await runCli('report', missing);
+
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    `schemamill: cannot read ${missing}: ENOENT: no such file or directory, open '${missing}'\n`,
+  );
+  assert.equal(result.code, 1);
+});
+
+test('report prints the parse-failure row on stdout with empty stderr, exit 1', async () => {
+  const result = await runCli('report', fixturePath('report-fidelity.sql'));
+
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 1);
+  assert.match(
+    result.stdout,
+    /^error parse-failure\tsyntax error at or near "UNSIGNED" \(\d+:\d+\)$/m,
+  );
+});
+
+test('report reads a dump from stdin with the bare - positional', () => {
+  const input = testText('fixtures/report-fidelity.sql');
+
+  const piped = runCliWithInput(input, ['report', '-']);
+  const fromPath = runCliWithInput(input, ['report', fixturePath('report-fidelity.sql')]);
+
+  assert.equal(piped.stdout, fromPath.stdout);
+  assert.equal(piped.stdout, testText('goldens/report.report.txt'));
+  assert.equal(piped.stderr, '');
+  assert.equal(piped.code, 1);
+});
+
+test('report of a clean dump prints exactly No findings. and exits 0', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = await writeDump(dir, 'clean.sql', 'CREATE TABLE public.t (id integer);\n');
+
+  const fromFile = await runCli('report', dump);
+  const fromStdin = runCliWithInput('', ['report', '-']);
+
+  assert.equal(fromFile.stdout, 'No findings.\n');
+  assert.equal(fromFile.stderr, '');
+  assert.equal(fromFile.code, 0);
+  assert.equal(fromStdin.stdout, 'No findings.\n');
+  assert.equal(fromStdin.stderr, '');
+  assert.equal(fromStdin.code, 0);
+});
+
+test('report is byte-identical across reruns and a copy at another path', async (t) => {
+  const dir = await fixtureDir(t);
+  const dump = fixturePath('report-fidelity.sql');
+  const copy = await writeDump(dir, 'copy.sql', testText('fixtures/report-fidelity.sql'));
+
+  const first = await runCli('report', dump);
+  const second = await runCli('report', dump);
+  const copied = await runCli('report', copy);
+
+  assert.equal(first.stdout, second.stdout, 'a second render changed the bytes');
+  assert.equal(first.stdout, copied.stdout, 'the dump path leaked into the document');
+  assert.equal(first.stdout, testText('goldens/report.report.txt'));
+  assert.equal(first.stderr, '');
+  assert.equal(first.code, 1);
 });

@@ -13,7 +13,8 @@ import { promisify } from 'node:util';
  * full change vocabulary. JSON scenes instead pin `<scene>.<command>.json.txt` after the D4
  * path/version normalization. Only stdout and the exit code are pinned: diagnostics belong on
  * stderr, and a fixture may legitimately carry a skippable statement, so stderr is not
- * asserted here.
+ * asserted here. The import fidelity report golden is registered standalone: it has one fixture
+ * rather than a scene pair and is not part of the compare/plan command loops.
  */
 
 const execFileAsync = promisify(execFile);
@@ -190,6 +191,20 @@ for (const scene of JSON_SCENES) {
     });
   }
 }
+
+test('report prints exactly the report-fidelity golden', async () => {
+  const dump = fixturePath('../test/fixtures/report-fidelity.sql');
+
+  const result = await runCli('report', dump);
+
+  assert.equal(
+    result.code,
+    1,
+    `schemamill report exited ${String(result.code)}; stderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, readText('../test/goldens/report.report.txt'));
+  assert.equal(result.stderr, '');
+});
 
 test('JSON goldens are byte-stable across repeated renders', async () => {
   const baseline = fixturePath(`../test/fixtures/json-rich.baseline.sql`);

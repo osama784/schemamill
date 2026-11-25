@@ -164,9 +164,17 @@ _Avoid_: import, scan, sync
 Projecting the canonical model into a reviewable artifact — migration-style DDL or canonical JSON — without changing the workspace. Read-only: schemamill never applies the SQL it prints.
 _Avoid_: dump, save, serialize
 
+**Report artifact**:
+A deterministic, human-reviewable document that presents findings another operation already produced, without changing the workspace — the import fidelity report aggregates one DDL dump's diagnostics so a human can judge round-trip fidelity before accepting the Model. It reports on a Schema or a Model but is neither, and is read-only like Export. See Import, DDL dump, Export, Model, Schema, and Round-trip fidelity.
+_Avoid_: score, verdict, snapshot
+
 **DDL dump**:
 The textual source import reads: a file or paste of DDL statements.
 _Avoid_: SQL file, pg_dump output
+
+**Diagnostic**:
+A structured finding emitted while working with a schema — from Import, a kind (`skip`, `flag`, or `error`) with a stable code, a source position, a human-facing message, and an owning object on skips and flags. The import fidelity report aggregates the DDL importer's diagnostics for one DDL dump; a live catalog read is Introspection and its findings stay with that owner. See Import, DDL dump, and Round-trip fidelity.
+_Avoid_: warning, issue, log line
 
 **Apply**:
 What the user does with migration SQL — runs it against their database. Schemamill never applies; it generates.

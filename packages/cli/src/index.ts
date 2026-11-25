@@ -14,6 +14,7 @@ import { registerCompare } from './compare.ts';
 import { registerExport } from './export.ts';
 import { registerInit } from './init.ts';
 import { registerPlan } from './plan.ts';
+import { registerReport } from './report.ts';
 
 const program = new Command();
 
@@ -26,5 +27,6 @@ registerCompare(program);
 registerExport(program);
 registerInit(program);
 registerPlan(program);
+registerReport(program);
 
 await program.parseAsync(process.argv);
