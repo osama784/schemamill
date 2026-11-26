@@ -4,6 +4,7 @@ import type {
   Column,
   ColumnFieldChange,
   CommentTarget,
+  ExclusionConstraint,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
@@ -14,6 +15,7 @@ import type {
   IdentityFieldChange,
   IdentityGeneration,
   Index,
+  IndexElement,
   Plan,
   PrimaryKey,
   Sequence,
@@ -29,6 +31,7 @@ import type {
   ViewFieldChange,
   ViewIdentity,
 } from '@schemamill/core';
+import { serializeIndexElement } from '@schemamill/core';
 
 /**
  * Human-readable rendering of a diff and a migration plan for the terminal.
@@ -274,6 +277,9 @@ function formatTable(sign: string, table: Table): string {
   for (const checkConstraint of table.checkConstraints) {
     lines.push(`    ${formatCheckConstraint(checkConstraint)}`);
   }
+  for (const exclusionConstraint of table.exclusionConstraints ?? []) {
+    lines.push(`    ${formatExclusionConstraint(exclusionConstraint)}`);
+  }
   for (const index of table.indexes) lines.push(`    ${formatIndex(index)}`);
   return lines.join('\n');
 }
@@ -385,6 +391,42 @@ function formatTableChange(change: TableChange): string {
       }
       return `~ check constraint (${change.before.expression}): ${fields.join(', ')}`;
     }
+    case 'exclusion-constraint-added':
+      return `+ ${formatExclusionConstraint(change.exclusionConstraint)}`;
+    case 'exclusion-constraint-removed':
+      return `- ${formatExclusionConstraint(change.exclusionConstraint)}`;
+    case 'exclusion-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.accessMethod !== change.after.accessMethod) {
+        fields.push(
+          `access method ${formatOptional(change.before.accessMethod)} → ${formatOptional(
+            change.after.accessMethod,
+          )}`,
+        );
+      }
+      if (change.before.where !== change.after.where) {
+        fields.push(
+          `where ${formatOptional(change.before.where)} → ${formatOptional(change.after.where)}`,
+        );
+      }
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      return `~ exclusion constraint (${change.before.elements}): ${fields.join(', ')}`;
+    }
     case 'index-added':
       return `+ ${formatIndex(change.index)}`;
     case 'index-removed':
@@ -442,6 +484,9 @@ function formatStep(step: Step): string {
     case 'add-check-constraint':
     case 'drop-check-constraint':
       return `${formatIdentity(step.table)}: ${formatCheckConstraint(step.checkConstraint)}`;
+    case 'add-exclusion-constraint':
+    case 'drop-exclusion-constraint':
+      return `${formatIdentity(step.table)}: ${formatExclusionConstraint(step.exclusionConstraint)}`;
     case 'create-index':
     case 'drop-index':
     case 'create-index-concurrently':
@@ -538,11 +583,32 @@ function formatCheckConstraint(checkConstraint: CheckConstraint): string {
   return `check constraint ${name}CHECK (${checkConstraint.expression})`;
 }
 
-/** An index line: `unique` when it is, its name when present, then its ordered columns. */
+/** An exclusion-constraint line: its name, access method, opaque elements, and clauses. */
+function formatExclusionConstraint(exclusionConstraint: ExclusionConstraint): string {
+  const name =
+    exclusionConstraint.name === undefined ? '' : `${formatPresent(exclusionConstraint.name)} `;
+  const accessMethod = exclusionConstraint.accessMethod ?? 'gist';
+  const where =
+    exclusionConstraint.where === undefined ? '' : ` WHERE ${exclusionConstraint.where}`;
+  const deferrable = exclusionConstraint.deferrable === true ? ' DEFERRABLE' : '';
+  const deferred = exclusionConstraint.initiallyDeferred === true ? ' INITIALLY DEFERRED' : '';
+  return `exclusion constraint ${name}EXCLUDE USING ${accessMethod} (${exclusionConstraint.elements})${where}${deferrable}${deferred}`;
+}
+
+/** An index line: `unique` when it is, its name, its ordered elements, then its clauses. */
 function formatIndex(index: Index): string {
   const unique = index.unique ? 'unique ' : '';
   const name = index.name === undefined ? '' : `${formatPresent(index.name)} `;
-  return `${unique}index ${name}(${index.columns.join(', ')})`;
+  const include = index.include === undefined ? '' : ` INCLUDE (${index.include.join(', ')})`;
+  const where = index.where === undefined ? '' : ` WHERE ${index.where}`;
+  return `${unique}index ${name}(${formatIndexElements(index.columns)})${include}${where}`;
+}
+
+/** The display text of an ordered element list: plain column names and raw expression text. */
+function formatIndexElements(elements: readonly IndexElement[]): string {
+  return elements
+    .map((element) => (typeof element === 'string' ? element : element.expression))
+    .join(', ');
 }
 
 /** A sequence line and its options: the signed identity, then every option one per line. */
@@ -668,9 +734,12 @@ function formatCommentTarget(target: CommentTarget): string {
     case 'index': {
       const unique = target.index.unique ? 'unique ' : '';
       const name = target.index.name === undefined ? '' : ` — ${formatPresent(target.index.name)}`;
-      return `${unique}index ${formatIdentity(target.table)} (${target.index.columns.join(
-        ', ',
-      )})${name}`;
+      const include =
+        target.index.include === undefined ? '' : ` INCLUDE (${target.index.include.join(', ')})`;
+      const where = target.index.where === undefined ? '' : ` WHERE ${target.index.where}`;
+      return `${unique}index ${formatIdentity(target.table)} (${formatIndexElements(
+        target.index.columns,
+      )})${include}${where}${name}`;
     }
     case 'primary-key':
       return `primary key ${formatIdentity(target.table)} (${target.primaryKey.columns.join(
@@ -688,6 +757,8 @@ function formatCommentTarget(target: CommentTarget): string {
       return `foreign key ${formatIdentity(target.table)} (${target.foreignKey.columns.join(
         ', ',
       )}) → ${formatIdentity(target.foreignKey.referencedTable)}`;
+    case 'exclusion-constraint':
+      return `exclusion constraint ${formatIdentity(target.table)} (${target.exclusionConstraint.elements})`;
   }
 }
 
@@ -841,17 +912,36 @@ function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string[
 }
 
 /**
- * A changed index pair's differing fields — `unique`, then `columns`, in that order, joined
- * `, `. The pairing identity (the name) anchors the line and is never repeated here;
- * `concurrently` is apply metadata and never a difference.
+ * A changed index pair's differing fields — `unique`, `columns`, `include`, then `where`, in
+ * that order, joined `, `. The pairing identity (the name) anchors the line and is never
+ * repeated here; `concurrently` is apply metadata and never a difference.
  */
 function formatIndexChanges(before: Index, after: Index): string {
   const fields: string[] = [];
   if (before.unique !== after.unique) {
     fields.push(`unique ${String(before.unique)} → ${String(after.unique)}`);
   }
-  if (!sameStrings(before.columns, after.columns)) {
-    fields.push(`columns (${before.columns.join(', ')}) → (${after.columns.join(', ')})`);
+  if (
+    before.columns.length !== after.columns.length ||
+    before.columns.some(
+      (element, position) =>
+        serializeIndexElement(element) !== serializeIndexElement(after.columns[position]!),
+    )
+  ) {
+    fields.push(
+      `columns (${formatIndexElements(before.columns)}) → (${formatIndexElements(after.columns)})`,
+    );
+  }
+  if (
+    before.include?.join('\u0000') !== after.include?.join('\u0000') ||
+    before.include?.length !== after.include?.length
+  ) {
+    fields.push(
+      `include (${before.include?.join(', ') ?? 'none'}) → (${after.include?.join(', ') ?? 'none'})`,
+    );
+  }
+  if (before.where !== after.where) {
+    fields.push(`where ${before.where ?? '(none)'} → ${after.where ?? '(none)'}`);
   }
   return fields.join(', ');
 }

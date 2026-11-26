@@ -1288,6 +1288,14 @@ const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
     },
   ],
   [
+    'exclusion constraint public.users (email WITH =)',
+    {
+      kind: 'exclusion-constraint',
+      table: users,
+      exclusionConstraint: { elements: 'email WITH =' },
+    },
+  ],
+  [
     'foreign key public.users (team_id) → public.teams',
     {
       kind: 'foreign-key',
@@ -1736,4 +1744,58 @@ test('empty identity components print as "" instead of a bare separator', () => 
       `identity / ${label}`,
     );
   }
+});
+
+test('index lines carry expression elements, INCLUDE, and the partial WHERE', () => {
+  const entry: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  };
+  const table = { schema: 'public', name: 't' };
+
+  assert.equal(
+    formatChanges([
+      {
+        kind: 'table-changed',
+        table,
+        changes: [{ kind: 'index-added', index: entry }],
+      },
+    ]),
+    ['~ table public.t', '    + index t_idx (a, lower(b)) INCLUDE (c) WHERE a > 0', ''].join('\n'),
+  );
+  assert.equal(
+    formatPlan(
+      aPlan({
+        kind: 'create-index',
+        owner: { kind: 'table', table },
+        index: entry,
+      }),
+    ),
+    [
+      '1 step in one transaction:',
+      ' 1. create-index  public.t: index t_idx (a, lower(b)) INCLUDE (c) WHERE a > 0',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    formatChanges([
+      {
+        kind: 'table-changed',
+        table,
+        changes: [
+          {
+            kind: 'index-changed',
+            before: { ...entry, include: ['d'], where: 'b > 0' },
+            after: entry,
+          },
+        ],
+      },
+    ]),
+    ['~ table public.t', '    ~ index t_idx: include (d) → (c), where b > 0 → a > 0', ''].join(
+      '\n',
+    ),
+  );
 });

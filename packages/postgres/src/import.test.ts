@@ -1928,9 +1928,6 @@ test('an unnamed foreign key without referenced columns round-trips against a du
 test('skips whole indexes with elements or clauses outside the minimal envelope', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
-    `CREATE INDEX t_expr_idx ON public.t ((a + 1));`,
-    `CREATE INDEX t_partial_idx ON public.t (a) WHERE (a > 0);`,
-    `CREATE INDEX t_include_idx ON public.t (a) INCLUDE (b);`,
     `CREATE INDEX t_hash_idx ON public.t USING hash (a);`,
     `CREATE INDEX t_desc_idx ON public.t (a DESC);`,
     `CREATE INDEX t_nulls_idx ON public.t (a NULLS FIRST);`,
@@ -1951,9 +1948,6 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
   assert.deepEqual(
     diagnostics.map(summarize),
     [
-      'public.t_expr_idx',
-      'public.t_partial_idx',
-      'public.t_include_idx',
       'public.t_hash_idx',
       'public.t_desc_idx',
       'public.t_nulls_idx',
@@ -1966,9 +1960,6 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
   );
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX public\.t_expr_idx \(expression element\)/);
-  assert.match(messages, /CREATE INDEX public\.t_partial_idx \(partial WHERE\)/);
-  assert.match(messages, /CREATE INDEX public\.t_include_idx \(INCLUDE\)/);
   assert.match(messages, /CREATE INDEX public\.t_hash_idx \(access method hash\)/);
   assert.match(messages, /CREATE INDEX public\.t_desc_idx \(non-default ordering\)/);
   assert.match(messages, /CREATE INDEX public\.t_nulls_idx \(non-default NULLS ordering\)/);
@@ -1980,7 +1971,7 @@ test('skips whole indexes with elements or clauses outside the minimal envelope'
 });
 
 test('names an unnamed skipped index by its owning table identity', async () => {
-  const dump = [`CREATE TABLE app.t (a integer);`, `CREATE INDEX ON app.t ((a + 1));`].join('\n');
+  const dump = [`CREATE TABLE app.t (a integer);`, `CREATE INDEX ON app.t (a DESC);`].join('\n');
 
   const { model, diagnostics } = await importDump(dump);
   const table = model.tables.find((candidate) => candidate.name === 't');
@@ -1993,7 +1984,7 @@ test('names an unnamed skipped index by its owning table identity', async () => 
       kind: 'skip',
       code: 'unsupported-statement',
       object: 'app.t',
-      message: 'skipped CREATE INDEX app.t (expression element)',
+      message: 'skipped CREATE INDEX app.t (non-default ordering)',
     },
   ]);
 });
@@ -2076,10 +2067,10 @@ test('flags IF NOT EXISTS on a unique concurrent named index', async () => {
   ]);
 });
 
-test('skips an IF NOT EXISTS index whole when INCLUDE falls outside the envelope', async () => {
+test('skips an IF NOT EXISTS index whole when ordering falls outside the envelope', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
-    `CREATE INDEX IF NOT EXISTS t_i_idx ON public.t USING btree (a) INCLUDE (b);`,
+    `CREATE INDEX IF NOT EXISTS t_i_idx ON public.t USING btree (a DESC);`,
   ].join('\n');
 
   const { model, diagnostics } = await importDump(dump);
@@ -2094,7 +2085,7 @@ test('skips an IF NOT EXISTS index whole when INCLUDE falls outside the envelope
       kind: 'skip',
       code: 'unsupported-statement',
       object: 'public.t_i_idx',
-      message: 'skipped CREATE INDEX public.t_i_idx (INCLUDE)',
+      message: 'skipped CREATE INDEX public.t_i_idx (non-default ordering)',
     },
   ]);
 });
@@ -2186,7 +2177,7 @@ test('reads deferrability from a USING INDEX unique constraint', async () => {
   assert.deepEqual(diagnostics, []);
 });
 
-test('flags an exclusion constraint instead of modeling it', async () => {
+test('models inline and added exclusion constraints without diagnostics', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, EXCLUDE USING gist (a WITH =));`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_excl EXCLUDE USING gist (a WITH <>);`,
@@ -2196,18 +2187,72 @@ test('flags an exclusion constraint instead of modeling it', async () => {
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // Exclusion constraints remain outside the model, as before this slice.
-  assert.deepEqual(table.uniqueConstraints, []);
-  assert.deepEqual(table.checkConstraints, []);
-  assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'flag', code: 'unsupported-attribute', object: 'public.t' },
-    { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
+  assert.deepEqual(table.exclusionConstraints, [
+    { name: 't_excl', elements: 'a WITH <>' },
+    { elements: 'a WITH =' },
   ]);
-  assert.match(diagnostics[0]?.message ?? '', /dropped exclusion constraint from public\.t/);
-  assert.match(diagnostics[1]?.message ?? '', /exclusion constraint t_excl on public\.t/);
+  assert.deepEqual(diagnostics, []);
 });
 
-test('flags a comment on an exclusion backing index without changing the skip', async () => {
+test('models exclusion clauses, deferrability, and non-default operator-class text', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a text, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT t_excl EXCLUDE USING gist (a text_pattern_ops WITH =, (lower(a)) WITH <>) WHERE (b > 0) DEFERRABLE INITIALLY DEFERRED;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.exclusionConstraints, [
+    {
+      name: 't_excl',
+      elements: 'a text_pattern_ops WITH =,(lower(a)) WITH <>',
+      where: '(b > 0)',
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('reads an exclusion WHERE predicate that contains NOT as an operator', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT is_not_excl EXCLUDE USING gist (a WITH =) WHERE (a IS NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT not_in_excl EXCLUDE USING gist (b WITH =) WHERE (b NOT IN (1, 2));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.exclusionConstraints, [
+    { name: 'is_not_excl', elements: 'a WITH =', where: '(a IS NOT NULL)' },
+    { name: 'not_in_excl', elements: 'b WITH =', where: '(b NOT IN(1,2))' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('bounds an inline exclusion WHERE predicate before a trailing column and constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, EXCLUDE USING gist (a WITH =) WHERE (a > 0), b integer, CHECK (b > 0));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(
+    table.columns.map((candidate) => candidate.name),
+    ['a', 'b'],
+  );
+  assert.deepEqual(table.exclusionConstraints, [{ elements: 'a WITH =', where: '(a > 0)' }]);
+  assert.deepEqual(table.checkConstraints, [{ expression: 'b > 0' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('models an exclusion constraint and still flags its backing-index comment', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
@@ -2218,17 +2263,9 @@ test('flags a comment on an exclusion backing index without changing the skip', 
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The exclusion constraint stays skipped whole with ADR 0031's object and message; the backing
-  // index's comment gets the ADR 0030 flag, naming the schema-qualified index the dump comments.
-  assert.deepEqual(table.uniqueConstraints, []);
+  assert.deepEqual(table.exclusionConstraints, [{ elements: 'a WITH =' }]);
   assert.deepEqual(table.indexes, []);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_a_excl on public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2238,25 +2275,22 @@ test('flags a comment on an exclusion backing index without changing the skip', 
   ]);
 });
 
-test('flags an unqualified comment on an exclusion backing index with the schema-qualified object', async () => {
+test('models a named exclusion constraint and flags its unqualified backing-index comment', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT custom_excl_name EXCLUDE USING gist (a WITH =);`,
     `COMMENT ON INDEX custom_excl_name IS 'idx note';`,
   ].join('\n');
 
-  const { diagnostics } = await importDump(dump);
+  const { model, diagnostics } = await importDump(dump);
 
-  // The recorded conname resolves against the draft's schema, so the flag is the exact ADR 0030
-  // message whether or not the dump qualified the index target. A generated, constraint-style
-  // name is taken verbatim — no `_idx` canonicalization is involved.
+  // The recorded conname resolves against the draft's schema, so the flag names the
+  // schema-qualified index even when the dump left it unqualified. The constraint's own name is
+  // not the generated `_excl` form, so it stays.
+  assert.deepEqual(model.tables[0]!.exclusionConstraints, [
+    { name: 'custom_excl_name', elements: 'a WITH =' },
+  ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint custom_excl_name on public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2274,15 +2308,9 @@ test('flags a comment on an inline exclusion backing index', async () => {
 
   const { diagnostics } = await importDump(dump);
 
-  // The inline declaration is flagged, never modeled; its conname is still recorded for the
-  // later `COMMENT ON INDEX` so the backing-index comment takes the precise flag.
+  // The inline declaration is modeled with its generated name stripped; the conname is still
+  // recorded for the later `COMMENT ON INDEX` so the backing-index comment takes the precise flag.
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'public.t',
-      message: 'dropped exclusion constraint t_a_excl from public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2292,7 +2320,7 @@ test('flags a comment on an inline exclusion backing index', async () => {
   ]);
 });
 
-test('flags only the index comment when an exclusion also carries a constraint comment', async () => {
+test('carries the constraint comment while flagging only its backing-index comment', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,
     `ALTER TABLE ONLY public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);`,
@@ -2300,28 +2328,17 @@ test('flags only the index comment when an exclusion also carries a constraint c
     `COMMENT ON CONSTRAINT t_a_excl ON public.t IS 'constraint note';`,
   ].join('\n');
 
-  const { diagnostics } = await importDump(dump);
+  const { model, diagnostics } = await importDump(dump);
 
-  // Only the backing index takes the new flag. The constraint's own comment keeps today's
-  // generic path — it stays deferred on #90 — so its object is the three-part comment target.
+  assert.deepEqual(model.tables[0]!.exclusionConstraints, [
+    { elements: 'a WITH =', comment: 'constraint note' },
+  ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_a_excl on public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
       object: 'public.t_a_excl',
       message: 'dropped comment from public.t_a_excl',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'public.t.t_a_excl',
-      message: 'dropped comment from public.t.t_a_excl',
     },
   ]);
 });
@@ -2337,12 +2354,6 @@ test('keeps the generic flag for an unknown index beside an exclusion constraint
 
   // An unrelated index name must not be captured by the recorded exclusion names.
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_a_excl on public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2360,15 +2371,9 @@ test('keeps the generic flag for an unnamed inline exclusion', async () => {
 
   const { diagnostics } = await importDump(dump);
 
-  // The dump carries no conname for an unnamed inline EXCLUDE, so there is nothing to record;
-  // the comment keeps the generic flag rather than gaining a synthesized index name (ADR 0035).
+  // The dump carries no conname for an unnamed inline EXCLUDE, so there is no backing name to
+  // resolve; the comment keeps the generic flag rather than gaining a synthesized index name.
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'public.t',
-      message: 'dropped exclusion constraint from public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2390,14 +2395,9 @@ test('keeps diagnostic order stable across exclusion backing-index comments', as
 
   const { diagnostics } = await importDump(dump);
 
-  // The new flag is emitted in place at the comment statement; no existing diagnostic moves.
+  // The constraint's own comment is modeled, so only the backing-index comments are flagged,
+  // in statement order, and no existing diagnostic moves.
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_a_excl on public.t',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2409,12 +2409,6 @@ test('keeps diagnostic order stable across exclusion backing-index comments', as
       code: 'unsupported-attribute',
       object: 'public.other_idx',
       message: 'dropped comment from public.other_idx',
-    },
-    {
-      kind: 'flag',
-      code: 'unsupported-attribute',
-      object: 'public.t.t_a_excl',
-      message: 'dropped comment from public.t.t_a_excl',
     },
     {
       kind: 'flag',
@@ -2439,22 +2433,26 @@ test('skips a USING INDEX constraint whole when the index cannot back it', async
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
-  // skipped whole, and every USING INDEX constraint that cannot consume a plain unique index is
-  // skipped and named.
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index
+  // imports whole, and every USING INDEX constraint that cannot consume a plain unique index
+  // is skipped and named.
   assert.deepEqual(table.uniqueConstraints, []);
-  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['a'] },
+    { name: 't_b_idx', unique: true, columns: [{ expression: '(b + 1)' }] },
+  ]);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 'public.t_b_idx' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX public\.t_b_idx \(expression element\)/);
   assert.match(messages, /unique constraint t_a_key on public\.t \(USING INDEX t_a_idx\)/);
-  assert.match(messages, /unique constraint t_b_key on public\.t \(USING INDEX t_b_idx\)/);
+  assert.match(
+    messages,
+    /skipped USING INDEX t_b_idx \(expression, partial, or INCLUDE index cannot back a constraint\)/,
+  );
   assert.match(messages, /unique constraint t_missing_key on public\.t \(USING INDEX t_missing\)/);
 });
 
@@ -2549,22 +2547,26 @@ test('skips a USING INDEX primary key whole when the index cannot back it', asyn
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The non-unique index stays standalone, canonicalized to unnamed; the expression index was
-  // skipped whole, and every USING INDEX primary key that cannot consume a plain unique index is
-  // skipped and named.
+  // The non-unique index stays standalone, canonicalized to unnamed; the expression index
+  // imports whole, and every USING INDEX primary key that cannot consume a plain unique index
+  // is skipped and named.
   assert.equal(table.primaryKey, undefined);
-  assert.deepEqual(table.indexes, [{ unique: false, columns: ['a'] }]);
+  assert.deepEqual(table.indexes, [
+    { unique: false, columns: ['a'] },
+    { name: 't_b_idx', unique: true, columns: [{ expression: '(b + 1)' }] },
+  ]);
   assert.deepEqual(diagnostics.map(summarize), [
-    { kind: 'skip', code: 'unsupported-statement', object: 'public.t_b_idx' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
     { kind: 'skip', code: 'unsupported-statement', object: 'public.t' },
   ]);
 
   const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
-  assert.match(messages, /CREATE INDEX public\.t_b_idx \(expression element\)/);
   assert.match(messages, /skipped primary key t_a_pk on public\.t \(USING INDEX t_a_idx\)/);
-  assert.match(messages, /skipped primary key t_b_pk on public\.t \(USING INDEX t_b_idx\)/);
+  assert.match(
+    messages,
+    /skipped USING INDEX t_b_idx \(expression, partial, or INCLUDE index cannot back a constraint\)/,
+  );
   assert.match(messages, /skipped primary key t_missing_pk on public\.t \(USING INDEX t_missing\)/);
 });
 
@@ -3129,7 +3131,7 @@ test('flags the comment and CONCURRENTLY for a consumed commented concurrent pri
   ]);
 });
 
-test('keeps the existing skips for an INCLUDE index referenced by USING INDEX', async () => {
+test('skips a constraint whose USING INDEX is a covering index', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer, b integer);`,
     `CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a) INCLUDE (b);`,
@@ -3140,22 +3142,19 @@ test('keeps the existing skips for an INCLUDE index referenced by USING INDEX', 
   const table = model.tables.find((candidate) => candidate.name === 't');
   assert.ok(table, 'the table is imported');
 
-  // The covering index is outside the envelope, so it is skipped whole; the key then has no
-  // index to consume and is skipped and named too. Neither statement is partially imported.
+  // The covering index imports whole; the constraint that would consume it is skipped and
+  // named, and the source index is left untouched.
   assert.equal(table.primaryKey, undefined);
-  assert.deepEqual(table.indexes, []);
+  assert.deepEqual(table.indexes, [
+    { name: 't_a_idx', unique: true, columns: ['a'], include: ['b'] },
+  ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_a_idx',
-      message: 'skipped CREATE INDEX public.t_a_idx (INCLUDE)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
       object: 'public.t',
-      message: 'skipped primary key t_pk on public.t (USING INDEX t_a_idx)',
+      message:
+        'skipped USING INDEX t_a_idx (expression, partial, or INCLUDE index cannot back a constraint)',
     },
   ]);
 });
@@ -6276,4 +6275,119 @@ test('refuses a comment carrying NUL before it can reach the model', () => {
   storeComment(statement, 'public.t', undefined, (text) => stored.push(text), diagnostics);
   assert.deepEqual(stored, ['plain', undefined]);
   assert.equal(diagnostics.length, 1);
+});
+
+test('imports expression, partial, and covering indexes with authored clause text', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer, c integer);`,
+    `CREATE INDEX t_expr_idx ON public.t (lower(b));`,
+    `CREATE INDEX t_partial_idx ON public.t (a) WHERE a > 0;`,
+    `CREATE INDEX t_include_idx ON public.t (a) INCLUDE (b);`,
+    `CREATE INDEX t_all_idx ON public.t (a, (a + 1)) INCLUDE (b, c) WHERE a > 0;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.indexes, [
+    {
+      name: 't_all_idx',
+      unique: false,
+      columns: ['a', { expression: '(a + 1)' }],
+      include: ['b', 'c'],
+      where: 'a > 0',
+    },
+    { name: 't_expr_idx', unique: false, columns: [{ expression: 'lower(b)' }] },
+    { name: 't_include_idx', unique: false, columns: ['a'], include: ['b'] },
+    { name: 't_partial_idx', unique: false, columns: ['a'], where: 'a > 0' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('a materialized-view index still skips expression, partial, and INCLUDE forms whole', async () => {
+  const dump = [
+    `CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a, 2 AS b WITH NO DATA;`,
+    `CREATE INDEX mv_expr_idx ON app.mv ((a + 1));`,
+    `CREATE INDEX mv_partial_idx ON app.mv (a) WHERE a > 0;`,
+    `CREATE INDEX mv_include_idx ON app.mv (a) INCLUDE (b);`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const view = model.views.find((candidate) => candidate.name === 'mv');
+  assert.ok(view, 'the materialized view is imported');
+
+  assert.deepEqual(view.indexes ?? [], []);
+  assert.deepEqual(
+    diagnostics.map(describeDiagnostic),
+    ['app.mv_expr_idx', 'app.mv_partial_idx', 'app.mv_include_idx'].map((object) => ({
+      kind: 'skip',
+      code: 'unsupported-statement',
+      object,
+      message: `skipped CREATE INDEX ${object} (${
+        object.includes('expr')
+          ? 'expression element'
+          : object.includes('partial')
+            ? 'partial WHERE'
+            : 'INCLUDE'
+      })`,
+    })),
+  );
+  const messages = diagnostics.map((diagnostic) => diagnostic.message).join('\n');
+  assert.match(messages, /CREATE INDEX app\.mv_expr_idx \(expression element\)/);
+  assert.match(messages, /CREATE INDEX app\.mv_include_idx \(INCLUDE\)/);
+  assert.match(messages, /CREATE INDEX app\.mv_partial_idx \(partial WHERE\)/);
+});
+
+test('a constraint backed by an expression, partial, or INCLUDE index is skipped whole', async () => {
+  for (const clause of [
+    `CREATE UNIQUE INDEX t_backing_idx ON public.t ((a + 1));`,
+    `CREATE UNIQUE INDEX t_backing_idx ON public.t (a) INCLUDE (b);`,
+    `CREATE UNIQUE INDEX t_backing_idx ON public.t (a) WHERE a > 0;`,
+  ]) {
+    const dump = [
+      `CREATE TABLE public.t (a integer, b integer);`,
+      clause,
+      `ALTER TABLE ONLY public.t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_backing_idx;`,
+    ].join('\n');
+
+    const { model, diagnostics } = await importDump(dump);
+    const table = model.tables.find((candidate) => candidate.name === 't');
+    assert.ok(table, 'the table is imported');
+
+    assert.equal(table.primaryKey, undefined);
+    assert.equal(table.indexes.length, 1, 'the source index is not consumed');
+    assert.deepEqual(diagnostics.map(describeDiagnostic), [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.t',
+        message:
+          'skipped USING INDEX t_backing_idx (expression, partial, or INCLUDE index cannot back a constraint)',
+      },
+    ]);
+  }
+});
+
+test('an IF NOT EXISTS expression index is imported and its clause is flagged', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer);`,
+    `CREATE INDEX IF NOT EXISTS t_expr_idx ON public.t ((a + 1));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  // The authored expression keeps its own parentheses; the name equals the generated mirror
+  // for an `expr` element, so canonicalization strips it back to unnamed.
+  assert.deepEqual(table.indexes, [{ unique: false, columns: [{ expression: '(a + 1)' }] }]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'public.t_expr_idx',
+      message: 'dropped IF NOT EXISTS from public.t_expr_idx',
+    },
+  ]);
 });

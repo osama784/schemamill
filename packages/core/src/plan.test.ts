@@ -7,6 +7,7 @@ import {
   diff,
   effectiveIdentity,
   effectiveSequence,
+  indexElementsKey,
   plan,
   SequenceOwnershipError,
   sequenceTypeBounds,
@@ -27,9 +28,11 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Index,
+  IndexElement,
   Model,
   PrimaryKey,
   Sequence,
@@ -72,6 +75,7 @@ interface TableParts {
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
+  exclusionConstraints?: readonly ExclusionConstraint[];
   indexes?: readonly Index[];
   persistence?: TablePersistence;
   comment?: string;
@@ -86,6 +90,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
+  ...(parts.exclusionConstraints === undefined
+    ? {}
+    : { exclusionConstraints: parts.exclusionConstraints }),
   indexes: parts.indexes ?? [],
   ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   ...(parts.comment === undefined ? {} : { comment: parts.comment }),
@@ -133,6 +140,12 @@ const checkConstraint = (
   expression: string,
   rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
 ): CheckConstraint => ({ expression, ...rest });
+
+/** An exclusion constraint on `elements`: unnamed unless overridden. */
+const exclusionConstraint = (
+  elements: string,
+  rest: Partial<Omit<ExclusionConstraint, 'elements'>> = {},
+): ExclusionConstraint => ({ elements, ...rest });
 
 /** A non-unique index on `columns`: unnamed unless overridden. */
 const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>> = {}): Index => ({
@@ -292,6 +305,7 @@ interface SimulatedTable {
   readonly foreignKeys: Mutable<ForeignKey>[];
   readonly uniqueConstraints: Mutable<UniqueConstraint>[];
   readonly checkConstraints: Mutable<CheckConstraint>[];
+  readonly exclusionConstraints: Mutable<ExclusionConstraint>[];
   readonly indexes: Mutable<Index>[];
   persistence: TablePersistence | undefined;
   comment: string | undefined;
@@ -393,9 +407,26 @@ const checkConstraintKey = (checkConstraint: CheckConstraint): string =>
     checkConstraint.enforcement ?? null,
   ]);
 
+/** A structural key for an exclusion constraint, comparing every field but the comment. */
+const exclusionConstraintKey = (entry: ExclusionConstraint): string =>
+  JSON.stringify([
+    entry.name ?? null,
+    entry.elements,
+    entry.accessMethod ?? null,
+    entry.where ?? null,
+    entry.deferrable ?? null,
+    entry.initiallyDeferred ?? null,
+  ]);
+
 /** A structural key for an index; `concurrently` is apply metadata and excluded. */
 const indexKey = (entry: Index): string =>
-  JSON.stringify([entry.name ?? null, entry.unique, entry.columns]);
+  JSON.stringify([
+    entry.name ?? null,
+    entry.unique,
+    indexElementsKey(entry.columns),
+    entry.include ?? null,
+    entry.where ?? null,
+  ]);
 
 /** The simulated state of `model`. */
 const stateOf = (model: Model): SimulatedState => {
@@ -407,6 +438,7 @@ const stateOf = (model: Model): SimulatedState => {
       foreignKeys: source.foreignKeys.map(copyForeignKey),
       uniqueConstraints: source.uniqueConstraints.map(copyUniqueConstraint),
       checkConstraints: source.checkConstraints.map(copyCheckConstraint),
+      exclusionConstraints: (source.exclusionConstraints ?? []).map((entry) => ({ ...entry })),
       indexes: source.indexes.map(copyIndex),
       persistence: source.persistence,
       comment: source.comment,
@@ -618,6 +650,17 @@ const commentTargetNode = (
       assert.ok(found !== undefined, `comment on missing foreign key of ${key}`);
       return found;
     }
+    case 'exclusion-constraint': {
+      const key = keyOf(target.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `comment on constraint of missing table ${key}`);
+      const found = table.exclusionConstraints.find(
+        (entry) =>
+          exclusionConstraintKey(entry) === exclusionConstraintKey(target.exclusionConstraint),
+      );
+      assert.ok(found !== undefined, `comment on missing exclusion constraint of ${key}`);
+      return found;
+    }
   }
 };
 
@@ -637,6 +680,7 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         foreignKeys: [],
         uniqueConstraints: [],
         checkConstraints: [],
+        exclusionConstraints: [],
         indexes: [],
         persistence: step.table.persistence,
         comment: step.table.comment,
@@ -952,6 +996,36 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       table.checkConstraints.splice(found, 1);
       return;
     }
+    case 'add-exclusion-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `add-exclusion-constraint on missing table ${key}`);
+      assert.ok(
+        !table.exclusionConstraints.some(
+          (entry) =>
+            exclusionConstraintKey(entry) === exclusionConstraintKey(step.exclusionConstraint),
+        ),
+        `add-exclusion-constraint of live ${exclusionConstraintKey(step.exclusionConstraint)} on ${key}`,
+      );
+      table.exclusionConstraints.push({ ...step.exclusionConstraint });
+      return;
+    }
+    case 'drop-exclusion-constraint': {
+      const key = keyOf(step.table);
+      const table = state.tables.get(key);
+      assert.ok(table !== undefined, `drop-exclusion-constraint on missing table ${key}`);
+      const found = table.exclusionConstraints.findIndex(
+        (entry) =>
+          exclusionConstraintKey(entry) === exclusionConstraintKey(step.exclusionConstraint),
+      );
+      assert.notEqual(
+        found,
+        -1,
+        `drop-exclusion-constraint of missing ${exclusionConstraintKey(step.exclusionConstraint)} on ${key}`,
+      );
+      table.exclusionConstraints.splice(found, 1);
+      return;
+    }
     case 'create-index':
     case 'create-index-concurrently': {
       if (step.owner.kind === 'materialized-view') {
@@ -971,10 +1045,11 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       const key = keyOf(step.owner.table);
       const table = state.tables.get(key);
       assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
-      for (const name of step.index.columns) {
+      for (const element of step.index.columns) {
+        if (typeof element !== 'string') continue;
         assert.ok(
-          table.columns.has(name),
-          `${step.kind} on ${key} covering missing column ${name}`,
+          table.columns.has(element),
+          `${step.kind} on ${key} covering missing column ${element}`,
         );
       }
       const entryKey = indexKey(step.index);
@@ -1179,6 +1254,11 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       `check constraints of ${key}`,
     );
     assert.deepStrictEqual(
+      actual.exclusionConstraints.map(exclusionConstraintKey).sort(),
+      (expected.exclusionConstraints ?? []).map(exclusionConstraintKey).sort(),
+      `exclusion constraints of ${key}`,
+    );
+    assert.deepStrictEqual(
       actual.indexes.map(indexKey).sort(),
       expected.indexes.map(indexKey).sort(),
       `indexes of ${key}`,
@@ -1197,6 +1277,11 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       commentPairs(actual.checkConstraints, checkConstraintKey),
       commentPairs(expected.checkConstraints, checkConstraintKey),
       `check-constraint comments of ${key}`,
+    );
+    assert.deepStrictEqual(
+      commentPairs(actual.exclusionConstraints, exclusionConstraintKey),
+      commentPairs(expected.exclusionConstraints ?? [], exclusionConstraintKey),
+      `exclusion-constraint comments of ${key}`,
     );
     assert.deepStrictEqual(
       commentPairs(actual.indexes, indexKey),
@@ -2036,8 +2121,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     );
     retainDistinct(
       generated.indexes,
-      (member) => member.columns.every((name) => columnNames.has(name)),
-      (member) => JSON.stringify([member.name]),
+      (member) =>
+        member.columns.every((element) => typeof element !== 'string' || columnNames.has(element)),
+      (member) => JSON.stringify([member.name, indexElementsKey(member.columns)]),
     );
     for (const entry of generated.columns) {
       if (entry.identity !== undefined && canonicalIntType(entry.type) === undefined) {
@@ -2198,6 +2284,8 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'drop-unique-constraint',
     'add-check-constraint',
     'drop-check-constraint',
+    'add-exclusion-constraint',
+    'drop-exclusion-constraint',
     'create-index',
     'drop-index',
     'create-index-concurrently',
@@ -2214,7 +2302,7 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'comment',
   ];
 
-  assert.equal(kinds.length, 34);
+  assert.equal(kinds.length, 36);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -3653,6 +3741,103 @@ test('a check constraint add, change, or drop becomes its own step', () => {
     },
   ]);
   simulate(model(strict), model(loose));
+});
+
+test('an exclusion constraint add, change, or drop becomes its own step', () => {
+  const columns = [column('a')];
+  const before = table('t', {
+    columns,
+    exclusionConstraints: [exclusionConstraint('a WITH =', { name: 't_excl' })],
+  });
+  const after = table('t', {
+    columns,
+    exclusionConstraints: [exclusionConstraint('a WITH =', { name: 't_excl', where: 'a > 0' })],
+  });
+  const without = table('t', { columns });
+
+  assertPlan(model(without), model(before), [
+    {
+      kind: 'add-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl' }),
+    },
+  ]);
+  assertPlan(model(before), model(without), [
+    {
+      kind: 'drop-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl' }),
+    },
+  ]);
+  assertPlan(model(before), model(after), [
+    {
+      kind: 'drop-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl' }),
+    },
+    {
+      kind: 'add-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl', where: 'a > 0' }),
+    },
+  ]);
+});
+
+test('exclusion drops follow check drops and exclusion adds follow check adds', () => {
+  const columns = [column('a')];
+  const baseline = table('t', {
+    columns,
+    checkConstraints: [checkConstraint('a > 0')],
+    exclusionConstraints: [exclusionConstraint('a WITH =')],
+  });
+  const target = table('t', {
+    columns,
+    checkConstraints: [checkConstraint('a > 1')],
+    exclusionConstraints: [exclusionConstraint('a WITH <>')],
+  });
+
+  assert.deepStrictEqual(plan(model(baseline), model(target)).steps, [
+    {
+      kind: 'drop-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('a > 0'),
+    },
+    {
+      kind: 'drop-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH ='),
+    },
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('a > 1'),
+    },
+    {
+      kind: 'add-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('a WITH <>'),
+    },
+  ]);
+});
+
+test('an added table attaches its exclusion constraints with their own steps', () => {
+  const entry = exclusionConstraint('a WITH =', { name: 't_excl' });
+  const added = table('t', { columns: [column('a')], exclusionConstraints: [entry] });
+
+  const withoutExclusions: Mutable<Table> = { ...added };
+  delete (withoutExclusions as { exclusionConstraints?: readonly ExclusionConstraint[] })
+    .exclusionConstraints;
+  assert.deepStrictEqual(plan(model(), model(added)).steps, [
+    {
+      kind: 'create-table',
+      table: withoutExclusions,
+    },
+    {
+      kind: 'add-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: entry,
+    },
+  ]);
 });
 
 test('an index add or drop becomes its own step', () => {
@@ -6135,6 +6320,8 @@ const applicationArrays = [
   'uniqueConstraintAdds',
   'checkConstraintDrops',
   'checkConstraintAdds',
+  'exclusionConstraintDrops',
+  'exclusionConstraintAdds',
   'indexDrops',
   'indexCreates',
   'identityDrops',
@@ -6187,6 +6374,8 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     uniqueConstraintAdds: 0,
     checkConstraintDrops: 0,
     checkConstraintAdds: 0,
+    exclusionConstraintDrops: 0,
+    exclusionConstraintAdds: 0,
     indexDrops: 0,
     indexCreates: 0,
     identityDrops: 0,
@@ -6222,6 +6411,7 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
         counts.foreignKeyAdds += change.table.foreignKeys.length;
         counts.uniqueConstraintAdds += change.table.uniqueConstraints.length;
         counts.checkConstraintAdds += change.table.checkConstraints.length;
+        counts.exclusionConstraintAdds += change.table.exclusionConstraints?.length ?? 0;
         counts.indexCreates += change.table.indexes.length;
         counts.identityAdds += change.table.columns.filter(
           (column) => column.identity !== undefined,
@@ -6302,6 +6492,17 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'check-constraint-changed':
               count('checkConstraintDrops');
               count('checkConstraintAdds');
+              if (tableChange.after.comment !== undefined) count('comments');
+              break;
+            case 'exclusion-constraint-added':
+              count('exclusionConstraintAdds');
+              break;
+            case 'exclusion-constraint-removed':
+              count('exclusionConstraintDrops');
+              break;
+            case 'exclusion-constraint-changed':
+              count('exclusionConstraintDrops');
+              count('exclusionConstraintAdds');
               if (tableChange.after.comment !== undefined) count('comments');
               break;
             case 'index-added':
@@ -6403,6 +6604,8 @@ const appendApplication = (target: ChangeApplication, source: ChangeApplication)
   target.uniqueConstraintAdds.push(...source.uniqueConstraintAdds);
   target.checkConstraintDrops.push(...source.checkConstraintDrops);
   target.checkConstraintAdds.push(...source.checkConstraintAdds);
+  target.exclusionConstraintDrops.push(...source.exclusionConstraintDrops);
+  target.exclusionConstraintAdds.push(...source.exclusionConstraintAdds);
   target.indexDrops.push(...source.indexDrops);
   target.indexCreates.push(...source.indexCreates);
   target.identityDrops.push(...source.identityDrops);
@@ -6473,7 +6676,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 34, 'every step kind must be classified');
+  assert.equal(kinds.length, 36, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -6555,14 +6758,15 @@ const generateTwinShape = (random: Random): TwinShape => {
     }
     return picked;
   };
-  const conventionalName = (columns: readonly string[]): string => `t_${columns.join('_')}_idx`;
+  const conventionalName = (columns: readonly IndexElement[]): string =>
+    `t_${columns.map((element) => (typeof element === 'string' ? element : element.expression)).join('_')}_idx`;
   const sigma: Mutable<Index> = {
     unique: random.chance(0.4),
     columns: pickColumns(),
     ...(random.chance(0.35) ? { concurrently: true } : {}),
   };
   const mode = random.pick(['same', 'different', 'replace'] as const);
-  let twinColumns = pickColumns();
+  let twinColumns: readonly IndexElement[] = pickColumns();
   if (mode === 'different') {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       if (JSON.stringify(twinColumns) !== JSON.stringify(sigma.columns)) break;
@@ -8407,4 +8611,56 @@ test('a name-involved not-null change re-asserts an unchanged notNullComment', (
     },
   ]);
   simulate(baseline, target);
+});
+
+test('an added or removed expression, partial, covering index carries every field into steps', () => {
+  const columns = [column('a'), column('b'), column('c')];
+  const entry: Index = {
+    name: 't_expr_idx',
+    unique: true,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  };
+  const empty = model(table('t', { columns }));
+  const full = model(table('t', { columns, indexes: [entry] }));
+  const owner = { kind: 'table' as const, table: identity('t') };
+
+  assertPlan(empty, full, [{ kind: 'create-index', owner, index: entry }]);
+  assertPlan(full, empty, [{ kind: 'drop-index', owner, index: entry }]);
+});
+
+test('a changed expression index decomposes into a drop and a create with both shapes', () => {
+  const columns = [column('a'), column('b')];
+  const before: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: [{ expression: 'lower(a)' }, 'b'],
+    where: 'a > 0',
+  };
+  const after: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: ['b', { expression: 'lower(a)' }],
+    include: ['a'],
+  };
+  const owner = { kind: 'table' as const, table: identity('t') };
+
+  assertPlan(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [after] })),
+    [
+      { kind: 'drop-index', owner, index: before },
+      { kind: 'create-index', owner, index: after },
+    ],
+  );
+});
+
+test('a concurrently-only difference on an expression index produces no plan', () => {
+  const columns = [column('a')];
+  const before: Index = { columns: [{ expression: 'lower(a)' }], unique: false };
+  const baseline = model(table('t', { columns, indexes: [before] }));
+  const target = model(table('t', { columns, indexes: [{ ...before, concurrently: true }] }));
+
+  assertPlan(baseline, target, []);
 });

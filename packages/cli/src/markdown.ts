@@ -13,6 +13,7 @@ import type {
   UniqueConstraint,
   View,
 } from '@schemamill/core';
+import { serializeIndexElement } from '@schemamill/core';
 
 /**
  * The deterministic Markdown projection of the canonical model (brief v4, D1–D3).
@@ -80,7 +81,12 @@ const compareIdentity = chain<TableIdentity>(
 const compareIndexes = chain<Index>(
   (left, right) => compareOptional(left.name, right.name, compareStrings),
   (left, right) => compareBooleans(left.unique, right.unique),
-  (left, right) => compareArrays(left.columns, right.columns, compareStrings),
+  (left, right) =>
+    compareArrays(left.columns, right.columns, (before, after) =>
+      compareStrings(serializeIndexElement(before), serializeIndexElement(after)),
+    ),
+  (left, right) => compareArrays(left.include ?? [], right.include ?? [], compareStrings),
+  (left, right) => compareOptional(left.where, right.where, compareStrings),
 );
 
 const compareUniqueConstraints = chain<UniqueConstraint>(
@@ -218,9 +224,14 @@ function renderForeignKey(foreignKey: ForeignKey): string {
 }
 
 function renderIndex(index: Index): string {
+  const elements = index.columns.map((element) =>
+    typeof element === 'string' ? element : `expression ${element.expression}`,
+  );
+  const clauses = index.include === undefined ? '' : `, include: ${fmt(index.include)}`;
+  const where = index.where === undefined ? '' : `, where: ${fmt(index.where)}`;
   return (
-    `name: ${fmt(index.name)}, unique: ${fmt(index.unique)}, columns: ${fmt(index.columns)}, ` +
-    `concurrently: ${fmt(index.concurrently)}, comment: ${fmt(index.comment)}`
+    `name: ${fmt(index.name)}, unique: ${fmt(index.unique)}, columns: ${fmt(elements)}, ` +
+    `concurrently: ${fmt(index.concurrently)}, comment: ${fmt(index.comment)}${clauses}${where}`
   );
 }
 
@@ -255,6 +266,18 @@ function renderTable(out: MarkdownBuilder, table: Table): void {
       out.bullet(
         `name: ${fmt(check.name)}, expression: ${fmt(check.expression)}, ` +
           `enforcement: ${fmt(check.enforcement)}, comment: ${fmt(check.comment)}`,
+      );
+    }
+  }
+  if (table.exclusionConstraints !== undefined && table.exclusionConstraints.length > 0) {
+    out.heading(4, 'Exclusion constraints');
+    for (const exclusion of table.exclusionConstraints) {
+      out.bullet(
+        `name: ${fmt(exclusion.name)}, elements: ${fmt(exclusion.elements)}, ` +
+          `access method: ${fmt(exclusion.accessMethod ?? 'gist')}, where: ${fmt(exclusion.where)}, ` +
+          `deferrable: ${fmt(exclusion.deferrable)}, initially deferred: ${fmt(
+            exclusion.initiallyDeferred,
+          )}, comment: ${fmt(exclusion.comment)}`,
       );
     }
   }

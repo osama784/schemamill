@@ -12,9 +12,10 @@ import type { Identity } from './identity.ts';
  * - A table is identified by its schema and its name together, e.g. `public.users`.
  * - A column is identified by its name within its table.
  * - A primary key or unique constraint is identified by the columns it covers, a check
- *   constraint by its expression, and a foreign key by its referencing columns and the table
- *   it references; a constraint `name` travels with it when the source has one but is not part
- *   of its identity. An index is identified by its name.
+ *   constraint by its expression, an exclusion constraint by its canonical element text, and a
+ *   foreign key by its referencing columns and the table it references; a constraint `name`
+ *   travels with it when the source has one but is not part of its identity. An index is
+ *   identified by its name.
  * - A sequence is identified by its schema and its name together, like a table.
  * - A view is identified by its schema and its name together, like a table. A view and a
  *   materialized view share one namespace, so the `materialized` discriminator is part of the
@@ -26,7 +27,7 @@ import type { Identity } from './identity.ts';
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
  * - `columns` keep source order: ordinal position is part of a table's shape.
  * - `primaryKey.columns`, `uniqueConstraint.columns`, `index.columns`, and `foreignKey.columns`
- *   keep the constraint's or index's column order.
+ *   keep the constraint's or index's authored order; an index's elements may be expressions.
  * - `foreignKeys` are sorted by referencing columns (element-wise lexicographic), then
  *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
  *   first).
@@ -34,6 +35,8 @@ import type { Identity } from './identity.ts';
  *   constraint name (`name ?? ''`, so unnamed first).
  * - `checkConstraints` are sorted by expression, then constraint name (`name ?? ''`, so
  *   unnamed first).
+ * - `exclusionConstraints` are sorted by their canonical element text, then constraint name
+ *   (`name ?? ''`, so unnamed first).
  * - `indexes` are sorted by name (`name ?? ''`, so unnamed first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
  * - `views` are sorted by schema, then name (JavaScript string comparison).
@@ -106,6 +109,8 @@ export interface Table extends TableIdentity {
   readonly uniqueConstraints: readonly UniqueConstraint[];
   /** Check constraints declared on the table, in the model's deterministic order. */
   readonly checkConstraints: readonly CheckConstraint[];
+  /** Exclusion constraints declared on the table, in the model's deterministic order. */
+  readonly exclusionConstraints?: readonly ExclusionConstraint[];
   /** Standalone indexes on the table, in the model's deterministic order. */
   readonly indexes: readonly Index[];
   /**
@@ -273,6 +278,39 @@ export interface CheckConstraint {
   readonly comment?: string;
 }
 
+/**
+ * An exclusion constraint: the listed expressions and operators must not compare equal for any
+ * two rows. Operator, operator-class, and collation text stays inside the opaque `elements`
+ * text, which is whitespace-normalized by the importing parser and never reconstructed by core.
+ * `accessMethod` is explicit-only: absence means PostgreSQL's `gist` default.
+ */
+export interface ExclusionConstraint {
+  /** Constraint name as written, when the source names it. */
+  readonly name?: string;
+  /** The exclusion elements as canonical, whitespace-normalized text, in authored order. */
+  readonly elements: string;
+  /**
+   * The access method, as written, when the source states one; absent means PostgreSQL's
+   * `gist` default.
+   */
+  readonly accessMethod?: string;
+  /** The exclusion's `WHERE` clause; absent means the constraint applies to every row. */
+  readonly where?: string;
+  /** Whether the constraint is declared `DEFERRABLE`; absent means `NOT DEFERRABLE`. */
+  readonly deferrable?: boolean;
+  /**
+   * Whether the constraint is declared `INITIALLY DEFERRED`; implies `deferrable`, and absent
+   * means `INITIALLY IMMEDIATE`.
+   */
+  readonly initiallyDeferred?: boolean;
+  /**
+   * The exclusion constraint's PostgreSQL comment, stored verbatim; absent means none. An empty
+   * string is not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized,
+   * and no NUL.
+   */
+  readonly comment?: string;
+}
+
 /** A foreign key constraint: columns on this table pointing at columns of another table. */
 export interface ForeignKey {
   /** Constraint name as written, when the source names it. */
@@ -304,18 +342,35 @@ export interface ForeignKey {
 }
 
 /**
- * A standalone index: an access path on the table's columns, not backing a constraint. A named
- * index is identified by its name; an unnamed index by its structure — `unique` and ordered
- * columns — with a missing name itself distinct in a diff. A unique constraint is never
- * modeled as, or accompanied by, an index.
+ * One ordered element of an index's key list: a plain string names a column; the tagged object
+ * carries an expression as written, whitespace-normalized and opaque to the model — operator,
+ * operator-class, and collation text stay inside it, never becoming separate fields. The two
+ * shapes are distinct: a column named `{"expression":"x"}` is not that expression.
+ */
+export type IndexElement = string | { readonly expression: string };
+
+/**
+ * A standalone index: an access path on the table's ordered key elements, not backing a
+ * constraint. A named index is identified by its name; an unnamed index by its structure —
+ * `unique`, its ordered key elements, and its `INCLUDE` columns and partial `where` clause —
+ * with a missing name itself distinct in a diff. A unique constraint is never modeled as, or
+ * accompanied by, an index.
+ *
+ * `where` is the partial index's clause, not a check constraint's predicate: the model keeps it
+ * as whitespace-normalized, opaque text. `include` holds the `INCLUDE` columns after the keys.
+ * `concurrently` stays apply metadata, excluded from structural identity and equality.
  */
 export interface Index {
   /** Index name as written, when the source names it. */
   readonly name?: string;
   /** Whether the index is declared `UNIQUE`. */
   readonly unique: boolean;
-  /** Indexed columns, in the index's order. */
-  readonly columns: readonly string[];
+  /** Indexed columns and expressions, in the index's authored order. */
+  readonly columns: readonly IndexElement[];
+  /** `INCLUDE` columns, in the index's authored order; absent means no `INCLUDE` clause. */
+  readonly include?: readonly string[];
+  /** The partial index's `WHERE` clause; absent means the index is not partial. */
+  readonly where?: string;
   /**
    * Whether a create or drop applies `CONCURRENTLY`; apply metadata, not structure, excluded
    * from identity and equality. The target's flag drives a create, the baseline's drives a

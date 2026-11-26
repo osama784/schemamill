@@ -11,6 +11,7 @@ import type {
 
 import {
   chooseNameAddition,
+  indexElementNames,
   makeObjectName,
   synthesizedCheckConstraintName,
   synthesizedForeignKeyName,
@@ -30,8 +31,13 @@ import {
 /** A table identity named `name` in `public`. */
 const table = (name: string): TableIdentity => ({ schema: 'public', name });
 
-/** An unnamed non-unique index on `columns`. */
-const index = (columns: readonly string[]): Index => ({ unique: false, columns });
+/** An unnamed non-unique index on `columns`, with optional `INCLUDE` and partial `WHERE`. */
+const index = (columns: Index['columns'], include?: readonly string[], where?: string): Index => ({
+  unique: false,
+  columns,
+  ...(include === undefined ? {} : { include }),
+  ...(where === undefined ? {} : { where }),
+});
 
 /** An unnamed unique constraint on `columns`. */
 const unique = (columns: readonly string[]): UniqueConstraint => ({ columns });
@@ -141,4 +147,63 @@ test('synthesized names predict the server form for long inputs', () => {
     `${'t'.repeat(55)}_a_check`,
   );
   assert.equal(synthesizedNotNullName(long, 'a'), `${'t'.repeat(52)}_a_not_null`);
+});
+
+test('indexElementNames labels columns, function calls, nullif, and opaque expressions', () => {
+  assert.deepEqual(indexElementNames(index(['a', 'b'])), ['a', 'b']);
+  const labels: readonly [string, string][] = [
+    ['lower(email)', 'lower'],
+    ['public.upper(name)', 'upper'],
+    ['nullif(a, b)', 'nullif'],
+    ['a + b', 'expr'],
+    ['(lower(x))', 'lower'],
+    ['"MixedCase"(x)', 'MixedCase'],
+    ['lower(x)::text', 'expr'],
+    ["lower(x) || 'y'", 'expr'],
+    ['CASE WHEN a THEN b ELSE c END', 'expr'],
+  ];
+  for (const [expression, label] of labels) {
+    assert.deepEqual(indexElementNames(index([{ expression }])), [label], expression);
+  }
+});
+
+test('indexElementNames appends INCLUDE and dedupes with numeric suffixes', () => {
+  assert.deepEqual(
+    indexElementNames(
+      index(['c', { expression: 'a + b' }, { expression: 'lower(x)' }], ['c', 'd']),
+    ),
+    ['c', 'expr', 'lower', 'c1', 'd'],
+  );
+  assert.deepEqual(indexElementNames(index([{ expression: 'a + b' }, { expression: 'c + d' }])), [
+    'expr',
+    'expr1',
+  ]);
+  // A literal `expr1` column cannot collide with a generated suffix.
+  assert.deepEqual(
+    indexElementNames(index([{ expression: 'a + b' }, { expression: 'c + d' }, 'expr1'])),
+    ['expr', 'expr1', 'expr11'],
+  );
+});
+
+test('indexElementNames truncates each label to fit 63 bytes minus its suffix', () => {
+  const long = 'a'.repeat(70);
+  assert.deepEqual(indexElementNames(index([long, long])), ['a'.repeat(63), `${'a'.repeat(62)}1`]);
+  assert.deepEqual(indexElementNames(index([{ expression: `${'f'.repeat(70)}(x)` }])), [
+    'f'.repeat(63),
+  ]);
+});
+
+test('synthesizedIndexName uses element labels and INCLUDE, never the partial WHERE', () => {
+  assert.equal(
+    synthesizedIndexName(table('t'), index([{ expression: 'lower(email)' }, 'a'], ['c'], 'a > 0')),
+    't_lower_a_c_idx',
+  );
+  assert.equal(synthesizedIndexName(table('t'), index([{ expression: 'a + b' }])), 't_expr_idx');
+  assert.equal(
+    synthesizedIndexName(
+      table('t'),
+      index([{ expression: 'lower(a)' }, { expression: 'upper(b)' }], ['lower_c']),
+    ),
+    't_lower_upper_lower_c_idx',
+  );
 });

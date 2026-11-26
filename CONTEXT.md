@@ -34,9 +34,33 @@ _Avoid_: unique index, key
 A table constraint requiring every row to satisfy an expression, stored as opaque, whitespace-normalized text and named in the source or left unnamed. On import, a check constraint whose name is exactly PostgreSQL's generated name for it (`<table>_<column>_check`, or `<table>_check` when the expression does not single out one column) is canonicalized back to unnamed, so a dump of a model-declared unnamed check constraint round-trips.
 _Avoid_: validation rule, predicate
 
+**Exclusion constraint**:
+A table constraint whose ordered elements and operators must not compare equal for any two rows. Its `elements` are opaque, whitespace-normalized canonical text — operator, operator-class, and collation spelling stays inside them — and it may carry an explicit `accessMethod` (absent means `gist`), a partial `where`, deferrability, and its own comment. A named exclusion constraint travels its name, but identity is the canonical element text; a generated `<table>_<elements>_excl` name is canonicalized back to unnamed on both read paths. Its backing index is consumed into the constraint, never modeled as a standalone index, and a comment on that backing index is flagged rather than copied.
+_Avoid_: exclusion rule, exclusion index
+
 **Index**:
-A standalone access path over a table's or a materialized view's columns. A named index is identified by its name; an unnamed index by its structure — `unique` and ordered columns, with a missing name itself distinct in a diff. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
-_Avoid_: key, access method
+A standalone access path over a table's or a materialized view's ordered key elements. Each element is either a column name or an opaque expression; the index may also carry `INCLUDE` columns and a partial `where` clause. A named index is identified by its name; an unnamed index by its structure — `unique`, its authored element order, its `include` columns, and its `where` clause — with a missing name itself distinct in a diff. `concurrently` is apply metadata, never structure. A unique constraint is never an index, and a constraint-backed index is consumed into its constraint rather than modeled on its own. On import, an index whose name is exactly PostgreSQL's generated name for its structure (`<table>_<cols>_idx`) is canonicalized back to unnamed, so a dump of a model-declared unnamed index round-trips.
+_Avoid_: key
+
+**Expression index**:
+An index whose ordered key elements include an expression, carried as opaque, whitespace-normalized text in an `IndexElement` rather than as a column name. Operator and operator-class spelling stays inside that text; the model has no separate field for it. The renderer emits the text as written, and a generated name uses a best-effort label (a function's last identifier, `nullif`, or `expr`), never deparsed text.
+_Avoid_: functional index, computed index
+
+**Partial index**:
+An index carrying the `where` clause that limits which rows its access path covers. The field and headword are `where`, not "predicate": **predicate** is the banned synonym for a check constraint's expression. A partial index's `where` participates in identity and equality but not in PostgreSQL's generated-name formula.
+_Avoid_: filtered index, predicate index
+
+**Covering (INCLUDE) index**:
+An index with `INCLUDE` columns carried after its ordered key elements. These columns are structure — they take part in identity, equality, and the generated-name addition — but they are not keys and cannot back a constraint. A table-owned index may carry them; an index on a materialized view keeps the older named skip.
+_Avoid_: covering key, included column
+
+**Operator class**:
+PostgreSQL's operator class (`opclass`) for an index element. The model has no operator-class field: any operator-class spelling lives inside the element's opaque expression text, and an explicit `opclass` on a plain column or expression element keeps the whole index out of the envelope.
+_Avoid_: opclass as a model field
+
+**Access method**:
+PostgreSQL's index access method, e.g. `btree` or `hash`. The model renders `USING btree`; an index declared with another access method is skipped whole and named on import, and a non-btree access method remains a named residual rather than a modeled field.
+_Avoid_: index type
 
 **Index owner**:
 The relation an index belongs to: a table or a materialized view, carried as a discriminated payload on index changes and steps so one `Index` shape and one set of index steps serve both. An ordinary view cannot own an index; an index on one is skipped by name on import. A table-owned index keeps its identity, ordering, canonicalization, and plan placement unchanged.
@@ -79,7 +103,7 @@ A column's explicit compression method: `pglz` or `lz4`. Absent means the type's
 _Avoid_: codec, encoding
 
 **Comment**:
-Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key constraint, index, or extension — carried verbatim as the entity's `comment`, plus the text on a column's named not-null constraint, carried as the same column's `notNullComment`. The not-null surface is the same **Comment**, not a new entity: it travels as a `not-null` `CommentTarget` variant and renders against the column's **Not-null constraint name** or the name synthesized when a generated one was stripped. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
+Descriptive text PostgreSQL stores on a modeled entity — a table, column, sequence, view, materialized view, primary key, unique/check/foreign-key/exclusion constraint, index, or extension — carried verbatim as the entity's `comment`, plus the text on a column's named not-null constraint, carried as the same column's `notNullComment`. The not-null surface is the same **Comment**, not a new entity: it travels as a `not-null` `CommentTarget` variant and renders against the column's **Not-null constraint name** or the name synthesized when a generated one was stripped. Absent means no comment; the empty string is not a model value, because `COMMENT … IS ''` removes a comment exactly as `IS NULL` does. A comment is never identity or structure, so a comment-only change never recreates the object it describes.
 _Avoid_: description, annotation, docstring, metadata
 
 **Table persistence**:

@@ -6,6 +6,7 @@ import type {
   ColumnAttributes,
   ColumnFieldChange,
   CommentTarget,
+  ExclusionConstraint,
   Diagnostic,
   Extension,
   ExtensionFieldChange,
@@ -342,11 +343,33 @@ function mapForeignKey(foreignKey: ForeignKey): object {
   };
 }
 
+function mapExclusionConstraint(exclusionConstraint: ExclusionConstraint): object {
+  return {
+    ...(exclusionConstraint.name === undefined ? {} : { name: exclusionConstraint.name }),
+    elements: exclusionConstraint.elements,
+    ...(exclusionConstraint.accessMethod === undefined
+      ? {}
+      : { accessMethod: exclusionConstraint.accessMethod }),
+    ...(exclusionConstraint.where === undefined ? {} : { where: exclusionConstraint.where }),
+    ...(exclusionConstraint.deferrable === undefined
+      ? {}
+      : { deferrable: exclusionConstraint.deferrable }),
+    ...(exclusionConstraint.initiallyDeferred === undefined
+      ? {}
+      : { initiallyDeferred: exclusionConstraint.initiallyDeferred }),
+    ...(exclusionConstraint.comment === undefined ? {} : { comment: exclusionConstraint.comment }),
+  };
+}
+
 function mapIndex(index: Index): object {
   return {
     ...(index.name === undefined ? {} : { name: index.name }),
     unique: index.unique,
-    columns: [...index.columns],
+    columns: index.columns.map((element) =>
+      typeof element === 'string' ? element : { expression: element.expression },
+    ),
+    ...(index.include === undefined ? {} : { include: [...index.include] }),
+    ...(index.where === undefined ? {} : { where: index.where }),
     ...(index.concurrently === undefined ? {} : { concurrently: index.concurrently }),
     ...(index.comment === undefined ? {} : { comment: index.comment }),
   };
@@ -399,6 +422,9 @@ function mapTable(table: Table): object {
     foreignKeys: table.foreignKeys.map(mapForeignKey),
     uniqueConstraints: table.uniqueConstraints.map(mapUniqueConstraint),
     checkConstraints: table.checkConstraints.map(mapCheckConstraint),
+    ...(table.exclusionConstraints === undefined
+      ? {}
+      : { exclusionConstraints: table.exclusionConstraints.map(mapExclusionConstraint) }),
     indexes: table.indexes.map(mapIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
@@ -516,6 +542,12 @@ function mapCommentTarget(target: CommentTarget): object {
         kind: 'foreign-key',
         table: mapTableIdentity(target.table),
         foreignKey: mapForeignKey(target.foreignKey),
+      };
+    case 'exclusion-constraint':
+      return {
+        kind: 'exclusion-constraint',
+        table: mapTableIdentity(target.table),
+        exclusionConstraint: mapExclusionConstraint(target.exclusionConstraint),
       };
     default:
       return assertNever(target, 'CommentTarget');
@@ -684,6 +716,22 @@ function mapTableChange(change: TableChange): object {
         before: mapCheckConstraint(change.before),
         after: mapCheckConstraint(change.after),
       };
+    case 'exclusion-constraint-added':
+      return {
+        kind: 'exclusion-constraint-added',
+        exclusionConstraint: mapExclusionConstraint(change.exclusionConstraint),
+      };
+    case 'exclusion-constraint-removed':
+      return {
+        kind: 'exclusion-constraint-removed',
+        exclusionConstraint: mapExclusionConstraint(change.exclusionConstraint),
+      };
+    case 'exclusion-constraint-changed':
+      return {
+        kind: 'exclusion-constraint-changed',
+        before: mapExclusionConstraint(change.before),
+        after: mapExclusionConstraint(change.after),
+      };
     case 'index-added':
       return { kind: 'index-added', index: mapIndex(change.index) };
     case 'index-removed':
@@ -840,6 +888,18 @@ function mapStep(step: Step): object {
         kind: 'drop-check-constraint',
         table: mapTableIdentity(step.table),
         checkConstraint: mapCheckConstraint(step.checkConstraint),
+      };
+    case 'add-exclusion-constraint':
+      return {
+        kind: 'add-exclusion-constraint',
+        table: mapTableIdentity(step.table),
+        exclusionConstraint: mapExclusionConstraint(step.exclusionConstraint),
+      };
+    case 'drop-exclusion-constraint':
+      return {
+        kind: 'drop-exclusion-constraint',
+        table: mapTableIdentity(step.table),
+        exclusionConstraint: mapExclusionConstraint(step.exclusionConstraint),
       };
     case 'create-index':
       return {

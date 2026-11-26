@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { diff } from '@schemamill/core';
 import type { Diagnostic, Index, Model, TableIdentity } from '@schemamill/core';
 
 import { canonicalizeConstraintNames, canonicalizeIndexNames, mapCatalog } from './catalog.ts';
@@ -109,6 +110,7 @@ const constraint = (
   validated: null,
   enforced: null,
   noInherit: null,
+  definition: null,
   nullsNotDistinct: null,
   including: null,
   period: null,
@@ -183,9 +185,20 @@ const foreignKey = (
     ...rest,
   });
 
-/** An `exclusion` constraint row: identity only, every other key null. */
-const exclusionConstraint = (schema: string, tableName: string, conname: string) =>
-  constraint(schema, tableName, conname, 'exclusion');
+/** An `exclusion` constraint row with the server-deparsed definition its kind requires. */
+const exclusionConstraint = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  rest: Record<string, unknown> = {},
+) =>
+  constraint(schema, tableName, conname, 'exclusion', {
+    definition: 'EXCLUDE USING gist (a WITH =)',
+    deferrable: false,
+    deferred: false,
+    backingIndexName: conname,
+    ...rest,
+  });
 
 /** A `notNullConstraints` row: validated, inheriting, conventionally named, and uncommented unless overridden. */
 const notNull = (
@@ -1906,7 +1919,7 @@ test('flags a comment on a unique constraint backing index without modeling it',
   ]);
 });
 
-test('flags a comment on an exclusion backing index while leaving the constraint own comment unused', async () => {
+test('models an exclusion constraint with its own comment and flags its backing-index comment', async () => {
   const read = await mapCatalog(
     payload({
       tables: [table('public', 't')],
@@ -1922,15 +1935,11 @@ test('flags a comment on an exclusion backing index while leaving the constraint
     }),
   );
 
-  assert.deepEqual(read.model.tables[0]?.uniqueConstraints, []);
+  assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+    { name: 't_excl', elements: 'a WITH =', comment: 'comment on the constraint itself' },
+  ]);
   assert.deepEqual(read.model.tables[0]?.indexes, []);
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -1938,6 +1947,80 @@ test('flags a comment on an exclusion backing index while leaving the constraint
       message: 'dropped comment from public.t_excl',
     },
   ]);
+});
+
+test('models catalog exclusion clauses identically to the dump canonicalization', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a')],
+      constraints: [
+        exclusionConstraint('public', 't', 't_excl', {
+          definition:
+            'EXCLUDE USING gist (a text_pattern_ops WITH =,(lower(a)) WITH <>) WHERE (b > 0)',
+          deferrable: true,
+          deferred: true,
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+    {
+      name: 't_excl',
+      elements: 'a text_pattern_ops WITH =,(lower(a)) WITH <>',
+      where: '(b > 0)',
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('models catalog exclusion WHERE predicates that contain NOT as an operator', async () => {
+  const predicates = [
+    { definition: '(a IS NOT NULL)', expected: '(a IS NOT NULL)' },
+    { definition: '(a NOT IN (1, 2))', expected: '(a NOT IN(1,2))' },
+  ];
+  for (const { definition, expected } of predicates) {
+    const read = await mapCatalog(
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'a')],
+        constraints: [
+          exclusionConstraint('public', 't', 't_excl', {
+            definition: `EXCLUDE USING gist (a WITH =) WHERE ${definition}`,
+          }),
+        ],
+      }),
+    );
+
+    assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+      { name: 't_excl', elements: 'a WITH =', where: expected },
+    ]);
+    assert.deepEqual(read.diagnostics, []);
+  }
+});
+
+test('skips an exclusion row whose definition is absent or unparseable', async () => {
+  for (const definition of [null, 'NO EXCLUSION HERE']) {
+    const read = await mapCatalog(
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'a')],
+        constraints: [exclusionConstraint('public', 't', 't_excl', { definition })],
+      }),
+    );
+    assert.equal(Object.hasOwn(read.model.tables[0]!, 'exclusionConstraints'), false);
+    assert.deepEqual(read.diagnostics, [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.t',
+        message: 'skipped exclusion constraint t_excl',
+      },
+    ]);
+  }
 });
 
 test('sorts an exclusion backing-index comment with the p/u dropped comments by index name', async () => {
@@ -1960,12 +2043,6 @@ test('sorts an exclusion backing-index comment with the p/u dropped comments by 
   );
 
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint a_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2150,12 +2227,6 @@ test('keeps a tablespace index comment and drops comments on skipped rows withou
     'the conventional tablespace index name strips while the comment stays',
   );
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2568,19 +2639,7 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
           't_desc_idx',
           'CREATE INDEX t_desc_idx ON public.t USING btree (a DESC)',
         ),
-        index(
-          'public',
-          't',
-          't_expr_idx',
-          'CREATE INDEX t_expr_idx ON public.t USING btree (((a + 1)))',
-        ),
         index('public', 't', 't_hash_idx', 'CREATE INDEX t_hash_idx ON public.t USING hash (a)'),
-        index(
-          'public',
-          't',
-          't_include_idx',
-          'CREATE INDEX t_include_idx ON public.t USING btree (a) INCLUDE (b)',
-        ),
         index(
           'public',
           't',
@@ -2598,12 +2657,6 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
           't',
           't_opclass_idx',
           'CREATE INDEX t_opclass_idx ON public.t USING btree (c text_pattern_ops)',
-        ),
-        index(
-          'public',
-          't',
-          't_partial_idx',
-          'CREATE INDEX t_partial_idx ON public.t USING btree (a) WHERE (a > 0)',
         ),
         index(
           'public',
@@ -2634,20 +2687,8 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_expr_idx',
-      message: 'skipped CREATE INDEX public.t_expr_idx (expression element)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
       object: 'public.t_hash_idx',
       message: 'skipped CREATE INDEX public.t_hash_idx (access method hash)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t_include_idx',
-      message: 'skipped CREATE INDEX public.t_include_idx (INCLUDE)',
     },
     {
       kind: 'skip',
@@ -2670,12 +2711,6 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_partial_idx',
-      message: 'skipped CREATE INDEX public.t_partial_idx (partial WHERE)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
       object: 'public.t_storage_idx',
       message: 'skipped CREATE INDEX public.t_storage_idx (storage parameters)',
     },
@@ -2683,6 +2718,54 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
   for (const diagnostic of read.diagnostics) {
     assert.equal('position' in diagnostic, false, 'introspection diagnostics carry no position');
   }
+});
+
+test('catalog and dump imports agree on expression, partial, and covering index shapes', async () => {
+  const clauses = [
+    ['t_expr_idx', 'lower(b)', ''],
+    ['t_partial_idx', 'a', ' WHERE (a > 0)'],
+    ['t_include_idx', 'a', ' INCLUDE (b)'],
+    ['t_all_idx', 'a, (a + 1)', ' INCLUDE (b, c) WHERE (a > 0)'],
+  ] as const;
+  const definitions = clauses.map(
+    ([name, keys, tail]) => `CREATE INDEX ${name} ON public.t USING btree (${keys})${tail}`,
+  );
+
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'a', { type: 'integer' }),
+        column('public', 't', 2, 'b', { type: 'integer' }),
+        column('public', 't', 3, 'c', { type: 'integer' }),
+      ],
+      indexes: clauses.map(([name], position) =>
+        index('public', 't', name, definitions[position]!),
+      ),
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.indexes, [
+    {
+      name: 't_all_idx',
+      unique: false,
+      columns: ['a', { expression: '(a + 1)' }],
+      include: ['b', 'c'],
+      where: '(a > 0)',
+    },
+    { name: 't_expr_idx', unique: false, columns: [{ expression: 'lower(b)' }] },
+    { name: 't_include_idx', unique: false, columns: ['a'], include: ['b'] },
+    { name: 't_partial_idx', unique: false, columns: ['a'], where: '(a > 0)' },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+
+  const dumped = await importDump(
+    [
+      `CREATE TABLE public.t (a integer, b integer, c integer);`,
+      ...definitions.map((statement) => `${statement};`),
+    ].join('\n'),
+  );
+  assert.deepEqual(diff(dumped.model, read.model), []);
 });
 
 test('skips indexes that are not valid and ready', async () => {
@@ -3614,12 +3697,6 @@ test('reports every constraint diagnostic with the exact line, object, and order
       code: 'unsupported-attribute',
       object: 'public.t',
       message: 'dropped NO INHERIT on check constraint c_inherit from public.t',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint ex_skip',
     },
     {
       kind: 'flag',

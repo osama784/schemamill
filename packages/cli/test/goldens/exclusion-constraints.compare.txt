@@ -1,0 +1,5 @@
+~ table public.t
+    - exclusion constraint t_excl EXCLUDE USING gist (a WITH <>)
+    + exclusion constraint t_excl EXCLUDE USING gist (a WITH =) WHERE (a > 0)
+
++ comment on exclusion constraint public.t (a WITH =): (none) → "new note"

@@ -10,6 +10,7 @@ import type {
   Column,
   CommentTarget,
   Diagnostic,
+  ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
@@ -71,6 +72,12 @@ const FOREIGN_KEY: ForeignKey = {
 };
 const UNIQUE_CONSTRAINT: UniqueConstraint = { columns: ['id'] };
 const CHECK_CONSTRAINT: CheckConstraint = { expression: 'id > 0' };
+const EXCLUSION_CONSTRAINT: ExclusionConstraint = {
+  name: 'widgets_no_overlap',
+  elements: 'id WITH =',
+  where: 'id > 0',
+  deferrable: true,
+};
 const INDEX: Index = { unique: false, columns: ['id'] };
 const IDENTITY: Identity = {
   generated: 'always',
@@ -106,6 +113,7 @@ const TABLE: Table = {
   foreignKeys: [FOREIGN_KEY],
   uniqueConstraints: [UNIQUE_CONSTRAINT],
   checkConstraints: [CHECK_CONSTRAINT],
+  exclusionConstraints: [EXCLUSION_CONSTRAINT],
   indexes: [INDEX],
   persistence: 'unlogged',
 };
@@ -127,6 +135,11 @@ const COMMENT_TARGETS: readonly CommentTarget[] = [
   { kind: 'primary-key', table: TABLE_ID, primaryKey: PRIMARY_KEY },
   { kind: 'unique-constraint', table: TABLE_ID, uniqueConstraint: UNIQUE_CONSTRAINT },
   { kind: 'check-constraint', table: TABLE_ID, checkConstraint: CHECK_CONSTRAINT },
+  {
+    kind: 'exclusion-constraint',
+    table: TABLE_ID,
+    exclusionConstraint: EXCLUSION_CONSTRAINT,
+  },
   { kind: 'foreign-key', table: TABLE_ID, foreignKey: FOREIGN_KEY },
 ];
 
@@ -153,6 +166,19 @@ const TABLE_CHANGES: readonly TableChange[] = [
   { kind: 'check-constraint-added', checkConstraint: CHECK_CONSTRAINT },
   { kind: 'check-constraint-removed', checkConstraint: CHECK_CONSTRAINT },
   { kind: 'check-constraint-changed', before: CHECK_CONSTRAINT, after: CHECK_CONSTRAINT },
+  {
+    kind: 'exclusion-constraint-added',
+    exclusionConstraint: EXCLUSION_CONSTRAINT,
+  },
+  {
+    kind: 'exclusion-constraint-removed',
+    exclusionConstraint: EXCLUSION_CONSTRAINT,
+  },
+  {
+    kind: 'exclusion-constraint-changed',
+    before: EXCLUSION_CONSTRAINT,
+    after: EXCLUSION_CONSTRAINT,
+  },
   { kind: 'index-added', index: INDEX },
   { kind: 'index-removed', index: INDEX },
   { kind: 'index-changed', before: INDEX, after: INDEX },
@@ -236,6 +262,16 @@ const STEPS: readonly Step[] = [
   { kind: 'drop-unique-constraint', table: TABLE_ID, uniqueConstraint: UNIQUE_CONSTRAINT },
   { kind: 'add-check-constraint', table: TABLE_ID, checkConstraint: CHECK_CONSTRAINT },
   { kind: 'drop-check-constraint', table: TABLE_ID, checkConstraint: CHECK_CONSTRAINT },
+  {
+    kind: 'add-exclusion-constraint',
+    table: TABLE_ID,
+    exclusionConstraint: EXCLUSION_CONSTRAINT,
+  },
+  {
+    kind: 'drop-exclusion-constraint',
+    table: TABLE_ID,
+    exclusionConstraint: EXCLUSION_CONSTRAINT,
+  },
   { kind: 'create-index', owner: TABLE_OWNER, index: INDEX },
   { kind: 'drop-index', owner: TABLE_OWNER, index: INDEX },
   { kind: 'create-index-concurrently', owner: MATVIEW_OWNER, index: INDEX },
@@ -423,6 +459,9 @@ const TABLE_CHANGE_KEYS: Record<TableChange['kind'], readonly string[]> = {
   'check-constraint-added': ['kind', 'checkConstraint'],
   'check-constraint-removed': ['kind', 'checkConstraint'],
   'check-constraint-changed': ['kind', 'before', 'after'],
+  'exclusion-constraint-added': ['kind', 'exclusionConstraint'],
+  'exclusion-constraint-removed': ['kind', 'exclusionConstraint'],
+  'exclusion-constraint-changed': ['kind', 'before', 'after'],
   'index-added': ['kind', 'index'],
   'index-removed': ['kind', 'index'],
   'index-changed': ['kind', 'before', 'after'],
@@ -450,6 +489,8 @@ const STEP_KEYS: Record<Step['kind'], readonly string[]> = {
   'drop-unique-constraint': ['kind', 'table', 'uniqueConstraint'],
   'add-check-constraint': ['kind', 'table', 'checkConstraint'],
   'drop-check-constraint': ['kind', 'table', 'checkConstraint'],
+  'add-exclusion-constraint': ['kind', 'table', 'exclusionConstraint'],
+  'drop-exclusion-constraint': ['kind', 'table', 'exclusionConstraint'],
   'create-index': ['kind', 'owner', 'index'],
   'drop-index': ['kind', 'owner', 'index'],
   'create-index-concurrently': ['kind', 'owner', 'index'],
@@ -487,6 +528,7 @@ const COMMENT_TARGET_KEYS: Record<CommentTarget['kind'], readonly string[]> = {
   'primary-key': ['kind', 'table', 'primaryKey'],
   'unique-constraint': ['kind', 'table', 'uniqueConstraint'],
   'check-constraint': ['kind', 'table', 'checkConstraint'],
+  'exclusion-constraint': ['kind', 'table', 'exclusionConstraint'],
   'foreign-key': ['kind', 'table', 'foreignKey'],
 };
 
@@ -587,10 +629,12 @@ const ALLOWED_KEYS = new Set<string>([
   'foreignKey',
   'uniqueConstraint',
   'checkConstraint',
+  'exclusionConstraint',
   'index',
   'foreignKeys',
   'uniqueConstraints',
   'checkConstraints',
+  'exclusionConstraints',
   'indexes',
   'persistence',
   'comment',
@@ -614,12 +658,16 @@ const ALLOWED_KEYS = new Set<string>([
   'deferrable',
   'initiallyDeferred',
   'expression',
+  'elements',
+  'accessMethod',
   'enforcement',
   'referencedTable',
   'referencedColumns',
   'onUpdate',
   'onDelete',
   'unique',
+  'include',
+  'where',
   'concurrently',
   'dataType',
   'ownedBy',
@@ -1017,4 +1065,33 @@ test('importPair surfaces per-side diagnostics and the workspace root without ne
     process.chdir(originalCwd);
     stream.write = originalWrite;
   }
+});
+
+test('the JSON mapper carries expression elements, INCLUDE, and the partial WHERE', () => {
+  const entry: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  };
+  const document = buildJsonDocument(
+    compareInput([
+      {
+        kind: 'table-changed',
+        table: TABLE_ID,
+        changes: [{ kind: 'index-added', index: entry }],
+      },
+    ]),
+  );
+  const result = document.result as {
+    changes: readonly { changes: readonly { index: unknown }[] }[];
+  };
+  assert.deepEqual(result.changes[0]!.changes[0]!.index, {
+    name: 't_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  });
 });

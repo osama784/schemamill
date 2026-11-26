@@ -8,6 +8,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Index,
@@ -47,6 +48,7 @@ interface TableParts {
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
+  exclusionConstraints?: readonly ExclusionConstraint[];
   indexes?: readonly Index[];
   persistence?: TablePersistence;
   comment?: string;
@@ -61,6 +63,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
+  ...(parts.exclusionConstraints === undefined
+    ? {}
+    : { exclusionConstraints: parts.exclusionConstraints }),
   indexes: parts.indexes ?? [],
   ...(parts.persistence === undefined ? {} : { persistence: parts.persistence }),
   ...(parts.comment === undefined ? {} : { comment: parts.comment }),
@@ -89,6 +94,12 @@ const checkConstraint = (
   expression: string,
   rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
 ): CheckConstraint => ({ expression, ...rest });
+
+/** An exclusion constraint on `elements`: unnamed and gist unless overridden. */
+const exclusionConstraint = (
+  elements: string,
+  rest: Partial<Omit<ExclusionConstraint, 'elements'>> = {},
+): ExclusionConstraint => ({ elements, ...rest });
 
 /** A non-unique index on `columns`: unnamed unless overridden. */
 const index = (columns: readonly string[], rest: Partial<Omit<Index, 'columns'>> = {}): Index => ({
@@ -3424,6 +3435,193 @@ test('changed check constraint pairs with equal baseline names order by their ta
   ]);
 });
 
+test('an exclusion constraint added or removed reports the whole constraint', () => {
+  const constraint = exclusionConstraint('a WITH =', {
+    name: 't_excl',
+    accessMethod: 'gist',
+    where: 'a > 0',
+    deferrable: true,
+    initiallyDeferred: true,
+  });
+  const columns = [column('a')];
+  const without = model(table('t', { columns }));
+  const withConstraint = model(table('t', { columns, exclusionConstraints: [constraint] }));
+
+  assertDiff(without, withConstraint, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'exclusion-constraint-added', exclusionConstraint: constraint }],
+    },
+  ]);
+  assertDiff(withConstraint, without, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'exclusion-constraint-removed', exclusionConstraint: constraint }],
+    },
+  ]);
+});
+
+test("an exclusion constraint's name is not identity but every other field is equality", () => {
+  const columns = [column('a')];
+  const base = model(
+    table('t', {
+      columns,
+      exclusionConstraints: [exclusionConstraint('a WITH =', { name: 'excl_a' })],
+    }),
+  );
+  const renamed = model(
+    table('t', {
+      columns,
+      exclusionConstraints: [exclusionConstraint('a WITH =', { name: 'excl_b' })],
+    }),
+  );
+  assertDiff(base, renamed, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'exclusion-constraint-changed',
+          before: exclusionConstraint('a WITH =', { name: 'excl_a' }),
+          after: exclusionConstraint('a WITH =', { name: 'excl_b' }),
+        },
+      ],
+    },
+  ]);
+
+  const changedElements = model(
+    table('t', { columns, exclusionConstraints: [exclusionConstraint('a WITH <>')] }),
+  );
+  assertDiff(base, changedElements, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'exclusion-constraint-removed',
+          exclusionConstraint: base.tables[0]!.exclusionConstraints![0]!,
+        },
+        {
+          kind: 'exclusion-constraint-added',
+          exclusionConstraint: changedElements.tables[0]!.exclusionConstraints![0]!,
+        },
+      ],
+    },
+  ]);
+
+  for (const field of [
+    { accessMethod: 'gist', where: 'a > 0' },
+    { deferrable: true },
+    { initiallyDeferred: true },
+  ] as const) {
+    const altered = model(
+      table('t', {
+        columns,
+        exclusionConstraints: [exclusionConstraint('a WITH =', { name: 'excl_a', ...field })],
+      }),
+    );
+    assertDiff(base, altered, [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          {
+            kind: 'exclusion-constraint-changed',
+            before: base.tables[0]!.exclusionConstraints![0]!,
+            after: altered.tables[0]!.exclusionConstraints![0]!,
+          },
+        ],
+      },
+    ]);
+  }
+});
+
+test("an exclusion constraint's own comment is a terminal comment change", () => {
+  const columns = [column('a')];
+  const plain = model(
+    table('t', { columns, exclusionConstraints: [exclusionConstraint('a WITH =')] }),
+  );
+  const commented = model(
+    table('t', {
+      columns,
+      exclusionConstraints: [exclusionConstraint('a WITH =', { comment: 'note' })],
+    }),
+  );
+
+  assertDiff(plain, commented, [
+    {
+      kind: 'comment-changed',
+      target: {
+        kind: 'exclusion-constraint',
+        table: identity('t'),
+        exclusionConstraint: exclusionConstraint('a WITH ='),
+      },
+      after: 'note',
+    },
+  ]);
+});
+
+test('a changed table emits exclusion constraints after check constraints and before indexes', () => {
+  const baseline = model(
+    table('t', {
+      checkConstraints: [checkConstraint('a > 0')],
+      exclusionConstraints: [exclusionConstraint('a WITH =')],
+      indexes: [index(['a'])],
+    }),
+  );
+  const target = model(
+    table('t', {
+      checkConstraints: [checkConstraint('a > 1')],
+      exclusionConstraints: [exclusionConstraint('a WITH <>')],
+      indexes: [index(['a'], { where: 'a > 0' })],
+    }),
+  );
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        { kind: 'check-constraint-removed', checkConstraint: checkConstraint('a > 0') },
+        { kind: 'check-constraint-added', checkConstraint: checkConstraint('a > 1') },
+        {
+          kind: 'exclusion-constraint-removed',
+          exclusionConstraint: exclusionConstraint('a WITH ='),
+        },
+        {
+          kind: 'exclusion-constraint-added',
+          exclusionConstraint: exclusionConstraint('a WITH <>'),
+        },
+        {
+          kind: 'index-changed',
+          before: index(['a']),
+          after: index(['a'], { where: 'a > 0' }),
+        },
+      ],
+    },
+  ]);
+});
+
+test('added and removed tables carry exclusion constraints in canonical order', () => {
+  const first = exclusionConstraint('a WITH =', { name: 'x' });
+  const second = exclusionConstraint('a WITH =', { name: 'y' });
+  const tableWith = table('t', { exclusionConstraints: [second, first] });
+  assertDiff(model(), model(tableWith), [
+    {
+      kind: 'table-added',
+      table: table('t', { exclusionConstraints: [first, second] }),
+    },
+  ]);
+  assertDiff(model(tableWith), model(), [
+    {
+      kind: 'table-removed',
+      table: table('t', { exclusionConstraints: [first, second] }),
+    },
+  ]);
+});
+
 test('an index added or removed reports the whole index with its flag', () => {
   const entry = index(['user_id'], {
     name: 't_user_id_idx',
@@ -5076,4 +5274,87 @@ test('a notNullComment-only change is one comment change on the not-null target'
   assertDiff(model(commented), model(changed), [
     { kind: 'comment-changed', target, before: 'login', after: 'sign-in' },
   ]);
+});
+
+test('an index expression, clause, or INCLUDE list is a structural difference', () => {
+  const columns = [column('a'), column('b'), column('c')];
+  const base: Index = { name: 't_idx', unique: false, columns: ['a'] };
+  const variants: readonly Index[] = [
+    { ...base, columns: [{ expression: 'lower(a)' }] },
+    { ...base, include: ['b'] },
+    { ...base, where: 'a > 0' },
+  ];
+
+  for (const after of variants) {
+    assertDiff(
+      model(table('t', { columns, indexes: [base] })),
+      model(table('t', { columns, indexes: [after] })),
+      [
+        {
+          kind: 'table-changed',
+          table: identity('t'),
+          changes: [{ kind: 'index-changed', before: base, after }],
+        },
+      ],
+    );
+  }
+
+  for (const same of variants) {
+    assertDiff(
+      model(table('t', { columns, indexes: [same] })),
+      model(table('t', { columns, indexes: [{ ...same, concurrently: true }] })),
+      [],
+    );
+  }
+});
+
+test('index element order is semantic and unnamed expression indexes pair by full structure', () => {
+  const columns = [column('a'), column('b')];
+  const expression = { expression: 'lower(b)' } as const;
+  const before: Index = { unique: false, columns: ['a', expression] };
+  const reordered: Index = { unique: false, columns: [expression, 'a'] };
+
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [reordered] })),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [{ kind: 'index-changed', before, after: reordered }],
+      },
+    ],
+  );
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [before] })),
+    [],
+  );
+});
+
+test('an expression index rename removes then adds its full shape', () => {
+  const columns = [column('a'), column('b')];
+  const before: Index = {
+    name: 'old_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['b'],
+    where: 'a > 0',
+  };
+  const after: Index = { ...before, name: 'new_idx' };
+
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [after] })),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          { kind: 'index-removed', index: before },
+          { kind: 'index-added', index: after },
+        ],
+      },
+    ],
+  );
 });

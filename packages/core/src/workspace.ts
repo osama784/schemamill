@@ -10,9 +10,11 @@ import type {
   ColumnCompression,
   ColumnStorage,
   ConstraintEnforcement,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Index,
+  IndexElement,
   Model,
   PrimaryKey,
   ReferentialAction,
@@ -429,6 +431,9 @@ function serializeTable(table: Table): object {
     foreignKeys: table.foreignKeys.map(serializeForeignKey),
     uniqueConstraints: table.uniqueConstraints.map(serializeKey),
     checkConstraints: table.checkConstraints.map(serializeCheckConstraint),
+    ...(table.exclusionConstraints === undefined
+      ? {}
+      : { exclusionConstraints: table.exclusionConstraints.map(serializeExclusionConstraint) }),
     indexes: table.indexes.map(serializeIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
@@ -489,6 +494,24 @@ function serializeCheckConstraint(checkConstraint: CheckConstraint): object {
   };
 }
 
+function serializeExclusionConstraint(exclusionConstraint: ExclusionConstraint): object {
+  return {
+    ...(exclusionConstraint.name === undefined ? {} : { name: exclusionConstraint.name }),
+    elements: exclusionConstraint.elements,
+    ...(exclusionConstraint.accessMethod === undefined
+      ? {}
+      : { accessMethod: exclusionConstraint.accessMethod }),
+    ...(exclusionConstraint.where === undefined ? {} : { where: exclusionConstraint.where }),
+    ...(exclusionConstraint.deferrable === undefined
+      ? {}
+      : { deferrable: exclusionConstraint.deferrable }),
+    ...(exclusionConstraint.initiallyDeferred === undefined
+      ? {}
+      : { initiallyDeferred: exclusionConstraint.initiallyDeferred }),
+    ...(exclusionConstraint.comment === undefined ? {} : { comment: exclusionConstraint.comment }),
+  };
+}
+
 function serializeForeignKey(foreignKey: ForeignKey): object {
   return {
     ...(foreignKey.name === undefined ? {} : { name: foreignKey.name }),
@@ -510,10 +533,17 @@ function serializeIndex(index: Index): object {
   return {
     ...(index.name === undefined ? {} : { name: index.name }),
     unique: index.unique,
-    columns: [...index.columns],
+    columns: index.columns.map(serializeIndexElement),
+    ...(index.include === undefined ? {} : { include: [...index.include] }),
+    ...(index.where === undefined ? {} : { where: index.where }),
     ...(index.concurrently === undefined ? {} : { concurrently: index.concurrently }),
     ...(index.comment === undefined ? {} : { comment: index.comment }),
   };
+}
+
+/** A writable copy of an index element, so a tagged expression cannot alias the caller's model. */
+function serializeIndexElement(element: IndexElement): IndexElement {
+  return typeof element === 'string' ? element : { expression: element.expression };
 }
 
 function serializeSequence(sequence: Sequence): object {
@@ -586,6 +616,7 @@ const TABLE_KEYS = [
   'foreignKeys',
   'uniqueConstraints',
   'checkConstraints',
+  'exclusionConstraints',
   'indexes',
   'persistence',
   'comment',
@@ -616,6 +647,15 @@ const IDENTITY_KEYS = [
 ] as const;
 const KEY_KEYS = ['name', 'columns', 'deferrable', 'initiallyDeferred', 'comment'] as const;
 const CHECK_CONSTRAINT_KEYS = ['name', 'expression', 'enforcement', 'comment'] as const;
+const EXCLUSION_CONSTRAINT_KEYS = [
+  'name',
+  'elements',
+  'accessMethod',
+  'where',
+  'deferrable',
+  'initiallyDeferred',
+  'comment',
+] as const;
 const FOREIGN_KEY_KEYS = [
   'name',
   'columns',
@@ -628,7 +668,16 @@ const FOREIGN_KEY_KEYS = [
   'initiallyDeferred',
   'comment',
 ] as const;
-const INDEX_KEYS = ['name', 'unique', 'columns', 'concurrently', 'comment'] as const;
+const INDEX_KEYS = [
+  'name',
+  'unique',
+  'columns',
+  'include',
+  'where',
+  'concurrently',
+  'comment',
+] as const;
+const EXPRESSION_KEYS = ['expression'] as const;
 const SEQUENCE_KEYS = [
   'schema',
   'name',
@@ -793,6 +842,19 @@ function parseNonEmptyStringArray(
   return array;
 }
 
+/**
+ * One index element: a plain column name, or a `{"expression": ...}` object carrying opaque
+ * whitespace-normalized expression text. Any other object — including one with an extra key —
+ * fails closed, so a new binary cannot invent a shape an older reader would silently drop.
+ */
+function parseIndexElement(value: unknown, path: string): Parsed<IndexElement> {
+  if (typeof value === 'string') return parseNonEmptyString(value, path);
+  return parseObject(value, path, EXPRESSION_KEYS, (object) => {
+    const expression = parseNonEmptyString(object.expression, fieldPath(path, 'expression'));
+    return expression.ok ? parsed({ expression: expression.value }) : expression;
+  });
+}
+
 /** An exact 64-bit integer in canonical decimal form. */
 function parseInteger(value: unknown, path: string): Parsed<string> {
   const string = parseString(value, path);
@@ -864,6 +926,12 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       parseCheckConstraint,
     );
     if (!checkConstraints.ok) return checkConstraints;
+    const exclusionConstraints = parseOptional(
+      object.exclusionConstraints,
+      fieldPath(path, 'exclusionConstraints'),
+      (value, at) => parseArrayOf(value, at, parseExclusionConstraint),
+    );
+    if (!exclusionConstraints.ok) return exclusionConstraints;
     const indexes = parseArrayOf(object.indexes, fieldPath(path, 'indexes'), parseIndex);
     if (!indexes.ok) return indexes;
     const persistence = parseOptional(
@@ -882,6 +950,9 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       foreignKeys: foreignKeys.value,
       uniqueConstraints: uniqueConstraints.value,
       checkConstraints: checkConstraints.value,
+      ...(exclusionConstraints.value === undefined
+        ? {}
+        : { exclusionConstraints: exclusionConstraints.value }),
       indexes: indexes.value,
       ...(persistence.value === undefined ? {} : { persistence: persistence.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
@@ -1083,6 +1154,48 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
   });
 }
 
+function parseExclusionConstraint(value: unknown, path: string): Parsed<ExclusionConstraint> {
+  return parseObject(value, path, EXCLUSION_CONSTRAINT_KEYS, (object) => {
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
+    if (!name.ok) return name;
+    const elements = parseNonEmptyString(object.elements, fieldPath(path, 'elements'));
+    if (!elements.ok) return elements;
+    const accessMethod = parseOptional(
+      object.accessMethod,
+      fieldPath(path, 'accessMethod'),
+      parseNonEmptyString,
+    );
+    if (!accessMethod.ok) return accessMethod;
+    const where = parseOptional(object.where, fieldPath(path, 'where'), parseNonEmptyString);
+    if (!where.ok) return where;
+    const deferrable = parseOptional(
+      object.deferrable,
+      fieldPath(path, 'deferrable'),
+      parseBoolean,
+    );
+    if (!deferrable.ok) return deferrable;
+    const initiallyDeferred = parseOptional(
+      object.initiallyDeferred,
+      fieldPath(path, 'initiallyDeferred'),
+      parseBoolean,
+    );
+    if (!initiallyDeferred.ok) return initiallyDeferred;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
+    return parsed({
+      ...(name.value === undefined ? {} : { name: name.value }),
+      elements: elements.value,
+      ...(accessMethod.value === undefined ? {} : { accessMethod: accessMethod.value }),
+      ...(where.value === undefined ? {} : { where: where.value }),
+      ...(deferrable.value === undefined ? {} : { deferrable: deferrable.value }),
+      ...(initiallyDeferred.value === undefined
+        ? {}
+        : { initiallyDeferred: initiallyDeferred.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
+    });
+  });
+}
+
 function parseForeignKey(value: unknown, path: string): Parsed<ForeignKey> {
   return parseObject(value, path, FOREIGN_KEY_KEYS, (object) => {
     const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
@@ -1164,12 +1277,16 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
     if (!name.ok) return name;
     const unique = parseBoolean(object.unique, fieldPath(path, 'unique'));
     if (!unique.ok) return unique;
-    const columns = parseNonEmptyStringArray(
-      object.columns,
-      fieldPath(path, 'columns'),
-      parseNonEmptyString,
-    );
+    const columnsPath = fieldPath(path, 'columns');
+    const columns = parseArrayOf(object.columns, columnsPath, parseIndexElement);
     if (!columns.ok) return columns;
+    if (columns.value.length === 0) return invalid(`${columnsPath} is not a non-empty list`);
+    const include = parseOptional(object.include, fieldPath(path, 'include'), (value, at) =>
+      parseNonEmptyStringArray(value, at, parseNonEmptyString),
+    );
+    if (!include.ok) return include;
+    const where = parseOptional(object.where, fieldPath(path, 'where'), parseNonEmptyString);
+    if (!where.ok) return where;
     const concurrently = parseOptional(
       object.concurrently,
       fieldPath(path, 'concurrently'),
@@ -1182,6 +1299,8 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
       ...(name.value === undefined ? {} : { name: name.value }),
       unique: unique.value,
       columns: columns.value,
+      ...(include.value === undefined ? {} : { include: include.value }),
+      ...(where.value === undefined ? {} : { where: where.value }),
       ...(concurrently.value === undefined ? {} : { concurrently: concurrently.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });

@@ -60,6 +60,7 @@ import type {
   ColumnStorage,
   ConstraintEnforcement,
   Diagnostic,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Identity,
@@ -84,6 +85,8 @@ import { parse, type IndexStmt } from 'libpg-query';
 import {
   checkConstraintStructureKey,
   classifyIndexEnvelope,
+  type ExclusionDefinition,
+  parseExclusionDefinition,
   foreignKeyStructureKey,
   indexStructureKey,
   normalizeSourceText,
@@ -92,6 +95,7 @@ import {
 } from './import.ts';
 import {
   synthesizedCheckConstraintName,
+  synthesizedExclusionConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
   synthesizedNotNullName,
@@ -335,13 +339,16 @@ SELECT json_build_object(
           ) > 0
         END AS "deleteSetColumnList",
         CASE
-          WHEN c.contype IN ('u', 'c', 'f')
+          WHEN c.contype IN ('u', 'c', 'f', 'x')
           THEN c.condeferrable
         END AS deferrable,
         CASE
-          WHEN c.contype IN ('u', 'c', 'f')
+          WHEN c.contype IN ('u', 'c', 'f', 'x')
           THEN c.condeferred
         END AS deferred,
+        CASE
+          WHEN c.contype = 'x' THEN pg_catalog.pg_get_constraintdef(c.oid)
+        END AS definition,
         CASE
           WHEN c.contype IN ('u', 'c', 'f')
           THEN c.convalidated
@@ -677,12 +684,16 @@ interface ConstraintRow {
   readonly validated: boolean | null;
   readonly enforced: boolean | null;
   readonly noInherit: boolean | null;
+  /** The server-deparsed `pg_get_constraintdef` text, present only for an exclusion constraint. */
+  readonly definition: string | null;
   readonly nullsNotDistinct: boolean | null;
   readonly including: boolean | null;
   readonly period: boolean | null;
   readonly comment: string | null;
   readonly backingIndexName: string | null;
   readonly backingIndexComment: string | null;
+  /** The canonicalized exclusion definition, or `null` when the server text could not be read. */
+  readonly exclusion?: ExclusionDefinition | null;
 }
 
 /** One `notNullConstraints` row of the payload, after validation. */
@@ -712,6 +723,8 @@ interface IndexRow {
   readonly valid: boolean;
   readonly ready: boolean;
   readonly tablespace: string | null;
+  /** The original `pg_get_indexdef` text, the source the classifier slices authored text from. */
+  readonly definition: string;
   readonly create: IndexStmt;
   readonly comment: string | null;
 }
@@ -832,9 +845,10 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
   const keyRows = expectArray(document, 'primaryKeys', 'catalog payload').map((row, index) =>
     parsePrimaryKeyRow(row, `catalog payload.primaryKeys[${index}]`),
   );
-  const constraintRows = expectArray(document, 'constraints', 'catalog payload').map((row, index) =>
-    parseConstraintRow(row, `catalog payload.constraints[${index}]`),
-  );
+  const constraintRows: ConstraintRow[] = [];
+  for (const [index, row] of expectArray(document, 'constraints', 'catalog payload').entries()) {
+    constraintRows.push(await parseConstraintRow(row, `catalog payload.constraints[${index}]`));
+  }
   const notNullRows = expectArray(document, 'notNullConstraints', 'catalog payload').map(
     (row, index) => parseNotNullConstraintRow(row, `catalog payload.notNullConstraints[${index}]`),
   );
@@ -1100,6 +1114,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
 
     const uniqueConstraints: UniqueConstraint[] = [];
     const checkConstraints: CheckConstraint[] = [];
+    const exclusionConstraints: ExclusionConstraint[] = [];
     const foreignKeys: ForeignKey[] = [];
     const tableConstraintRows = [
       ...(constraintsByTable.get(tableKey(row.schema, row.name)) ?? []),
@@ -1125,15 +1140,20 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
           findings.push(...foreignKeyFindings(constraintRow, object));
           break;
         case 'exclusion': {
-          findings.push({
-            conname: constraintRow.conname,
-            diagnostic: {
-              kind: 'skip',
-              code: 'unsupported-statement',
-              object,
-              message: `skipped exclusion constraint ${constraintRow.conname}`,
-            },
-          });
+          const exclusion = exclusionConstraintFromRow(constraintRow, identity);
+          if (exclusion === undefined) {
+            findings.push({
+              conname: constraintRow.conname,
+              diagnostic: {
+                kind: 'skip',
+                code: 'unsupported-statement',
+                object,
+                message: `skipped exclusion constraint ${constraintRow.conname}`,
+              },
+            });
+          } else {
+            exclusionConstraints.push(exclusion);
+          }
           if (constraintRow.backingIndexComment !== null) {
             consumedIndexComments.push(
               droppedIndexCommentFinding(constraintRow.schema, constraintRow.backingIndexName!),
@@ -1160,6 +1180,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       uniqueConstraints,
       checkConstraints,
       foreignKeys,
+      ...(exclusionConstraints.length === 0 ? {} : { exclusionConstraints }),
     });
 
     const tableIndexRows = [...(indexesByTable.get(tableKey(row.schema, row.name)) ?? [])].sort(
@@ -1181,7 +1202,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         });
         continue;
       }
-      const envelope = classifyIndexEnvelope(indexRow.create);
+      const envelope = classifyIndexEnvelope(indexRow.create, indexRow.definition, 'table');
       if (envelope.kind === 'skip') {
         indexFindings.push({
           indexName: indexRow.indexName,
@@ -1210,6 +1231,8 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         index: {
           unique: envelope.unique,
           columns: envelope.columns,
+          ...(envelope.include === undefined ? {} : { include: envelope.include }),
+          ...(envelope.where === undefined ? {} : { where: envelope.where }),
           ...(indexRow.comment === null ? {} : { comment: indexRow.comment }),
         },
       });
@@ -1245,6 +1268,13 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
       foreignKeys: [...constraints.foreignKeys].sort(compareForeignKeys),
       uniqueConstraints: [...constraints.uniqueConstraints].sort(compareUniqueConstraints),
       checkConstraints: [...constraints.checkConstraints].sort(compareCheckConstraints),
+      ...(constraints.exclusionConstraints === undefined
+        ? {}
+        : {
+            exclusionConstraints: [...constraints.exclusionConstraints].sort(
+              compareExclusionConstraints,
+            ),
+          }),
       indexes: canonicalizeIndexNames(identity, namedIndexes).sort(compareIndexes),
       ...(persistence === undefined ? {} : { persistence }),
       ...(row.comment === null ? {} : { comment: row.comment }),
@@ -1837,8 +1867,6 @@ function validateConstraintRow(row: ConstraintRow): void {
         'onDelete',
         'matchType',
         'deleteSetColumnList',
-        'deferrable',
-        'deferred',
         'validated',
         'enforced',
         'noInherit',
@@ -1858,6 +1886,33 @@ function uniqueConstraintFromRow(row: ConstraintRow): UniqueConstraint {
   applyRowDeferrability(row, uniqueConstraint);
   if (row.comment !== null) uniqueConstraint.comment = row.comment;
   return uniqueConstraint;
+}
+
+/** One exclusion constraint row as the model spells it, or `undefined` when the row is incomplete. */
+function exclusionConstraintFromRow(
+  row: ConstraintRow,
+  identity: TableIdentity,
+): ExclusionConstraint | undefined {
+  const definition = row.exclusion;
+  if (
+    definition === undefined ||
+    definition === null ||
+    row.deferrable === null ||
+    row.deferred === null
+  ) {
+    return undefined;
+  }
+  const exclusionConstraint: Mutable<ExclusionConstraint> = { elements: definition.elements };
+  if (row.conname !== synthesizedExclusionConstraintName(identity, exclusionConstraint)) {
+    exclusionConstraint.name = row.conname;
+  }
+  if (definition.accessMethod !== undefined)
+    exclusionConstraint.accessMethod = definition.accessMethod;
+  if (definition.where !== undefined) exclusionConstraint.where = definition.where;
+  if (row.deferrable) exclusionConstraint.deferrable = true;
+  if (row.deferred) exclusionConstraint.initiallyDeferred = true;
+  if (row.comment !== null) exclusionConstraint.comment = row.comment;
+  return exclusionConstraint;
 }
 
 /** The unique constraint's unrepresentable attributes, in the pinned order. */
@@ -2027,11 +2082,15 @@ export function canonicalizeIndexNames(
     const structure: {
       name?: string;
       unique: boolean;
-      columns: string[];
+      columns: Index['columns'];
+      include?: readonly string[];
+      where?: string;
       comment?: string;
     } = {
       unique: row.index.unique,
       columns: [...row.index.columns],
+      ...(row.index.include === undefined ? {} : { include: [...row.index.include] }),
+      ...(row.index.where === undefined ? {} : { where: row.index.where }),
       ...(row.index.comment === undefined ? {} : { comment: row.index.comment }),
     };
     const key = indexStructureKey(structure);
@@ -2051,6 +2110,7 @@ export interface CatalogConstraints {
   readonly uniqueConstraints: readonly UniqueConstraint[];
   readonly checkConstraints: readonly CheckConstraint[];
   readonly foreignKeys: readonly ForeignKey[];
+  readonly exclusionConstraints?: readonly ExclusionConstraint[];
 }
 
 /**
@@ -2072,6 +2132,7 @@ export function canonicalizeConstraintNames(
   const seenUnique = new Set<string>();
   const seenForeign = new Set<string>();
   const seenCheck = new Set<string>();
+  const seenExclusion = new Set<string>();
 
   // Pre-scan the unnamed entries of each kind, then strip in a second, position-independent pass.
   for (const uniqueConstraint of constraints.uniqueConstraints) {
@@ -2086,6 +2147,9 @@ export function canonicalizeConstraintNames(
     if (checkConstraint.name === undefined) {
       seenCheck.add(checkConstraintStructureKey(checkConstraint));
     }
+  }
+  for (const exclusionConstraint of constraints.exclusionConstraints ?? []) {
+    if (exclusionConstraint.name === undefined) seenExclusion.add(exclusionConstraint.elements);
   }
 
   let primaryKey = constraints.primaryKey;
@@ -2119,10 +2183,21 @@ export function canonicalizeConstraintNames(
     return withoutName(checkConstraint);
   });
 
+  const exclusionConstraints = (constraints.exclusionConstraints ?? []).map((entry) => {
+    if (entry.name !== synthesizedExclusionConstraintName(identity, entry)) return entry;
+    if (seenExclusion.has(entry.elements)) return entry;
+    seenExclusion.add(entry.elements);
+    return withoutName(entry);
+  });
+
   return {
     ...(primaryKey === undefined ? {} : { primaryKey }),
     uniqueConstraints,
     checkConstraints,
+    ...(constraints.exclusionConstraints === undefined ||
+    constraints.exclusionConstraints.length === 0
+      ? {}
+      : { exclusionConstraints }),
     foreignKeys,
   };
 }
@@ -2190,6 +2265,17 @@ function compareUniqueConstraints(left: UniqueConstraint, right: UniqueConstrain
 function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint): number {
   return (
     compareStrings(left.expression, right.expression) ||
+    compareStrings(left.name ?? '', right.name ?? '')
+  );
+}
+
+/** Canonical exclusion-constraint order, mirroring core's comparator. */
+function compareExclusionConstraints(
+  left: ExclusionConstraint,
+  right: ExclusionConstraint,
+): number {
+  return (
+    compareStrings(left.elements, right.elements) ||
     compareStrings(left.name ?? '', right.name ?? '')
   );
 }
@@ -2428,7 +2514,7 @@ function parsePrimaryKeyRow(value: unknown, path: string): PrimaryKeyRow {
 }
 
 /** A `constraints` row, validated field by field; the per-kind matrix is the mapper's check. */
-function parseConstraintRow(value: unknown, path: string): ConstraintRow {
+async function parseConstraintRow(value: unknown, path: string): Promise<ConstraintRow> {
   const row = expectObject(value, path);
   expectFields(row, path, [
     'schema',
@@ -2449,6 +2535,7 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     'validated',
     'enforced',
     'noInherit',
+    'definition',
     'nullsNotDistinct',
     'including',
     'period',
@@ -2479,13 +2566,51 @@ function parseConstraintRow(value: unknown, path: string): ConstraintRow {
     validated: expectNullableBoolean(row, path, 'validated'),
     enforced: expectNullableBoolean(row, path, 'enforced'),
     noInherit: expectNullableBoolean(row, path, 'noInherit'),
+    definition: expectNullableString(row, path, 'definition'),
     nullsNotDistinct: expectNullableBoolean(row, path, 'nullsNotDistinct'),
     including: expectNullableBoolean(row, path, 'including'),
     period: expectNullableBoolean(row, path, 'period'),
     comment: expectNullableString(row, path, 'comment'),
     backingIndexName: expectNullableString(row, path, 'backingIndexName'),
     backingIndexComment: expectNullableString(row, path, 'backingIndexComment'),
+    ...(kind === 'exclusion' ? { exclusion: await parseExclusionRowDefinition(row) } : {}),
   };
+}
+
+/**
+ * Wraps a server-deparsed exclusion definition in a complete `ALTER TABLE … ADD CONSTRAINT`
+ * statement, parses it with libpg-query to confirm it is an exclusion constraint, and reads the
+ * canonical element text with the same slicer the dump import uses. A missing, inconsistent, or
+ * unparseable definition yields `null` so the mapper can skip the row closed with a diagnostic.
+ */
+async function parseExclusionRowDefinition(
+  row: Record<string, unknown>,
+): Promise<ExclusionDefinition | null> {
+  const definition = row.definition;
+  if (typeof definition !== 'string' || definition === '') return null;
+  const sql = `ALTER TABLE ${quoteIdentifierForCatalog(String(row.schema))}.${quoteIdentifierForCatalog(
+    String(row.tableName),
+  )} ADD CONSTRAINT ${quoteIdentifierForCatalog(String(row.conname))} ${definition};`;
+  try {
+    const result = await parse(sql);
+    const statement = result.stmts?.[0]?.stmt;
+    if (result.stmts?.length !== 1 || statement === undefined || !('AlterTableStmt' in statement)) {
+      return null;
+    }
+    const command = statement.AlterTableStmt.cmds?.[0];
+    if (command === undefined || !('AlterTableCmd' in command)) return null;
+    const node = command.AlterTableCmd.def;
+    if (node === undefined || !('Constraint' in node)) return null;
+    if (node.Constraint.contype !== 'CONSTR_EXCLUSION') return null;
+  } catch {
+    return null;
+  }
+  return parseExclusionDefinition(sql, 0) ?? null;
+}
+
+/** Quotes a catalog identifier for the synthesized parse statement. */
+function quoteIdentifierForCatalog(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 /** A `notNullConstraints` row, validated field by field. */
@@ -2532,6 +2657,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     valid: expectBoolean(row, path, 'valid'),
     ready: expectBoolean(row, path, 'ready'),
     tablespace: expectNullableString(row, path, 'tablespace'),
+    definition,
     create: await parseIndexDefinition(definition, path),
     comment: expectNullableString(row, path, 'comment'),
   };

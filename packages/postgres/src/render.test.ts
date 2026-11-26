@@ -8,6 +8,7 @@ import type {
   Column,
   CommentTarget,
   ConstraintEnforcement,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Identity,
@@ -84,9 +85,15 @@ const checkConstraint = (
   rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
 ): CheckConstraint => ({ expression, ...rest });
 
+/** An exclusion constraint on `elements`: unnamed and gist unless overridden. */
+const exclusionConstraint = (
+  elements: string,
+  rest: Partial<Omit<ExclusionConstraint, 'elements'>> = {},
+): ExclusionConstraint => ({ elements, ...rest });
+
 /** A non-unique index on `columns`: unnamed and non-concurrent unless overridden. */
 const tableIndex = (
-  columns: readonly string[],
+  columns: Index['columns'],
   rest: Partial<Omit<Index, 'columns'>> = {},
 ): Index => ({ unique: false, columns, ...rest });
 
@@ -595,6 +602,76 @@ test('renders unique and check constraint adds and drops, naming only when state
       'ALTER TABLE public.t DROP CONSTRAINT t_a_key;',
       'ALTER TABLE public.t DROP CONSTRAINT t_check;',
       'ALTER TABLE app."Order" DROP CONSTRAINT "we""ird";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders exclusion adds and drops with the default method, quoting, and deferrability', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl' }),
+        },
+        {
+          kind: 'add-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('(lower(a)) WITH <>', {
+            accessMethod: 'gist',
+            where: 'b > 0',
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
+        },
+        {
+          kind: 'drop-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('a WITH ='),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_excl EXCLUDE USING gist (a WITH =);',
+      'ALTER TABLE public.t ADD EXCLUDE USING gist ((lower(a)) WITH <>) WHERE b > 0 DEFERRABLE INITIALLY DEFERRED;',
+      'ALTER TABLE public.t DROP CONSTRAINT t_a_excl;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a comment on an exclusion constraint by its stored or synthesized name', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'comment',
+          target: {
+            kind: 'exclusion-constraint',
+            table: identity('t'),
+            exclusionConstraint: exclusionConstraint('a WITH =', { name: 'we"ird' }),
+          },
+          text: 'note',
+        },
+        {
+          kind: 'comment',
+          target: {
+            kind: 'exclusion-constraint',
+            table: identity('t'),
+            exclusionConstraint: exclusionConstraint('a WITH ='),
+          },
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'COMMENT ON CONSTRAINT "we""ird" ON public.t IS \'note\';',
+      'COMMENT ON CONSTRAINT t_a_excl ON public.t IS NULL;',
       'COMMIT;',
       '',
     ].join('\n'),
@@ -1826,6 +1903,43 @@ test('renders index creates and drops, named or unnamed, unique or not', () => {
   );
 });
 
+test('renders expression, partial, and covering index creates with authored text', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'create-index',
+          owner,
+          index: tableIndex(['a', { expression: 'lower(b)' }], {
+            name: 't_expr_idx',
+            include: ['c'],
+            where: 'a > 0',
+          }),
+        },
+        {
+          kind: 'drop-index',
+          owner,
+          index: tableIndex([{ expression: 'a + 1' }], { name: 't_drop_idx' }),
+        },
+        {
+          kind: 'drop-index',
+          owner,
+          index: tableIndex(['a', { expression: 'lower(b)' }]),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE INDEX t_expr_idx ON public.t USING btree (a, lower(b)) INCLUDE (c) WHERE a > 0;',
+      'DROP INDEX public.t_drop_idx;',
+      'DROP INDEX public.t_a_lower_idx;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('renders index statements on a materialized view using its schema and name', () => {
   const viewOwner = { kind: 'materialized-view' as const, view: { schema: 'app', name: 'mv' } };
 
@@ -1909,6 +2023,42 @@ test('refuses two index creates on one materialized view that resolve to one nam
         ),
       ),
     'refusing to render: index creates on public.m would share the name "m_a_idx": an index named "m_a_idx" on (a) and an index named "m_a_idx" on (b)',
+  );
+});
+
+test('refuses two index creates whose new clauses collapse onto one name', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner,
+            index: tableIndex(['a'], { name: 't_idx', include: ['b'] }),
+          },
+          {
+            kind: 'create-index',
+            owner,
+            index: tableIndex(['a'], { name: 't_idx', include: ['c'] }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_idx": an index named "t_idx" on (a) INCLUDE (b) and an index named "t_idx" on (a) INCLUDE (c)',
+  );
+});
+
+test('the duplicate-name guard shows raw expression text in untruncated predictions', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', owner, index: tableIndex([{ expression: 'a + 1' }]) },
+          { kind: 'create-index', owner, index: tableIndex([{ expression: 'a + 2' }]) },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_expr_idx": an unnamed index on (a + 1) (predicting "t_a + 1_idx") and an unnamed index on (a + 2) (predicting "t_a + 2_idx")',
   );
 });
 
