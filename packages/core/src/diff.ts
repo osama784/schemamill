@@ -1,3 +1,4 @@
+import { compareIndexElements, indexElementsKey, sameIndexElements } from './index-elements.ts';
 import { canonicalIntType } from './identity.ts';
 import type { Identity, IdentityGeneration } from './identity.ts';
 import type {
@@ -55,8 +56,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * check constraints when their expressions are the same, with any other difference — a name or
  * an attribute, for either — reading as a change to that pair; a named index is identified by
  * its name, so a rename is a removal and an addition, and an unnamed index by its structure —
- * `unique` and ordered columns — with a missing name itself distinct in a diff; a sequence is
- * its schema and name, like a table.
+ * `unique`, its authored element order, its `INCLUDE` columns, and its partial `where` — with a
+ * missing name itself distinct in a diff; `concurrently` is apply metadata and never a
+ * difference. A sequence is its schema and name, like a table.
  *
  * A view is identified by its schema and name, like a sequence, and one identity names either
  * a view or a materialized view: a change between the two kinds is a `view-changed` carrying
@@ -775,7 +777,13 @@ function diffComments(baseline: Model, target: Model): readonly CommentChange[] 
 function commentIndexIdentity(index: Index): string {
   return index.name !== undefined
     ? indexIdentity(index)
-    : JSON.stringify([null, index.unique, index.columns]);
+    : JSON.stringify([
+        null,
+        index.unique,
+        indexElementsKey(index.columns),
+        index.include ?? null,
+        index.where ?? null,
+      ]);
 }
 
 /** A writable view of a model payload, for the one place a copy is stripped. */
@@ -886,7 +894,13 @@ function commentTargetKey(target: CommentTarget): string {
         target.table.schema,
         target.table.name,
         'index',
-        target.index.name ?? [null, target.index.unique, target.index.columns],
+        target.index.name ?? [
+          null,
+          target.index.unique,
+          indexElementsKey(target.index.columns),
+          target.index.include ?? null,
+          target.index.where ?? null,
+        ],
       ]);
     case 'primary-key':
       return JSON.stringify([
@@ -1051,7 +1065,13 @@ function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint 
 
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
-  return { ...index, columns: [...index.columns] };
+  return {
+    ...index,
+    columns: index.columns.map((element) =>
+      typeof element === 'string' ? element : { expression: element.expression },
+    ),
+    ...(index.include === undefined ? {} : { include: [...index.include] }),
+  };
 }
 
 /** A copy of `owner`, independent of the caller's model. */
@@ -1866,8 +1886,19 @@ function indexesEqual(left: Index, right: Index): boolean {
   return (
     left.name === right.name &&
     left.unique === right.unique &&
-    sameStrings(left.columns, right.columns)
+    sameIndexElements(left.columns, right.columns) &&
+    sameOptionalStringArrays(left.include, right.include) &&
+    left.where === right.where
   );
+}
+
+/** Whether two optional string arrays carry the same list, absence distinct from presence. */
+function sameOptionalStringArrays(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return sameStrings(left, right);
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
@@ -1949,7 +1980,13 @@ function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint):
 }
 
 function compareIndexes(left: Index, right: Index): number {
-  return compareOptionalStrings(left.name, right.name);
+  return (
+    compareOptionalStrings(left.name, right.name) ||
+    (left.unique === right.unique ? 0 : left.unique ? 1 : -1) ||
+    compareIndexElements(left.columns, right.columns) ||
+    compareOptionalStringArrays(left.include, right.include) ||
+    compareOptionalStrings(left.where, right.where)
+  );
 }
 
 /**
@@ -1997,7 +2034,9 @@ function compareCheckConstraintPairing(left: CheckConstraint, right: CheckConstr
 function compareIndexPairing(left: Index, right: Index): number {
   return (
     (left.unique === right.unique ? 0 : left.unique ? 1 : -1) ||
-    compareStringArrays(left.columns, right.columns)
+    compareIndexElements(left.columns, right.columns) ||
+    compareOptionalStringArrays(left.include, right.include) ||
+    compareOptionalStrings(left.where, right.where)
   );
 }
 
@@ -2051,4 +2090,14 @@ function compareStringArrays(left: readonly string[], right: readonly string[]):
     if (comparison !== 0) return comparison;
   }
   return left.length - right.length;
+}
+
+/** Orders an optional string list by absence first, then element-wise. */
+function compareOptionalStringArrays(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): number {
+  if (left === undefined) return right === undefined ? 0 : -1;
+  if (right === undefined) return 1;
+  return compareStringArrays(left, right);
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { diff } from '@schemamill/core';
 import type { Diagnostic, Index, Model, TableIdentity } from '@schemamill/core';
 
 import { canonicalizeConstraintNames, canonicalizeIndexNames, mapCatalog } from './catalog.ts';
@@ -2568,19 +2569,7 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
           't_desc_idx',
           'CREATE INDEX t_desc_idx ON public.t USING btree (a DESC)',
         ),
-        index(
-          'public',
-          't',
-          't_expr_idx',
-          'CREATE INDEX t_expr_idx ON public.t USING btree (((a + 1)))',
-        ),
         index('public', 't', 't_hash_idx', 'CREATE INDEX t_hash_idx ON public.t USING hash (a)'),
-        index(
-          'public',
-          't',
-          't_include_idx',
-          'CREATE INDEX t_include_idx ON public.t USING btree (a) INCLUDE (b)',
-        ),
         index(
           'public',
           't',
@@ -2598,12 +2587,6 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
           't',
           't_opclass_idx',
           'CREATE INDEX t_opclass_idx ON public.t USING btree (c text_pattern_ops)',
-        ),
-        index(
-          'public',
-          't',
-          't_partial_idx',
-          'CREATE INDEX t_partial_idx ON public.t USING btree (a) WHERE (a > 0)',
         ),
         index(
           'public',
@@ -2634,20 +2617,8 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_expr_idx',
-      message: 'skipped CREATE INDEX public.t_expr_idx (expression element)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
       object: 'public.t_hash_idx',
       message: 'skipped CREATE INDEX public.t_hash_idx (access method hash)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t_include_idx',
-      message: 'skipped CREATE INDEX public.t_include_idx (INCLUDE)',
     },
     {
       kind: 'skip',
@@ -2670,12 +2641,6 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
     {
       kind: 'skip',
       code: 'unsupported-statement',
-      object: 'public.t_partial_idx',
-      message: 'skipped CREATE INDEX public.t_partial_idx (partial WHERE)',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
       object: 'public.t_storage_idx',
       message: 'skipped CREATE INDEX public.t_storage_idx (storage parameters)',
     },
@@ -2683,6 +2648,54 @@ test('skips out-of-envelope indexes with the pinned grammar', async () => {
   for (const diagnostic of read.diagnostics) {
     assert.equal('position' in diagnostic, false, 'introspection diagnostics carry no position');
   }
+});
+
+test('catalog and dump imports agree on expression, partial, and covering index shapes', async () => {
+  const clauses = [
+    ['t_expr_idx', 'lower(b)', ''],
+    ['t_partial_idx', 'a', ' WHERE (a > 0)'],
+    ['t_include_idx', 'a', ' INCLUDE (b)'],
+    ['t_all_idx', 'a, (a + 1)', ' INCLUDE (b, c) WHERE (a > 0)'],
+  ] as const;
+  const definitions = clauses.map(
+    ([name, keys, tail]) => `CREATE INDEX ${name} ON public.t USING btree (${keys})${tail}`,
+  );
+
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [
+        column('public', 't', 1, 'a', { type: 'integer' }),
+        column('public', 't', 2, 'b', { type: 'integer' }),
+        column('public', 't', 3, 'c', { type: 'integer' }),
+      ],
+      indexes: clauses.map(([name], position) =>
+        index('public', 't', name, definitions[position]!),
+      ),
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.indexes, [
+    {
+      name: 't_all_idx',
+      unique: false,
+      columns: ['a', { expression: '(a + 1)' }],
+      include: ['b', 'c'],
+      where: '(a > 0)',
+    },
+    { name: 't_expr_idx', unique: false, columns: [{ expression: 'lower(b)' }] },
+    { name: 't_include_idx', unique: false, columns: ['a'], include: ['b'] },
+    { name: 't_partial_idx', unique: false, columns: ['a'], where: '(a > 0)' },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+
+  const dumped = await importDump(
+    [
+      `CREATE TABLE public.t (a integer, b integer, c integer);`,
+      ...definitions.map((statement) => `${statement};`),
+    ].join('\n'),
+  );
+  assert.deepEqual(diff(dumped.model, read.model), []);
 });
 
 test('skips indexes that are not valid and ready', async () => {

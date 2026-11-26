@@ -514,15 +514,23 @@ function indexStatement(step: Step): IndexStatement | undefined {
  * so it needs no repetition.
  */
 function describeIndex(table: TableIdentity, index: Index, serverName: string): string {
-  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
-  if (index.name !== undefined) {
-    return `an index named ${JSON.stringify(index.name)} on (${columns})`;
-  }
-  const description = `an unnamed index on (${columns})`;
+  const elements = index.columns.map(describeIndexElement).join(', ');
+  const include = index.include === undefined ? '' : ` INCLUDE (${index.include.join(', ')})`;
+  const where = index.where === undefined ? '' : ` WHERE ${index.where}`;
+  const description =
+    index.name === undefined
+      ? `an unnamed index on (${elements})${include}${where}`
+      : `an index named ${JSON.stringify(index.name)} on (${elements})${include}${where}`;
+  if (index.name !== undefined) return description;
   const prediction = untruncatedIndexName(table, index);
   return prediction === serverName
     ? description
     : `${description} (predicting ${JSON.stringify(prediction)})`;
+}
+
+/** A display element: a quoted column name, or the expression's raw authored text. */
+function describeIndexElement(element: Index['columns'][number]): string {
+  return typeof element === 'string' ? quoteIdentifier(element) : element.expression;
 }
 
 /**
@@ -532,7 +540,10 @@ function describeIndex(table: TableIdentity, index: Index, serverName: string): 
  * clipping at all.
  */
 function untruncatedIndexName(table: TableIdentity, index: Index): string {
-  return `${table.name}${index.columns.map((column) => `_${column}`).join('')}_idx`;
+  const elements = index.columns.map((element) =>
+    typeof element === 'string' ? element : element.expression,
+  );
+  return `${table.name}${elements.map((element) => `_${element}`).join('')}_idx`;
 }
 
 /** One indexed step of a foreign-key polarity, for the in-place collapse pass. */
@@ -1247,16 +1258,27 @@ function renderCheckConstraint(checkConstraint: CheckConstraint): string {
   )}`;
 }
 
-/** `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <owner> USING btree (cols)`. */
+/**
+ * `CREATE [UNIQUE] INDEX [CONCURRENTLY] [name] ON <owner> USING btree (<elements>) [INCLUDE
+ * (…)] [WHERE …]`: a plain element is a quoted column, an expression is its raw authored text,
+ * and the partial clause is carried exactly as stored (ADR 0024, render as declared).
+ */
 function renderCreateIndex(owner: IndexOwner, index: Index, concurrently: boolean): string {
   const relation = owner.kind === 'table' ? owner.table : owner.view;
   const unique = index.unique ? 'UNIQUE ' : '';
   const concurrent = concurrently ? 'CONCURRENTLY ' : '';
   const name = index.name === undefined ? '' : `${quoteIdentifier(index.name)} `;
-  const columns = index.columns.map((column) => quoteIdentifier(column)).join(', ');
+  const elements = index.columns.map((element) =>
+    typeof element === 'string' ? quoteIdentifier(element) : element.expression,
+  );
+  const include =
+    index.include === undefined
+      ? ''
+      : ` INCLUDE (${index.include.map(quoteIdentifier).join(', ')})`;
+  const where = index.where === undefined ? '' : ` WHERE ${index.where}`;
   return `CREATE ${unique}INDEX ${concurrent}${name}ON ${renderTable(
     relation,
-  )} USING btree (${columns});`;
+  )} USING btree (${elements.join(', ')})${include}${where};`;
 }
 
 /**

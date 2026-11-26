@@ -897,3 +897,26 @@ test('separates adjacent entity blocks with exactly one blank line', () => {
       'compression (none), statistics target (none), comment (none), not-null comment (none)\n',
   );
 });
+
+test('renderMarkdown shows index expression elements, INCLUDE, and the partial WHERE', () => {
+  const text = renderMarkdown(
+    modelWith({
+      tables: [
+        makeTable('t', {
+          indexes: [
+            makeIndex({
+              name: 'i',
+              columns: ['a', { expression: 'lower(b)' }],
+              include: ['c'],
+              where: 'a > 0',
+            }),
+          ],
+        }),
+      ],
+    }),
+  );
+  assert.match(
+    text,
+    /name: `i`, unique: no, columns: \(`a`, `expression lower\(b\)`\), concurrently: \(none\), comment: \(none\), include: \(`c`\), where: `a > 0`/,
+  );
+});

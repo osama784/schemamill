@@ -161,6 +161,7 @@ import type {
   IdentityInput,
   IdentityOptions,
   Index,
+  IndexElement,
   Model,
   PrimaryKey,
   ReadResult,
@@ -185,6 +186,8 @@ import {
   defaultSequenceMin,
   effectiveIdentity,
   effectiveSequence,
+  indexElementsKey,
+  sameIndexElements,
   sequenceTypeBounds,
   sequenceTypeChange,
 } from '@schemamill/core';
@@ -2520,7 +2523,11 @@ function translateCreateIndex(
     return;
   }
 
-  const envelope = classifyIndexEnvelope(create);
+  const envelope = classifyIndexEnvelope(
+    create,
+    statement.sql,
+    draft === undefined ? 'view' : 'table',
+  );
   if (envelope.kind === 'skip') {
     diagnostics.push(
       skipStatement(statement, `CREATE INDEX ${object} (${envelope.reason})`, object),
@@ -2529,6 +2536,8 @@ function translateCreateIndex(
   }
 
   const index: Mutable<Index> = { unique: envelope.unique, columns: envelope.columns };
+  if (envelope.include !== undefined) index.include = envelope.include;
+  if (envelope.where !== undefined) index.where = envelope.where;
   if (create.idxname !== undefined) index.name = create.idxname;
   if (create.concurrent === true) index.concurrently = true;
   if (create.if_not_exists === true) {
@@ -2539,32 +2548,39 @@ function translateCreateIndex(
 
 /**
  * The envelope classification of a parsed `CREATE [UNIQUE] INDEX`: the model index's
- * structure — `unique` and the ordered columns, never the name or `concurrently`, which the
- * callers own — or the reason the statement falls outside the minimal envelope.
+ * structure — `unique`, its ordered elements, its `INCLUDE` columns and partial `where` —
+ * never the name or `concurrently`, which the callers own — or the reason the statement falls
+ * outside the envelope.
  */
 export type IndexEnvelope =
-  | { readonly kind: 'index'; readonly unique: boolean; readonly columns: string[] }
+  | {
+      readonly kind: 'index';
+      readonly unique: boolean;
+      readonly columns: IndexElement[];
+      readonly include?: readonly string[];
+      readonly where?: string;
+    }
   | { readonly kind: 'skip'; readonly reason: string };
 
 /**
- * Classifies a parsed `CREATE [UNIQUE] INDEX` against the minimal envelope: a plain btree
- * column list, with no expression element, partial `WHERE`, `INCLUDE`, tablespace, storage
- * parameters, `NULLS NOT DISTINCT`, exclusion operators, non-btree access method, or
- * non-default ordering, operator class, collation, or NULLS ordering. The single
- * acceptance-rule source for both inbound paths: the dump importer's `translateCreateIndex`
- * and the live-catalog mapper classify through this function, so a definition the importer
- * rejects is never modeled from a catalog. Exported for `catalog.ts`; deliberately not
+ * Classifies a parsed `CREATE [UNIQUE] INDEX` as the single acceptance-rule source for both
+ * inbound paths: the dump importer's `translateCreateIndex` and the live-catalog mapper. A
+ * btree key list may now carry expression elements, an `INCLUDE` list, and a partial `WHERE`;
+ * their authored text is sliced from `sql` and whitespace-normalized by `normalizeSourceText`,
+ * never deparsed from the AST. Still skipped: a non-btree access method, tablespace, storage
+ * parameters, `NULLS NOT DISTINCT`, exclusion operators, and non-default ordering, operator
+ * class, collation, or NULLS ordering. A view owner keeps the old named skip for every new form
+ * — the model's view indexes stay plain-column-only for now. A definition the importer rejects
+ * is never modeled from a catalog either. Exported for `catalog.ts`; deliberately not
  * re-exported from `index.ts`.
  */
-export function classifyIndexEnvelope(create: IndexStmt): IndexEnvelope {
+export function classifyIndexEnvelope(
+  create: IndexStmt,
+  sql: string,
+  ownerKind: 'table' | 'view',
+): IndexEnvelope {
   if (create.accessMethod !== undefined && create.accessMethod !== 'btree') {
     return { kind: 'skip', reason: `access method ${create.accessMethod}` };
-  }
-  if ((create.indexIncludingParams ?? []).length > 0) {
-    return { kind: 'skip', reason: 'INCLUDE' };
-  }
-  if (create.whereClause !== undefined) {
-    return { kind: 'skip', reason: 'partial WHERE' };
   }
   if ((create.options ?? []).length > 0) {
     return { kind: 'skip', reason: 'storage parameters' };
@@ -2579,22 +2595,230 @@ export function classifyIndexEnvelope(create: IndexStmt): IndexEnvelope {
     return { kind: 'skip', reason: 'exclusion operators' };
   }
 
-  const columns: string[] = [];
-  for (const element of create.indexParams ?? []) {
+  const includes = create.indexIncludingParams ?? [];
+  if (ownerKind === 'view' && (includes.length > 0 || create.whereClause !== undefined)) {
+    return { kind: 'skip', reason: create.whereClause !== undefined ? 'partial WHERE' : 'INCLUDE' };
+  }
+  for (const element of includes) {
+    if (!('IndexElem' in element) || indexColumn(element.IndexElem) === undefined) {
+      return { kind: 'skip', reason: 'INCLUDE' };
+    }
+  }
+
+  const elements = create.indexParams ?? [];
+  if (elements.length === 0) {
+    return { kind: 'skip', reason: 'no index columns' };
+  }
+  const hasExpression = elements.some(
+    (element) => 'IndexElem' in element && element.IndexElem.expr !== undefined,
+  );
+  if (ownerKind === 'view' && hasExpression) {
+    return { kind: 'skip', reason: 'expression element' };
+  }
+
+  const needsText = hasExpression || create.whereClause !== undefined;
+  const clauses = needsText ? indexClauseText(sql, create, includes.length > 0) : undefined;
+  if (needsText && clauses === undefined) {
+    return {
+      kind: 'skip',
+      reason: hasExpression ? 'expression element text not found' : 'partial WHERE text not found',
+    };
+  }
+
+  const columns: IndexElement[] = [];
+  for (let position = 0; position < elements.length; position += 1) {
+    const element = elements[position]!;
     if (!('IndexElem' in element)) {
       return { kind: 'skip', reason: 'unrecognized index element' };
     }
-    const column = indexColumn(element.IndexElem);
-    if (column === undefined) {
-      return { kind: 'skip', reason: indexElementDescription(element.IndexElem) };
+    const item = element.IndexElem;
+    const plain = indexColumn(item);
+    if (plain !== undefined) {
+      columns.push(plain);
+      continue;
     }
-    columns.push(column);
-  }
-  if (columns.length === 0) {
-    return { kind: 'skip', reason: 'no index columns' };
+    if (item.expr === undefined) {
+      return { kind: 'skip', reason: indexElementDescription(item) };
+    }
+    const anomaly = indexElementAnomaly(item);
+    if (anomaly !== undefined) return { kind: 'skip', reason: anomaly };
+    const expression = clauses?.elements[position];
+    if (expression === undefined || expression === '') {
+      return { kind: 'skip', reason: 'expression element text not found' };
+    }
+    columns.push({ expression });
   }
 
-  return { kind: 'index', unique: create.unique === true, columns };
+  const envelope: {
+    kind: 'index';
+    unique: boolean;
+    columns: IndexElement[];
+    include?: readonly string[];
+    where?: string;
+  } = { kind: 'index', unique: create.unique === true, columns };
+  if (includes.length > 0) {
+    envelope.include = includes.map((element) => {
+      if (!('IndexElem' in element)) return '';
+      return indexColumn(element.IndexElem) ?? '';
+    });
+  }
+  if (create.whereClause !== undefined) {
+    if (clauses?.where === undefined || clauses.where === '') {
+      return { kind: 'skip', reason: 'partial WHERE text not found' };
+    }
+    envelope.where = clauses.where;
+  }
+  return envelope;
+}
+
+/** The authored text of an index's key list and partial clause, sliced from its statement. */
+function indexClauseText(
+  sql: string,
+  create: IndexStmt,
+  hasInclude: boolean,
+): { readonly elements: readonly string[]; readonly where: string | undefined } | undefined {
+  const location = create.relation?.location;
+  if (location === undefined || location < 0) return undefined;
+  const open = findNextOpenParen(sql, byteOffsetToUtf16(sql, location));
+  if (open === null) return undefined;
+  const close = matchingParenIndex(sql, open);
+  if (close === null) return undefined;
+  const elements = splitIndexList(sql.slice(open + 1, close));
+  if (elements === undefined) return undefined;
+
+  let after = close + 1;
+  if (hasInclude) {
+    const includeAt = findIndexKeyword(sql, 'INCLUDE', after);
+    if (includeAt === null) return undefined;
+    const includeOpen = findNextOpenParen(sql, includeAt + 'INCLUDE'.length);
+    if (includeOpen === null) return undefined;
+    const includeClose = matchingParenIndex(sql, includeOpen);
+    if (includeClose === null) return undefined;
+    if (splitIndexList(sql.slice(includeOpen + 1, includeClose)) === undefined) return undefined;
+    after = includeClose + 1;
+  }
+
+  let where: string | undefined;
+  if (create.whereClause !== undefined) {
+    const whereAt = findIndexKeyword(sql, 'WHERE', after);
+    if (whereAt === null) return undefined;
+    const start = skipTrivia(sql, whereAt + 'WHERE'.length);
+    where = normalizeSourceText(sql.slice(start, statementTerminator(sql, start)));
+  }
+  return { elements, where };
+}
+
+/** Index just past a quoted span or comment at `index`, or undefined when none starts there. */
+function skipLexicalSpan(text: string, index: number): number | undefined {
+  const character = text[index];
+  if (character === "'" || character === '"') return quotedSpanEnd(text, index);
+  if (character === '$') {
+    const end = dollarQuotedEnd(text, index);
+    if (end !== null) return end;
+  }
+  if (character === '-' && text[index + 1] === '-') return lineCommentEnd(text, index);
+  if (character === '/' && text[index + 1] === '*') return blockCommentEnd(text, index);
+  return undefined;
+}
+
+/** The first `(` at or after `from`, outside quoted spans and comments. */
+function findNextOpenParen(text: string, from: number): number | null {
+  for (let index = from; index < text.length;) {
+    const skipped = skipLexicalSpan(text, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    if (text[index] === '(') return index;
+    index += 1;
+  }
+  return null;
+}
+
+/** The `)` closing the `(` at `open`, outside quoted spans and comments. */
+function matchingParenIndex(text: string, open: number): number | null {
+  let depth = 0;
+  for (let index = open; index < text.length;) {
+    const skipped = skipLexicalSpan(text, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    const character = text[index]!;
+    if (character === '(') depth += 1;
+    else if (character === ')') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+/** Top-level comma-separated segments, each whitespace-normalized; `undefined` on an empty one. */
+function splitIndexList(text: string): string[] | undefined {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < text.length;) {
+    const skipped = skipLexicalSpan(text, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    const character = text[index]!;
+    if (character === '(' || character === '[') depth += 1;
+    else if (character === ')' || character === ']') depth -= 1;
+    else if (character === ',' && depth === 0) {
+      const part = normalizeSourceText(text.slice(start, index));
+      if (part === '') return undefined;
+      parts.push(part);
+      start = index + 1;
+      index += 1;
+      continue;
+    }
+    index += 1;
+  }
+  const last = normalizeSourceText(text.slice(start));
+  if (last === '') return undefined;
+  parts.push(last);
+  return parts;
+}
+
+/** The first whole-word occurrence of `keyword` at or after `from`, outside quoted spans. */
+function findIndexKeyword(text: string, keyword: string, from: number): number | null {
+  const word = keyword.toUpperCase();
+  const continuation = /[A-Za-z0-9_$\u0080-\uffff]/;
+  for (let index = from; index < text.length;) {
+    const skipped = skipLexicalSpan(text, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    if (
+      text.slice(index, index + keyword.length).toUpperCase() === word &&
+      (index === 0 || !continuation.test(text[index - 1]!)) &&
+      (index + keyword.length === text.length || !continuation.test(text[index + keyword.length]!))
+    ) {
+      return index;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+/** The end of the statement: its top-level `;`, or the end of text. */
+function statementTerminator(text: string, from: number): number {
+  for (let index = from; index < text.length;) {
+    const skipped = skipLexicalSpan(text, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    if (text[index] === ';') return index;
+    index += 1;
+  }
+  return text.length;
 }
 
 /**
@@ -2611,6 +2835,20 @@ function indexColumn(element: IndexElem): string | undefined {
     return undefined;
   }
   return element.name;
+}
+
+/** The out-of-envelope attribute an expression element carries, when it carries one. */
+function indexElementAnomaly(element: IndexElem): string | undefined {
+  if ((element.collation ?? []).length > 0) return 'collation';
+  if ((element.opclass ?? []).length > 0) return 'operator class';
+  if ((element.opclassopts ?? []).length > 0) return 'operator class options';
+  if (element.ordering !== undefined && element.ordering !== 'SORTBY_DEFAULT') {
+    return 'non-default ordering';
+  }
+  if (element.nulls_ordering !== undefined && element.nulls_ordering !== 'SORTBY_NULLS_DEFAULT') {
+    return 'non-default NULLS ordering';
+  }
+  return undefined;
 }
 
 /** What makes an `IndexElem` fall outside the minimal envelope, for a skip description. */
@@ -3798,6 +4036,18 @@ function flagConsumedIndexComment(
 }
 
 /**
+ * Whether a consumed index carries an expression key, a partial `WHERE`, or an `INCLUDE` list:
+ * none can back a modeled primary key or unique constraint, so the whole constraint skips.
+ */
+function indexCannotBackConstraint(index: Index): boolean {
+  return (
+    index.columns.some((element) => typeof element !== 'string') ||
+    index.include !== undefined ||
+    index.where !== undefined
+  );
+}
+
+/**
  * Attaches an `ADD CONSTRAINT … UNIQUE`: a plain key list attaches directly, while a
  * constraint stated `USING INDEX` consumes the named standalone index when it is a plain
  * column-list unique index; otherwise the whole constraint is skipped and named. The consumed
@@ -3833,10 +4083,22 @@ function attachAlteredUniqueConstraint(
     );
     return;
   }
+  if (indexCannotBackConstraint(index)) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `USING INDEX ${indexname} (expression, partial, or INCLUDE index cannot back a constraint)`,
+        identity,
+      ),
+    );
+    return;
+  }
 
   const comment = index.comment;
   draft.indexes.splice(position, 1);
-  const uniqueConstraint: Mutable<UniqueConstraint> = { columns: [...index.columns] };
+  const uniqueConstraint: Mutable<UniqueConstraint> = {
+    columns: index.columns.filter((element): element is string => typeof element === 'string'),
+  };
   const name = constraint.conname ?? index.name;
   if (name !== undefined) uniqueConstraint.name = name;
   applyConstraintDeferrability(constraint, uniqueConstraint);
@@ -3894,10 +4156,22 @@ function attachAlteredPrimaryKey(
     );
     return;
   }
+  if (indexCannotBackConstraint(index)) {
+    diagnostics.push(
+      skipStatement(
+        statement,
+        `USING INDEX ${indexname} (expression, partial, or INCLUDE index cannot back a constraint)`,
+        identity,
+      ),
+    );
+    return;
+  }
 
   const comment = index.comment;
   draft.indexes.splice(position, 1);
-  const primaryKey: Mutable<PrimaryKey> = { columns: [...index.columns] };
+  const primaryKey: Mutable<PrimaryKey> = {
+    columns: index.columns.filter((element): element is string => typeof element === 'string'),
+  };
   const name = constraint.conname ?? index.name;
   if (name !== undefined) primaryKey.name = name;
   applyConstraintDeferrability(constraint, primaryKey);
@@ -4189,7 +4463,12 @@ function getOrCreateTable(
  * structure; exported for `catalog.ts` and deliberately not re-exported from `index.ts`.
  */
 export function indexStructureKey(index: Index): string {
-  return JSON.stringify([index.unique, index.columns]);
+  return JSON.stringify([
+    index.unique,
+    indexElementsKey(index.columns),
+    index.include ?? null,
+    index.where ?? null,
+  ]);
 }
 
 /**
@@ -4544,8 +4823,19 @@ function sameIndex(left: Index, right: Index): boolean {
   return (
     left.name === right.name &&
     left.unique === right.unique &&
-    sameStringArray(left.columns, right.columns)
+    sameIndexElements(left.columns, right.columns) &&
+    sameOptionalStringArray(left.include, right.include) &&
+    left.where === right.where
   );
+}
+
+/** Whether two optional string arrays carry the same list, absence distinct from presence. */
+function sameOptionalStringArray(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return sameStringArray(left, right);
 }
 
 function sameStringArray(left: readonly string[], right: readonly string[]): boolean {

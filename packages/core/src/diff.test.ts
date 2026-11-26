@@ -5077,3 +5077,86 @@ test('a notNullComment-only change is one comment change on the not-null target'
     { kind: 'comment-changed', target, before: 'login', after: 'sign-in' },
   ]);
 });
+
+test('an index expression, clause, or INCLUDE list is a structural difference', () => {
+  const columns = [column('a'), column('b'), column('c')];
+  const base: Index = { name: 't_idx', unique: false, columns: ['a'] };
+  const variants: readonly Index[] = [
+    { ...base, columns: [{ expression: 'lower(a)' }] },
+    { ...base, include: ['b'] },
+    { ...base, where: 'a > 0' },
+  ];
+
+  for (const after of variants) {
+    assertDiff(
+      model(table('t', { columns, indexes: [base] })),
+      model(table('t', { columns, indexes: [after] })),
+      [
+        {
+          kind: 'table-changed',
+          table: identity('t'),
+          changes: [{ kind: 'index-changed', before: base, after }],
+        },
+      ],
+    );
+  }
+
+  for (const same of variants) {
+    assertDiff(
+      model(table('t', { columns, indexes: [same] })),
+      model(table('t', { columns, indexes: [{ ...same, concurrently: true }] })),
+      [],
+    );
+  }
+});
+
+test('index element order is semantic and unnamed expression indexes pair by full structure', () => {
+  const columns = [column('a'), column('b')];
+  const expression = { expression: 'lower(b)' } as const;
+  const before: Index = { unique: false, columns: ['a', expression] };
+  const reordered: Index = { unique: false, columns: [expression, 'a'] };
+
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [reordered] })),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [{ kind: 'index-changed', before, after: reordered }],
+      },
+    ],
+  );
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [before] })),
+    [],
+  );
+});
+
+test('an expression index rename removes then adds its full shape', () => {
+  const columns = [column('a'), column('b')];
+  const before: Index = {
+    name: 'old_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['b'],
+    where: 'a > 0',
+  };
+  const after: Index = { ...before, name: 'new_idx' };
+
+  assertDiff(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [after] })),
+    [
+      {
+        kind: 'table-changed',
+        table: identity('t'),
+        changes: [
+          { kind: 'index-removed', index: before },
+          { kind: 'index-added', index: after },
+        ],
+      },
+    ],
+  );
+});

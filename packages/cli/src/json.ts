@@ -346,7 +346,11 @@ function mapIndex(index: Index): object {
   return {
     ...(index.name === undefined ? {} : { name: index.name }),
     unique: index.unique,
-    columns: [...index.columns],
+    columns: index.columns.map((element) =>
+      typeof element === 'string' ? element : { expression: element.expression },
+    ),
+    ...(index.include === undefined ? {} : { include: [...index.include] }),
+    ...(index.where === undefined ? {} : { where: index.where }),
     ...(index.concurrently === undefined ? {} : { concurrently: index.concurrently }),
     ...(index.comment === undefined ? {} : { comment: index.comment }),
   };

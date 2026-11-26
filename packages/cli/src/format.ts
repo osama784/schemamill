@@ -14,6 +14,7 @@ import type {
   IdentityFieldChange,
   IdentityGeneration,
   Index,
+  IndexElement,
   Plan,
   PrimaryKey,
   Sequence,
@@ -29,6 +30,7 @@ import type {
   ViewFieldChange,
   ViewIdentity,
 } from '@schemamill/core';
+import { serializeIndexElement } from '@schemamill/core';
 
 /**
  * Human-readable rendering of a diff and a migration plan for the terminal.
@@ -538,11 +540,20 @@ function formatCheckConstraint(checkConstraint: CheckConstraint): string {
   return `check constraint ${name}CHECK (${checkConstraint.expression})`;
 }
 
-/** An index line: `unique` when it is, its name when present, then its ordered columns. */
+/** An index line: `unique` when it is, its name, its ordered elements, then its clauses. */
 function formatIndex(index: Index): string {
   const unique = index.unique ? 'unique ' : '';
   const name = index.name === undefined ? '' : `${formatPresent(index.name)} `;
-  return `${unique}index ${name}(${index.columns.join(', ')})`;
+  const include = index.include === undefined ? '' : ` INCLUDE (${index.include.join(', ')})`;
+  const where = index.where === undefined ? '' : ` WHERE ${index.where}`;
+  return `${unique}index ${name}(${formatIndexElements(index.columns)})${include}${where}`;
+}
+
+/** The display text of an ordered element list: plain column names and raw expression text. */
+function formatIndexElements(elements: readonly IndexElement[]): string {
+  return elements
+    .map((element) => (typeof element === 'string' ? element : element.expression))
+    .join(', ');
 }
 
 /** A sequence line and its options: the signed identity, then every option one per line. */
@@ -668,9 +679,12 @@ function formatCommentTarget(target: CommentTarget): string {
     case 'index': {
       const unique = target.index.unique ? 'unique ' : '';
       const name = target.index.name === undefined ? '' : ` — ${formatPresent(target.index.name)}`;
-      return `${unique}index ${formatIdentity(target.table)} (${target.index.columns.join(
-        ', ',
-      )})${name}`;
+      const include =
+        target.index.include === undefined ? '' : ` INCLUDE (${target.index.include.join(', ')})`;
+      const where = target.index.where === undefined ? '' : ` WHERE ${target.index.where}`;
+      return `${unique}index ${formatIdentity(target.table)} (${formatIndexElements(
+        target.index.columns,
+      )})${include}${where}${name}`;
     }
     case 'primary-key':
       return `primary key ${formatIdentity(target.table)} (${target.primaryKey.columns.join(
@@ -841,17 +855,36 @@ function formatForeignKeyChanges(before: ForeignKey, after: ForeignKey): string[
 }
 
 /**
- * A changed index pair's differing fields — `unique`, then `columns`, in that order, joined
- * `, `. The pairing identity (the name) anchors the line and is never repeated here;
- * `concurrently` is apply metadata and never a difference.
+ * A changed index pair's differing fields — `unique`, `columns`, `include`, then `where`, in
+ * that order, joined `, `. The pairing identity (the name) anchors the line and is never
+ * repeated here; `concurrently` is apply metadata and never a difference.
  */
 function formatIndexChanges(before: Index, after: Index): string {
   const fields: string[] = [];
   if (before.unique !== after.unique) {
     fields.push(`unique ${String(before.unique)} → ${String(after.unique)}`);
   }
-  if (!sameStrings(before.columns, after.columns)) {
-    fields.push(`columns (${before.columns.join(', ')}) → (${after.columns.join(', ')})`);
+  if (
+    before.columns.length !== after.columns.length ||
+    before.columns.some(
+      (element, position) =>
+        serializeIndexElement(element) !== serializeIndexElement(after.columns[position]!),
+    )
+  ) {
+    fields.push(
+      `columns (${formatIndexElements(before.columns)}) → (${formatIndexElements(after.columns)})`,
+    );
+  }
+  if (
+    before.include?.join('\u0000') !== after.include?.join('\u0000') ||
+    before.include?.length !== after.include?.length
+  ) {
+    fields.push(
+      `include (${before.include?.join(', ') ?? 'none'}) → (${after.include?.join(', ') ?? 'none'})`,
+    );
+  }
+  if (before.where !== after.where) {
+    fields.push(`where ${before.where ?? '(none)'} → ${after.where ?? '(none)'}`);
   }
   return fields.join(', ');
 }

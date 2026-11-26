@@ -86,7 +86,7 @@ const checkConstraint = (
 
 /** A non-unique index on `columns`: unnamed and non-concurrent unless overridden. */
 const tableIndex = (
-  columns: readonly string[],
+  columns: Index['columns'],
   rest: Partial<Omit<Index, 'columns'>> = {},
 ): Index => ({ unique: false, columns, ...rest });
 
@@ -1826,6 +1826,43 @@ test('renders index creates and drops, named or unnamed, unique or not', () => {
   );
 });
 
+test('renders expression, partial, and covering index creates with authored text', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'create-index',
+          owner,
+          index: tableIndex(['a', { expression: 'lower(b)' }], {
+            name: 't_expr_idx',
+            include: ['c'],
+            where: 'a > 0',
+          }),
+        },
+        {
+          kind: 'drop-index',
+          owner,
+          index: tableIndex([{ expression: 'a + 1' }], { name: 't_drop_idx' }),
+        },
+        {
+          kind: 'drop-index',
+          owner,
+          index: tableIndex(['a', { expression: 'lower(b)' }]),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'CREATE INDEX t_expr_idx ON public.t USING btree (a, lower(b)) INCLUDE (c) WHERE a > 0;',
+      'DROP INDEX public.t_drop_idx;',
+      'DROP INDEX public.t_a_lower_idx;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('renders index statements on a materialized view using its schema and name', () => {
   const viewOwner = { kind: 'materialized-view' as const, view: { schema: 'app', name: 'mv' } };
 
@@ -1909,6 +1946,42 @@ test('refuses two index creates on one materialized view that resolve to one nam
         ),
       ),
     'refusing to render: index creates on public.m would share the name "m_a_idx": an index named "m_a_idx" on (a) and an index named "m_a_idx" on (b)',
+  );
+});
+
+test('refuses two index creates whose new clauses collapse onto one name', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner,
+            index: tableIndex(['a'], { name: 't_idx', include: ['b'] }),
+          },
+          {
+            kind: 'create-index',
+            owner,
+            index: tableIndex(['a'], { name: 't_idx', include: ['c'] }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_idx": an index named "t_idx" on (a) INCLUDE (b) and an index named "t_idx" on (a) INCLUDE (c)',
+  );
+});
+
+test('the duplicate-name guard shows raw expression text in untruncated predictions', () => {
+  const owner = { kind: 'table' as const, table: identity('t') };
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'create-index', owner, index: tableIndex([{ expression: 'a + 1' }]) },
+          { kind: 'create-index', owner, index: tableIndex([{ expression: 'a + 2' }]) },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_expr_idx": an unnamed index on (a + 1) (predicting "t_a + 1_idx") and an unnamed index on (a + 2) (predicting "t_a + 2_idx")',
   );
 });
 

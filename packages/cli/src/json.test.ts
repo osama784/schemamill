@@ -620,6 +620,8 @@ const ALLOWED_KEYS = new Set<string>([
   'onUpdate',
   'onDelete',
   'unique',
+  'include',
+  'where',
   'concurrently',
   'dataType',
   'ownedBy',
@@ -1017,4 +1019,33 @@ test('importPair surfaces per-side diagnostics and the workspace root without ne
     process.chdir(originalCwd);
     stream.write = originalWrite;
   }
+});
+
+test('the JSON mapper carries expression elements, INCLUDE, and the partial WHERE', () => {
+  const entry: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  };
+  const document = buildJsonDocument(
+    compareInput([
+      {
+        kind: 'table-changed',
+        table: TABLE_ID,
+        changes: [{ kind: 'index-added', index: entry }],
+      },
+    ]),
+  );
+  const result = document.result as {
+    changes: readonly { changes: readonly { index: unknown }[] }[];
+  };
+  assert.deepEqual(result.changes[0]!.changes[0]!.index, {
+    name: 't_idx',
+    unique: false,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  });
 });

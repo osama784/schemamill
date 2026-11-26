@@ -13,6 +13,7 @@ import type {
   Extension,
   ForeignKey,
   Index,
+  IndexElement,
   Model,
   PrimaryKey,
   ReferentialAction,
@@ -510,10 +511,17 @@ function serializeIndex(index: Index): object {
   return {
     ...(index.name === undefined ? {} : { name: index.name }),
     unique: index.unique,
-    columns: [...index.columns],
+    columns: index.columns.map(serializeIndexElement),
+    ...(index.include === undefined ? {} : { include: [...index.include] }),
+    ...(index.where === undefined ? {} : { where: index.where }),
     ...(index.concurrently === undefined ? {} : { concurrently: index.concurrently }),
     ...(index.comment === undefined ? {} : { comment: index.comment }),
   };
+}
+
+/** A writable copy of an index element, so a tagged expression cannot alias the caller's model. */
+function serializeIndexElement(element: IndexElement): IndexElement {
+  return typeof element === 'string' ? element : { expression: element.expression };
 }
 
 function serializeSequence(sequence: Sequence): object {
@@ -628,7 +636,16 @@ const FOREIGN_KEY_KEYS = [
   'initiallyDeferred',
   'comment',
 ] as const;
-const INDEX_KEYS = ['name', 'unique', 'columns', 'concurrently', 'comment'] as const;
+const INDEX_KEYS = [
+  'name',
+  'unique',
+  'columns',
+  'include',
+  'where',
+  'concurrently',
+  'comment',
+] as const;
+const EXPRESSION_KEYS = ['expression'] as const;
 const SEQUENCE_KEYS = [
   'schema',
   'name',
@@ -791,6 +808,19 @@ function parseNonEmptyStringArray(
   if (!array.ok) return array;
   if (array.value.length === 0) return invalid(`${path} is not a non-empty list`);
   return array;
+}
+
+/**
+ * One index element: a plain column name, or a `{"expression": ...}` object carrying opaque
+ * whitespace-normalized expression text. Any other object — including one with an extra key —
+ * fails closed, so a new binary cannot invent a shape an older reader would silently drop.
+ */
+function parseIndexElement(value: unknown, path: string): Parsed<IndexElement> {
+  if (typeof value === 'string') return parseNonEmptyString(value, path);
+  return parseObject(value, path, EXPRESSION_KEYS, (object) => {
+    const expression = parseNonEmptyString(object.expression, fieldPath(path, 'expression'));
+    return expression.ok ? parsed({ expression: expression.value }) : expression;
+  });
 }
 
 /** An exact 64-bit integer in canonical decimal form. */
@@ -1164,12 +1194,16 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
     if (!name.ok) return name;
     const unique = parseBoolean(object.unique, fieldPath(path, 'unique'));
     if (!unique.ok) return unique;
-    const columns = parseNonEmptyStringArray(
-      object.columns,
-      fieldPath(path, 'columns'),
-      parseNonEmptyString,
-    );
+    const columnsPath = fieldPath(path, 'columns');
+    const columns = parseArrayOf(object.columns, columnsPath, parseIndexElement);
     if (!columns.ok) return columns;
+    if (columns.value.length === 0) return invalid(`${columnsPath} is not a non-empty list`);
+    const include = parseOptional(object.include, fieldPath(path, 'include'), (value, at) =>
+      parseNonEmptyStringArray(value, at, parseNonEmptyString),
+    );
+    if (!include.ok) return include;
+    const where = parseOptional(object.where, fieldPath(path, 'where'), parseNonEmptyString);
+    if (!where.ok) return where;
     const concurrently = parseOptional(
       object.concurrently,
       fieldPath(path, 'concurrently'),
@@ -1182,6 +1216,8 @@ function parseIndex(value: unknown, path: string): Parsed<Index> {
       ...(name.value === undefined ? {} : { name: name.value }),
       unique: unique.value,
       columns: columns.value,
+      ...(include.value === undefined ? {} : { include: include.value }),
+      ...(where.value === undefined ? {} : { where: where.value }),
       ...(concurrently.value === undefined ? {} : { concurrently: concurrently.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });

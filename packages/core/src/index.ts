@@ -20,6 +20,13 @@ export {
   WORKSPACE_DIR_NAME,
   WORKSPACE_MODEL_FILE_NAME,
 } from './workspace.ts';
+export {
+  compareIndexElements,
+  indexElementsKey,
+  sameIndexElements,
+  serializeIndexElement,
+} from './index-elements.ts';
+export type { IndexElement } from './model.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';
 export type * from './hazard.ts';

@@ -457,13 +457,13 @@ const EXPECTED_BASELINE_PARSE_FAILURE_COMPARE = [
   '',
 ].join('\n');
 
-/** A dump whose partial index the importer skips whole and names. */
+/** A dump whose out-of-envelope index the importer skips whole and names. */
 const PARTIAL_INDEX_DUMP = [
   'CREATE TABLE public.users (',
   '    id integer NOT NULL',
   ');',
   '',
-  'CREATE INDEX idx_users_email ON public.users (id) WHERE id > 0;',
+  'CREATE INDEX idx_users_email ON public.users USING hash (id);',
   '',
 ].join('\n');
 
@@ -1063,9 +1063,9 @@ test('skips print a counts line, and --verbose adds the skip line', async (t) =>
     verbose.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
+      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
+      'target: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)',
       '',
     ].join('\n'),
   );
@@ -1120,9 +1120,9 @@ test('plan --verbose adds the skip line', async (t) => {
     result.stderr,
     [
       'baseline: 1 skipped',
-      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
+      'baseline: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)',
       'target: 1 skipped',
-      'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
+      'target: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)',
       '',
     ].join('\n'),
   );
@@ -1602,7 +1602,7 @@ test('a workspace side contributes no import diagnostics, even with --verbose', 
   const dump = await writeDump(dumps, 'dump.sql', PARTIAL_INDEX_DUMP);
   const expectedStderr = [
     'target: 1 skipped',
-    'target: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)',
+    'target: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)',
     '',
   ].join('\n');
 
@@ -1797,7 +1797,7 @@ test('init --from writes a skip-only dump, and --verbose adds the skip line', as
   assert.equal(verbose.stdout, `Initialized workspace at ${verboseRoot}\n`);
   assert.equal(
     verbose.stderr,
-    'source: 1 skipped\nsource: [skip] skipped CREATE INDEX public.idx_users_email (partial WHERE) (5:1)\n',
+    'source: 1 skipped\nsource: [skip] skipped CREATE INDEX public.idx_users_email (access method hash) (5:1)\n',
   );
   assert.equal(verbose.code, 0);
 });
@@ -2483,7 +2483,7 @@ const JSON_DIAGNOSTICS_DUMP = [
   '    CONSTRAINT users_email_key UNIQUE NULLS NOT DISTINCT (email)',
   ');',
   '',
-  'CREATE INDEX idx_users_partial ON public.users (id) WHERE id > 0;',
+  'CREATE INDEX idx_users_partial ON public.users USING hash (id);',
   '',
 ].join('\n');
 
@@ -2786,7 +2786,7 @@ test('--json --verbose leaves the document byte-identical and diagnostics comple
     kind: 'skip',
     code: 'unsupported-statement',
     object: 'public.idx_users_partial',
-    message: 'skipped CREATE INDEX public.idx_users_partial (partial WHERE)',
+    message: 'skipped CREATE INDEX public.idx_users_partial (access method hash)',
     position: { line: 7, column: 1, offset: 138 },
   };
   const expectedDiagnostics = { baseline: [flag, skip], target: [flag, skip] };

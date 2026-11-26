@@ -7,6 +7,7 @@ import {
   diff,
   effectiveIdentity,
   effectiveSequence,
+  indexElementsKey,
   plan,
   SequenceOwnershipError,
   sequenceTypeBounds,
@@ -30,6 +31,7 @@ import type {
   Extension,
   ForeignKey,
   Index,
+  IndexElement,
   Model,
   PrimaryKey,
   Sequence,
@@ -395,7 +397,13 @@ const checkConstraintKey = (checkConstraint: CheckConstraint): string =>
 
 /** A structural key for an index; `concurrently` is apply metadata and excluded. */
 const indexKey = (entry: Index): string =>
-  JSON.stringify([entry.name ?? null, entry.unique, entry.columns]);
+  JSON.stringify([
+    entry.name ?? null,
+    entry.unique,
+    indexElementsKey(entry.columns),
+    entry.include ?? null,
+    entry.where ?? null,
+  ]);
 
 /** The simulated state of `model`. */
 const stateOf = (model: Model): SimulatedState => {
@@ -971,10 +979,11 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       const key = keyOf(step.owner.table);
       const table = state.tables.get(key);
       assert.ok(table !== undefined, `${step.kind} on missing table ${key}`);
-      for (const name of step.index.columns) {
+      for (const element of step.index.columns) {
+        if (typeof element !== 'string') continue;
         assert.ok(
-          table.columns.has(name),
-          `${step.kind} on ${key} covering missing column ${name}`,
+          table.columns.has(element),
+          `${step.kind} on ${key} covering missing column ${element}`,
         );
       }
       const entryKey = indexKey(step.index);
@@ -2036,8 +2045,9 @@ const generatePair = (random: Random): { baseline: Model; target: Model } => {
     );
     retainDistinct(
       generated.indexes,
-      (member) => member.columns.every((name) => columnNames.has(name)),
-      (member) => JSON.stringify([member.name]),
+      (member) =>
+        member.columns.every((element) => typeof element !== 'string' || columnNames.has(element)),
+      (member) => JSON.stringify([member.name, indexElementsKey(member.columns)]),
     );
     for (const entry of generated.columns) {
       if (entry.identity !== undefined && canonicalIntType(entry.type) === undefined) {
@@ -6555,14 +6565,15 @@ const generateTwinShape = (random: Random): TwinShape => {
     }
     return picked;
   };
-  const conventionalName = (columns: readonly string[]): string => `t_${columns.join('_')}_idx`;
+  const conventionalName = (columns: readonly IndexElement[]): string =>
+    `t_${columns.map((element) => (typeof element === 'string' ? element : element.expression)).join('_')}_idx`;
   const sigma: Mutable<Index> = {
     unique: random.chance(0.4),
     columns: pickColumns(),
     ...(random.chance(0.35) ? { concurrently: true } : {}),
   };
   const mode = random.pick(['same', 'different', 'replace'] as const);
-  let twinColumns = pickColumns();
+  let twinColumns: readonly IndexElement[] = pickColumns();
   if (mode === 'different') {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       if (JSON.stringify(twinColumns) !== JSON.stringify(sigma.columns)) break;
@@ -8407,4 +8418,56 @@ test('a name-involved not-null change re-asserts an unchanged notNullComment', (
     },
   ]);
   simulate(baseline, target);
+});
+
+test('an added or removed expression, partial, covering index carries every field into steps', () => {
+  const columns = [column('a'), column('b'), column('c')];
+  const entry: Index = {
+    name: 't_expr_idx',
+    unique: true,
+    columns: ['a', { expression: 'lower(b)' }],
+    include: ['c'],
+    where: 'a > 0',
+  };
+  const empty = model(table('t', { columns }));
+  const full = model(table('t', { columns, indexes: [entry] }));
+  const owner = { kind: 'table' as const, table: identity('t') };
+
+  assertPlan(empty, full, [{ kind: 'create-index', owner, index: entry }]);
+  assertPlan(full, empty, [{ kind: 'drop-index', owner, index: entry }]);
+});
+
+test('a changed expression index decomposes into a drop and a create with both shapes', () => {
+  const columns = [column('a'), column('b')];
+  const before: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: [{ expression: 'lower(a)' }, 'b'],
+    where: 'a > 0',
+  };
+  const after: Index = {
+    name: 't_idx',
+    unique: false,
+    columns: ['b', { expression: 'lower(a)' }],
+    include: ['a'],
+  };
+  const owner = { kind: 'table' as const, table: identity('t') };
+
+  assertPlan(
+    model(table('t', { columns, indexes: [before] })),
+    model(table('t', { columns, indexes: [after] })),
+    [
+      { kind: 'drop-index', owner, index: before },
+      { kind: 'create-index', owner, index: after },
+    ],
+  );
+});
+
+test('a concurrently-only difference on an expression index produces no plan', () => {
+  const columns = [column('a')];
+  const before: Index = { columns: [{ expression: 'lower(a)' }], unique: false };
+  const baseline = model(table('t', { columns, indexes: [before] }));
+  const target = model(table('t', { columns, indexes: [{ ...before, concurrently: true }] }));
+
+  assertPlan(baseline, target, []);
 });

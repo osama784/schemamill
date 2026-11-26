@@ -712,6 +712,8 @@ interface IndexRow {
   readonly valid: boolean;
   readonly ready: boolean;
   readonly tablespace: string | null;
+  /** The original `pg_get_indexdef` text, the source the classifier slices authored text from. */
+  readonly definition: string;
   readonly create: IndexStmt;
   readonly comment: string | null;
 }
@@ -1181,7 +1183,7 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         });
         continue;
       }
-      const envelope = classifyIndexEnvelope(indexRow.create);
+      const envelope = classifyIndexEnvelope(indexRow.create, indexRow.definition, 'table');
       if (envelope.kind === 'skip') {
         indexFindings.push({
           indexName: indexRow.indexName,
@@ -1210,6 +1212,8 @@ export async function mapCatalog(payload: unknown): Promise<ReadResult<Model, Di
         index: {
           unique: envelope.unique,
           columns: envelope.columns,
+          ...(envelope.include === undefined ? {} : { include: envelope.include }),
+          ...(envelope.where === undefined ? {} : { where: envelope.where }),
           ...(indexRow.comment === null ? {} : { comment: indexRow.comment }),
         },
       });
@@ -2027,11 +2031,15 @@ export function canonicalizeIndexNames(
     const structure: {
       name?: string;
       unique: boolean;
-      columns: string[];
+      columns: Index['columns'];
+      include?: readonly string[];
+      where?: string;
       comment?: string;
     } = {
       unique: row.index.unique,
       columns: [...row.index.columns],
+      ...(row.index.include === undefined ? {} : { include: [...row.index.include] }),
+      ...(row.index.where === undefined ? {} : { where: row.index.where }),
       ...(row.index.comment === undefined ? {} : { comment: row.index.comment }),
     };
     const key = indexStructureKey(structure);
@@ -2532,6 +2540,7 @@ async function parseIndexRow(value: unknown, path: string): Promise<IndexRow> {
     valid: expectBoolean(row, path, 'valid'),
     ready: expectBoolean(row, path, 'ready'),
     tablespace: expectNullableString(row, path, 'tablespace'),
+    definition,
     create: await parseIndexDefinition(definition, path),
     comment: expectNullableString(row, path, 'comment'),
   };

@@ -26,7 +26,7 @@ import type { Identity } from './identity.ts';
  * - `tables` are sorted by schema, then name (JavaScript string comparison).
  * - `columns` keep source order: ordinal position is part of a table's shape.
  * - `primaryKey.columns`, `uniqueConstraint.columns`, `index.columns`, and `foreignKey.columns`
- *   keep the constraint's or index's column order.
+ *   keep the constraint's or index's authored order; an index's elements may be expressions.
  * - `foreignKeys` are sorted by referencing columns (element-wise lexicographic), then
  *   referenced table (schema, then name), then constraint name (`name ?? ''`, so unnamed
  *   first).
@@ -304,18 +304,35 @@ export interface ForeignKey {
 }
 
 /**
- * A standalone index: an access path on the table's columns, not backing a constraint. A named
- * index is identified by its name; an unnamed index by its structure — `unique` and ordered
- * columns — with a missing name itself distinct in a diff. A unique constraint is never
- * modeled as, or accompanied by, an index.
+ * One ordered element of an index's key list: a plain string names a column; the tagged object
+ * carries an expression as written, whitespace-normalized and opaque to the model — operator,
+ * operator-class, and collation text stay inside it, never becoming separate fields. The two
+ * shapes are distinct: a column named `{"expression":"x"}` is not that expression.
+ */
+export type IndexElement = string | { readonly expression: string };
+
+/**
+ * A standalone index: an access path on the table's ordered key elements, not backing a
+ * constraint. A named index is identified by its name; an unnamed index by its structure —
+ * `unique`, its ordered key elements, and its `INCLUDE` columns and partial `where` clause —
+ * with a missing name itself distinct in a diff. A unique constraint is never modeled as, or
+ * accompanied by, an index.
+ *
+ * `where` is the partial index's clause, not a check constraint's predicate: the model keeps it
+ * as whitespace-normalized, opaque text. `include` holds the `INCLUDE` columns after the keys.
+ * `concurrently` stays apply metadata, excluded from structural identity and equality.
  */
 export interface Index {
   /** Index name as written, when the source names it. */
   readonly name?: string;
   /** Whether the index is declared `UNIQUE`. */
   readonly unique: boolean;
-  /** Indexed columns, in the index's order. */
-  readonly columns: readonly string[];
+  /** Indexed columns and expressions, in the index's authored order. */
+  readonly columns: readonly IndexElement[];
+  /** `INCLUDE` columns, in the index's authored order; absent means no `INCLUDE` clause. */
+  readonly include?: readonly string[];
+  /** The partial index's `WHERE` clause; absent means the index is not partial. */
+  readonly where?: string;
   /**
    * Whether a create or drop applies `CONCURRENTLY`; apply metadata, not structure, excluded
    * from identity and equality. The target's flag drives a create, the baseline's drives a

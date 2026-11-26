@@ -122,9 +122,136 @@ export function chooseNameAddition(names: readonly string[]): string {
   return addition;
 }
 
+/**
+ * The labels `ChooseIndexColumnNames` feeds `ChooseIndexNameAddition`: a plain column names
+ * itself, a function call contributes its last (unquoted) function identifier, `nullif` keeps its
+ * own label, and every other expression is `expr`. `INCLUDE` columns follow the keys and `WHERE`
+ * contributes nothing. Duplicates get numeric suffixes over the whole list, and each label is
+ * clipped so the base plus its suffix fits 63 bytes — the mirror of the server's truncation.
+ */
+export function indexElementNames(index: Index): string[] {
+  const labels: string[] = [];
+  for (const element of index.columns) {
+    labels.push(typeof element === 'string' ? element : expressionElementLabel(element.expression));
+  }
+  if (index.include !== undefined) labels.push(...index.include);
+
+  const used = new Set<string>();
+  return labels.map((label) => {
+    let name: string;
+    for (let counter = 0; ; counter += 1) {
+      const suffix = counter === 0 ? '' : String(counter);
+      name = `${clipToBytes(label, IDENTIFIER_BYTE_LIMIT - utf8Length(suffix))}${suffix}`;
+      if (!used.has(name)) break;
+    }
+    used.add(name);
+    return name;
+  });
+}
+
+/** The best-effort label an opaque expression contributes to a generated index name. */
+function expressionElementLabel(expression: string): string {
+  let text = expression.trim();
+  // Parentheses around the whole expression do not change its parse tree for the server.
+  while (text.length > 1 && text.startsWith('(')) {
+    const close = matchingCloseParen(text, 0);
+    if (close < 0 || skipWhitespace(text, close + 1) !== text.length) break;
+    text = text.slice(1, close).trim();
+  }
+
+  let cursor = 0;
+  let last: string;
+  for (;;) {
+    cursor = skipWhitespace(text, cursor);
+    const token = readIdentifier(text, cursor);
+    if (token === undefined) return 'expr';
+    last = token.value;
+    cursor = skipWhitespace(text, token.end);
+    if (text[cursor] === '(') {
+      const close = matchingCloseParen(text, cursor);
+      if (close < 0 || skipWhitespace(text, close + 1) !== text.length) return 'expr';
+      return last.toLowerCase() === 'nullif' ? 'nullif' : last;
+    }
+    if (text[cursor] !== '.') return 'expr';
+    cursor += 1;
+  }
+}
+
+/** A quoted or bare identifier at `start`, unquoted, with the index just past it. */
+function readIdentifier(
+  text: string,
+  start: number,
+): { readonly value: string; readonly end: number } | undefined {
+  if (text[start] === '"') {
+    let value = '';
+    let cursor = start + 1;
+    while (cursor < text.length) {
+      if (text[cursor] === '"') {
+        if (text[cursor + 1] === '"') {
+          value += '"';
+          cursor += 2;
+          continue;
+        }
+        return { value, end: cursor + 1 };
+      }
+      value += text[cursor]!;
+      cursor += 1;
+    }
+    return undefined;
+  }
+  const first = text[start];
+  if (first === undefined || !IDENTIFIER_START.test(first)) return undefined;
+  let end = start + 1;
+  while (end < text.length && IDENTIFIER_CONTINUATION.test(text[end]!)) end += 1;
+  return { value: text.slice(start, end), end };
+}
+
+/** The index of the `)` closing the `(` at `open`, skipping quoted spans and comments. */
+function matchingCloseParen(text: string, open: number): number {
+  let depth = 0;
+  let cursor = open;
+  while (cursor < text.length) {
+    const character = text[cursor]!;
+    if (character === "'" || character === '"') {
+      cursor = quotedSpanEnd(text, cursor);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(text, cursor);
+      if (end !== null) {
+        cursor = end;
+        continue;
+      }
+    }
+    if (character === '-' && text[cursor + 1] === '-') {
+      while (cursor < text.length && text[cursor] !== '\n') cursor += 1;
+      continue;
+    }
+    if (character === '/' && text[cursor + 1] === '*') {
+      const end = text.indexOf('*/', cursor + 2);
+      cursor = end === -1 ? text.length : end + 2;
+      continue;
+    }
+    if (character === '(') depth += 1;
+    else if (character === ')') {
+      depth -= 1;
+      if (depth === 0) return cursor;
+    }
+    cursor += 1;
+  }
+  return -1;
+}
+
+/** Index just past the whitespace at `from`. */
+function skipWhitespace(text: string, from: number): number {
+  let cursor = from;
+  while (cursor < text.length && isWhitespace(text[cursor]!)) cursor += 1;
+  return cursor;
+}
+
 /** PostgreSQL's conventional index name for an unnamed index. */
 export function synthesizedIndexName(table: TableIdentity, index: Index): string {
-  return makeObjectName(table.name, chooseNameAddition(index.columns), 'idx');
+  return makeObjectName(table.name, chooseNameAddition(indexElementNames(index)), 'idx');
 }
 
 /** PostgreSQL's conventional primary-key name for an unnamed primary key. */

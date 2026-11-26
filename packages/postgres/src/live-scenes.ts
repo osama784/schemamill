@@ -1,6 +1,11 @@
 import { isDeepStrictEqual } from 'node:util';
 
-import { diff, effectiveIdentity, effectiveSequence } from '@schemamill/core';
+import {
+  diff,
+  effectiveIdentity,
+  effectiveSequence,
+  serializeIndexElement,
+} from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
@@ -11,6 +16,7 @@ import type {
   Identity,
   IdentityInput,
   Index,
+  IndexElement,
   Model,
   Plan,
   PrimaryKey,
@@ -28,6 +34,11 @@ import type {
 } from '@schemamill/core';
 
 import { renderSql } from './render.ts';
+
+/** The one display/join rule for index elements: plain columns and `{"expression": …}` text. */
+function joinIndexElements(elements: readonly IndexElement[], separator = ','): string {
+  return elements.map(serializeIndexElement).join(separator);
+}
 
 /**
  * Scenes for the live-PostgreSQL harness (`live-pg.test.ts`).
@@ -3257,7 +3268,7 @@ const introspectionConstraintsScene = (): LiveScene => {
                 .map(
                   (index) =>
                     `${index.name ?? '<unnamed>'}:${index.unique ? 'unique' : 'plain'}:` +
-                    `${index.columns.join(',')}`,
+                    `${joinIndexElements(index.columns)}`,
                 )
                 .join(';');
               const foreign = found.foreignKeys
@@ -3844,7 +3855,7 @@ const indexCreateScene = (): LiveScene => {
           const indexes = table.indexes
             .map(
               (index) =>
-                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`,
+                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${joinIndexElements(index.columns)}`,
             )
             .join('; ');
           if (indexes !== '<unnamed>|plain|age; <unnamed>|unique|email') {
@@ -3977,7 +3988,7 @@ const indexConcurrentlyScene = (): LiveScene => {
             .map(
               (index) =>
                 `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|` +
-                `${index.columns.join(',')}|${index.concurrently === true ? 'concurrently' : 'ordinary'}`,
+                `${joinIndexElements(index.columns)}|${index.concurrently === true ? 'concurrently' : 'ordinary'}`,
             )
             .join('; ');
           return indexes === '<unnamed>|plain|email|ordinary; <unnamed>|plain|note|ordinary'
@@ -4046,7 +4057,7 @@ const unnamedIndexRoundTripScene = (): LiveScene => {
           const columnsCreated = steps
             .map((step) =>
               step.kind === 'create-index' || step.kind === 'create-index-concurrently'
-                ? step.index.columns.join('+')
+                ? joinIndexElements(step.index.columns, '+')
                 : '<other>',
             )
             .join(',');
@@ -4090,7 +4101,9 @@ const unnamedIndexRoundTripScene = (): LiveScene => {
               .join(',')}`;
           }
           const structures = table.indexes
-            .map((index) => `${index.unique ? 'unique' : 'plain'}|${index.columns.join(',')}`)
+            .map(
+              (index) => `${index.unique ? 'unique' : 'plain'}|${joinIndexElements(index.columns)}`,
+            )
             .join('; ');
           return structures === 'plain|a,b; plain|age; plain|note'
             ? undefined
@@ -5549,7 +5562,7 @@ const truncatedNameRoundTripScene = (): LiveScene => {
           if (drop.kind !== 'drop-index') return `first step: ${drop.kind}`;
           if (
             drop.index.name !== undefined ||
-            drop.index.columns.join(',') !== 'superseded_originator_reference_value'
+            joinIndexElements(drop.index.columns) !== 'superseded_originator_reference_value'
           ) {
             return `the drop does not name the unnamed superseded index`;
           }
@@ -5606,7 +5619,9 @@ const truncatedNameRoundTripScene = (): LiveScene => {
               .map((index) => index.name)
               .join(',')}`;
           }
-          const indexColumns = ledger.indexes.map((index) => index.columns.join(',')).join('; ');
+          const indexColumns = ledger.indexes
+            .map((index) => joinIndexElements(index.columns))
+            .join('; ');
           if (indexColumns !== 'originator_transaction_reference_number') {
             return `${source}: indexes: ${indexColumns}`;
           }
@@ -5976,7 +5991,7 @@ const viewRoundTripScene = (): LiveScene => {
           if (index?.name !== undefined) {
             return `${source}: the generated index name survived as ${String(index.name)}`;
           }
-          if (index?.unique !== true || index.columns.join(',') !== 'id') {
+          if (index?.unique !== true || joinIndexElements(index.columns) !== 'id') {
             return `${source}: the imported index is ${JSON.stringify(index)}`;
           }
           const skips = imported.diagnostics.filter(
@@ -7170,7 +7185,7 @@ const commentRoundTripScene = (): LiveScene => {
             (candidate) =>
               candidate.name === undefined &&
               !candidate.unique &&
-              candidate.columns.join(',') === 'code',
+              joinIndexElements(candidate.columns) === 'code',
           );
           if (index === undefined) {
             return `${source}: the unnamed (code) index is missing or named: ${JSON.stringify(

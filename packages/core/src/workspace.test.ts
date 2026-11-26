@@ -2853,3 +2853,84 @@ test('resolveWorkspace rejects an empty or NUL notNullComment', async (t) => {
     assert.match(diagnostic.message, /^invalid model: tables\[0\]\.columns\[0\]\.notNullComment/);
   }
 });
+
+test('serializeModel round-trips expression, partial, and covering index fields', async (t) => {
+  const model: Model = {
+    tables: [
+      {
+        schema: 'public',
+        name: 't',
+        columns: [],
+        foreignKeys: [],
+        uniqueConstraints: [],
+        checkConstraints: [],
+        indexes: [
+          {
+            name: 't_expr_idx',
+            unique: false,
+            columns: ['a', { expression: 'lower(b)' }],
+            include: ['c', 'd'],
+            where: 'a > 0',
+          },
+        ],
+      },
+    ],
+    sequences: [],
+    views: [],
+    extensions: [],
+  };
+  const bytes = serializeModel(model);
+  const payload = JSON.parse(bytes) as { tables: Array<{ indexes: unknown[] }> };
+  assert.deepStrictEqual(payload.tables[0]!.indexes, [
+    {
+      name: 't_expr_idx',
+      unique: false,
+      columns: ['a', { expression: 'lower(b)' }],
+      include: ['c', 'd'],
+      where: 'a > 0',
+    },
+  ]);
+
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+  assert.deepStrictEqual((await resolveOk(dir)).model, model);
+});
+
+test('resolveWorkspace fails closed on an unknown index field', async (t) => {
+  const diagnostic = await resolvePayload(t, {
+    tables: [
+      tablePayload({
+        indexes: [{ unique: false, columns: ['a'], where: 'a > 0', bogus: true }],
+      }),
+    ],
+    sequences: [],
+  });
+
+  assert.equal(diagnostic.code, 'workspace-model-invalid');
+  assert.equal(diagnostic.message, 'invalid model: unknown field tables[0].indexes[0].bogus');
+});
+
+test('resolveWorkspace reads an old-shaped index model byte-identically', async (t) => {
+  const bytes = `${JSON.stringify(
+    {
+      tables: [
+        tablePayload({
+          indexes: [{ name: 't_a_idx', unique: false, columns: ['a', 'b'] }],
+        }),
+      ],
+      sequences: [],
+      views: [],
+      extensions: [],
+    },
+    null,
+    2,
+  )}\n`;
+  const dir = await fixtureDir(t);
+  await writeWorkspace(dir, bytes);
+
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model.tables[0]!.indexes, [
+    { name: 't_a_idx', unique: false, columns: ['a', 'b'] },
+  ]);
+  assert.equal(serializeModel(resolved.model), bytes);
+});
