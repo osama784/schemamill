@@ -1,0 +1,26 @@
+CREATE TABLE app.t (
+    id integer NOT NULL,
+    email text
+);
+
+CREATE SEQUENCE app.s
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER TABLE app.t OWNER TO "Priv App User";
+
+ALTER SEQUENCE app.s OWNER TO "Priv App User";
+
+GRANT SELECT ON TABLE app.t TO app_user;
+
+GRANT UPDATE(email) ON TABLE app.t TO app_user;
+
+GRANT SELECT ON SEQUENCE app.s TO app_user;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE ALL ON TABLES FROM app_user;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app GRANT SELECT ON TABLES TO app_user;

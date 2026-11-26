@@ -7,10 +7,12 @@ import type {
   ColumnAttributes,
   ColumnCompression,
   ColumnStorage,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
   Index,
   IndexOwner,
   Model,
@@ -28,6 +30,12 @@ import type {
   ViewIdentity,
 } from './model.ts';
 import type { CommentTarget } from './plan.ts';
+import {
+  canonicalDefaultPrivileges,
+  canonicalGrants,
+  sameDefaultPrivileges,
+  sameGrants,
+} from './privileges.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
 
 /**
@@ -36,7 +44,9 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  * `diff` compares two models and reports one change per added, removed, or changed table,
  * column, primary key, foreign key, unique constraint, check constraint, index, sequence, view,
  * or extension, plus one `comment-changed` per target entity whose comment text differs (or
- * that the baseline lacks while it states one).
+ * that the baseline lacks while it states one). Object owners, object privileges, and default
+ * privileges are compared as canonical arrays; role names are opaque and `ALL` is never expanded
+ * into an explicit privilege list.
  * It never guesses a rename: a table or column under a new name is a removal and an addition,
  * a primary key with a different column list is a primary-key change, a foreign key pointing
  * at a different table is a removal and an addition, and so are a unique constraint with a
@@ -129,7 +139,8 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    then check constraints removed, added, and changed, each sorted in the model's
  *    check-constraint order (expression, then name, absent first); then indexes removed,
  *    added, and changed, each sorted by name, absent first; then the table's
- *    `persistence-changed` entry when the two sides' persistence differs. Changed pairs are
+ *    `persistence-changed` entry when the two sides' persistence differs, then `owner-changed`
+ *    and `privileges-changed` when the role owner or canonical grant list differs. Changed pairs are
  *    ordered by their baseline member in that member's order, then by their target member the
  *    same way.
  * 3. Columns are never sorted: column entries keep the stored source order of the side they
@@ -143,7 +154,8 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`, `ownedBy`; with a
  *    `dataType` change, `minValue`/`maxValue` compare the bounds the engine's `AS` conversion
  *    would leave, so a bound that only differs from the target after the conversion is still
- *    reported.
+ *    reported. A sequence's role owner and object privileges compare after `ownedBy`, as the
+ *    `owner` and `privileges` sequence fields, with canonical grant equality.
  * 5. View identities are merge-walked the same way, after every sequence change, and reported
  *    as a group in identity order: a baseline-only identity is `view-removed`, a target-only
  *    identity `view-added`, and a shared identity is compared on `materialized`, `definition`,
@@ -156,6 +168,10 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    field, reported value-carrying as `before` and `after`. The added and changed entries keep
  *    target name order and the removed entries baseline name order, so a model's array order
  *    never leaks into the result.
+ * 6a. Cluster-wide default privileges are compared as one canonical array after every extension
+ *    change: a differing array yields one `default-privileges-changed` carrying the target's
+ *    canonically ordered scopes, each scope's REVOKE before its GRANT. Source order never
+ *    matters, and `ALL` never compares equal to an explicit list.
  * 7. Comment changes are walked over the target model, after every extension change, and
  *    reported as a group in target identity order: the schema-qualified relation, then the
  *    target kind, then the member's name or identity. An entity the target removes contributes
@@ -232,6 +248,12 @@ export type Change =
       changes: readonly ExtensionFieldChange[];
     }
   /**
+   * Cluster-wide default privileges differ. The payload is the target's canonically ordered
+   * scopes: the plan emits one statement per scope, with REVOKE before GRANT, and no baseline
+   * lookup is needed.
+   */
+  | { kind: 'default-privileges-changed'; defaultPrivileges: readonly DefaultPrivilege[] }
+  /**
    * A comment differs, or the entity is new: `before`/`after` are the stored texts, a side
    * that states none omitted (a removal is `COMMENT … IS NULL`). Comment changes come last, in
    * target identity order, and the target is a copy without any carried node's own `comment`.
@@ -307,7 +329,11 @@ export type TableChange =
    * A table both sides have whose persistence differs; a side that states none is `LOGGED`,
    * the default, and is omitted.
    */
-  | { kind: 'persistence-changed'; before?: TablePersistence; after?: TablePersistence };
+  | { kind: 'persistence-changed'; before?: TablePersistence; after?: TablePersistence }
+  /** A table's role owner differs; a side that states none is omitted. */
+  | { kind: 'owner-changed'; before?: string; after?: string }
+  /** A table's canonical grant list differs; each side's list is an independent copy. */
+  | { kind: 'privileges-changed'; before?: readonly Grant[]; after?: readonly Grant[] };
 
 /**
  * One differing scalar field of a changed column; only fields that differ are reported, in
@@ -360,7 +386,7 @@ export type IdentityChange =
 /**
  * One differing option of a changed sequence; only fields that differ are reported, in the
  * fixed order `dataType`, `increment`, `minValue`, `maxValue`, `start`, `cache`, `cycle`,
- * `ownedBy`. A `minValue`/`maxValue` change reports the value in effect after the step's
+ * `ownedBy`, `owner`, `privileges`. A `minValue`/`maxValue` change reports the value in effect after the step's
  * `dataType` change — the engine rewrites a bound equal to the old type's bound to the new
  * type's — as `before`, flagged `converted` when the conversion is what produced it, so a
  * bound the target restores after that conversion is still reported and never reads as an
@@ -374,7 +400,9 @@ export type SequenceFieldChange =
   | { field: 'start'; before: string; after: string }
   | { field: 'cache'; before: string; after: string }
   | { field: 'cycle'; before: boolean; after: boolean }
-  | { field: 'ownedBy'; before?: SequenceOwner; after?: SequenceOwner };
+  | { field: 'ownedBy'; before?: SequenceOwner; after?: SequenceOwner }
+  | { field: 'owner'; before?: string; after?: string }
+  | { field: 'privileges'; before?: readonly Grant[]; after?: readonly Grant[] };
 
 /**
  * One differing field of a changed view; only fields that differ are reported, in the fixed
@@ -450,6 +478,7 @@ export function diff(baseline: Model, target: Model): readonly Change[] {
     ...diffViews(baseline, target),
     ...diffViewIndexesFor(baseline, target),
     ...diffExtensions(baseline, target),
+    ...diffDefaultPrivileges(baseline, target),
     ...diffComments(baseline, target),
   ];
 }
@@ -634,6 +663,23 @@ function diffExtensionFields(baseline: Extension, target: Extension): ExtensionF
     fields.push({ field: 'schema', before: baseline.schema, after: target.schema });
   }
   return fields;
+}
+
+/**
+ * Cluster-wide default privileges compare as one canonical array. Absence on both sides is no
+ * change; any difference emits one entry carrying the target's canonically ordered scopes.
+ */
+function diffDefaultPrivileges(baseline: Model, target: Model): readonly Change[] {
+  const before = baseline.defaultPrivileges ?? [];
+  const after = target.defaultPrivileges ?? [];
+  return sameDefaultPrivileges(before, after)
+    ? []
+    : [
+        {
+          kind: 'default-privileges-changed',
+          defaultPrivileges: canonicalDefaultPrivileges(after),
+        },
+      ];
 }
 
 /** A `comment-changed` entry, as the comment pass emits it. */
@@ -1034,6 +1080,22 @@ function diffSequenceFields(baseline: Sequence, target: Sequence): SequenceField
       ...(target.ownedBy === undefined ? {} : { after: copyOwner(target.ownedBy) }),
     });
   }
+  if (baseline.owner !== target.owner) {
+    fields.push({
+      field: 'owner',
+      ...(baseline.owner === undefined ? {} : { before: baseline.owner }),
+      ...(target.owner === undefined ? {} : { after: target.owner }),
+    });
+  }
+  if (!sameGrants(baseline.privileges ?? [], target.privileges ?? [])) {
+    fields.push({
+      field: 'privileges',
+      ...(baseline.privileges === undefined
+        ? {}
+        : { before: canonicalGrants(baseline.privileges) }),
+      ...(target.privileges === undefined ? {} : { after: canonicalGrants(target.privileges) }),
+    });
+  }
   return fields;
 }
 
@@ -1132,6 +1194,9 @@ function copySequence(sequence: Sequence): Sequence {
   return {
     ...sequence,
     ...(sequence.ownedBy === undefined ? {} : { ownedBy: copyOwner(sequence.ownedBy) }),
+    ...(sequence.privileges === undefined
+      ? {}
+      : { privileges: canonicalGrants(sequence.privileges) }),
   };
 }
 
@@ -1174,6 +1239,7 @@ function copyTable(table: Table): Table {
             .map(copyExclusionConstraint),
         }),
     indexes: [...table.indexes].sort(compareIndexesCanonically).map(copyIndex),
+    ...(table.privileges === undefined ? {} : { privileges: canonicalGrants(table.privileges) }),
   };
 }
 
@@ -1214,6 +1280,22 @@ function diffTable(
       kind: 'persistence-changed',
       ...(baseline.persistence === undefined ? {} : { before: baseline.persistence }),
       ...(target.persistence === undefined ? {} : { after: target.persistence }),
+    });
+  }
+  if (baseline.owner !== target.owner) {
+    changes.push({
+      kind: 'owner-changed',
+      ...(baseline.owner === undefined ? {} : { before: baseline.owner }),
+      ...(target.owner === undefined ? {} : { after: target.owner }),
+    });
+  }
+  if (!sameGrants(baseline.privileges ?? [], target.privileges ?? [])) {
+    changes.push({
+      kind: 'privileges-changed',
+      ...(baseline.privileges === undefined
+        ? {}
+        : { before: canonicalGrants(baseline.privileges) }),
+      ...(target.privileges === undefined ? {} : { after: canonicalGrants(target.privileges) }),
     });
   }
   return changes;

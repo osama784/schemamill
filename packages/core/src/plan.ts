@@ -7,14 +7,17 @@ import type {
   SequenceFieldChange,
 } from './diff.ts';
 import type { Identity } from './identity.ts';
+import { canonicalGrants, compareGrants } from './privileges.ts';
 import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
   Index,
   IndexOwner,
   Model,
@@ -42,7 +45,7 @@ import type {
  * partitions its steps into transaction groups, telling a renderer what applies as one unit;
  * hazards are a separate analysis.
  *
- * A step is one of thirty-six kinds. A schema the target's objects use but the baseline's do
+ * A step is one of forty kinds. A schema the target's objects use but the baseline's do
  * not becomes a create-schema step. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
@@ -72,6 +75,12 @@ import type {
  * add-exclusion-constraint step; and a removed, added, or changed index becomes a drop-index
  * and/or create-index step. A changed primary key, foreign key, unique constraint, check
  * constraint, exclusion constraint, or index decomposes into its drop half and its add half.
+ * A role-owner change becomes an `alter-owner` step carrying the object identity and the target
+ * role. A privilege change becomes one `revoke` step per grant only in the baseline, in table
+ * phase 3b, and one `grant` step per grant only in the target, in table phase 18b; a grant
+ * present on both sides is never re-sent, `ALL` is never compared against an explicit list, and
+ * removing an object suppresses its revokes because a removed object emits no table change.
+ * A changed sequence's role owner and grants take the same steps with a sequence identity.
  *
  * The concurrent index kinds are the plan's only non-transactional steps. A create step is
  * `create-index-concurrently` exactly when the target index states `concurrently: true`; a
@@ -89,8 +98,9 @@ import type {
  * removes the table or column that owned it: PostgreSQL drops an owned sequence together with
  * its owner, so an explicit drop is suppressed — but only then. A changed sequence maps field
  * by field: an ownership change becomes an ownership alter-sequence step in one of the two
- * ownership phases, and every other changed field becomes an option alter-sequence step,
- * carrying only the fields that differ.
+ * ownership phases, a role-owner or privilege change becomes an alter-owner/grant/revoke step on
+ * the sequence, and every other changed field becomes an option alter-sequence step, carrying
+ * only the fields that differ.
  *
  * A view addition becomes a create-view step carrying the view as stored; a view removal
  * becomes a drop-view step carrying the baseline identity and whether it was materialized. A
@@ -118,7 +128,13 @@ import type {
  * comment step right after its create when the target node states a comment, because the drop
  * took the old one away; the plan then keeps one step per target, first occurrence wins.
  *
- * The final sequence is the concatenation of thirteen global phases, in this exact order:
+ * Cluster-wide default privileges map to one `alter-default-privileges` step per target scope,
+ * in canonical order: REVOKE before GRANT within a scope, so a scope's revoke cannot erase its
+ * grant. Roles are opaque names the plan does not validate; a missing role fails at apply with
+ * PostgreSQL's error, consistent with the plan's other in-model assumptions.
+ *
+ * The final sequence is the concatenation of thirteen global phases plus lettered inserts, in
+ * this exact order:
  *
  * 1. create-schema, then create-extension — every schema the target uses that no baseline
  *    object uses, in name order, then every added extension, in name order, before everything
@@ -156,6 +172,9 @@ import type {
  *    whose target ownership differs from its baseline one and whose baseline owner is not
  *    removed in phase 4: a new owner after a phase-4 detach, a new owner over a surviving
  *    baseline one, or a detach when the target drops ownership but keeps the owner;
+ * 8a. alter-default-privileges — one step per target default-privilege scope, after sequence
+ *    ownership attaches and before sequence option alters. A scope's REVOKE renders before its
+ *    GRANT, so a re-tested grant cannot be erased by the revoke that precedes it;
  * 9. sequence option alters — one alter-sequence step per changed sequence, carrying its
  *    non-ownership field changes in the diff's fixed order, so each step can be applied in one
  *    statement without passing through an invalid intermediate state;
@@ -184,8 +203,8 @@ import type {
  * only when its column survives — a removed column or table carries its identity away in that
  * drop — so every collected drop-identity names an owner that still exists.
  *
- * The table phases inside phase 6 keep their documented semantics; phases 3a and 16a are the
- * two exclusion phases:
+ * The table phases inside phase 6 keep their documented semantics; the lettered phases 3a and
+ * 16a hold the exclusion constraints, 3b the revokes, and 18b the grants and role owners:
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
@@ -194,6 +213,9 @@ import type {
  * 3. drop-check-constraint — likewise, before the table and column drops;
  * 3a. drop-exclusion-constraint — its own distinct phase, immediately after check drops and
  *     before the unique drops;
+ * 3b. revoke — one step per grant a kept table or sequence carries in the baseline but not the
+ *     target, immediately after the exclusion drops and before phase 4. Removed objects emit no
+ *     revoke: the object's drop takes its privileges with it;
  * 4. drop-unique-constraint — likewise, before the table and column drops;
  * 5. drop-table — dependency-ordered among themselves, see below. Removed tables go before the
  *    primary-key and column drops, so a constraint a removed table still holds on a kept
@@ -221,7 +243,10 @@ import type {
  *     before index creates;
  * 17. create-index — after its columns exist; the concurrent variant stands alone;
  * 18. add-foreign-key — last, once both the table and the referenced table exist, with the
- *     synthesized primary-key dependents after the diff-derived adds.
+ *     synthesized primary-key dependents after the diff-derived adds;
+ * 18b. grant, then alter-owner — one grant per grant only in the target and one role-owner alter
+ *     per changed table or sequence, after every add-foreign-key so the object and its grants
+ *     exist before the privileges are asserted.
  *
  * Within a phase, steps keep the relative order the diff produced: table and sequence changes
  * in identity order, and inside a changed table the diff's documented member order. A table
@@ -345,6 +370,14 @@ export type CommentTarget =
       readonly table: TableIdentity;
       readonly foreignKey: ForeignKey;
     };
+
+/**
+ * The object a privilege step addresses: a table or a sequence. Both carry opaque role names
+ * and neither is a grantor — non-owner grantors stay named import skips.
+ */
+export type ObjectPrivilegeTarget =
+  | { readonly kind: 'table'; readonly table: TableIdentity }
+  | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity };
 
 /** One planned action. */
 export type Step =
@@ -474,6 +507,14 @@ export type Step =
    * `CREATE OR REPLACE VIEW`. Never materialized: a materialized view is dropped and created.
    */
   | { kind: 'replace-view'; view: View }
+  /** The target's role owner on a table or sequence, as an opaque role name. */
+  | { kind: 'alter-owner'; object: ObjectPrivilegeTarget; owner: string }
+  /** One grant only the target carries, on a table or sequence. */
+  | { kind: 'grant'; object: ObjectPrivilegeTarget; grant: Grant }
+  /** One grant only the baseline carries, on a kept table or sequence. */
+  | { kind: 'revoke'; object: ObjectPrivilegeTarget; grant: Grant }
+  /** One target default-privilege scope; a revoke scope renders before any grant scope. */
+  | { kind: 'alter-default-privileges'; privilege: DefaultPrivilege }
   /**
    * The target's comment on `target`, or the comment's removal when `text` is absent
    * (`COMMENT … IS NULL`). `text` is the single source of the rendered value: the copied
@@ -535,6 +576,10 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'create-extension': true,
   'alter-extension': true,
   'drop-extension': true,
+  'alter-owner': true,
+  grant: true,
+  revoke: true,
+  'alter-default-privileges': true,
   comment: true,
 };
 
@@ -796,6 +841,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.indexDrops,
     ...application.checkConstraintDrops,
     ...application.exclusionConstraintDrops,
+    ...application.revokeSteps,
     ...application.uniqueConstraintDrops,
     ...tableDrops,
     ...application.primaryKeyDrops,
@@ -813,10 +859,13 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.indexCreates,
     ...application.foreignKeyAdds,
     ...dependentKeyAdds,
+    ...application.grantSteps,
+    ...application.ownerAlters,
     ...application.viewCreates,
     ...application.viewReplaces,
     ...application.viewIndexCreates,
     ...ownershipAttaches,
+    ...application.defaultPrivilegeSteps,
     ...application.optionAlters,
     ...sequenceDrops,
     ...application.identityAdds,
@@ -884,6 +933,14 @@ export interface ChangeApplication {
   readonly viewIndexCreates: Step[];
   /** Changed plain views, applied with `CREATE OR REPLACE VIEW` after the table phases. */
   readonly viewReplaces: Step[];
+  /** Baseline-only grants on kept tables and sequences, in table phase 3b. */
+  readonly revokeSteps: Step[];
+  /** Target-only grants on tables and sequences, in table phase 18b. */
+  readonly grantSteps: Step[];
+  /** Role-owner alters on tables and sequences, in table phase 18b after the grants. */
+  readonly ownerAlters: Step[];
+  /** Target default-privilege scopes, in global phase 8a. */
+  readonly defaultPrivilegeSteps: Step[];
   /**
    * Every comment step: the diff's `comment-changed` changes and the recreate re-assertions
    * alike. `plan` keeps this bucket out of every other one, so the terminal phase owns every
@@ -939,6 +996,10 @@ export function emptyChangeApplication(): ChangeApplication {
     viewCreates: [],
     viewIndexCreates: [],
     viewReplaces: [],
+    revokeSteps: [],
+    grantSteps: [],
+    ownerAlters: [],
+    defaultPrivilegeSteps: [],
     comments: [],
     ownershipChanges: [],
     removedSequences: [],
@@ -952,6 +1013,60 @@ export function emptyChangeApplication(): ChangeApplication {
  * loop, with the same copies and in the same order. Internal test seam, see
  * `ChangeApplication`.
  */
+/** An independent copy of a privilege step's object identity. */
+function copyPrivilegeTarget(object: ObjectPrivilegeTarget): ObjectPrivilegeTarget {
+  return object.kind === 'table'
+    ? { kind: 'table', table: copyIdentity(object.table) }
+    : { kind: 'sequence', sequence: copySequenceIdentity(object.sequence) };
+}
+
+/**
+ * Emits one revoke per baseline-only grant and one grant per target-only grant. Both lists are
+ * canonical, so equality uses the shared grant comparator: `ALL` and an explicit list stay
+ * distinct, and a grant present on both sides is never re-sent.
+ */
+function addPrivilegeSteps(
+  application: ChangeApplication,
+  object: ObjectPrivilegeTarget,
+  before: readonly Grant[] | undefined,
+  after: readonly Grant[] | undefined,
+): void {
+  const baseline = before ?? [];
+  const target = after ?? [];
+  for (const grant of baseline) {
+    if (!target.some((candidate) => compareGrants(candidate, grant) === 0)) {
+      application.revokeSteps.push({
+        kind: 'revoke',
+        object: copyPrivilegeTarget(object),
+        grant: copyStepPayload(grant),
+      });
+    }
+  }
+  for (const grant of target) {
+    if (!baseline.some((candidate) => compareGrants(candidate, grant) === 0)) {
+      application.grantSteps.push({
+        kind: 'grant',
+        object: copyPrivilegeTarget(object),
+        grant: copyStepPayload(grant),
+      });
+    }
+  }
+}
+
+/** Emits a target role-owner alter when the target states one; removing an owner is a no-op. */
+function addOwnerStep(
+  application: ChangeApplication,
+  object: ObjectPrivilegeTarget,
+  owner: string | undefined,
+): void {
+  if (owner === undefined) return;
+  application.ownerAlters.push({
+    kind: 'alter-owner',
+    object: copyPrivilegeTarget(object),
+    owner,
+  });
+}
+
 export function applyChange(application: ChangeApplication, change: Change): void {
   switch (change.kind) {
     case 'table-removed': {
@@ -1354,6 +1469,19 @@ export function applyChange(application: ChangeApplication, change: Change): voi
             });
             break;
           }
+          case 'owner-changed': {
+            addOwnerStep(application, { kind: 'table', table: change.table }, tableChange.after);
+            break;
+          }
+          case 'privileges-changed': {
+            addPrivilegeSteps(
+              application,
+              { kind: 'table', table: change.table },
+              tableChange.before,
+              tableChange.after,
+            );
+            break;
+          }
           default:
             assertNever(tableChange, 'table change kind');
         }
@@ -1402,6 +1530,21 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           case 'cache':
           case 'cycle':
             options.push(copyStepPayload(field));
+            break;
+          case 'owner':
+            addOwnerStep(
+              application,
+              { kind: 'sequence', sequence: copySequenceIdentity(identity) },
+              field.after,
+            );
+            break;
+          case 'privileges':
+            addPrivilegeSteps(
+              application,
+              { kind: 'sequence', sequence: copySequenceIdentity(identity) },
+              field.before,
+              field.after,
+            );
             break;
           default:
             assertNever(field, 'sequence field');
@@ -1517,6 +1660,15 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           kind: 'alter-extension',
           extension: copyExtensionIdentity(change.extension),
           fields,
+        });
+      }
+      break;
+    }
+    case 'default-privileges-changed': {
+      for (const privilege of change.defaultPrivileges) {
+        application.defaultPrivilegeSteps.push({
+          kind: 'alter-default-privileges',
+          privilege: copyStepPayload(privilege),
         });
       }
       break;
@@ -1990,6 +2142,10 @@ function copySequenceWithoutOwner(sequence: Sequence): Sequence {
     start: sequence.start,
     cache: sequence.cache,
     cycle: sequence.cycle,
+    ...(sequence.owner === undefined ? {} : { owner: sequence.owner }),
+    ...(sequence.privileges === undefined
+      ? {}
+      : { privileges: canonicalGrants(sequence.privileges) }),
     ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
   };
 }
@@ -2020,6 +2176,8 @@ function copyTableForCreate(table: Table): Table {
     columns: table.columns.map(copyColumn),
     ...(table.primaryKey === undefined ? {} : { primaryKey: copyPrimaryKey(table.primaryKey) }),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.owner === undefined ? {} : { owner: table.owner }),
+    ...(table.privileges === undefined ? {} : { privileges: canonicalGrants(table.privileges) }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
     foreignKeys: [],
     uniqueConstraints: [],

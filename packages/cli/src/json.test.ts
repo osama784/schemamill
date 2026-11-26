@@ -9,11 +9,13 @@ import type {
   CheckConstraint,
   Column,
   CommentTarget,
+  DefaultPrivilege,
   Diagnostic,
   ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
   Hazard,
   HazardEntity,
   Identity,
@@ -79,6 +81,19 @@ const EXCLUSION_CONSTRAINT: ExclusionConstraint = {
   deferrable: true,
 };
 const INDEX: Index = { unique: false, columns: ['id'] };
+const GRANT: Grant = {
+  grantee: 'app_user',
+  privileges: ['SELECT'],
+  columns: ['email'],
+  grantOption: true,
+};
+const DEFAULT_PRIVILEGE: DefaultPrivilege = {
+  roles: ['postgres'],
+  schemas: ['app'],
+  objectType: 'table',
+  kind: 'grant',
+  grants: [GRANT],
+};
 const IDENTITY: Identity = {
   generated: 'always',
   increment: '1',
@@ -98,6 +113,8 @@ const SEQUENCE: Sequence = {
   start: '1',
   cache: '1',
   cycle: false,
+  owner: 'postgres',
+  privileges: [GRANT],
 };
 const VIEW: View = {
   schema: 'public',
@@ -116,6 +133,8 @@ const TABLE: Table = {
   exclusionConstraints: [EXCLUSION_CONSTRAINT],
   indexes: [INDEX],
   persistence: 'unlogged',
+  owner: 'postgres',
+  privileges: [GRANT],
 };
 const TABLE_OWNER: IndexOwner = { kind: 'table', table: TABLE_ID };
 const MATVIEW_OWNER: IndexOwner = { kind: 'materialized-view', view: VIEW_ID };
@@ -183,6 +202,8 @@ const TABLE_CHANGES: readonly TableChange[] = [
   { kind: 'index-removed', index: INDEX },
   { kind: 'index-changed', before: INDEX, after: INDEX },
   { kind: 'persistence-changed', before: 'unlogged' },
+  { kind: 'owner-changed', before: 'postgres', after: 'app' },
+  { kind: 'privileges-changed', before: [GRANT], after: [GRANT] },
 ];
 
 /** One instance of every `Change` kind, plus one `comment-changed` per `CommentTarget` kind. */
@@ -200,7 +221,13 @@ const CHANGES: readonly Change[] = [
       { field: 'cycle', before: false, after: true },
       { field: 'maxValue', before: '1', after: '2', converted: true },
       { field: 'ownedBy', after: { table: TABLE_ID, column: 'id' } },
+      { field: 'owner', before: 'postgres', after: 'app' },
+      { field: 'privileges', before: [GRANT], after: [GRANT] },
     ],
+  },
+  {
+    kind: 'default-privileges-changed',
+    defaultPrivileges: [DEFAULT_PRIVILEGE],
   },
   { kind: 'view-added', view: VIEW },
   { kind: 'view-removed', view: VIEW },
@@ -293,6 +320,14 @@ const STEPS: readonly Step[] = [
   { kind: 'create-view', view: VIEW },
   { kind: 'drop-view', view: VIEW_ID, materialized: true },
   { kind: 'replace-view', view: VIEW },
+  {
+    kind: 'alter-owner',
+    object: { kind: 'table', table: TABLE_ID },
+    owner: 'app',
+  },
+  { kind: 'grant', object: { kind: 'table', table: TABLE_ID }, grant: GRANT },
+  { kind: 'revoke', object: { kind: 'sequence', sequence: SEQUENCE_ID }, grant: GRANT },
+  { kind: 'alter-default-privileges', privilege: DEFAULT_PRIVILEGE },
   ...COMMENT_TARGETS.map((target): Step => ({ kind: 'comment', target, text: 'a comment' })),
 ];
 
@@ -440,6 +475,7 @@ const CHANGE_KEYS: Record<Change['kind'], readonly string[]> = {
   'extension-added': ['kind', 'extension'],
   'extension-removed': ['kind', 'extension'],
   'extension-changed': ['kind', 'extension', 'changes'],
+  'default-privileges-changed': ['kind', 'defaultPrivileges'],
   'comment-changed': ['kind', 'target', 'before?', 'after?'],
 };
 
@@ -466,6 +502,8 @@ const TABLE_CHANGE_KEYS: Record<TableChange['kind'], readonly string[]> = {
   'index-removed': ['kind', 'index'],
   'index-changed': ['kind', 'before', 'after'],
   'persistence-changed': ['kind', 'before?', 'after?'],
+  'owner-changed': ['kind', 'before?', 'after?'],
+  'privileges-changed': ['kind', 'before?', 'after?'],
 };
 
 const STEP_KEYS: Record<Step['kind'], readonly string[]> = {
@@ -504,6 +542,10 @@ const STEP_KEYS: Record<Step['kind'], readonly string[]> = {
   'create-view': ['kind', 'view'],
   'drop-view': ['kind', 'view', 'materialized'],
   'replace-view': ['kind', 'view'],
+  'alter-owner': ['kind', 'object', 'owner'],
+  grant: ['kind', 'object', 'grant'],
+  revoke: ['kind', 'object', 'grant'],
+  'alter-default-privileges': ['kind', 'privilege'],
   comment: ['kind', 'target', 'text?'],
 };
 
@@ -541,6 +583,11 @@ const HAZARD_ENTITY_KEYS: Record<HazardEntity['kind'], readonly string[]> = {
 const INDEX_OWNER_KEYS: Record<IndexOwner['kind'], readonly string[]> = {
   table: ['kind', 'table'],
   'materialized-view': ['kind', 'view'],
+};
+
+const PRIVILEGE_OBJECT_KEYS: Record<string, readonly string[]> = {
+  table: ['kind', 'table'],
+  sequence: ['kind', 'sequence'],
 };
 
 const DIAGNOSTIC_KEYS: Record<Diagnostic['kind'], readonly string[]> = {
@@ -671,6 +718,18 @@ const ALLOWED_KEYS = new Set<string>([
   'concurrently',
   'dataType',
   'ownedBy',
+  'owner',
+  'privileges',
+  'defaultPrivileges',
+  'privilege',
+  'grant',
+  'grants',
+  'grantee',
+  'grantOption',
+  'objectType',
+  'object',
+  'roles',
+  'schemas',
   'materialized',
   'definition',
   'checkOption',
@@ -798,10 +857,14 @@ test('every documented kind maps with exact recursive keys and the fixtures cove
   assertKinds(
     [...changes, ...steps]
       .map((dto) => fieldOf(dto, 'owner'))
-      .filter((value) => value !== undefined) as object[],
+      .filter((value) => typeof value === 'object' && value !== null),
     INDEX_OWNER_KEYS,
     'index owner',
   );
+  const privilegeObjects = [...changes, ...steps]
+    .map((dto) => fieldOf(dto, 'object'))
+    .filter((value) => typeof value === 'object' && value !== null);
+  assertKinds(privilegeObjects, PRIVILEGE_OBJECT_KEYS, 'privilege object');
 
   assertCoverage(changes.map(kindOf), CHANGE_KEYS, 'change');
   assertCoverage(tableChangesOf(changes).map(kindOf), TABLE_CHANGE_KEYS, 'table change');
@@ -814,14 +877,14 @@ test('every documented kind maps with exact recursive keys and the fixtures cove
     'hazard entity',
   );
   assertCoverage(
-    (
-      [...changes, ...steps]
-        .map((dto) => fieldOf(dto, 'owner'))
-        .filter((value) => value !== undefined) as object[]
-    ).map(kindOf),
+    [...changes, ...steps]
+      .map((dto) => fieldOf(dto, 'owner'))
+      .filter((value) => typeof value === 'object' && value !== null)
+      .map(kindOf),
     INDEX_OWNER_KEYS,
     'index owner',
   );
+  assertCoverage(privilegeObjects.map(kindOf), PRIVILEGE_OBJECT_KEYS, 'privilege object');
 
   // No internal field leaks anywhere in either document.
   assert.deepEqual(

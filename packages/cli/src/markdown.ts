@@ -1,8 +1,11 @@
+import { canonicalDefaultPrivileges } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
+  DefaultPrivilege,
   Extension,
   ForeignKey,
+  Grant,
   Identity,
   Index,
   Model,
@@ -241,10 +244,33 @@ function renderIndexes(out: MarkdownBuilder, indexes: readonly Index[]): void {
   for (const index of sorted(indexes, compareIndexes)) out.bullet(renderIndex(index));
 }
 
+/** One grant as compact text: grantee and columns, then the declared privileges. */
+function renderGrant(grant: Grant): string {
+  const privileges = grant.privileges === 'ALL' ? 'ALL' : grant.privileges.join(', ');
+  const columns = grant.columns === undefined ? '' : ` (${grant.columns.join(', ')})`;
+  const option = grant.grantOption === true ? ' with grant option' : '';
+  return `${grant.grantee}${columns}: ${privileges}${option}`;
+}
+
+/** A default-privilege scope as one bullet, with roles, schemas, action, and grants. */
+function renderDefaultPrivilege(privilege: DefaultPrivilege): string {
+  const roles = privilege.roles === undefined ? '' : ` for ${privilege.roles.join(', ')}`;
+  const schemas = privilege.schemas === undefined ? '' : ` in ${privilege.schemas.join(', ')}`;
+  return (
+    `${privilege.kind}${roles}${schemas} on ${privilege.objectType}s: ` +
+    privilege.grants.map(renderGrant).join('; ')
+  );
+}
+
 function renderTable(out: MarkdownBuilder, table: Table): void {
   out.heading(3, `Table ${qualified(table.schema, table.name)}`);
   if (table.comment !== undefined) out.bullet(`Comment: ${fmt(table.comment)}`);
   if (table.persistence !== undefined) out.bullet(`Persistence: ${fmt(table.persistence)}`);
+  if (table.owner !== undefined) out.bullet(`Owner: ${fmt(table.owner)}`);
+  if (table.privileges !== undefined && table.privileges.length > 0) {
+    out.heading(4, 'Privileges');
+    for (const grant of table.privileges) out.bullet(renderGrant(grant));
+  }
 
   if (table.columns.length > 0) {
     out.heading(4, 'Columns');
@@ -305,6 +331,11 @@ function renderSequence(out: MarkdownBuilder, sequence: Sequence): void {
       `owned by: ${codeSpan(`${owner.table.schema}.${owner.table.name}.${owner.column}`)}`,
     );
   }
+  if (sequence.owner !== undefined) out.bullet(`owner: ${fmt(sequence.owner)}`);
+  if (sequence.privileges !== undefined && sequence.privileges.length > 0) {
+    out.heading(4, 'Privileges');
+    for (const grant of sequence.privileges) out.bullet(renderGrant(grant));
+  }
   if (sequence.comment !== undefined) out.bullet(`comment: ${fmt(sequence.comment)}`);
 }
 
@@ -352,6 +383,12 @@ export function renderMarkdown(model: Model): string {
   if (extensions.length > 0) {
     out.heading(2, 'Extensions');
     for (const extension of extensions) renderExtension(out, extension);
+  }
+  if (model.defaultPrivileges !== undefined && model.defaultPrivileges.length > 0) {
+    out.heading(2, 'Default privileges');
+    for (const privilege of canonicalDefaultPrivileges(model.defaultPrivileges)) {
+      out.bullet(renderDefaultPrivilege(privilege));
+    }
   }
 
   return out.finish();

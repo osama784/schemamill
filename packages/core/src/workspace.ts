@@ -4,15 +4,18 @@ import type { Stats } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 import type { Identity, IdentityGeneration } from './identity.ts';
+import { canonicalDefaultPrivileges, canonicalGrants } from './privileges.ts';
 import type {
   CheckConstraint,
   Column,
   ColumnCompression,
   ColumnStorage,
   ConstraintEnforcement,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ForeignKey,
+  Grant,
   Index,
   IndexElement,
   Model,
@@ -270,8 +273,9 @@ export async function initWorkspace(
  * `model` as the canonical model file text: entities rebuilt in their declaration order with
  * `undefined` optionals omitted, `tables`, `sequences`, `views`, and `extensions` re-sorted into
  * canonical order (schema then name for the first three, name alone for extensions, JavaScript
- * string comparison), nested arrays kept as stored, two-space JSON, and a trailing newline.
- * `views` always follows `sequences`, and `extensions` always follows `views`. Deterministic:
+ * string comparison), grant and default-privilege lists re-sorted canonically, other nested arrays
+ * kept as stored, two-space JSON, and a trailing newline. `views` always follows `sequences`,
+ * `extensions` always follows `views`, and optional `defaultPrivileges` comes last. Deterministic:
  * one model always serializes to the same bytes.
  *
  * The public read-only projection: `schemamill export --format json` prints exactly these bytes.
@@ -283,6 +287,13 @@ export function serializeModel(model: Model): string {
     sequences: [...model.sequences].sort(compareNames).map(serializeSequence),
     views: [...model.views].sort(compareNames).map(serializeView),
     extensions: [...model.extensions].sort(compareExtensions).map(serializeExtension),
+    ...(model.defaultPrivileges === undefined
+      ? {}
+      : {
+          defaultPrivileges: canonicalDefaultPrivileges(model.defaultPrivileges).map(
+            serializeDefaultPrivilege,
+          ),
+        }),
   };
   return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -436,6 +447,10 @@ function serializeTable(table: Table): object {
       : { exclusionConstraints: table.exclusionConstraints.map(serializeExclusionConstraint) }),
     indexes: table.indexes.map(serializeIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.owner === undefined ? {} : { owner: table.owner }),
+    ...(table.privileges === undefined
+      ? {}
+      : { privileges: canonicalGrants(table.privileges).map(serializeGrant) }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
   };
 }
@@ -558,7 +573,32 @@ function serializeSequence(sequence: Sequence): object {
     cache: sequence.cache,
     cycle: sequence.cycle,
     ...(sequence.ownedBy === undefined ? {} : { ownedBy: serializeOwner(sequence.ownedBy) }),
+    ...(sequence.owner === undefined ? {} : { owner: sequence.owner }),
+    ...(sequence.privileges === undefined
+      ? {}
+      : { privileges: canonicalGrants(sequence.privileges).map(serializeGrant) }),
     ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
+  };
+}
+
+/** A grant: the marker or a copied privilege list, copied columns, then the grant option. */
+function serializeGrant(grant: Grant): object {
+  return {
+    grantee: grant.grantee,
+    privileges: grant.privileges === 'ALL' ? 'ALL' : [...grant.privileges],
+    ...(grant.columns === undefined ? {} : { columns: [...grant.columns] }),
+    ...(grant.grantOption === undefined ? {} : { grantOption: grant.grantOption }),
+  };
+}
+
+/** A default-privilege scope: optional roles and schemas, then the action and its grants. */
+function serializeDefaultPrivilege(privilege: DefaultPrivilege): object {
+  return {
+    ...(privilege.roles === undefined ? {} : { roles: [...privilege.roles] }),
+    ...(privilege.schemas === undefined ? {} : { schemas: [...privilege.schemas] }),
+    objectType: privilege.objectType,
+    kind: privilege.kind,
+    grants: canonicalGrants(privilege.grants).map(serializeGrant),
   };
 }
 
@@ -607,7 +647,7 @@ function invalid(message: string): ParseFailure {
   return { ok: false, message };
 }
 
-const MODEL_KEYS = ['tables', 'sequences', 'views', 'extensions'] as const;
+const MODEL_KEYS = ['tables', 'sequences', 'views', 'extensions', 'defaultPrivileges'] as const;
 const TABLE_KEYS = [
   'schema',
   'name',
@@ -619,8 +659,12 @@ const TABLE_KEYS = [
   'exclusionConstraints',
   'indexes',
   'persistence',
+  'owner',
+  'privileges',
   'comment',
 ] as const;
+const GRANT_KEYS = ['grantee', 'privileges', 'columns', 'grantOption'] as const;
+const DEFAULT_PRIVILEGE_KEYS = ['roles', 'schemas', 'objectType', 'kind', 'grants'] as const;
 const COLUMN_KEYS = [
   'name',
   'type',
@@ -689,6 +733,8 @@ const SEQUENCE_KEYS = [
   'cache',
   'cycle',
   'ownedBy',
+  'owner',
+  'privileges',
   'comment',
 ] as const;
 const OWNER_KEYS = ['table', 'column'] as const;
@@ -717,6 +763,11 @@ const TABLE_PERSISTENCES: readonly TablePersistence[] = ['unlogged'];
 const VIEW_CHECK_OPTIONS: readonly ViewCheckOption[] = ['local', 'cascaded'];
 const COLUMN_STORAGES: readonly ColumnStorage[] = ['plain', 'external', 'extended', 'main'];
 const COLUMN_COMPRESSIONS: readonly ColumnCompression[] = ['pglz', 'lz4'];
+const DEFAULT_PRIVILEGE_OBJECT_TYPES: readonly DefaultPrivilege['objectType'][] = [
+  'table',
+  'sequence',
+];
+const DEFAULT_PRIVILEGE_KINDS: readonly DefaultPrivilege['kind'][] = ['grant', 'revoke'];
 
 /** Canonical integer string form: optional minus, no leading zeros, `-0` excluded. */
 const CANONICAL_INTEGER = /^(0|-?[1-9][0-9]*)$/;
@@ -749,11 +800,20 @@ function parseModel(value: unknown): Parsed<Model> {
         ? parsed<Extension[]>([])
         : parseArrayOf(object.extensions, 'extensions', parseExtension);
     if (!extensions.ok) return extensions;
+    const defaultPrivileges = parseOptional(
+      object.defaultPrivileges,
+      fieldPath('', 'defaultPrivileges'),
+      (value, at) => parseArrayOf(value, at, parseDefaultPrivilege),
+    );
+    if (!defaultPrivileges.ok) return defaultPrivileges;
     return parsed({
       tables: tables.value,
       sequences: sequences.value,
       views: views.value,
       extensions: extensions.value,
+      ...(defaultPrivileges.value === undefined
+        ? {}
+        : { defaultPrivileges: canonicalDefaultPrivileges(defaultPrivileges.value) }),
     });
   });
 }
@@ -940,6 +1000,14 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       parseTablePersistence,
     );
     if (!persistence.ok) return persistence;
+    const owner = parseOptional(object.owner, fieldPath(path, 'owner'), parseNonEmptyString);
+    if (!owner.ok) return owner;
+    const privileges = parseOptional(
+      object.privileges,
+      fieldPath(path, 'privileges'),
+      (value, at) => parseArrayOf(value, at, parseGrant),
+    );
+    if (!privileges.ok) return privileges;
     const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
     if (!comment.ok) return comment;
     return parsed({
@@ -955,7 +1023,79 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
         : { exclusionConstraints: exclusionConstraints.value }),
       indexes: indexes.value,
       ...(persistence.value === undefined ? {} : { persistence: persistence.value }),
+      ...(owner.value === undefined ? {} : { owner: owner.value }),
+      ...(privileges.value === undefined ? {} : { privileges: canonicalGrants(privileges.value) }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
+    });
+  });
+}
+
+/**
+ * One grant: `ALL` is the marker the source used when it omitted the privilege list, and an
+ * explicit list is kept as written. The two spellings stay distinct — `ALL` is never expanded and
+ * a complete-looking list is never collapsed into it.
+ */
+function parseGrant(value: unknown, path: string): Parsed<Grant> {
+  return parseObject(value, path, GRANT_KEYS, (object) => {
+    const grantee = parseNonEmptyString(object.grantee, fieldPath(path, 'grantee'));
+    if (!grantee.ok) return grantee;
+    const privileges =
+      object.privileges === 'ALL'
+        ? parsed<Grant['privileges']>('ALL')
+        : parseNonEmptyStringArray(object.privileges, fieldPath(path, 'privileges'));
+    if (!privileges.ok) return privileges;
+    const columns = parseOptional(object.columns, fieldPath(path, 'columns'), (value, at) =>
+      parseNonEmptyStringArray(value, at),
+    );
+    if (!columns.ok) return columns;
+    const grantOption = parseOptional(
+      object.grantOption,
+      fieldPath(path, 'grantOption'),
+      parseBoolean,
+    );
+    if (!grantOption.ok) return grantOption;
+    return parsed({
+      grantee: grantee.value,
+      privileges: privileges.value,
+      ...(columns.value === undefined ? {} : { columns: columns.value }),
+      ...(grantOption.value === undefined ? {} : { grantOption: grantOption.value }),
+    });
+  });
+}
+
+/** One default-privilege scope. An empty scope or grant list is not a statement and fails closed. */
+function parseDefaultPrivilege(value: unknown, path: string): Parsed<DefaultPrivilege> {
+  return parseObject(value, path, DEFAULT_PRIVILEGE_KEYS, (object) => {
+    const roles = parseOptional(object.roles, fieldPath(path, 'roles'), (value, at) =>
+      parseNonEmptyStringArray(value, at),
+    );
+    if (!roles.ok) return roles;
+    const schemas = parseOptional(object.schemas, fieldPath(path, 'schemas'), (value, at) =>
+      parseNonEmptyStringArray(value, at),
+    );
+    if (!schemas.ok) return schemas;
+    const objectType = parseEnum(
+      object.objectType,
+      fieldPath(path, 'objectType'),
+      DEFAULT_PRIVILEGE_OBJECT_TYPES,
+      'default privilege object type',
+    );
+    if (!objectType.ok) return objectType;
+    const kind = parseEnum(
+      object.kind,
+      fieldPath(path, 'kind'),
+      DEFAULT_PRIVILEGE_KINDS,
+      'default privilege kind',
+    );
+    if (!kind.ok) return kind;
+    const grants = parseArrayOf(object.grants, fieldPath(path, 'grants'), parseGrant);
+    if (!grants.ok) return grants;
+    return parsed({
+      ...(roles.value === undefined ? {} : { roles: roles.value }),
+      ...(schemas.value === undefined ? {} : { schemas: schemas.value }),
+      objectType: objectType.value,
+      kind: kind.value,
+      grants: canonicalGrants(grants.value),
     });
   });
 }
@@ -1334,6 +1474,14 @@ function parseSequence(value: unknown, path: string): Parsed<Sequence> {
     if (!cycle.ok) return cycle;
     const ownedBy = parseOptional(object.ownedBy, fieldPath(path, 'ownedBy'), parseOwner);
     if (!ownedBy.ok) return ownedBy;
+    const owner = parseOptional(object.owner, fieldPath(path, 'owner'), parseNonEmptyString);
+    if (!owner.ok) return owner;
+    const privileges = parseOptional(
+      object.privileges,
+      fieldPath(path, 'privileges'),
+      (value, at) => parseArrayOf(value, at, parseGrant),
+    );
+    if (!privileges.ok) return privileges;
     const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
     if (!comment.ok) return comment;
     return parsed({
@@ -1347,6 +1495,8 @@ function parseSequence(value: unknown, path: string): Parsed<Sequence> {
       cache: cache.value,
       cycle: cycle.value,
       ...(ownedBy.value === undefined ? {} : { ownedBy: ownedBy.value }),
+      ...(owner.value === undefined ? {} : { owner: owner.value }),
+      ...(privileges.value === undefined ? {} : { privileges: canonicalGrants(privileges.value) }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });

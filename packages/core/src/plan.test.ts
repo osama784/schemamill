@@ -28,9 +28,11 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ForeignKey,
+  Grant,
   Index,
   IndexElement,
   Model,
@@ -44,12 +46,18 @@ import type {
   UniqueConstraint,
   View,
 } from './model.ts';
-import type { ChangeApplication, CommentTarget, Step, TransactionGroup } from './plan.ts';
+import type {
+  ChangeApplication,
+  CommentTarget,
+  ObjectPrivilegeTarget,
+  Step,
+  TransactionGroup,
+} from './plan.ts';
 import { applyChange, emptyChangeApplication, groupSteps, TRANSACTIONAL } from './plan.ts';
 
 /**
- * Tests for the migration plan: the thirteen global phases with the eighteen table phases at their
- * center, dependency-ordered table drops, cycle breaking, primary-key changes that set
+ * Tests for the migration plan: the thirteen global phases and their lettered inserts with the
+ * eighteen table phases at their center, dependency-ordered table drops, cycle breaking, primary-key changes that set
  * surviving foreign keys aside, sequence ownership detaches and drop suppression, identity
  * drops, additions, alters and conversions, transaction grouping, determinism, and a
  * dependency-invariant simulator run over hand-built cases and seeded pseudo-random model
@@ -308,6 +316,8 @@ interface SimulatedTable {
   readonly exclusionConstraints: Mutable<ExclusionConstraint>[];
   readonly indexes: Mutable<Index>[];
   persistence: TablePersistence | undefined;
+  owner: string | undefined;
+  privileges: readonly Grant[] | undefined;
   comment: string | undefined;
 }
 
@@ -317,6 +327,7 @@ interface SimulatedState {
   readonly sequences: Map<string, Mutable<Sequence>>;
   readonly views: Map<string, Mutable<View>>;
   readonly extensions: Map<string, Mutable<Extension>>;
+  readonly defaultPrivileges: Mutable<DefaultPrivilege>[];
 }
 
 /** The map key of a table identity; JSON keeps any characters unambiguous. */
@@ -441,6 +452,8 @@ const stateOf = (model: Model): SimulatedState => {
       exclusionConstraints: (source.exclusionConstraints ?? []).map((entry) => ({ ...entry })),
       indexes: source.indexes.map(copyIndex),
       persistence: source.persistence,
+      owner: source.owner,
+      privileges: source.privileges === undefined ? undefined : structuredClone(source.privileges),
       comment: source.comment,
     });
   }
@@ -450,7 +463,8 @@ const stateOf = (model: Model): SimulatedState => {
   for (const source of model.views) views.set(keyOf(source), { ...source });
   const extensions = new Map<string, Mutable<Extension>>();
   for (const source of model.extensions) extensions.set(extensionKey(source), { ...source });
-  return { tables, sequences, views, extensions };
+  const defaultPrivileges = (model.defaultPrivileges ?? []).map((entry) => structuredClone(entry));
+  return { tables, sequences, views, extensions, defaultPrivileges };
 };
 
 /**
@@ -664,6 +678,29 @@ const commentTargetNode = (
   }
 };
 
+/** A live object whose role owner and grants a privilege step can change. */
+interface PrivilegeNode {
+  owner: string | undefined;
+  privileges: readonly Grant[] | undefined;
+}
+
+/** The live table or sequence a privilege step addresses. */
+const privilegeNode = (state: SimulatedState, object: ObjectPrivilegeTarget): PrivilegeNode => {
+  const key = object.kind === 'table' ? keyOf(object.table) : keyOf(object.sequence);
+  const node = object.kind === 'table' ? state.tables.get(key) : state.sequences.get(key);
+  assert.ok(node !== undefined, `privilege step on missing object ${key}`);
+  return node as PrivilegeNode;
+};
+
+/** The scope key of a default-privilege statement, ignoring its grants. */
+const defaultPrivilegeScope = (privilege: DefaultPrivilege): string =>
+  JSON.stringify([
+    privilege.roles ?? null,
+    privilege.schemas ?? null,
+    privilege.objectType,
+    privilege.kind,
+  ]);
+
 /** Applies one step to `state`, failing the test when the step is illegal there. */
 const applyStep = (state: SimulatedState, step: Step): void => {
   switch (step.kind) {
@@ -683,6 +720,9 @@ const applyStep = (state: SimulatedState, step: Step): void => {
         exclusionConstraints: [],
         indexes: [],
         persistence: step.table.persistence,
+        owner: step.table.owner,
+        privileges:
+          step.table.privileges === undefined ? undefined : structuredClone(step.table.privileges),
         comment: step.table.comment,
       });
       return;
@@ -1141,6 +1181,19 @@ const applyStep = (state: SimulatedState, step: Step): void => {
           case 'cycle':
             altered.cycle = field.after;
             break;
+          case 'owner':
+            assert.equal(altered.owner, field.before, `owner of ${keyOf(step.sequence)}`);
+            altered.owner = field.after;
+            break;
+          case 'privileges':
+            assert.deepStrictEqual(
+              altered.privileges ?? [],
+              field.before ?? [],
+              `privileges of ${keyOf(step.sequence)}`,
+            );
+            altered.privileges =
+              field.after === undefined ? undefined : structuredClone(field.after);
+            break;
           default:
             assertNever(field, 'sequence field');
         }
@@ -1200,6 +1253,41 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       state.extensions.delete(key);
       return;
     }
+    case 'alter-owner': {
+      privilegeNode(state, step.object).owner = step.owner;
+      return;
+    }
+    case 'grant': {
+      const node = privilegeNode(state, step.object);
+      const grants = node.privileges === undefined ? [] : [...node.privileges];
+      assert.equal(
+        grants.some((grant) => JSON.stringify(grant) === JSON.stringify(step.grant)),
+        false,
+        `grant of an already-held privilege on ${JSON.stringify(step.object)}`,
+      );
+      grants.push(step.grant);
+      node.privileges = grants;
+      return;
+    }
+    case 'revoke': {
+      const node = privilegeNode(state, step.object);
+      const grants = (node.privileges ?? []).filter(
+        (grant) => JSON.stringify(grant) !== JSON.stringify(step.grant),
+      );
+      assert.equal(grants.length, (node.privileges ?? []).length - 1, `revoke of a missing grant`);
+      node.privileges = grants;
+      return;
+    }
+    case 'alter-default-privileges': {
+      const scope = defaultPrivilegeScope(step.privilege);
+      const index = state.defaultPrivileges.findIndex(
+        (candidate) => defaultPrivilegeScope(candidate) === scope,
+      );
+      const copy = structuredClone(step.privilege);
+      if (index === -1) state.defaultPrivileges.push(copy);
+      else state.defaultPrivileges[index] = copy;
+      return;
+    }
     case 'comment': {
       const node = commentTargetNode(state, step.target);
       if (step.text === undefined) delete node.comment;
@@ -1237,6 +1325,12 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
     }
     assert.deepStrictEqual(actual.primaryKey, expected.primaryKey, `primary key of ${key}`);
     assert.deepStrictEqual(actual.persistence, expected.persistence, `persistence of ${key}`);
+    assert.equal(actual.owner, expected.owner, `owner of ${key}`);
+    assert.deepStrictEqual(
+      actual.privileges ?? [],
+      expected.privileges ?? [],
+      `privileges of ${key}`,
+    );
     assert.equal(actual.comment, expected.comment, `comment of ${key}`);
     assert.deepStrictEqual(
       actual.foreignKeys.map(foreignKeyKey).sort(),
@@ -1321,6 +1415,11 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
       `extension ${extensionKey(expected)}`,
     );
   }
+  assert.deepStrictEqual(
+    state.defaultPrivileges,
+    target.defaultPrivileges ?? [],
+    'default privileges',
+  );
 };
 
 /**
@@ -2299,10 +2398,14 @@ test('every current step kind is classified, and only the concurrent kinds stand
     'create-extension',
     'alter-extension',
     'drop-extension',
+    'alter-owner',
+    'grant',
+    'revoke',
+    'alter-default-privileges',
     'comment',
   ];
 
-  assert.equal(kinds.length, 36);
+  assert.equal(kinds.length, 40);
   assert.deepStrictEqual(Object.keys(TRANSACTIONAL).sort(), [...kinds].sort());
   for (const kind of kinds) {
     const standalone = kind === 'create-index-concurrently' || kind === 'drop-index-concurrently';
@@ -5645,6 +5748,65 @@ test('applyChange writes each outer change kind into its buckets', () => {
         ],
       },
     },
+    {
+      name: 'default-privileges-changed',
+      change: {
+        kind: 'default-privileges-changed',
+        defaultPrivileges: [
+          {
+            objectType: 'table',
+            kind: 'grant',
+            grants: [{ grantee: 'app', privileges: ['SELECT'] }],
+          },
+        ],
+      },
+      buckets: {
+        defaultPrivilegeSteps: [
+          {
+            kind: 'alter-default-privileges',
+            privilege: {
+              objectType: 'table',
+              kind: 'grant',
+              grants: [{ grantee: 'app', privileges: ['SELECT'] }],
+            },
+          },
+        ],
+      },
+    },
+    {
+      name: 'sequence-changed (role owner and grants)',
+      change: sequenceChanged([
+        { field: 'owner', before: 'postgres', after: 'app' },
+        {
+          field: 'privileges',
+          before: [{ grantee: 'reader', privileges: 'ALL' }],
+          after: [{ grantee: 'reader', privileges: ['USAGE'] }],
+        },
+      ]),
+      buckets: {
+        ownerAlters: [
+          {
+            kind: 'alter-owner',
+            object: { kind: 'sequence', sequence: identity('s') },
+            owner: 'app',
+          },
+        ],
+        revokeSteps: [
+          {
+            kind: 'revoke',
+            object: { kind: 'sequence', sequence: identity('s') },
+            grant: { grantee: 'reader', privileges: 'ALL' },
+          },
+        ],
+        grantSteps: [
+          {
+            kind: 'grant',
+            object: { kind: 'sequence', sequence: identity('s') },
+            grant: { grantee: 'reader', privileges: ['USAGE'] },
+          },
+        ],
+      },
+    },
   ];
 
   for (const { name, change, buckets } of cases) assertBuckets(name, change, buckets);
@@ -5732,6 +5894,44 @@ test('applyChange writes each table change kind into its buckets', () => {
       change: tableChanged({ kind: 'persistence-changed', before: 'unlogged' }),
       buckets: {
         persistenceAlters: [{ kind: 'alter-persistence', table: identity('t') }],
+      },
+    },
+    {
+      name: 'owner-changed',
+      change: tableChanged({ kind: 'owner-changed', before: 'postgres', after: 'app' }),
+      buckets: {
+        ownerAlters: [
+          { kind: 'alter-owner', object: { kind: 'table', table: identity('t') }, owner: 'app' },
+        ],
+      },
+    },
+    {
+      name: 'owner-changed (removal emits nothing)',
+      change: tableChanged({ kind: 'owner-changed', before: 'postgres' }),
+      buckets: {},
+    },
+    {
+      name: 'privileges-changed',
+      change: tableChanged({
+        kind: 'privileges-changed',
+        before: [{ grantee: 'reader', privileges: 'ALL' }],
+        after: [{ grantee: 'reader', privileges: ['SELECT'] }],
+      }),
+      buckets: {
+        revokeSteps: [
+          {
+            kind: 'revoke',
+            object: { kind: 'table', table: identity('t') },
+            grant: { grantee: 'reader', privileges: 'ALL' },
+          },
+        ],
+        grantSteps: [
+          {
+            kind: 'grant',
+            object: { kind: 'table', table: identity('t') },
+            grant: { grantee: 'reader', privileges: ['SELECT'] },
+          },
+        ],
       },
     },
     {
@@ -6337,6 +6537,10 @@ const applicationArrays = [
   'viewCreates',
   'viewIndexCreates',
   'viewReplaces',
+  'revokeSteps',
+  'grantSteps',
+  'ownerAlters',
+  'defaultPrivilegeSteps',
   'comments',
   'ownershipChanges',
   'removedSequences',
@@ -6391,6 +6595,10 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
     viewCreates: 0,
     viewIndexCreates: 0,
     viewReplaces: 0,
+    revokeSteps: 0,
+    grantSteps: 0,
+    ownerAlters: 0,
+    defaultPrivilegeSteps: 0,
     comments: 0,
     ownershipChanges: 0,
     removedSequences: 0,
@@ -6519,6 +6727,21 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
             case 'persistence-changed':
               count('persistenceAlters');
               break;
+            case 'owner-changed':
+              if (tableChange.after !== undefined) count('ownerAlters');
+              break;
+            case 'privileges-changed': {
+              const before = tableChange.before ?? [];
+              const after = tableChange.after ?? [];
+              const key = (grant: Grant): string => JSON.stringify(grant);
+              counts.revokeSteps += before.filter(
+                (grant) => !after.some((candidate) => key(candidate) === key(grant)),
+              ).length;
+              counts.grantSteps += after.filter(
+                (grant) => !before.some((candidate) => key(candidate) === key(grant)),
+              ).length;
+              break;
+            }
             default:
               assertNever(tableChange, 'table change kind');
           }
@@ -6531,12 +6754,32 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
       case 'sequence-removed':
         count('removedSequences');
         break;
-      case 'sequence-changed':
-        if (change.changes.some((field) => field.field !== 'ownedBy')) count('optionAlters');
+      case 'sequence-changed': {
+        const optionFields = change.changes.filter(
+          (field) =>
+            field.field !== 'ownedBy' && field.field !== 'owner' && field.field !== 'privileges',
+        );
+        if (optionFields.length > 0) count('optionAlters');
         counts.ownershipChanges += change.changes.filter(
           (field) => field.field === 'ownedBy',
         ).length;
+        counts.ownerAlters += change.changes.filter(
+          (field) => field.field === 'owner' && field.after !== undefined,
+        ).length;
+        const key = (grant: Grant): string => JSON.stringify(grant);
+        for (const field of change.changes) {
+          if (field.field !== 'privileges') continue;
+          const before = field.before ?? [];
+          const after = field.after ?? [];
+          counts.revokeSteps += before.filter(
+            (grant) => !after.some((candidate) => key(candidate) === key(grant)),
+          ).length;
+          counts.grantSteps += after.filter(
+            (grant) => !before.some((candidate) => key(candidate) === key(grant)),
+          ).length;
+        }
         break;
+      }
       case 'view-added':
         count('viewCreates');
         counts.viewIndexCreates += change.view.indexes?.length ?? 0;
@@ -6573,6 +6816,9 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
         break;
       case 'extension-changed':
         if (change.changes.length > 0) count('extensionAlters');
+        break;
+      case 'default-privileges-changed':
+        counts.defaultPrivilegeSteps += change.defaultPrivileges.length;
         break;
       case 'comment-changed':
         count('comments');
@@ -6676,7 +6922,7 @@ test('seeded diffs are consumed exactly once by the change application', () => {
 test('randomized step-kind sequences partition into transaction groups', () => {
   const random = randomOf(GROUP_SEED);
   const kinds = Object.keys(TRANSACTIONAL) as Step['kind'][];
-  assert.equal(kinds.length, 36, 'every step kind must be classified');
+  assert.equal(kinds.length, 40, 'every step kind must be classified');
   const seen = new Set<Step['kind']>();
   for (let round = 0; round < PROPERTY_ROUNDS; round += 1) {
     const length = round === 0 ? 0 : Math.floor(random.next() * 13);
@@ -8663,4 +8909,165 @@ test('a concurrently-only difference on an expression index produces no plan', (
   const target = model(table('t', { columns, indexes: [{ ...before, concurrently: true }] }));
 
   assertPlan(baseline, target, []);
+});
+
+/** A grant on `grantee` with the given privilege spelling. */
+const grant = (grantee: string, privileges: readonly string[] | 'ALL') => ({ grantee, privileges });
+
+/** A table carrying a role owner and an optional canonical grant list. */
+const privilegeTable = (
+  fields: {
+    readonly owner?: string;
+    readonly privileges?: readonly ReturnType<typeof grant>[];
+    readonly exclusionConstraints?: readonly ExclusionConstraint[];
+    readonly uniqueConstraints?: readonly UniqueConstraint[];
+  } = {},
+): Table => ({
+  ...table('t', { columns: [column('id', { type: 'integer' })] }),
+  ...(fields.exclusionConstraints === undefined
+    ? {}
+    : { exclusionConstraints: fields.exclusionConstraints }),
+  ...(fields.uniqueConstraints === undefined
+    ? {}
+    : { uniqueConstraints: fields.uniqueConstraints }),
+  ...(fields.owner === undefined ? {} : { owner: fields.owner }),
+  ...(fields.privileges === undefined ? {} : { privileges: fields.privileges }),
+});
+
+/** The kinds of a plan's steps, in order. */
+const kindsOf = (steps: readonly Step[]): readonly string[] => steps.map((step) => step.kind);
+
+test('revokes land in phase 3b and grants and owners in phase 18b', () => {
+  const exclusion: ExclusionConstraint = { name: 't_excl', elements: 'id WITH =' };
+  const unique: UniqueConstraint = { name: 't_id_key', columns: ['id'] };
+  const baseline = model(
+    privilegeTable({
+      owner: 'postgres',
+      privileges: [grant('reader', 'ALL')],
+      exclusionConstraints: [exclusion],
+      uniqueConstraints: [unique],
+    }),
+  );
+  const target = model(
+    privilegeTable({
+      owner: 'app',
+      privileges: [grant('reader', ['SELECT'])],
+    }),
+  );
+
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(kindsOf(steps), [
+    'drop-exclusion-constraint',
+    'revoke',
+    'drop-unique-constraint',
+    'grant',
+    'alter-owner',
+  ]);
+  assert.deepStrictEqual(steps[1], {
+    kind: 'revoke',
+    object: { kind: 'table', table: identity('t') },
+    grant: grant('reader', 'ALL'),
+  });
+  assert.deepStrictEqual(steps[3], {
+    kind: 'grant',
+    object: { kind: 'table', table: identity('t') },
+    grant: grant('reader', ['SELECT']),
+  });
+  assert.deepStrictEqual(steps[4], {
+    kind: 'alter-owner',
+    object: { kind: 'table', table: identity('t') },
+    owner: 'app',
+  });
+});
+
+test('a removed table carries its grants away without a revoke step', () => {
+  const baseline = model(
+    privilegeTable({ owner: 'postgres', privileges: [grant('reader', 'ALL')] }),
+  );
+  const steps = plan(baseline, model()).steps;
+  assert.deepStrictEqual(kindsOf(steps), ['drop-table']);
+});
+
+test('default privileges land in phase 8a, after ownership attaches and before option alters', () => {
+  const withTable = (owned: boolean, increment: string): Model => ({
+    ...model(table('t', { columns: [column('id', { type: 'integer' })] })),
+    sequences: [sequence('s', { increment, ...(owned ? { ownedBy: owner('t', 'id') } : {}) })],
+  });
+  const baseline = withTable(false, '1');
+  const target = {
+    ...withTable(true, '5'),
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table' as const,
+        kind: 'revoke' as const,
+        grants: [grant('reader', 'ALL')],
+      },
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table' as const,
+        kind: 'grant' as const,
+        grants: [grant('reader', ['SELECT'])],
+      },
+    ],
+  };
+
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(kindsOf(steps), [
+    'alter-sequence',
+    'alter-default-privileges',
+    'alter-default-privileges',
+    'alter-sequence',
+  ]);
+  assert.deepStrictEqual(steps[0], {
+    kind: 'alter-sequence',
+    sequence: identity('s'),
+    fields: [{ field: 'ownedBy', after: owner('t', 'id') }],
+  });
+  assert.deepStrictEqual(
+    steps[1]!.kind === 'alter-default-privileges' && steps[1].privilege.kind,
+    'revoke',
+  );
+  assert.deepStrictEqual(
+    steps[2]!.kind === 'alter-default-privileges' && steps[2].privilege.kind,
+    'grant',
+  );
+  assert.deepStrictEqual(steps[3], {
+    kind: 'alter-sequence',
+    sequence: identity('s'),
+    fields: [{ field: 'increment', before: '1', after: '5' }],
+  });
+});
+
+test('a revoke and a grant of different spellings are both emitted', () => {
+  const baseline = model(privilegeTable({ privileges: [grant('reader', 'ALL')] }));
+  const target = model(
+    privilegeTable({ privileges: [grant('reader', ['SELECT', 'INSERT', 'UPDATE', 'DELETE'])] }),
+  );
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(kindsOf(steps), ['revoke', 'grant']);
+});
+
+test('a new table carries its owner and grants in the create payload', () => {
+  const target = model(privilegeTable({ owner: 'app', privileges: [grant('reader', ['SELECT'])] }));
+  const steps = plan(model(), target).steps;
+  assert.deepStrictEqual(kindsOf(steps), ['create-table']);
+  const created = steps[0]!;
+  assert.equal(created.kind, 'create-table');
+  if (created.kind !== 'create-table') throw new Error('expected a create-table step');
+  assert.equal(created.table.owner, 'app');
+  assert.deepStrictEqual(created.table.privileges, [grant('reader', ['SELECT'])]);
+});
+
+test('privilege step payloads are independent copies of the target', () => {
+  const privileges = [grant('reader', ['SELECT'])];
+  const target = model(privilegeTable({ privileges }));
+  const steps = plan(model(), target).steps;
+  const created = steps[0]!;
+  assert.equal(created.kind, 'create-table');
+  if (created.kind !== 'create-table') throw new Error('expected a create-table step');
+  (created.table.privileges![0] as { grantee: string }).grantee = 'mutated';
+  assert.equal(privileges[0]!.grantee, 'reader');
 });

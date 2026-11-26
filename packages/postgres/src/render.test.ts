@@ -11,6 +11,7 @@ import type {
   ExclusionConstraint,
   Extension,
   ForeignKey,
+  Grant,
   Identity,
   IdentityInput,
   Index,
@@ -56,6 +57,8 @@ interface TableParts {
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
   indexes?: readonly Index[];
+  owner?: string;
+  privileges?: readonly Grant[];
   comment?: string;
 }
 
@@ -70,6 +73,8 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
   indexes: parts.indexes ?? [],
+  ...(parts.owner === undefined ? {} : { owner: parts.owner }),
+  ...(parts.privileges === undefined ? {} : { privileges: parts.privileges }),
   ...(parts.comment === undefined ? {} : { comment: parts.comment }),
 });
 
@@ -4300,4 +4305,176 @@ test('schema creates render before extension creates and the objects they hold',
       '',
     ].join('\n'),
   );
+});
+
+/** A grant with the given grantee and privilege spelling. */
+const grant = (grantee: string, privileges: readonly string[] | 'ALL') => ({ grantee, privileges });
+
+test('owner alters quote the role and qualify the table or sequence', () => {
+  const sql = renderSql(
+    planOf(
+      {
+        kind: 'alter-owner',
+        object: { kind: 'table', table: identity('Mixed Case') },
+        owner: 'Priv App User',
+      },
+      {
+        kind: 'alter-owner',
+        object: { kind: 'sequence', sequence: identity('s', 'app') },
+        owner: 'postgres',
+      },
+    ),
+  );
+  assert.equal(
+    sql,
+    'BEGIN;\n' +
+      'ALTER TABLE public."Mixed Case" OWNER TO "Priv App User";\n' +
+      'ALTER SEQUENCE app.s OWNER TO postgres;\n' +
+      'COMMIT;\n',
+  );
+});
+
+test('grants and revokes render ALL, PUBLIC unquoted, columns, and grant option', () => {
+  const sql = renderSql(
+    planOf(
+      {
+        kind: 'revoke',
+        object: { kind: 'table', table: identity('t') },
+        grant: grant('PUBLIC', 'ALL'),
+      },
+      {
+        kind: 'grant',
+        object: { kind: 'table', table: identity('t') },
+        grant: {
+          grantee: 'Priv App User',
+          privileges: ['SELECT', 'UPDATE'],
+          columns: ['email'],
+          grantOption: true,
+        },
+      },
+      {
+        kind: 'grant',
+        object: { kind: 'sequence', sequence: identity('s', 'app') },
+        grant: grant('PUBLIC', ['USAGE']),
+      },
+    ),
+  );
+  assert.equal(
+    sql,
+    'BEGIN;\n' +
+      'REVOKE ALL ON TABLE public.t FROM PUBLIC;\n' +
+      'GRANT SELECT, UPDATE (email) ON TABLE public.t TO "Priv App User" WITH GRANT OPTION;\n' +
+      'GRANT USAGE ON SEQUENCE app.s TO PUBLIC;\n' +
+      'COMMIT;\n',
+  );
+});
+
+test('default privileges render revoke before grant with roles and schemas quoted', () => {
+  const sql = renderSql(
+    planOf(
+      {
+        kind: 'alter-default-privileges',
+        privilege: {
+          roles: ['Priv App User'],
+          schemas: ['app'],
+          objectType: 'table',
+          kind: 'revoke',
+          grants: [grant('PUBLIC', 'ALL')],
+        },
+      },
+      {
+        kind: 'alter-default-privileges',
+        privilege: {
+          roles: ['Priv App User'],
+          schemas: ['app'],
+          objectType: 'table',
+          kind: 'grant',
+          grants: [grant('app_user', ['SELECT'])],
+        },
+      },
+      {
+        kind: 'alter-default-privileges',
+        privilege: {
+          objectType: 'sequence',
+          kind: 'grant',
+          grants: [{ grantee: 'reader', privileges: ['USAGE'] }],
+        },
+      },
+    ),
+  );
+  assert.equal(
+    sql,
+    'BEGIN;\n' +
+      'ALTER DEFAULT PRIVILEGES FOR ROLE "Priv App User" IN SCHEMA app REVOKE ALL ON TABLES FROM PUBLIC;\n' +
+      'ALTER DEFAULT PRIVILEGES FOR ROLE "Priv App User" IN SCHEMA app GRANT SELECT ON TABLES TO app_user;\n' +
+      'ALTER DEFAULT PRIVILEGES GRANT USAGE ON SEQUENCES TO reader;\n' +
+      'COMMIT;\n',
+  );
+});
+
+test('created tables and sequences carry their grants and owner after the create', () => {
+  const baseline = model();
+  const target: Model = {
+    ...model(
+      table('t', {
+        columns: [column('id')],
+        owner: 'Priv App User',
+        privileges: [grant('PUBLIC', 'ALL')],
+      }),
+    ),
+    sequences: [
+      sequence('s', { owner: 'Priv App User', privileges: [grant('app_user', ['USAGE'])] }),
+    ],
+  };
+  const sql = renderSql(plan(baseline, target), { targetVersion: 13 });
+  assert.match(
+    sql,
+    /GRANT ALL ON TABLE public.t TO PUBLIC;\nALTER TABLE public.t OWNER TO "Priv App User";/,
+  );
+  assert.match(
+    sql,
+    /GRANT USAGE ON SEQUENCE public.s TO app_user;\nALTER SEQUENCE public.s OWNER TO "Priv App User";/,
+  );
+});
+
+test('golden: renders ownership, grants, and default privileges in phase order', () => {
+  const baseline: Model = {
+    ...model(
+      table('t', {
+        columns: [column('id', { type: 'integer' })],
+        owner: 'postgres',
+        privileges: [grant('app_user', 'ALL')],
+      }),
+    ),
+    sequences: [sequence('s', { owner: 'postgres' })],
+  };
+  const target: Model = {
+    ...model(
+      table('t', {
+        columns: [column('id', { type: 'integer' })],
+        owner: 'Priv App User',
+        privileges: [grant('app_user', ['SELECT']), grant('PUBLIC', 'ALL')],
+      }),
+    ),
+    sequences: [
+      sequence('s', { owner: 'Priv App User', privileges: [grant('reader', ['USAGE'])] }),
+    ],
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'revoke',
+        grants: [grant('app_user', 'ALL')],
+      },
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'grant',
+        grants: [grant('app_user', ['SELECT'])],
+      },
+    ],
+  };
+  assertGolden('privileges', baseline, target);
 });

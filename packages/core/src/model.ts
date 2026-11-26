@@ -42,6 +42,10 @@ import type { Identity } from './identity.ts';
  * - `views` are sorted by schema, then name (JavaScript string comparison).
  * - `extensions` are sorted by name (JavaScript string comparison); the schema is not part of
  *   the order.
+ * - `privileges` are sorted by grantee, privilege list, columns, then grant option; `ALL` is a
+ *   distinct marker that sorts before an explicit list and is never expanded into one.
+ * - `defaultPrivileges` are sorted by roles, schemas, object type, then revoke before grant
+ *   within one scope, so a scope's REVOKE renders before its GRANT.
  *
  * `Index.concurrently` is apply metadata, not structure: it is excluded from structural
  * identity and equality, and only steers how a create or drop is applied — the target index's
@@ -77,6 +81,45 @@ import type { Identity } from './identity.ts';
  * This module declares shapes only; it holds no behavior.
  */
 
+/**
+ * One privilege assignment on a table or sequence. `grantee` is an opaque role name carried as
+ * written, or the literal `PUBLIC`; roles are not modeled objects and are never resolved here.
+ * `privileges` is either the marker `ALL`, meaning the source omitted the privilege list, or an
+ * explicit list kept as written: the marker is never expanded and an explicit list is never
+ * collapsed into it, because which privileges `ALL` carries depends on server version, object
+ * type, and column level. `columns` narrows column-level privileges; `grantOption` records
+ * `WITH GRANT OPTION`. There is no grantor: non-owner grantors stay named import skips.
+ */
+export interface Grant {
+  /** The grantee's opaque role name, or the literal `PUBLIC`. */
+  readonly grantee: string;
+  /** `ALL` when the source omitted the list, otherwise the explicit privilege names. */
+  readonly privileges: readonly string[] | 'ALL';
+  /** Column names for a column-level grant; absent means the whole object. */
+  readonly columns?: readonly string[];
+  /** Whether the grant carries `WITH GRANT OPTION`. */
+  readonly grantOption?: boolean;
+}
+
+/**
+ * One `ALTER DEFAULT PRIVILEGES` scope. `roles` names the roles whose future objects the
+ * statement affects (absent means the current role), `schemas` limits it to one or more schemas
+ * (absent means every schema), and `kind` records GRANT or REVOKE. Repeated statements in the
+ * same scope merge their grants; a per-schema scope never cancels a global one.
+ */
+export interface DefaultPrivilege {
+  /** The roles the default applies to; absent means the current role. */
+  readonly roles?: readonly string[];
+  /** The schemas the default applies to; absent means every schema. */
+  readonly schemas?: readonly string[];
+  /** Whether the default affects future tables or future sequences. */
+  readonly objectType: 'table' | 'sequence';
+  /** GRANT or REVOKE; both are modeled and REVOKE renders first within a scope. */
+  readonly kind: 'grant' | 'revoke';
+  /** The assignments in this statement, in canonical order. */
+  readonly grants: readonly Grant[];
+}
+
 /** Identifies a table in the model: the schema-qualified name, e.g. `public.users`. */
 export interface TableIdentity {
   /** The namespace that qualifies the table, e.g. `public`. */
@@ -95,6 +138,11 @@ export interface Model {
   readonly views: readonly View[];
   /** Every imported extension, in the model's deterministic order. */
   readonly extensions: readonly Extension[];
+  /**
+   * Cluster-wide default privileges for future tables and sequences, in canonical order; absent
+   * means the source declared none. Default privileges are not part of any entity's identity.
+   */
+  readonly defaultPrivileges?: readonly DefaultPrivilege[];
 }
 
 /** A table and its imported structure. */
@@ -118,6 +166,10 @@ export interface Table extends TableIdentity {
    * `LOGGED`. Temporary persistence is not modeled and stays flagged by import and introspection.
    */
   readonly persistence?: TablePersistence;
+  /** The table's role-level object owner, an opaque role name; absent means unstated. */
+  readonly owner?: string;
+  /** The table's object privileges, in canonical order; absent means unstated. */
+  readonly privileges?: readonly Grant[];
   /**
    * The table's PostgreSQL comment, stored verbatim; absent means none. An empty string is not a
    * comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.
@@ -438,6 +490,10 @@ export interface Sequence extends SequenceIdentity {
   readonly cycle: boolean;
   /** The owning table and column, when the sequence is owned. */
   readonly ownedBy?: SequenceOwner;
+  /** The sequence's role-level object owner, an opaque role name; absent means unstated. */
+  readonly owner?: string;
+  /** The sequence's object privileges, in canonical order; absent means unstated. */
+  readonly privileges?: readonly Grant[];
   /**
    * The sequence's PostgreSQL comment, stored verbatim; absent means none. An empty string is
    * not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized, and no NUL.

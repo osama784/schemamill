@@ -4,11 +4,14 @@ import type {
   Column,
   ColumnFieldChange,
   CommentTarget,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
+  ObjectPrivilegeTarget,
   Hazard,
   HazardEntity,
   IdentityChange,
@@ -257,6 +260,11 @@ function formatChange(change: Change): string {
       return formatExtension('-', change.extension);
     case 'extension-changed':
       return formatExtensionChange(change.extension, change.changes);
+    case 'default-privileges-changed':
+      return [
+        '~ default privileges',
+        ...change.defaultPrivileges.map((privilege) => `    ${formatDefaultPrivilege(privilege)}`),
+      ].join('\n');
     case 'comment-changed':
       return formatCommentChange(change.target, change.before, change.after);
   }
@@ -281,6 +289,8 @@ function formatTable(sign: string, table: Table): string {
     lines.push(`    ${formatExclusionConstraint(exclusionConstraint)}`);
   }
   for (const index of table.indexes) lines.push(`    ${formatIndex(index)}`);
+  if (table.owner !== undefined) lines.push(`    owner ${formatPresent(table.owner)}`);
+  for (const grant of table.privileges ?? []) lines.push(`    grant ${formatGrant(grant)}`);
   return lines.join('\n');
 }
 
@@ -438,6 +448,13 @@ function formatTableChange(change: TableChange): string {
       )}`;
     case 'persistence-changed':
       return `persistence ${formatPersistence(change.before)} → ${formatPersistence(change.after)}`;
+    case 'owner-changed':
+      return `owner ${formatOptional(change.before)} → ${formatOptional(change.after)}`;
+    case 'privileges-changed':
+      return (
+        `privileges [${(change.before ?? []).map(formatGrant).join(', ')}] → ` +
+        `[${(change.after ?? []).map(formatGrant).join(', ')}]`
+      );
   }
 }
 
@@ -508,9 +525,40 @@ function formatStep(step: Step): string {
     case 'replace-view':
     case 'drop-view':
       return formatIdentity(step.view);
+    case 'alter-owner':
+      return `${formatPrivilegeObject(step.object)}: owner ${formatPresent(step.owner)}`;
+    case 'grant':
+      return `${formatPrivilegeObject(step.object)}: grant ${formatGrant(step.grant)}`;
+    case 'revoke':
+      return `${formatPrivilegeObject(step.object)}: revoke ${formatGrant(step.grant)}`;
+    case 'alter-default-privileges':
+      return `default privileges: ${formatDefaultPrivilege(step.privilege)}`;
     case 'comment':
       return `${formatCommentTarget(step.target)}: ${formatCommentText(step.text)}`;
   }
+}
+
+/** One grant in compact prose: grantee and optional columns, then the declared privileges. */
+function formatGrant(grant: Grant): string {
+  const privileges = grant.privileges === 'ALL' ? 'ALL' : grant.privileges.join(', ');
+  const columns = grant.columns === undefined ? '' : `(${grant.columns.join(', ')})`;
+  const option = grant.grantOption === true ? ' with grant option' : '';
+  return `${grant.grantee}${columns}: ${privileges}${option}`;
+}
+
+/** The table or sequence a privilege step addresses. */
+function formatPrivilegeObject(object: ObjectPrivilegeTarget): string {
+  return `${object.kind} ${formatIdentity(object.kind === 'table' ? object.table : object.sequence)}`;
+}
+
+/** One default-privilege scope, with its roles, schemas, action, object type, and grants. */
+function formatDefaultPrivilege(privilege: DefaultPrivilege): string {
+  const roles = privilege.roles === undefined ? '' : ` for ${privilege.roles.join(', ')}`;
+  const schemas = privilege.schemas === undefined ? '' : ` in ${privilege.schemas.join(', ')}`;
+  return (
+    `${privilege.kind}${roles}${schemas} on ${privilege.objectType}s: ` +
+    privilege.grants.map(formatGrant).join('; ')
+  );
 }
 
 /** `schema.name`, exactly as stored; no SQL quoting. */
@@ -622,6 +670,8 @@ function formatSequence(sign: string, sequence: Sequence): string {
   lines.push(`    cache ${sequence.cache}`);
   lines.push(`    cycle ${String(sequence.cycle)}`);
   if (sequence.ownedBy !== undefined) lines.push(`    owned by ${formatOwner(sequence.ownedBy)}`);
+  if (sequence.owner !== undefined) lines.push(`    owner ${formatPresent(sequence.owner)}`);
+  for (const grant of sequence.privileges ?? []) lines.push(`    grant ${formatGrant(grant)}`);
   return lines.join('\n');
 }
 
@@ -644,6 +694,13 @@ function formatSequenceField(field: SequenceFieldChange): string {
       return `cycle ${String(field.before)} → ${String(field.after)}`;
     case 'ownedBy':
       return `owned by ${formatOptionalOwner(field.before)} → ${formatOptionalOwner(field.after)}`;
+    case 'owner':
+      return `owner ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'privileges':
+      return (
+        `privileges [${(field.before ?? []).map(formatGrant).join(', ')}] → ` +
+        `[${(field.after ?? []).map(formatGrant).join(', ')}]`
+      );
   }
 }
 

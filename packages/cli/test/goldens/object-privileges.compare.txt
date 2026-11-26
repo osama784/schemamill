@@ -1,0 +1,11 @@
+~ table app.t
+    owner postgres → Priv App User
+    privileges [app_user: ALL] → [app_user: select, app_user(email): update]
+
+~ sequence app.s
+    owner postgres → Priv App User
+    privileges [app_user: usage] → [app_user: select]
+
+~ default privileges
+    revoke for postgres in app on tables: app_user: ALL
+    grant for postgres in app on tables: app_user: select
