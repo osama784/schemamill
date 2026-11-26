@@ -1288,6 +1288,14 @@ const COMMENT_TARGETS: readonly (readonly [string, CommentTarget])[] = [
     },
   ],
   [
+    'exclusion constraint public.users (email WITH =)',
+    {
+      kind: 'exclusion-constraint',
+      table: users,
+      exclusionConstraint: { elements: 'email WITH =' },
+    },
+  ],
+  [
     'foreign key public.users (team_id) → public.teams',
     {
       kind: 'foreign-key',

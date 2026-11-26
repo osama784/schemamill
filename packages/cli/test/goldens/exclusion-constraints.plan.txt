@@ -1,0 +1,10 @@
+3 steps in one transaction:
+ 1. drop-exclusion-constraint  public.t: exclusion constraint t_excl EXCLUDE USING gist (a WITH <>)
+ 2. add-exclusion-constraint   public.t: exclusion constraint t_excl EXCLUDE USING gist (a WITH =) WHERE (a > 0)
+ 3. comment                    exclusion constraint public.t (a WITH =): "new note"
+
+BEGIN;
+ALTER TABLE public.t DROP CONSTRAINT t_excl;
+ALTER TABLE public.t ADD CONSTRAINT t_excl EXCLUDE USING gist (a WITH =) WHERE (a > 0);
+COMMENT ON CONSTRAINT t_excl ON public.t IS 'new note';
+COMMIT;

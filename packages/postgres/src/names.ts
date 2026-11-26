@@ -1,5 +1,6 @@
 import type {
   CheckConstraint,
+  ExclusionConstraint,
   ForeignKey,
   Index,
   TableIdentity,
@@ -247,6 +248,85 @@ function skipWhitespace(text: string, from: number): number {
   let cursor = from;
   while (cursor < text.length && isWhitespace(text[cursor]!)) cursor += 1;
   return cursor;
+}
+
+/**
+ * PostgreSQL's conventional constraint name for an unnamed exclusion constraint: the table
+ * name, the element-name mirror the index formula uses, and the `_excl` label. Operator and
+ * operator-class text after `WITH` never participates, just as a partial `WHERE` never does for
+ * an index. Like the other mirrors this is a canonicalization and render-guard prediction only;
+ * collision suffixes stay offline-unpredictable and such constraints remain named.
+ */
+export function synthesizedExclusionConstraintName(
+  table: TableIdentity,
+  exclusionConstraint: ExclusionConstraint,
+): string {
+  return makeObjectName(
+    table.name,
+    chooseNameAddition(exclusionElementNames(exclusionConstraint.elements)),
+    'excl',
+  );
+}
+
+/**
+ * The labels an exclusion element list contributes to a generated name. Each element's text is
+ * cut before its `WITH` operator, then the same best-effort mirror as an index element is used:
+ * a bare column names itself, a function call contributes its function identifier, and anything
+ * else becomes `expr`. Duplicates get numeric suffixes over the whole list.
+ */
+function exclusionElementNames(elements: string): string[] {
+  const labels: string[] = [];
+  for (const element of splitExclusionElements(elements)) {
+    const beforeWith = element.replace(/\s+WITH\b[\s\S]*$/i, '').trim();
+    labels.push(
+      /^[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*$/.test(beforeWith)
+        ? beforeWith
+        : expressionElementLabel(beforeWith),
+    );
+  }
+
+  const used = new Set<string>();
+  return labels.map((label) => {
+    let name: string;
+    for (let counter = 0; ; counter += 1) {
+      const suffix = counter === 0 ? '' : String(counter);
+      name = `${clipToBytes(label, IDENTIFIER_BYTE_LIMIT - utf8Length(suffix))}${suffix}`;
+      if (!used.has(name)) break;
+    }
+    used.add(name);
+    return name;
+  });
+}
+
+/** Splits an exclusion element list on commas outside quotes and parentheses. */
+function splitExclusionElements(elements: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let index = 0;
+  while (index < elements.length) {
+    const character = elements[index]!;
+    if (character === "'" || character === '"') {
+      index = quotedSpanEnd(elements, index);
+      continue;
+    }
+    if (character === '$') {
+      const end = dollarQuotedEnd(elements, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
+    if (character === '(') depth += 1;
+    else if (character === ')') depth -= 1;
+    else if (character === ',' && depth === 0) {
+      parts.push(elements.slice(start, index));
+      start = index + 1;
+    }
+    index += 1;
+  }
+  parts.push(elements.slice(start));
+  return parts;
 }
 
 /** PostgreSQL's conventional index name for an unnamed index. */

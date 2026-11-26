@@ -382,6 +382,8 @@ function findIdentityStep(
       case 'drop-unique-constraint':
       case 'add-check-constraint':
       case 'drop-check-constraint':
+      case 'add-exclusion-constraint':
+      case 'drop-exclusion-constraint':
       case 'create-index':
       case 'drop-index':
       case 'create-index-concurrently':

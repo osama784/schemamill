@@ -154,6 +154,7 @@ import type {
   ConstraintEnforcement,
   DdlImporter,
   Diagnostic,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Identity,
@@ -214,6 +215,7 @@ import type {
 
 import {
   synthesizedCheckConstraintName,
+  synthesizedExclusionConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
   synthesizedNotNullName,
@@ -235,6 +237,7 @@ interface TableDraft {
   readonly foreignKeys: ForeignKey[];
   readonly uniqueConstraints: UniqueConstraint[];
   readonly checkConstraints: CheckConstraint[];
+  readonly exclusionConstraints: ExclusionConstraint[];
   readonly indexes: Index[];
   /**
    * Names of exclusion constraints seen on this table. Draft-only bookkeeping: the exclusion's
@@ -559,6 +562,7 @@ function translateCreateTable(
   draft.foreignKeys.length = 0;
   draft.uniqueConstraints.length = 0;
   draft.checkConstraints.length = 0;
+  draft.exclusionConstraints.length = 0;
   draft.indexes.length = 0;
   draft.exclusionBackingNames.clear();
   draft.persistence = undefined;
@@ -589,6 +593,9 @@ function translateCreateTable(
       }
       for (const checkConstraint of translated.checkConstraints) {
         attachCheckConstraint(draft, checkConstraint);
+      }
+      for (const exclusionConstraint of translated.exclusionConstraints) {
+        attachExclusionConstraint(draft, exclusionConstraint);
       }
       continue;
     }
@@ -622,6 +629,7 @@ interface TranslatedColumn {
   foreignKeys: ForeignKey[];
   uniqueConstraints: UniqueConstraint[];
   checkConstraints: CheckConstraint[];
+  exclusionConstraints: ExclusionConstraint[];
 }
 
 /** The constraint an inline `CONSTR_ATTR_*` sibling can fold into. */
@@ -680,6 +688,7 @@ function translateColumn(
     foreignKeys: [],
     uniqueConstraints: [],
     checkConstraints: [],
+    exclusionConstraints: [],
   };
 
   const defaultConstraint = constraints.find(
@@ -770,12 +779,20 @@ function translateColumn(
         }
         break;
       }
-      case 'CONSTR_EXCLUSION':
+      case 'CONSTR_EXCLUSION': {
         fold = undefined;
-        diagnostics.push(
-          flagAttribute(statement, identity, `${constraintLabel(constraint)} on ${place}`),
+        const exclusionConstraint = exclusionConstraintFromConstraint(
+          statement,
+          constraint,
+          table,
+          place,
+          diagnostics,
         );
+        if (exclusionConstraint !== undefined) {
+          translated.exclusionConstraints.push(exclusionConstraint);
+        }
         break;
+      }
       case 'CONSTR_IDENTITY':
         fold = undefined;
         translated.column = columnWithIdentity(
@@ -1142,12 +1159,22 @@ function translateTableConstraint(
         diagnostics,
       );
       return;
+    case 'CONSTR_EXCLUSION': {
+      const exclusionConstraint = exclusionConstraintFromConstraint(
+        statement,
+        constraint,
+        draft,
+        identity,
+        diagnostics,
+      );
+      if (exclusionConstraint !== undefined) attachExclusionConstraint(draft, exclusionConstraint);
+      return;
+    }
     case undefined:
     case 'CONSTR_NULL':
     case 'CONSTR_DEFAULT':
     case 'CONSTR_IDENTITY':
     case 'CONSTR_GENERATED':
-    case 'CONSTR_EXCLUSION':
     case 'CONSTR_ATTR_DEFERRABLE':
     case 'CONSTR_ATTR_NOT_DEFERRABLE':
     case 'CONSTR_ATTR_DEFERRED':
@@ -1676,6 +1703,26 @@ function applyConstraintComment(
       text,
       (value) => {
         draft.checkConstraints[checkPosition] = withComment(checkConstraint, value);
+      },
+      diagnostics,
+    );
+    return;
+  }
+
+  const exclusionPosition = draft.exclusionConstraints.findIndex((exclusionConstraint) =>
+    matches(
+      exclusionConstraint.name,
+      synthesizedExclusionConstraintName(identity, exclusionConstraint),
+    ),
+  );
+  if (exclusionPosition !== -1) {
+    const exclusionConstraint = draft.exclusionConstraints[exclusionPosition]!;
+    storeComment(
+      statement,
+      object,
+      text,
+      (value) => {
+        draft.exclusionConstraints[exclusionPosition] = withComment(exclusionConstraint, value);
       },
       diagnostics,
     );
@@ -2421,6 +2468,17 @@ function translateAlterTableCommand(
         draft.columns,
         diagnostics,
       );
+      return;
+    }
+    if (constraint.contype === 'CONSTR_EXCLUSION') {
+      const exclusionConstraint = exclusionConstraintFromConstraint(
+        statement,
+        constraint,
+        draft,
+        identity,
+        diagnostics,
+      );
+      if (exclusionConstraint !== undefined) attachExclusionConstraint(draft, exclusionConstraint);
       return;
     }
     diagnostics.push(
@@ -3515,6 +3573,9 @@ function attachColumn(
   for (const checkConstraint of translated.checkConstraints) {
     attachCheckConstraint(draft, checkConstraint);
   }
+  for (const exclusionConstraint of translated.exclusionConstraints) {
+    attachExclusionConstraint(draft, exclusionConstraint);
+  }
 }
 
 /**
@@ -3884,6 +3945,159 @@ function checkExpressionText(
   const start = findCheckExpressionStart(statement.sql, byteOffsetToUtf16(statement.sql, location));
   if (start === null) return undefined;
   return extractSourceText(statement.sql, start, []);
+}
+
+/**
+ * The canonical shape an `EXCLUDE USING <method> (<elements>) [WHERE …]` declaration carries:
+ * opaque whitespace-normalized element text, the access method only when it is not PostgreSQL's
+ * `gist` default, and the `WHERE` clause only when the declaration states one.
+ */
+export interface ExclusionDefinition {
+  readonly elements: string;
+  readonly accessMethod?: string;
+  readonly where?: string;
+}
+
+/**
+ * Slices an exclusion declaration from source text starting at or before its `EXCLUDE` keyword.
+ * The dump and catalog paths share this reader so both normalize identically with
+ * `normalizeSourceText`; no AST deparser is involved. `undefined` means the text could not be cut
+ * unambiguously, and callers fail closed with a skip rather than storing an invented shape.
+ */
+export function parseExclusionDefinition(
+  sql: string,
+  from: number,
+): ExclusionDefinition | undefined {
+  const exclude = findKeywordFrom(sql, from, 'EXCLUDE');
+  if (exclude === null) return undefined;
+  const using = findKeywordFrom(sql, exclude + 'EXCLUDE'.length, 'USING');
+  if (using === null) return undefined;
+  const methodStart = skipTrivia(sql, using + 'USING'.length);
+  const method = readBareIdentifier(sql, methodStart);
+  if (method === undefined) return undefined;
+  const open = skipTrivia(sql, method.end);
+  if (sql[open] !== '(') return undefined;
+  const close = matchingParen(sql, open);
+  if (close === null) return undefined;
+  const elements = normalizeSourceText(sql.slice(open + 1, close));
+  if (elements === '') return undefined;
+
+  let where: string | undefined;
+  const after = skipTrivia(sql, close + 1);
+  if (isKeywordAt(sql, after, 'WHERE')) {
+    const start = skipTrivia(sql, after + 'WHERE'.length);
+    const terminator = statementTerminator(sql, start);
+    let end = terminator;
+    for (let index = start; index < terminator; index += 1) {
+      const skipped = skipLexicalSpan(sql, index);
+      if (skipped !== undefined && skipped > index) {
+        index = skipped - 1;
+        continue;
+      }
+      if (
+        isKeywordAt(sql, index, 'DEFERRABLE') ||
+        isKeywordAt(sql, index, 'INITIALLY') ||
+        isKeywordAt(sql, index, 'NOT')
+      ) {
+        end = index;
+        break;
+      }
+    }
+    where = normalizeSourceText(sql.slice(start, end));
+    if (where === '') return undefined;
+  }
+
+  return {
+    elements,
+    ...(method.value.toLowerCase() === 'gist' ? {} : { accessMethod: method.value }),
+    ...(where === undefined ? {} : { where }),
+  };
+}
+
+/** The first `keyword` at or after `from`, outside quoted spans and comments. */
+function findKeywordFrom(sql: string, from: number, keyword: string): number | null {
+  for (let index = from; index < sql.length; index += 1) {
+    if (isKeywordAt(sql, index, keyword)) return index;
+    const skipped = skipLexicalSpan(sql, index);
+    if (skipped !== undefined && skipped > index) index = skipped - 1;
+  }
+  return null;
+}
+
+/** A bare identifier at `start`, unquoted, with the index just past it. */
+function readBareIdentifier(
+  sql: string,
+  start: number,
+): { readonly value: string; readonly end: number } | undefined {
+  const first = sql[start];
+  if (first === undefined || !IDENTIFIER_CHARACTER.test(first)) return undefined;
+  let end = start + 1;
+  while (end < sql.length && IDENTIFIER_CHARACTER.test(sql[end]!)) end += 1;
+  return { value: sql.slice(start, end), end };
+}
+
+/** The index of the `)` matching `open`, skipping quoted spans and comments, or `null`. */
+function matchingParen(sql: string, open: number): number | null {
+  let depth = 0;
+  for (let index = open; index < sql.length; index += 1) {
+    const skipped = skipLexicalSpan(sql, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped - 1;
+      continue;
+    }
+    if (sql[index] === '(') depth += 1;
+    else if (sql[index] === ')') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return null;
+}
+
+/**
+ * Models one `EXCLUDE` declaration. Element text comes from the canonical slicer above, and a
+ * generated name is stripped back to unnamed with the `_excl` mirror so a dump round-trips an
+ * unnamed declaration. An uncuttable declaration is skipped whole.
+ */
+function exclusionConstraintFromConstraint(
+  statement: ParsedStatement,
+  constraint: Constraint,
+  draft: TableDraft,
+  place: string,
+  diagnostics: PositionedDiagnostic[],
+): ExclusionConstraint | undefined {
+  const location = constraint.location;
+  const definition =
+    location === undefined || location < 0
+      ? undefined
+      : parseExclusionDefinition(statement.sql, byteOffsetToUtf16(statement.sql, location));
+  if (definition === undefined) {
+    diagnostics.push(skipStatement(statement, `${constraintLabel(constraint)} on ${place}`, place));
+    return undefined;
+  }
+
+  const identity: TableIdentity = { schema: draft.schema, name: draft.name };
+  const exclusionConstraint: Mutable<ExclusionConstraint> = { elements: definition.elements };
+  if (
+    constraint.conname !== undefined &&
+    constraint.conname !== synthesizedExclusionConstraintName(identity, exclusionConstraint)
+  ) {
+    exclusionConstraint.name = constraint.conname;
+  }
+  if (definition.accessMethod !== undefined)
+    exclusionConstraint.accessMethod = definition.accessMethod;
+  if (definition.where !== undefined) exclusionConstraint.where = definition.where;
+  if (constraint.deferrable === true) exclusionConstraint.deferrable = true;
+  if (constraint.initdeferred === true) exclusionConstraint.initiallyDeferred = true;
+  return exclusionConstraint;
+}
+
+/** Pushes a modeled exclusion constraint onto its table draft. */
+function attachExclusionConstraint(
+  draft: TableDraft,
+  exclusionConstraint: ExclusionConstraint,
+): void {
+  draft.exclusionConstraints.push(exclusionConstraint);
 }
 
 /** Index just past the `(` after the first `CHECK` keyword at or after `from`, or `null`. */
@@ -4450,6 +4664,7 @@ function getOrCreateTable(
     foreignKeys: [],
     uniqueConstraints: [],
     checkConstraints: [],
+    exclusionConstraints: [],
     indexes: [],
     exclusionBackingNames: new Set<string>(),
   };
@@ -4567,6 +4782,7 @@ function canonicalizeConstraintNames(draft: TableDraft): void {
   const seenUnique = new Set<string>();
   const seenForeign = new Set<string>();
   const seenCheck = new Set<string>();
+  const seenExclusion = new Set<string>();
 
   // Pre-scan the unnamed entries of each kind, then strip in a second, position-independent pass.
   for (const uniqueConstraint of draft.uniqueConstraints) {
@@ -4581,6 +4797,9 @@ function canonicalizeConstraintNames(draft: TableDraft): void {
     if (checkConstraint.name === undefined) {
       seenCheck.add(checkConstraintStructureKey(checkConstraint));
     }
+  }
+  for (const exclusionConstraint of draft.exclusionConstraints) {
+    if (exclusionConstraint.name === undefined) seenExclusion.add(exclusionConstraint.elements);
   }
 
   const primaryKey = draft.primaryKey;
@@ -4619,6 +4838,18 @@ function canonicalizeConstraintNames(draft: TableDraft): void {
     delete (checkConstraint as Mutable<CheckConstraint>).name;
     seenCheck.add(key);
   }
+  for (const exclusionConstraint of draft.exclusionConstraints) {
+    const name = exclusionConstraint.name;
+    if (
+      name === undefined ||
+      name !== synthesizedExclusionConstraintName(identity, exclusionConstraint)
+    ) {
+      continue;
+    }
+    if (seenExclusion.has(exclusionConstraint.elements)) continue;
+    delete (exclusionConstraint as Mutable<ExclusionConstraint>).name;
+    seenExclusion.add(exclusionConstraint.elements);
+  }
 }
 
 function finalizeTable(draft: TableDraft): Table {
@@ -4633,6 +4864,11 @@ function finalizeTable(draft: TableDraft): Table {
     foreignKeys: [...draft.foreignKeys].sort(compareForeignKeys),
     uniqueConstraints: [...draft.uniqueConstraints].sort(compareUniqueConstraints),
     checkConstraints: [...draft.checkConstraints].sort(compareCheckConstraints),
+    ...(draft.exclusionConstraints.length === 0
+      ? {}
+      : {
+          exclusionConstraints: [...draft.exclusionConstraints].sort(compareExclusionConstraints),
+        }),
     indexes: [...draft.indexes].sort(compareIndexes),
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
@@ -4877,6 +5113,16 @@ function compareUniqueConstraints(left: UniqueConstraint, right: UniqueConstrain
 function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint): number {
   return (
     compareStrings(left.expression, right.expression) ||
+    compareStrings(left.name ?? '', right.name ?? '')
+  );
+}
+
+function compareExclusionConstraints(
+  left: ExclusionConstraint,
+  right: ExclusionConstraint,
+): number {
+  return (
+    compareStrings(left.elements, right.elements) ||
     compareStrings(left.name ?? '', right.name ?? '')
   );
 }

@@ -269,6 +269,18 @@ function renderTable(out: MarkdownBuilder, table: Table): void {
       );
     }
   }
+  if (table.exclusionConstraints !== undefined && table.exclusionConstraints.length > 0) {
+    out.heading(4, 'Exclusion constraints');
+    for (const exclusion of table.exclusionConstraints) {
+      out.bullet(
+        `name: ${fmt(exclusion.name)}, elements: ${fmt(exclusion.elements)}, ` +
+          `access method: ${fmt(exclusion.accessMethod ?? 'gist')}, where: ${fmt(exclusion.where)}, ` +
+          `deferrable: ${fmt(exclusion.deferrable)}, initially deferred: ${fmt(
+            exclusion.initiallyDeferred,
+          )}, comment: ${fmt(exclusion.comment)}`,
+      );
+    }
+  }
   if (table.foreignKeys.length > 0) {
     out.heading(4, 'Foreign keys');
     for (const foreignKey of sorted(table.foreignKeys, compareForeignKeys)) {

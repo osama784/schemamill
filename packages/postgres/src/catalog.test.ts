@@ -110,6 +110,7 @@ const constraint = (
   validated: null,
   enforced: null,
   noInherit: null,
+  definition: null,
   nullsNotDistinct: null,
   including: null,
   period: null,
@@ -184,9 +185,20 @@ const foreignKey = (
     ...rest,
   });
 
-/** An `exclusion` constraint row: identity only, every other key null. */
-const exclusionConstraint = (schema: string, tableName: string, conname: string) =>
-  constraint(schema, tableName, conname, 'exclusion');
+/** An `exclusion` constraint row with the server-deparsed definition its kind requires. */
+const exclusionConstraint = (
+  schema: string,
+  tableName: string,
+  conname: string,
+  rest: Record<string, unknown> = {},
+) =>
+  constraint(schema, tableName, conname, 'exclusion', {
+    definition: 'EXCLUDE USING gist (a WITH =)',
+    deferrable: false,
+    deferred: false,
+    backingIndexName: conname,
+    ...rest,
+  });
 
 /** A `notNullConstraints` row: validated, inheriting, conventionally named, and uncommented unless overridden. */
 const notNull = (
@@ -1907,7 +1919,7 @@ test('flags a comment on a unique constraint backing index without modeling it',
   ]);
 });
 
-test('flags a comment on an exclusion backing index while leaving the constraint own comment unused', async () => {
+test('models an exclusion constraint with its own comment and flags its backing-index comment', async () => {
   const read = await mapCatalog(
     payload({
       tables: [table('public', 't')],
@@ -1923,15 +1935,11 @@ test('flags a comment on an exclusion backing index while leaving the constraint
     }),
   );
 
-  assert.deepEqual(read.model.tables[0]?.uniqueConstraints, []);
+  assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+    { name: 't_excl', elements: 'a WITH =', comment: 'comment on the constraint itself' },
+  ]);
   assert.deepEqual(read.model.tables[0]?.indexes, []);
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -1939,6 +1947,55 @@ test('flags a comment on an exclusion backing index while leaving the constraint
       message: 'dropped comment from public.t_excl',
     },
   ]);
+});
+
+test('models catalog exclusion clauses identically to the dump canonicalization', async () => {
+  const read = await mapCatalog(
+    payload({
+      tables: [table('public', 't')],
+      columns: [column('public', 't', 1, 'a')],
+      constraints: [
+        exclusionConstraint('public', 't', 't_excl', {
+          definition:
+            'EXCLUDE USING gist (a text_pattern_ops WITH =,(lower(a)) WITH <>) WHERE (b > 0)',
+          deferrable: true,
+          deferred: true,
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+    {
+      name: 't_excl',
+      elements: 'a text_pattern_ops WITH =,(lower(a)) WITH <>',
+      where: '(b > 0)',
+      deferrable: true,
+      initiallyDeferred: true,
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('skips an exclusion row whose definition is absent or unparseable', async () => {
+  for (const definition of [null, 'NO EXCLUSION HERE']) {
+    const read = await mapCatalog(
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'a')],
+        constraints: [exclusionConstraint('public', 't', 't_excl', { definition })],
+      }),
+    );
+    assert.equal(Object.hasOwn(read.model.tables[0]!, 'exclusionConstraints'), false);
+    assert.deepEqual(read.diagnostics, [
+      {
+        kind: 'skip',
+        code: 'unsupported-statement',
+        object: 'public.t',
+        message: 'skipped exclusion constraint t_excl',
+      },
+    ]);
+  }
 });
 
 test('sorts an exclusion backing-index comment with the p/u dropped comments by index name', async () => {
@@ -1961,12 +2018,6 @@ test('sorts an exclusion backing-index comment with the p/u dropped comments by 
   );
 
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint a_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -2151,12 +2202,6 @@ test('keeps a tablespace index comment and drops comments on skipped rows withou
     'the conventional tablespace index name strips while the comment stays',
   );
   assert.deepEqual(read.diagnostics, [
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint t_excl',
-    },
     {
       kind: 'flag',
       code: 'unsupported-attribute',
@@ -3627,12 +3672,6 @@ test('reports every constraint diagnostic with the exact line, object, and order
       code: 'unsupported-attribute',
       object: 'public.t',
       message: 'dropped NO INHERIT on check constraint c_inherit from public.t',
-    },
-    {
-      kind: 'skip',
-      code: 'unsupported-statement',
-      object: 'public.t',
-      message: 'skipped exclusion constraint ex_skip',
     },
     {
       kind: 'flag',

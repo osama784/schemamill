@@ -62,7 +62,7 @@ A group is `{ "start": number, "end": number, "transactional": boolean }`: a hal
 
 ## DTOs
 
-Each DTO is built explicitly by `packages/cli/src/json.ts`; no internal class crosses the boundary. A `?` in a field list marks an optional key that is omitted when absent, never emitted as `null`. Embedded model values — a table, column, sequence, view, extension, index, constraint, or identity — reuse the field names and optional-field omission of `serializeModel`; step payloads are flattened exactly as the core union reads. The recursive key set of each kind is pinned by the mapper's contract checks, and the dispatch is exhaustive: a new core kind fails the build until it is mapped here too.
+Each DTO is built explicitly by `packages/cli/src/json.ts`; no internal class crosses the boundary. A `?` in a field list marks an optional key that is omitted when absent, never emitted as `null`. Embedded model values — a table, column, sequence, view, extension, index, constraint (including an exclusion constraint's optional `elements`, `accessMethod`, `where`, `deferrable`, `initiallyDeferred`, and `comment`), or identity — reuse the field names and optional-field omission of `serializeModel`; step payloads are flattened exactly as the core union reads. The recursive key set of each kind is pinned by the mapper's contract checks, and the dispatch is exhaustive: a new core kind fails the build until it is mapped here too.
 
 ### Change
 
@@ -98,6 +98,8 @@ TableChange objects, nested under `table-changed`:
 | `unique-constraint-changed` | `before`, `after` |
 | `check-constraint-added`, `check-constraint-removed` | `checkConstraint` |
 | `check-constraint-changed` | `before`, `after` |
+| `exclusion-constraint-added`, `exclusion-constraint-removed` | `exclusionConstraint` |
+| `exclusion-constraint-changed` | `before`, `after` |
 | `index-added`, `index-removed` | `index` |
 | `index-changed` | `before`, `after` |
 | `persistence-changed` | `before?`, `after?` |
@@ -116,6 +118,7 @@ An `identity` on `column-changed` is an IdentityChange: `added`, `removed`, and 
 | `primary-key` | `table`, `primaryKey` |
 | `unique-constraint` | `table`, `uniqueConstraint` |
 | `check-constraint` | `table`, `checkConstraint` |
+| `exclusion-constraint` | `table`, `exclusionConstraint` |
 | `foreign-key` | `table`, `foreignKey` |
 
 An embedded `column` payload carries the optional `notNullComment` field beside `notNullName` when the column declares a not-null constraint comment ([ADR 0038](./adr/0038-not-null-constraint-comments-travel-the-model.md)); both keys are omitted when absent. The `not-null` target carries the whole column, not just its name, so a renderer can resolve the constraint by `notNullName ?? synthesizedNotNullName` when a generated name was stripped on import; its comment key is `[schema, table, 'not-null', column]`, distinct from the plain column target's key.
@@ -142,6 +145,7 @@ A view-index change or index step names its owner with `kind: "table"` (`table`)
 | `add-foreign-key`, `drop-foreign-key` | `table`, `foreignKey` |
 | `add-unique-constraint`, `drop-unique-constraint` | `table`, `uniqueConstraint` |
 | `add-check-constraint`, `drop-check-constraint` | `table`, `checkConstraint` |
+| `add-exclusion-constraint`, `drop-exclusion-constraint` | `table`, `exclusionConstraint` |
 | `create-index`, `drop-index`, `create-index-concurrently`, `drop-index-concurrently` | `owner`, `index` |
 | `create-sequence` | `sequence` |
 | `drop-sequence` | `sequence` |

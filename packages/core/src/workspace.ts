@@ -10,6 +10,7 @@ import type {
   ColumnCompression,
   ColumnStorage,
   ConstraintEnforcement,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Index,
@@ -430,6 +431,9 @@ function serializeTable(table: Table): object {
     foreignKeys: table.foreignKeys.map(serializeForeignKey),
     uniqueConstraints: table.uniqueConstraints.map(serializeKey),
     checkConstraints: table.checkConstraints.map(serializeCheckConstraint),
+    ...(table.exclusionConstraints === undefined
+      ? {}
+      : { exclusionConstraints: table.exclusionConstraints.map(serializeExclusionConstraint) }),
     indexes: table.indexes.map(serializeIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
@@ -487,6 +491,24 @@ function serializeCheckConstraint(checkConstraint: CheckConstraint): object {
       ? {}
       : { enforcement: checkConstraint.enforcement }),
     ...(checkConstraint.comment === undefined ? {} : { comment: checkConstraint.comment }),
+  };
+}
+
+function serializeExclusionConstraint(exclusionConstraint: ExclusionConstraint): object {
+  return {
+    ...(exclusionConstraint.name === undefined ? {} : { name: exclusionConstraint.name }),
+    elements: exclusionConstraint.elements,
+    ...(exclusionConstraint.accessMethod === undefined
+      ? {}
+      : { accessMethod: exclusionConstraint.accessMethod }),
+    ...(exclusionConstraint.where === undefined ? {} : { where: exclusionConstraint.where }),
+    ...(exclusionConstraint.deferrable === undefined
+      ? {}
+      : { deferrable: exclusionConstraint.deferrable }),
+    ...(exclusionConstraint.initiallyDeferred === undefined
+      ? {}
+      : { initiallyDeferred: exclusionConstraint.initiallyDeferred }),
+    ...(exclusionConstraint.comment === undefined ? {} : { comment: exclusionConstraint.comment }),
   };
 }
 
@@ -594,6 +616,7 @@ const TABLE_KEYS = [
   'foreignKeys',
   'uniqueConstraints',
   'checkConstraints',
+  'exclusionConstraints',
   'indexes',
   'persistence',
   'comment',
@@ -624,6 +647,15 @@ const IDENTITY_KEYS = [
 ] as const;
 const KEY_KEYS = ['name', 'columns', 'deferrable', 'initiallyDeferred', 'comment'] as const;
 const CHECK_CONSTRAINT_KEYS = ['name', 'expression', 'enforcement', 'comment'] as const;
+const EXCLUSION_CONSTRAINT_KEYS = [
+  'name',
+  'elements',
+  'accessMethod',
+  'where',
+  'deferrable',
+  'initiallyDeferred',
+  'comment',
+] as const;
 const FOREIGN_KEY_KEYS = [
   'name',
   'columns',
@@ -894,6 +926,12 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       parseCheckConstraint,
     );
     if (!checkConstraints.ok) return checkConstraints;
+    const exclusionConstraints = parseOptional(
+      object.exclusionConstraints,
+      fieldPath(path, 'exclusionConstraints'),
+      (value, at) => parseArrayOf(value, at, parseExclusionConstraint),
+    );
+    if (!exclusionConstraints.ok) return exclusionConstraints;
     const indexes = parseArrayOf(object.indexes, fieldPath(path, 'indexes'), parseIndex);
     if (!indexes.ok) return indexes;
     const persistence = parseOptional(
@@ -912,6 +950,9 @@ function parseTable(value: unknown, path: string): Parsed<Table> {
       foreignKeys: foreignKeys.value,
       uniqueConstraints: uniqueConstraints.value,
       checkConstraints: checkConstraints.value,
+      ...(exclusionConstraints.value === undefined
+        ? {}
+        : { exclusionConstraints: exclusionConstraints.value }),
       indexes: indexes.value,
       ...(persistence.value === undefined ? {} : { persistence: persistence.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
@@ -1108,6 +1149,48 @@ function parseCheckConstraint(value: unknown, path: string): Parsed<CheckConstra
       ...(name.value === undefined ? {} : { name: name.value }),
       expression: expression.value,
       ...(enforcement.value === undefined ? {} : { enforcement: enforcement.value }),
+      ...(comment.value === undefined ? {} : { comment: comment.value }),
+    });
+  });
+}
+
+function parseExclusionConstraint(value: unknown, path: string): Parsed<ExclusionConstraint> {
+  return parseObject(value, path, EXCLUSION_CONSTRAINT_KEYS, (object) => {
+    const name = parseOptional(object.name, fieldPath(path, 'name'), parseNonEmptyString);
+    if (!name.ok) return name;
+    const elements = parseNonEmptyString(object.elements, fieldPath(path, 'elements'));
+    if (!elements.ok) return elements;
+    const accessMethod = parseOptional(
+      object.accessMethod,
+      fieldPath(path, 'accessMethod'),
+      parseNonEmptyString,
+    );
+    if (!accessMethod.ok) return accessMethod;
+    const where = parseOptional(object.where, fieldPath(path, 'where'), parseNonEmptyString);
+    if (!where.ok) return where;
+    const deferrable = parseOptional(
+      object.deferrable,
+      fieldPath(path, 'deferrable'),
+      parseBoolean,
+    );
+    if (!deferrable.ok) return deferrable;
+    const initiallyDeferred = parseOptional(
+      object.initiallyDeferred,
+      fieldPath(path, 'initiallyDeferred'),
+      parseBoolean,
+    );
+    if (!initiallyDeferred.ok) return initiallyDeferred;
+    const comment = parseOptional(object.comment, fieldPath(path, 'comment'), parseComment);
+    if (!comment.ok) return comment;
+    return parsed({
+      ...(name.value === undefined ? {} : { name: name.value }),
+      elements: elements.value,
+      ...(accessMethod.value === undefined ? {} : { accessMethod: accessMethod.value }),
+      ...(where.value === undefined ? {} : { where: where.value }),
+      ...(deferrable.value === undefined ? {} : { deferrable: deferrable.value }),
+      ...(initiallyDeferred.value === undefined
+        ? {}
+        : { initiallyDeferred: initiallyDeferred.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
   });

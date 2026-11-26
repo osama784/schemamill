@@ -8,6 +8,7 @@ import type {
   Column,
   CommentTarget,
   ConstraintEnforcement,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Identity,
@@ -83,6 +84,12 @@ const checkConstraint = (
   expression: string,
   rest: Partial<Omit<CheckConstraint, 'expression'>> = {},
 ): CheckConstraint => ({ expression, ...rest });
+
+/** An exclusion constraint on `elements`: unnamed and gist unless overridden. */
+const exclusionConstraint = (
+  elements: string,
+  rest: Partial<Omit<ExclusionConstraint, 'elements'>> = {},
+): ExclusionConstraint => ({ elements, ...rest });
 
 /** A non-unique index on `columns`: unnamed and non-concurrent unless overridden. */
 const tableIndex = (
@@ -595,6 +602,76 @@ test('renders unique and check constraint adds and drops, naming only when state
       'ALTER TABLE public.t DROP CONSTRAINT t_a_key;',
       'ALTER TABLE public.t DROP CONSTRAINT t_check;',
       'ALTER TABLE app."Order" DROP CONSTRAINT "we""ird";',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders exclusion adds and drops with the default method, quoting, and deferrability', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'add-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('a WITH =', { name: 't_excl' }),
+        },
+        {
+          kind: 'add-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('(lower(a)) WITH <>', {
+            accessMethod: 'gist',
+            where: 'b > 0',
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
+        },
+        {
+          kind: 'drop-exclusion-constraint',
+          table: identity('t'),
+          exclusionConstraint: exclusionConstraint('a WITH ='),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_excl EXCLUDE USING gist (a WITH =);',
+      'ALTER TABLE public.t ADD EXCLUDE USING gist ((lower(a)) WITH <>) WHERE b > 0 DEFERRABLE INITIALLY DEFERRED;',
+      'ALTER TABLE public.t DROP CONSTRAINT t_a_excl;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('renders a comment on an exclusion constraint by its stored or synthesized name', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'comment',
+          target: {
+            kind: 'exclusion-constraint',
+            table: identity('t'),
+            exclusionConstraint: exclusionConstraint('a WITH =', { name: 'we"ird' }),
+          },
+          text: 'note',
+        },
+        {
+          kind: 'comment',
+          target: {
+            kind: 'exclusion-constraint',
+            table: identity('t'),
+            exclusionConstraint: exclusionConstraint('a WITH ='),
+          },
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'COMMENT ON CONSTRAINT "we""ird" ON public.t IS \'note\';',
+      'COMMENT ON CONSTRAINT t_a_excl ON public.t IS NULL;',
       'COMMIT;',
       '',
     ].join('\n'),

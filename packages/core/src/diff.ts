@@ -7,6 +7,7 @@ import type {
   ColumnAttributes,
   ColumnCompression,
   ColumnStorage,
+  ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
@@ -286,6 +287,16 @@ export type TableChange =
   | { kind: 'check-constraint-removed'; checkConstraint: CheckConstraint }
   /** A matched check constraint pair with any difference. */
   | { kind: 'check-constraint-changed'; before: CheckConstraint; after: CheckConstraint }
+  /** An exclusion constraint only the target has. */
+  | { kind: 'exclusion-constraint-added'; exclusionConstraint: ExclusionConstraint }
+  /** An exclusion constraint only the baseline has. */
+  | { kind: 'exclusion-constraint-removed'; exclusionConstraint: ExclusionConstraint }
+  /** A matched exclusion constraint pair with any difference. */
+  | {
+      kind: 'exclusion-constraint-changed';
+      before: ExclusionConstraint;
+      after: ExclusionConstraint;
+    }
   /** An index only the target has. */
   | { kind: 'index-added'; index: Index }
   /** An index only the baseline has. */
@@ -731,6 +742,20 @@ function diffComments(baseline: Model, target: Model): readonly CommentChange[] 
       );
     }
 
+    const beforeExclusionConstraints = new Map(
+      (before?.exclusionConstraints ?? []).map((entry) => [
+        exclusionConstraintIdentity(entry),
+        entry,
+      ]),
+    );
+    for (const exclusionConstraint of table.exclusionConstraints ?? []) {
+      emit(
+        { kind: 'exclusion-constraint', table, exclusionConstraint },
+        beforeExclusionConstraints.get(exclusionConstraintIdentity(exclusionConstraint))?.comment,
+        exclusionConstraint.comment,
+      );
+    }
+
     const beforeIndexes = new Map(
       (before?.indexes ?? []).map((entry) => [commentIndexIdentity(entry), entry]),
     );
@@ -856,6 +881,17 @@ function copyTarget(target: CommentTarget): CommentTarget {
       delete foreignKey.comment;
       return { kind: 'foreign-key', table: copyTargetIdentity(target.table), foreignKey };
     }
+    case 'exclusion-constraint': {
+      const exclusionConstraint: Mutable<ExclusionConstraint> = copyExclusionConstraint(
+        target.exclusionConstraint,
+      );
+      delete exclusionConstraint.comment;
+      return {
+        kind: 'exclusion-constraint',
+        table: copyTargetIdentity(target.table),
+        exclusionConstraint,
+      };
+    }
   }
 }
 
@@ -933,6 +969,13 @@ function commentTargetKey(target: CommentTarget): string {
           target.foreignKey.referencedTable.schema,
           target.foreignKey.referencedTable.name,
         ],
+      ]);
+    case 'exclusion-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'exclusion-constraint',
+        target.exclusionConstraint.elements,
       ]);
   }
 }
@@ -1063,6 +1106,11 @@ function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint 
   return { ...checkConstraint };
 }
 
+/** A copy of `exclusionConstraint`, independent of the caller's model. */
+function copyExclusionConstraint(exclusionConstraint: ExclusionConstraint): ExclusionConstraint {
+  return { ...exclusionConstraint };
+}
+
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
   return {
@@ -1118,6 +1166,13 @@ function copyTable(table: Table): Table {
     checkConstraints: [...table.checkConstraints]
       .sort(compareCheckConstraintsCanonically)
       .map(copyCheckConstraint),
+    ...(table.exclusionConstraints === undefined
+      ? {}
+      : {
+          exclusionConstraints: [...table.exclusionConstraints]
+            .sort(compareExclusionConstraintsCanonically)
+            .map(copyExclusionConstraint),
+        }),
     indexes: [...table.indexes].sort(compareIndexesCanonically).map(copyIndex),
   };
 }
@@ -1147,6 +1202,12 @@ function diffTable(
   );
   changes.push(...diffUniqueConstraints(baseline.uniqueConstraints, target.uniqueConstraints));
   changes.push(...diffCheckConstraints(baseline.checkConstraints, target.checkConstraints));
+  changes.push(
+    ...diffExclusionConstraints(
+      baseline.exclusionConstraints ?? [],
+      target.exclusionConstraints ?? [],
+    ),
+  );
   changes.push(...diffIndexes(baseline.indexes, target.indexes));
   if (baseline.persistence !== target.persistence) {
     changes.push({
@@ -1602,6 +1663,72 @@ function diffCheckConstraints(
   ];
 }
 
+/** One matched exclusion-constraint pair, remembered with both sides for a change entry. */
+interface ExclusionConstraintPair {
+  readonly before: ExclusionConstraint;
+  readonly after: ExclusionConstraint;
+}
+
+/**
+ * Exclusion constraints pair like check constraints, with the canonical element text as
+ * identity and `name` as an attribute: identical constraints cancel, the rest pairs
+ * positionally in name order, and a different element text is a removal and an addition.
+ */
+function diffExclusionConstraints(
+  baseline: readonly ExclusionConstraint[],
+  target: readonly ExclusionConstraint[],
+): TableChange[] {
+  const baselineGroups = groupExclusionConstraints(baseline);
+  const targetGroups = groupExclusionConstraints(target);
+
+  const removed: ExclusionConstraint[] = [];
+  const added: ExclusionConstraint[] = [];
+  const changed: ExclusionConstraintPair[] = [];
+
+  const identities = new Set([...baselineGroups.keys(), ...targetGroups.keys()]);
+  for (const identity of identities) {
+    const remainingBaseline = [...(baselineGroups.get(identity) ?? [])];
+    const remainingTarget: ExclusionConstraint[] = [];
+
+    for (const after of targetGroups.get(identity) ?? []) {
+      const match = remainingBaseline.findIndex((before) =>
+        exclusionConstraintsEqual(before, after),
+      );
+      if (match === -1) remainingTarget.push(after);
+      else remainingBaseline.splice(match, 1);
+    }
+
+    remainingBaseline.sort(compareExclusionConstraintPairing);
+    remainingTarget.sort(compareExclusionConstraintPairing);
+    const paired = Math.min(remainingBaseline.length, remainingTarget.length);
+    for (let index = 0; index < paired; index += 1) {
+      changed.push({ before: remainingBaseline[index]!, after: remainingTarget[index]! });
+    }
+    removed.push(...remainingBaseline.slice(paired));
+    added.push(...remainingTarget.slice(paired));
+  }
+
+  removed.sort(compareExclusionConstraints);
+  added.sort(compareExclusionConstraints);
+  changed.sort(compareExclusionConstraintChanges);
+
+  return [
+    ...removed.map((exclusionConstraint): TableChange => ({
+      kind: 'exclusion-constraint-removed',
+      exclusionConstraint: copyExclusionConstraint(exclusionConstraint),
+    })),
+    ...added.map((exclusionConstraint): TableChange => ({
+      kind: 'exclusion-constraint-added',
+      exclusionConstraint: copyExclusionConstraint(exclusionConstraint),
+    })),
+    ...changed.map((pair): TableChange => ({
+      kind: 'exclusion-constraint-changed',
+      before: copyExclusionConstraint(pair.before),
+      after: copyExclusionConstraint(pair.after),
+    })),
+  ];
+}
+
 /**
  * Indexes pair like tables and sequences: a named index's identity is its name, so a rename is
  * a removal and an addition, and two indexes with the same name differ by `unique` or
@@ -1861,6 +1988,36 @@ function checkConstraintsEqual(left: CheckConstraint, right: CheckConstraint): b
   );
 }
 
+function groupExclusionConstraints(
+  exclusionConstraints: readonly ExclusionConstraint[],
+): Map<string, ExclusionConstraint[]> {
+  const groups = new Map<string, ExclusionConstraint[]>();
+  for (const exclusionConstraint of [...exclusionConstraints].sort(compareExclusionConstraints)) {
+    const identity = exclusionConstraintIdentity(exclusionConstraint);
+    const group = groups.get(identity);
+    if (group === undefined) groups.set(identity, [exclusionConstraint]);
+    else group.push(exclusionConstraint);
+  }
+  return groups;
+}
+
+/** The matching key of an exclusion constraint: its canonical element text. */
+function exclusionConstraintIdentity(exclusionConstraint: ExclusionConstraint): string {
+  return JSON.stringify(exclusionConstraint.elements);
+}
+
+/** Equality over every field; `name` is an attribute, never identity. */
+function exclusionConstraintsEqual(left: ExclusionConstraint, right: ExclusionConstraint): boolean {
+  return (
+    left.name === right.name &&
+    left.elements === right.elements &&
+    left.accessMethod === right.accessMethod &&
+    left.where === right.where &&
+    left.deferrable === right.deferrable &&
+    left.initiallyDeferred === right.initiallyDeferred
+  );
+}
+
 function groupIndexes(indexes: readonly Index[]): Map<string, Index[]> {
   const groups = new Map<string, Index[]>();
   for (const index of [...indexes].sort(compareIndexes)) {
@@ -1976,6 +2133,48 @@ function compareCheckConstraints(left: CheckConstraint, right: CheckConstraint):
   return (
     compareStrings(left.expression, right.expression) ||
     compareOptionalStrings(left.name, right.name)
+  );
+}
+
+function compareExclusionConstraints(
+  left: ExclusionConstraint,
+  right: ExclusionConstraint,
+): number {
+  return (
+    compareStrings(left.elements, right.elements) ||
+    compareOptionalStrings(left.name, right.name) ||
+    compareOptionalStrings(left.accessMethod, right.accessMethod) ||
+    compareOptionalStrings(left.where, right.where)
+  );
+}
+
+function compareExclusionConstraintsCanonically(
+  left: ExclusionConstraint,
+  right: ExclusionConstraint,
+): number {
+  return compareExclusionConstraints(left, right) || compareExclusionConstraintPairing(left, right);
+}
+
+function compareExclusionConstraintPairing(
+  left: ExclusionConstraint,
+  right: ExclusionConstraint,
+): number {
+  return (
+    compareOptionalStrings(left.name, right.name) ||
+    compareOptionalStrings(left.accessMethod, right.accessMethod) ||
+    compareOptionalStrings(left.where, right.where) ||
+    (left.deferrable === right.deferrable ? 0 : left.deferrable ? 1 : -1) ||
+    (left.initiallyDeferred === right.initiallyDeferred ? 0 : left.initiallyDeferred ? 1 : -1)
+  );
+}
+
+function compareExclusionConstraintChanges(
+  left: ExclusionConstraintPair,
+  right: ExclusionConstraintPair,
+): number {
+  return (
+    compareExclusionConstraints(left.before, right.before) ||
+    compareExclusionConstraints(left.after, right.after)
   );
 }
 

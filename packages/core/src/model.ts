@@ -12,9 +12,10 @@ import type { Identity } from './identity.ts';
  * - A table is identified by its schema and its name together, e.g. `public.users`.
  * - A column is identified by its name within its table.
  * - A primary key or unique constraint is identified by the columns it covers, a check
- *   constraint by its expression, and a foreign key by its referencing columns and the table
- *   it references; a constraint `name` travels with it when the source has one but is not part
- *   of its identity. An index is identified by its name.
+ *   constraint by its expression, an exclusion constraint by its canonical element text, and a
+ *   foreign key by its referencing columns and the table it references; a constraint `name`
+ *   travels with it when the source has one but is not part of its identity. An index is
+ *   identified by its name.
  * - A sequence is identified by its schema and its name together, like a table.
  * - A view is identified by its schema and its name together, like a table. A view and a
  *   materialized view share one namespace, so the `materialized` discriminator is part of the
@@ -34,6 +35,8 @@ import type { Identity } from './identity.ts';
  *   constraint name (`name ?? ''`, so unnamed first).
  * - `checkConstraints` are sorted by expression, then constraint name (`name ?? ''`, so
  *   unnamed first).
+ * - `exclusionConstraints` are sorted by their canonical element text, then constraint name
+ *   (`name ?? ''`, so unnamed first).
  * - `indexes` are sorted by name (`name ?? ''`, so unnamed first).
  * - `sequences` are sorted by schema, then name (JavaScript string comparison).
  * - `views` are sorted by schema, then name (JavaScript string comparison).
@@ -106,6 +109,8 @@ export interface Table extends TableIdentity {
   readonly uniqueConstraints: readonly UniqueConstraint[];
   /** Check constraints declared on the table, in the model's deterministic order. */
   readonly checkConstraints: readonly CheckConstraint[];
+  /** Exclusion constraints declared on the table, in the model's deterministic order. */
+  readonly exclusionConstraints?: readonly ExclusionConstraint[];
   /** Standalone indexes on the table, in the model's deterministic order. */
   readonly indexes: readonly Index[];
   /**
@@ -267,6 +272,39 @@ export interface CheckConstraint {
   readonly enforcement?: ConstraintEnforcement;
   /**
    * The check constraint's PostgreSQL comment, stored verbatim; absent means none. An empty
+   * string is not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized,
+   * and no NUL.
+   */
+  readonly comment?: string;
+}
+
+/**
+ * An exclusion constraint: the listed expressions and operators must not compare equal for any
+ * two rows. Operator, operator-class, and collation text stays inside the opaque `elements`
+ * text, which is whitespace-normalized by the importing parser and never reconstructed by core.
+ * `accessMethod` is explicit-only: absence means PostgreSQL's `gist` default.
+ */
+export interface ExclusionConstraint {
+  /** Constraint name as written, when the source names it. */
+  readonly name?: string;
+  /** The exclusion elements as canonical, whitespace-normalized text, in authored order. */
+  readonly elements: string;
+  /**
+   * The access method, as written, when the source states one; absent means PostgreSQL's
+   * `gist` default.
+   */
+  readonly accessMethod?: string;
+  /** The exclusion's `WHERE` clause; absent means the constraint applies to every row. */
+  readonly where?: string;
+  /** Whether the constraint is declared `DEFERRABLE`; absent means `NOT DEFERRABLE`. */
+  readonly deferrable?: boolean;
+  /**
+   * Whether the constraint is declared `INITIALLY DEFERRED`; implies `deferrable`, and absent
+   * means `INITIALLY IMMEDIATE`.
+   */
+  readonly initiallyDeferred?: boolean;
+  /**
+   * The exclusion constraint's PostgreSQL comment, stored verbatim; absent means none. An empty
    * string is not a comment (`COMMENT … IS ''` removes it), text is never whitespace-normalized,
    * and no NUL.
    */

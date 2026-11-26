@@ -11,6 +11,7 @@ import type {
   Column,
   CommentTarget,
   Diagnostic,
+  ExclusionConstraint,
   Extension,
   ForeignKey,
   Identity,
@@ -227,6 +228,7 @@ interface TableParts {
   foreignKeys?: readonly ForeignKey[];
   uniqueConstraints?: readonly UniqueConstraint[];
   checkConstraints?: readonly CheckConstraint[];
+  exclusionConstraints?: readonly ExclusionConstraint[];
   indexes?: readonly Index[];
 }
 
@@ -241,6 +243,9 @@ const table = (name: string, parts: TableParts = {}): Table => ({
   foreignKeys: parts.foreignKeys ?? [],
   uniqueConstraints: parts.uniqueConstraints ?? [],
   checkConstraints: parts.checkConstraints ?? [],
+  ...(parts.exclusionConstraints === undefined
+    ? {}
+    : { exclusionConstraints: parts.exclusionConstraints }),
   indexes: parts.indexes ?? [],
 });
 
@@ -3786,6 +3791,100 @@ const enforcementInPlaceScene = (): LiveScene => {
           const expected = 'guests:guests_team_fk:not-enforced members:members_team_fk:undefined';
           return facts === expected ? undefined : `imported enforcement: ${facts}`;
         },
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The exclusion-constraint round trip: a target adding a named constraint with a non-default
+ * operator class and its own comment, plus an unnamed one whose generated `_excl` name must strip
+ * back to unnamed. `pg_trgm` supplies the `gist_trgm_ops` operator class on every server the suite
+ * runs (the PostgreSQL 13 floor included), so no scene is skipped. Both imports must model the
+ * canonical element text identically to the catalog read; any new skip fails the scene.
+ */
+const exclusionConstraintRoundTripScene = (): LiveScene => {
+  const columns = [
+    column('note', { notNull: true }),
+    column('a', { type: 'integer', notNull: true }),
+  ];
+  const baseline = table('reservations', { columns });
+  const target = table('reservations', {
+    columns,
+    exclusionConstraints: [
+      {
+        name: 'res_no_similar',
+        elements: 'note gist_trgm_ops WITH %',
+        comment: 'no similar notes',
+      },
+      { elements: 'a WITH =' },
+    ],
+  });
+
+  return {
+    name: 'exclusion-constraint-round-trip',
+    baseline: model(baseline),
+    target: model(target),
+    setupSql: 'CREATE EXTENSION IF NOT EXISTS pg_trgm;',
+    baselineChecks: [
+      {
+        description: 'baseline reservations has no exclusion constraint',
+        sql: "select count(*) from pg_constraint where contype = 'x' and conrelid = 'public.reservations'::regclass",
+        expected: '0',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the plan adds two exclusion constraints and one comment',
+        failure: (steps) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          return kinds === 'add-exclusion-constraint,add-exclusion-constraint,comment'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports model both exclusion constraints and carry the own comment',
+        failure: (imported) => {
+          const table = imported.model.tables.find(
+            (candidate) => candidate.name === 'reservations',
+          );
+          if (table === undefined) return 'reservations is not imported';
+          const exclusions = table.exclusionConstraints ?? [];
+          if (exclusions.length !== 2) return `modeled exclusions: ${exclusions.length}`;
+          const opclass = exclusions.find((entry) => entry.elements.includes('gist_trgm_ops'));
+          if (opclass === undefined) return 'the non-default operator class was not modeled';
+          if (opclass.name !== 'res_no_similar' || opclass.comment !== 'no similar notes') {
+            return `the named constraint lost its name or comment: ${JSON.stringify(opclass)}`;
+          }
+          const unnamed = exclusions.find((entry) => entry.name === undefined);
+          if (unnamed === undefined || !unnamed.elements.includes('a WITH =')) {
+            return 'the generated exclusion name was not stripped back to unnamed';
+          }
+          const skips = imported.diagnostics.filter(
+            (diagnostic) =>
+              diagnostic.kind === 'skip' && diagnostic.message.includes('exclusion constraint'),
+          );
+          return skips.length === 0
+            ? undefined
+            : `new exclusion skip: ${skips.map((diagnostic) => diagnostic.message).join(',')}`;
+        },
+      },
+    ],
+    checks: [
+      { description: 'tables', sql: TABLES, expected: 'reservations' },
+      {
+        description: 'the two exclusion constraints are physically present',
+        sql: "select string_agg(conname, ',' order by conname) from pg_constraint where contype = 'x' and conrelid = 'public.reservations'::regclass",
+        expected: 'res_no_similar,reservations_a_excl',
+      },
+      {
+        description: 'the constraint comment is on pg_constraint',
+        sql: "select obj_description((select oid from pg_constraint where conname = 'res_no_similar' and conrelid = 'public.reservations'::regclass), 'pg_constraint')",
+        expected: 'no similar notes',
       },
     ],
     introspection: { assert: 'matches-import' },
@@ -7670,6 +7769,7 @@ export const scenes: readonly LiveScene[] = [
   constraintAttributesScene(),
   notNullConstraintNamesScene(),
   enforcementInPlaceScene(),
+  exclusionConstraintRoundTripScene(),
   indexCreateScene(),
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),

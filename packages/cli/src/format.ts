@@ -4,6 +4,7 @@ import type {
   Column,
   ColumnFieldChange,
   CommentTarget,
+  ExclusionConstraint,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
@@ -276,6 +277,9 @@ function formatTable(sign: string, table: Table): string {
   for (const checkConstraint of table.checkConstraints) {
     lines.push(`    ${formatCheckConstraint(checkConstraint)}`);
   }
+  for (const exclusionConstraint of table.exclusionConstraints ?? []) {
+    lines.push(`    ${formatExclusionConstraint(exclusionConstraint)}`);
+  }
   for (const index of table.indexes) lines.push(`    ${formatIndex(index)}`);
   return lines.join('\n');
 }
@@ -387,6 +391,42 @@ function formatTableChange(change: TableChange): string {
       }
       return `~ check constraint (${change.before.expression}): ${fields.join(', ')}`;
     }
+    case 'exclusion-constraint-added':
+      return `+ ${formatExclusionConstraint(change.exclusionConstraint)}`;
+    case 'exclusion-constraint-removed':
+      return `- ${formatExclusionConstraint(change.exclusionConstraint)}`;
+    case 'exclusion-constraint-changed': {
+      const fields = [
+        `name ${formatOptional(change.before.name)} → ${formatOptional(change.after.name)}`,
+      ];
+      if (change.before.accessMethod !== change.after.accessMethod) {
+        fields.push(
+          `access method ${formatOptional(change.before.accessMethod)} → ${formatOptional(
+            change.after.accessMethod,
+          )}`,
+        );
+      }
+      if (change.before.where !== change.after.where) {
+        fields.push(
+          `where ${formatOptional(change.before.where)} → ${formatOptional(change.after.where)}`,
+        );
+      }
+      if (change.before.deferrable !== change.after.deferrable) {
+        fields.push(
+          `deferrable ${formatBooleanOptional(change.before.deferrable)} → ${formatBooleanOptional(
+            change.after.deferrable,
+          )}`,
+        );
+      }
+      if (change.before.initiallyDeferred !== change.after.initiallyDeferred) {
+        fields.push(
+          `initially deferred ${formatBooleanOptional(
+            change.before.initiallyDeferred,
+          )} → ${formatBooleanOptional(change.after.initiallyDeferred)}`,
+        );
+      }
+      return `~ exclusion constraint (${change.before.elements}): ${fields.join(', ')}`;
+    }
     case 'index-added':
       return `+ ${formatIndex(change.index)}`;
     case 'index-removed':
@@ -444,6 +484,9 @@ function formatStep(step: Step): string {
     case 'add-check-constraint':
     case 'drop-check-constraint':
       return `${formatIdentity(step.table)}: ${formatCheckConstraint(step.checkConstraint)}`;
+    case 'add-exclusion-constraint':
+    case 'drop-exclusion-constraint':
+      return `${formatIdentity(step.table)}: ${formatExclusionConstraint(step.exclusionConstraint)}`;
     case 'create-index':
     case 'drop-index':
     case 'create-index-concurrently':
@@ -538,6 +581,18 @@ function formatUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
 function formatCheckConstraint(checkConstraint: CheckConstraint): string {
   const name = checkConstraint.name === undefined ? '' : `${formatPresent(checkConstraint.name)} `;
   return `check constraint ${name}CHECK (${checkConstraint.expression})`;
+}
+
+/** An exclusion-constraint line: its name, access method, opaque elements, and clauses. */
+function formatExclusionConstraint(exclusionConstraint: ExclusionConstraint): string {
+  const name =
+    exclusionConstraint.name === undefined ? '' : `${formatPresent(exclusionConstraint.name)} `;
+  const accessMethod = exclusionConstraint.accessMethod ?? 'gist';
+  const where =
+    exclusionConstraint.where === undefined ? '' : ` WHERE ${exclusionConstraint.where}`;
+  const deferrable = exclusionConstraint.deferrable === true ? ' DEFERRABLE' : '';
+  const deferred = exclusionConstraint.initiallyDeferred === true ? ' INITIALLY DEFERRED' : '';
+  return `exclusion constraint ${name}EXCLUDE USING ${accessMethod} (${exclusionConstraint.elements})${where}${deferrable}${deferred}`;
 }
 
 /** An index line: `unique` when it is, its name, its ordered elements, then its clauses. */
@@ -702,6 +757,8 @@ function formatCommentTarget(target: CommentTarget): string {
       return `foreign key ${formatIdentity(target.table)} (${target.foreignKey.columns.join(
         ', ',
       )}) → ${formatIdentity(target.foreignKey.referencedTable)}`;
+    case 'exclusion-constraint':
+      return `exclusion constraint ${formatIdentity(target.table)} (${target.exclusionConstraint.elements})`;
   }
 }
 

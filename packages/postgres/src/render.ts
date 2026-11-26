@@ -7,6 +7,7 @@ import type {
   ColumnStorage,
   CommentTarget,
   ConstraintEnforcement,
+  ExclusionConstraint,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
@@ -30,6 +31,7 @@ import type {
 
 import {
   synthesizedCheckConstraintName,
+  synthesizedExclusionConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
   synthesizedNotNullName,
@@ -491,6 +493,8 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'drop-unique-constraint':
     case 'add-check-constraint':
     case 'drop-check-constraint':
+    case 'add-exclusion-constraint':
+    case 'drop-exclusion-constraint':
     case 'create-sequence':
     case 'drop-sequence':
     case 'alter-sequence':
@@ -783,6 +787,8 @@ function stepPrincipalTable(step: Step): TableIdentity | undefined {
     case 'drop-unique-constraint':
     case 'add-check-constraint':
     case 'drop-check-constraint':
+    case 'add-exclusion-constraint':
+    case 'drop-exclusion-constraint':
       return step.table;
     case 'create-index':
     case 'drop-index':
@@ -884,6 +890,15 @@ function renderStep(step: Step, targetVersion: number): string {
         step.checkConstraint.name ??
           synthesizedCheckConstraintName(step.table, step.checkConstraint),
       )};`;
+    case 'add-exclusion-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} ADD ${renderExclusionConstraint(
+        step.exclusionConstraint,
+      )};`;
+    case 'drop-exclusion-constraint':
+      return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
+        step.exclusionConstraint.name ??
+          synthesizedExclusionConstraintName(step.table, step.exclusionConstraint),
+      )};`;
     case 'create-index':
       return renderCreateIndex(step.owner, step.index, false);
     case 'create-index-concurrently':
@@ -976,6 +991,12 @@ function renderCommentTarget(target: CommentTarget): string {
     case 'foreign-key': {
       const name =
         target.foreignKey.name ?? synthesizedForeignKeyName(target.table, target.foreignKey);
+      return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
+    }
+    case 'exclusion-constraint': {
+      const name =
+        target.exclusionConstraint.name ??
+        synthesizedExclusionConstraintName(target.table, target.exclusionConstraint);
       return `CONSTRAINT ${quoteIdentifier(name)} ON ${renderTable(target.table)}`;
     }
   }
@@ -1255,6 +1276,24 @@ function renderCheckConstraint(checkConstraint: CheckConstraint): string {
       : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
   return `${name}CHECK (${checkConstraint.expression})${renderEnforcement(
     checkConstraint.enforcement,
+  )}`;
+}
+
+/**
+ * An exclusion-constraint clause, with its name when it has one. The access method defaults to
+ * PostgreSQL's `gist` when absent, the elements are opaque canonical text, and the `WHERE`
+ * clause and deferrability ride at the end in that order (ADR 0024, render as declared).
+ */
+function renderExclusionConstraint(exclusionConstraint: ExclusionConstraint): string {
+  const name =
+    exclusionConstraint.name === undefined
+      ? ''
+      : `CONSTRAINT ${quoteIdentifier(exclusionConstraint.name)} `;
+  const accessMethod = exclusionConstraint.accessMethod ?? 'gist';
+  const where =
+    exclusionConstraint.where === undefined ? '' : ` WHERE ${exclusionConstraint.where}`;
+  return `${name}EXCLUDE USING ${accessMethod} (${exclusionConstraint.elements})${where}${renderDeferrability(
+    exclusionConstraint,
   )}`;
 }
 

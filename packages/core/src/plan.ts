@@ -11,6 +11,7 @@ import type {
   CheckConstraint,
   Column,
   ColumnAttributes,
+  ExclusionConstraint,
   Extension,
   ExtensionIdentity,
   ForeignKey,
@@ -41,12 +42,13 @@ import type {
  * partitions its steps into transaction groups, telling a renderer what applies as one unit;
  * hazards are a separate analysis.
  *
- * A step is one of thirty-four kinds. A schema the target's objects use but the baseline's do
+ * A step is one of thirty-six kinds. A schema the target's objects use but the baseline's do
  * not becomes a create-schema step. A table addition becomes a create-table step carrying
  * the table's columns and primary key as they are, plus one add-foreign-key step per foreign
  * key, one add-unique-constraint step per unique constraint, one add-check-constraint step per
- * check constraint, and one create-index step per index — the create-table payload is always
- * free of foreign keys, unique constraints, check constraints, and indexes, so each attaches
+ * check constraint, one add-exclusion-constraint step per exclusion constraint, and one
+ * create-index step per index — the create-table payload is always free of foreign keys, unique
+ * constraints, check constraints, exclusion constraints, and indexes, so each attaches
  * with its own step and constraints attach only once every referenced table exists. A table
  * removal becomes a drop-table step. A changed table is mapped member by member: a removed
  * column becomes drop-column, an added column add-column, a changed column alter-column
@@ -65,10 +67,11 @@ import type {
  * step; a removed, added, or changed foreign key becomes a drop-foreign-key and/or
  * add-foreign-key step; a removed, added, or changed unique constraint becomes a
  * drop-unique-constraint and/or add-unique-constraint step; a removed, added, or changed check
- * constraint becomes a drop-check-constraint and/or add-check-constraint step; and a removed,
- * added, or changed index becomes a drop-index and/or create-index step. A changed primary key,
- * foreign key, unique constraint, check constraint, or index decomposes into its drop half and
- * its add half.
+ * constraint becomes a drop-check-constraint and/or add-check-constraint step; a removed, added,
+ * or changed exclusion constraint becomes a drop-exclusion-constraint and/or
+ * add-exclusion-constraint step; and a removed, added, or changed index becomes a drop-index
+ * and/or create-index step. A changed primary key, foreign key, unique constraint, check
+ * constraint, exclusion constraint, or index decomposes into its drop half and its add half.
  *
  * The concurrent index kinds are the plan's only non-transactional steps. A create step is
  * `create-index-concurrently` exactly when the target index states `concurrently: true`; a
@@ -181,13 +184,16 @@ import type {
  * only when its column survives — a removed column or table carries its identity away in that
  * drop — so every collected drop-identity names an owner that still exists.
  *
- * The table phases inside phase 6 are numbered as before (and keep their documented semantics):
+ * The table phases inside phase 6 keep their documented semantics; phases 3a and 16a are the
+ * two exclusion phases:
  *
  * 1. drop-foreign-key — the diff-derived drops, then the steps synthesized for primary-key
  *    changes and the cycle-breaking drops described below;
  * 2. drop-index — the diff-derived drops, before the table and column drops that would take
  *    their columns away;
  * 3. drop-check-constraint — likewise, before the table and column drops;
+ * 3a. drop-exclusion-constraint — its own distinct phase, immediately after check drops and
+ *     before the unique drops;
  * 4. drop-unique-constraint — likewise, before the table and column drops;
  * 5. drop-table — dependency-ordered among themselves, see below. Removed tables go before the
  *    primary-key and column drops, so a constraint a removed table still holds on a kept
@@ -211,14 +217,17 @@ import type {
  * 14. add-primary-key — after its columns exist;
  * 15. add-unique-constraint — after its columns exist;
  * 16. add-check-constraint — after its columns exist;
+ * 16a. add-exclusion-constraint — its own distinct phase, immediately after check adds and
+ *     before index creates;
  * 17. create-index — after its columns exist; the concurrent variant stands alone;
  * 18. add-foreign-key — last, once both the table and the referenced table exist, with the
  *     synthesized primary-key dependents after the diff-derived adds.
  *
  * Within a phase, steps keep the relative order the diff produced: table and sequence changes
  * in identity order, and inside a changed table the diff's documented member order. A table
- * addition contributes its unique-constraint, check-constraint, and index steps to table phases
- * 15–17 and its foreign-key steps to table phase 18, each in the added table's canonical order.
+ * addition contributes its unique-constraint, check-constraint, exclusion-constraint, and index
+ * steps to the add phases and its foreign-key steps to the last table phase, each in the added
+ * table's canonical order.
  * The steps synthesized for primary-key changes are ordered as described below, and the
  * cycle-breaking drop-foreign-key steps close table phase 1.
  *
@@ -327,6 +336,11 @@ export type CommentTarget =
       readonly checkConstraint: CheckConstraint;
     }
   | {
+      readonly kind: 'exclusion-constraint';
+      readonly table: TableIdentity;
+      readonly exclusionConstraint: ExclusionConstraint;
+    }
+  | {
       readonly kind: 'foreign-key';
       readonly table: TableIdentity;
       readonly foreignKey: ForeignKey;
@@ -404,6 +418,18 @@ export type Step =
   | { kind: 'add-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
   /** The baseline has a check constraint the target does not. */
   | { kind: 'drop-check-constraint'; table: TableIdentity; checkConstraint: CheckConstraint }
+  /** The target has an exclusion constraint the baseline does not. */
+  | {
+      kind: 'add-exclusion-constraint';
+      table: TableIdentity;
+      exclusionConstraint: ExclusionConstraint;
+    }
+  /** The baseline has an exclusion constraint the target does not. */
+  | {
+      kind: 'drop-exclusion-constraint';
+      table: TableIdentity;
+      exclusionConstraint: ExclusionConstraint;
+    }
   /** The target has a standalone index the baseline does not, on the named owner. */
   | { kind: 'create-index'; owner: IndexOwner; index: Index }
   /** The baseline has a standalone index the target does not, on the named owner. */
@@ -494,6 +520,8 @@ export const TRANSACTIONAL: Record<Step['kind'], boolean> = {
   'drop-unique-constraint': true,
   'add-check-constraint': true,
   'drop-check-constraint': true,
+  'add-exclusion-constraint': true,
+  'drop-exclusion-constraint': true,
   'create-index': true,
   'drop-index': true,
   'create-index-concurrently': false,
@@ -767,6 +795,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...breaks,
     ...application.indexDrops,
     ...application.checkConstraintDrops,
+    ...application.exclusionConstraintDrops,
     ...application.uniqueConstraintDrops,
     ...tableDrops,
     ...application.primaryKeyDrops,
@@ -780,6 +809,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.primaryKeyAdds,
     ...application.uniqueConstraintAdds,
     ...application.checkConstraintAdds,
+    ...application.exclusionConstraintAdds,
     ...application.indexCreates,
     ...application.foreignKeyAdds,
     ...dependentKeyAdds,
@@ -829,6 +859,8 @@ export interface ChangeApplication {
   readonly uniqueConstraintAdds: Step[];
   readonly checkConstraintDrops: Step[];
   readonly checkConstraintAdds: Step[];
+  readonly exclusionConstraintDrops: Step[];
+  readonly exclusionConstraintAdds: Step[];
   readonly indexDrops: Step[];
   readonly indexCreates: Step[];
   readonly identityDrops: Step[];
@@ -890,6 +922,8 @@ export function emptyChangeApplication(): ChangeApplication {
     uniqueConstraintAdds: [],
     checkConstraintDrops: [],
     checkConstraintAdds: [],
+    exclusionConstraintDrops: [],
+    exclusionConstraintAdds: [],
     indexDrops: [],
     indexCreates: [],
     identityDrops: [],
@@ -952,6 +986,13 @@ export function applyChange(application: ChangeApplication, change: Change): voi
           kind: 'add-check-constraint',
           table: copyIdentity(change.table),
           checkConstraint: copyCheckConstraint(checkConstraint),
+        });
+      }
+      for (const exclusionConstraint of change.table.exclusionConstraints ?? []) {
+        application.exclusionConstraintAdds.push({
+          kind: 'add-exclusion-constraint',
+          table: copyIdentity(change.table),
+          exclusionConstraint: copyExclusionConstraint(exclusionConstraint),
         });
       }
       for (const index of change.table.indexes) {
@@ -1238,6 +1279,44 @@ export function applyChange(application: ChangeApplication, change: Change): voi
                 kind: 'check-constraint',
                 table: change.table,
                 checkConstraint: tableChange.after,
+              },
+              tableChange.after.comment,
+            );
+            break;
+          }
+          case 'exclusion-constraint-removed': {
+            application.exclusionConstraintDrops.push({
+              kind: 'drop-exclusion-constraint',
+              table: copyIdentity(change.table),
+              exclusionConstraint: copyExclusionConstraint(tableChange.exclusionConstraint),
+            });
+            break;
+          }
+          case 'exclusion-constraint-added': {
+            application.exclusionConstraintAdds.push({
+              kind: 'add-exclusion-constraint',
+              table: copyIdentity(change.table),
+              exclusionConstraint: copyExclusionConstraint(tableChange.exclusionConstraint),
+            });
+            break;
+          }
+          case 'exclusion-constraint-changed': {
+            application.exclusionConstraintDrops.push({
+              kind: 'drop-exclusion-constraint',
+              table: copyIdentity(change.table),
+              exclusionConstraint: copyExclusionConstraint(tableChange.before),
+            });
+            application.exclusionConstraintAdds.push({
+              kind: 'add-exclusion-constraint',
+              table: copyIdentity(change.table),
+              exclusionConstraint: copyExclusionConstraint(tableChange.after),
+            });
+            pushRecreateComment(
+              application,
+              {
+                kind: 'exclusion-constraint',
+                table: change.table,
+                exclusionConstraint: tableChange.after,
               },
               tableChange.after.comment,
             );
@@ -1622,6 +1701,11 @@ function copyCheckConstraint(checkConstraint: CheckConstraint): CheckConstraint 
   return copyStepPayload(checkConstraint);
 }
 
+/** A copy of `exclusionConstraint`, independent of the caller's model. */
+function copyExclusionConstraint(exclusionConstraint: ExclusionConstraint): ExclusionConstraint {
+  return copyStepPayload(exclusionConstraint);
+}
+
 /** A copy of `index`, independent of the caller's model. */
 function copyIndex(index: Index): Index {
   return copyStepPayload(index);
@@ -1742,6 +1826,17 @@ function copyCommentTarget(target: CommentTarget): CommentTarget {
       delete foreignKey.comment;
       return { kind: 'foreign-key', table: copyIdentity(target.table), foreignKey };
     }
+    case 'exclusion-constraint': {
+      const exclusionConstraint: Mutable<ExclusionConstraint> = copyExclusionConstraint(
+        target.exclusionConstraint,
+      );
+      delete exclusionConstraint.comment;
+      return {
+        kind: 'exclusion-constraint',
+        table: copyIdentity(target.table),
+        exclusionConstraint,
+      };
+    }
   }
 }
 
@@ -1814,6 +1909,13 @@ function commentTargetKey(target: CommentTarget): string {
           target.foreignKey.referencedTable.schema,
           target.foreignKey.referencedTable.name,
         ],
+      ]);
+    case 'exclusion-constraint':
+      return JSON.stringify([
+        target.table.schema,
+        target.table.name,
+        'exclusion-constraint',
+        target.exclusionConstraint.elements,
       ]);
   }
 }
@@ -1899,14 +2001,17 @@ function copyTable(table: Table): Table {
     foreignKeys: table.foreignKeys.map(copyForeignKey),
     uniqueConstraints: table.uniqueConstraints.map(copyUniqueConstraint),
     checkConstraints: table.checkConstraints.map(copyCheckConstraint),
+    ...(table.exclusionConstraints === undefined
+      ? {}
+      : { exclusionConstraints: table.exclusionConstraints.map(copyExclusionConstraint) }),
     indexes: table.indexes.map(copyIndex),
   };
 }
 
 /**
  * A copy of `table` for a create-table step: columns and primary key as they are, and empty
- * foreign keys, unique constraints, check constraints, and indexes, each of which attaches with
- * its own step.
+ * foreign keys, unique constraints, check constraints, exclusion constraints, and indexes, each
+ * of which attaches with its own step.
  */
 function copyTableForCreate(table: Table): Table {
   return {
