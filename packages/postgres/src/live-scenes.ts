@@ -425,9 +425,9 @@ export interface LiveScene {
    */
   readonly setupSql?: string;
   /**
-   * Raw SQL appended to the target database's build, for objects the model cannot declare,
-   * such as a partial or expression index. The plan, built from the model, never renders them;
-   * the target dump carries them, and the scene's `importChecks` pin the skip that names them.
+   * Raw SQL appended to the target database's build, for objects the model cannot declare.
+   * The plan, built from the model, never renders them; the target dump carries them, and the
+   * scene's `importChecks` pin whatever diagnostic names them.
    */
   readonly targetExtraSql?: string;
   /** Catalog facts to assert after the baseline build, before the migration. */
@@ -3803,8 +3803,9 @@ const enforcementInPlaceScene = (): LiveScene => {
  * The exclusion-constraint round trip: a target adding a named constraint with a non-default
  * operator class and its own comment, plus an unnamed one whose generated `_excl` name must strip
  * back to unnamed. `pg_trgm` supplies the `gist_trgm_ops` operator class on every server the suite
- * runs (the PostgreSQL 13 floor included), so no scene is skipped. Both imports must model the
- * canonical element text identically to the catalog read; any new skip fails the scene.
+ * runs (the PostgreSQL 13 floor included), and `btree_gist` supplies the default GiST `=` operator
+ * class the plain-integer exclusion needs. Both imports must model the canonical element text
+ * identically to the catalog read; any new skip fails the scene.
  */
 const exclusionConstraintRoundTripScene = (): LiveScene => {
   const columns = [
@@ -3828,7 +3829,10 @@ const exclusionConstraintRoundTripScene = (): LiveScene => {
     name: 'exclusion-constraint-round-trip',
     baseline: model(baseline),
     target: model(target),
-    setupSql: 'CREATE EXTENSION IF NOT EXISTS pg_trgm;',
+    setupSql: [
+      'CREATE EXTENSION IF NOT EXISTS pg_trgm;',
+      'CREATE EXTENSION IF NOT EXISTS btree_gist;',
+    ].join('\n'),
     baselineChecks: [
       {
         description: 'baseline reservations has no exclusion constraint',
@@ -3894,10 +3898,11 @@ const exclusionConstraintRoundTripScene = (): LiveScene => {
 };
 
 /**
- * The standalone-index round trip: a target adding a plain and a unique index, plus raw target
- * SQL declaring a partial and an expression index the model cannot represent. The plan renders
- * only the two modeled indexes; the target dump carries all four, and the import skips the two
- * unmodelable ones whole and by name, so the migrated and target imports still agree exactly.
+ * The standalone-index round trip: a target adding a plain, a unique, a partial, and an expression
+ * index. The plan renders all four, both databases build them, and both imports model their
+ * shapes — the conventional plain and unique names canonicalize back to unnamed while the partial
+ * and expression indexes keep their names and carry their `WHERE` and expression text — so the
+ * migrated and target imports agree exactly with no skip.
  */
 const indexCreateScene = (): LiveScene => {
   const accounts = table('accounts', {
@@ -3915,6 +3920,8 @@ const indexCreateScene = (): LiveScene => {
     indexes: [
       { name: 'accounts_age_idx', unique: false, columns: ['age'] },
       { name: 'accounts_email_idx', unique: true, columns: ['email'] },
+      { name: 'accounts_partial_idx', unique: false, columns: ['age'], where: '(age >= 18)' },
+      { name: 'accounts_lower_name_idx', unique: false, columns: [{ expression: 'lower(name)' }] },
     ],
   });
 
@@ -3922,9 +3929,6 @@ const indexCreateScene = (): LiveScene => {
     name: 'index-create',
     baseline: model(accounts),
     target: model(target),
-    targetExtraSql:
-      'CREATE INDEX accounts_partial_idx ON public.accounts USING btree (age) WHERE (age >= 18);\n' +
-      'CREATE INDEX accounts_lower_name_idx ON public.accounts USING btree (lower(name));',
     baselineChecks: [
       {
         description: 'baseline accounts has only its primary-key index',
@@ -3934,14 +3938,17 @@ const indexCreateScene = (): LiveScene => {
     ],
     planChecks: [
       {
-        description: 'the plan renders only the two modeled indexes',
+        description: 'the plan renders all four modeled indexes',
         failure: (steps) => {
           const kinds = steps.map((step) => step.kind).join(',');
-          if (kinds !== 'create-index,create-index') return `unexpected steps: ${kinds}`;
+          if (kinds !== 'create-index,create-index,create-index,create-index') {
+            return `unexpected steps: ${kinds}`;
+          }
           const created = steps.map((step) =>
             step.kind === 'create-index' ? (step.index.name ?? '<unnamed>') : '',
           );
-          return created.join(',') === 'accounts_age_idx,accounts_email_idx'
+          return created.join(',') ===
+            'accounts_age_idx,accounts_email_idx,accounts_lower_name_idx,accounts_partial_idx'
             ? undefined
             : `created: ${created.join(',')}`;
         },
@@ -3960,9 +3967,9 @@ const indexCreateScene = (): LiveScene => {
             )
             .join('; ');
           const expected =
-            source === 'applied'
-              ? '<unnamed>|plain|age|-|-; <unnamed>|unique|email|-|-'
-              : '<unnamed>|plain|age|-|-; <unnamed>|unique|email|-|-; accounts_lower_name_idx|plain|{"expression":"lower(name)"}|-|-; accounts_partial_idx|plain|age|-|(age >= 18)';
+            '<unnamed>|plain|age|-|-; <unnamed>|unique|email|-|-; ' +
+            'accounts_lower_name_idx|plain|{"expression":"lower(name)"}|-|-; ' +
+            'accounts_partial_idx|plain|age|-|(age >= 18)';
           if (indexes !== expected) return `${source}: modeled indexes: ${indexes}`;
           const skips = imported.diagnostics
             .filter((diagnostic) => diagnostic.kind === 'skip')
@@ -3984,7 +3991,8 @@ const indexCreateScene = (): LiveScene => {
       {
         description: 'indexes after the migration',
         sql: indexesOf('accounts'),
-        expected: 'accounts_age_idx,accounts_email_idx,accounts_pkey',
+        expected:
+          'accounts_age_idx,accounts_email_idx,accounts_lower_name_idx,accounts_partial_idx,accounts_pkey',
       },
       {
         description: 'the standalone unique index is unique',
@@ -3997,11 +4005,11 @@ const indexCreateScene = (): LiveScene => {
         expected: 'f',
       },
       {
-        description: 'the unmodelable indexes were never planned',
+        description: 'the modeled partial and expression indexes were created',
         sql:
           "select count(*) from pg_indexes where schemaname = 'public' and tablename = 'accounts'" +
           " and indexname in ('accounts_partial_idx', 'accounts_lower_name_idx')",
-        expected: '0',
+        expected: '2',
       },
     ],
   };
@@ -4456,11 +4464,13 @@ const introspectionIndexesScene = (): LiveScene => {
 
 /**
  * The live introspection round trip for the index family the model now carries: a partial index,
- * an expression index, a covering (`INCLUDE`) index, and an unnamed plain index whose
- * server-generated name canonicalizes back to unnamed. The scene declares `matches-import` — no
- * diagnostics, an empty `diff`, and a deep-equal model against the applied dump's import — and
- * its import check pins all four shapes with no skip on either side. The catalog check proves
- * the unnamed index really carries the server's conventional name before it is stripped.
+ * an expression index, a covering (`INCLUDE`) index, and a plain index. The conventional
+ * `<table>_<key>_idx` names, including the expression index's, canonicalize back to unnamed on
+ * import, so the import check pins a sorted shape inventory rather than name-keyed entries. The
+ * scene declares `matches-import` — no diagnostics, an empty `diff`, and a deep-equal model
+ * against the applied dump's import — and its import check asserts no skip on any of its indexes.
+ * The catalog check proves the plain index really carries the server's conventional name before
+ * it is stripped.
  */
 const introspectionIndexFamilyScene = (): LiveScene => {
   const columns = [
@@ -4511,33 +4521,44 @@ const introspectionIndexFamilyScene = (): LiveScene => {
         failure: (imported, source) => {
           const table = imported.model.tables.find((candidate) => candidate.name === 'idx_family');
           if (table === undefined) return `${source}: idx_family is not imported`;
+          const shapeOf = (index: Index): string =>
+            JSON.stringify({
+              name: index.name ?? '<unnamed>',
+              unique: index.unique,
+              columns: index.columns.map(serializeIndexElement),
+              ...(index.include === undefined ? {} : { include: [...index.include] }),
+              ...(index.where === undefined ? {} : { where: index.where }),
+            });
+          const shapes = table.indexes.map(shapeOf).sort();
+          // The conventional `<table>_<key>_idx` names strip on import, including the
+          // expression index's, so two unnamed shapes share the key and the comparison is
+          // a sorted shape inventory rather than a name-keyed map. The expression's
+          // server deparse carries both parenthesis levels.
+          const expected = [
+            { name: '<unnamed>', unique: false, columns: ['c'] },
+            { name: '<unnamed>', unique: false, columns: ['{"expression":"((a + b))"}'] },
+            { name: 'idx_family_cover_idx', unique: false, columns: ['a'], include: ['b'] },
+            { name: 'idx_family_partial_idx', unique: false, columns: ['a'], where: '(a > 0)' },
+          ]
+            .map((shape) => JSON.stringify(shape))
+            .sort();
+          if (!isDeepStrictEqual(shapes, expected)) {
+            return `${source}: index shapes: ${shapes.join('; ')}`;
+          }
+          const indexObjects = [
+            'idx_family_cover_idx',
+            'idx_family_expr_idx',
+            'idx_family_partial_idx',
+            'idx_family_c_idx',
+          ];
           const skips = imported.diagnostics
             .filter((diagnostic) => diagnostic.kind === 'skip')
-            .map((diagnostic) => diagnostic.message);
-          if (skips.length > 0) return `${source}: ${skips.join('; ')}`;
-          const shapes = new Map(
-            table.indexes.map((index) => [
-              index.name ?? '<unnamed>',
-              {
-                unique: index.unique,
-                columns: index.columns.map(serializeIndexElement),
-                ...(index.include === undefined ? {} : { include: [...index.include] }),
-                ...(index.where === undefined ? {} : { where: index.where }),
-              },
-            ]),
-          );
-          const expected = new Map<string, unknown>([
-            ['idx_family_cover_idx', { unique: false, columns: ['a'], include: ['b'] }],
-            ['idx_family_expr_idx', { unique: false, columns: ['{"expression":"(a + b)"}'] }],
-            ['idx_family_partial_idx', { unique: false, columns: ['a'], where: '(a > 0)' }],
-            ['<unnamed>', { unique: false, columns: ['c'] }],
-          ]);
-          for (const [name, shape] of expected) {
-            if (!isDeepStrictEqual(shapes.get(name), shape)) {
-              return `${source}: ${name}: ${JSON.stringify(shapes.get(name))}`;
-            }
-          }
-          return undefined;
+            .filter((diagnostic) =>
+              indexObjects.some((name) => diagnostic.object === `public.${name}`),
+            );
+          return skips.length === 0
+            ? undefined
+            : `${source}: stale skips: ${skips.map((diagnostic) => diagnostic.message).join('; ')}`;
         },
       },
     ],
@@ -5200,7 +5221,7 @@ const introspectionFlagsScene = (): LiveScene => {
             ]),
           );
           const expected = new Map<string, unknown>([
-            ['flag_expr_idx', { columns: ['{"expression":"(a + b)"}'] }],
+            ['flag_expr_idx', { columns: ['{"expression":"((a + b))"}'] }],
             ['flag_include_idx', { columns: ['a'], include: ['b'] }],
             ['flag_partial_idx', { columns: ['a'], where: '(a > 0)' }],
           ]);
@@ -5285,10 +5306,11 @@ const introspectionFlagsNullsNotDistinctScene = (): LiveScene => ({
 /**
  * The constraint flags scene: the constraint states the model cannot carry stay flagged, one
  * per table so the canonical table order is part of the pin. Raw setup SQL creates an
- * exclusion constraint (no model shape, skipped whole and named by its owning table), a
- * check marked `NO INHERIT`, a unique constraint with an `INCLUDE` column list, and a foreign
- * key with `MATCH FULL`; the model and target are empty, so the diagnostics are the whole
- * claim. The generated names are PostgreSQL 16.15's conventional ones, pinned exactly.
+ * exclusion constraint that now round-trips through the model, a check marked `NO INHERIT`,
+ * a unique constraint with an `INCLUDE` column list, and a foreign key with `MATCH FULL`;
+ * the model and target are empty, so the diagnostics are the whole claim, while the import
+ * check pins the modeled exclusion shape. The generated names are PostgreSQL 16.15's
+ * conventional ones, pinned exactly.
  */
 const introspectionFlagsConstraintsScene = (): LiveScene => ({
   name: 'introspection-flags-constraints',
@@ -5302,6 +5324,26 @@ const introspectionFlagsConstraintsScene = (): LiveScene => ({
   ].join('\n'),
   baseline: model(),
   target: model(),
+  importChecks: [
+    {
+      description: 'both imports model the exclusion constraint without a skip',
+      failure: (imported, source) => {
+        const table = imported.model.tables.find((candidate) => candidate.name === 'flag_excl');
+        if (table === undefined) return `${source}: flag_excl is not imported`;
+        const exclusions = table.exclusionConstraints ?? [];
+        if (exclusions.length !== 1) return `${source}: modeled exclusions: ${exclusions.length}`;
+        if (!exclusions[0]!.elements.includes('during WITH &&')) {
+          return `${source}: exclusion shape: ${JSON.stringify(exclusions[0])}`;
+        }
+        const skips = imported.diagnostics.filter(
+          (diagnostic) => diagnostic.kind === 'skip' && diagnostic.object === 'public.flag_excl',
+        );
+        return skips.length === 0
+          ? undefined
+          : `${source}: stale skips: ${skips.map((diagnostic) => diagnostic.message).join('; ')}`;
+      },
+    },
+  ],
   introspection: {
     assert: 'flags',
     expected: [
@@ -5310,12 +5352,6 @@ const introspectionFlagsConstraintsScene = (): LiveScene => ({
         code: 'unsupported-attribute',
         object: 'public.flag_check',
         message: 'dropped NO INHERIT on check constraint flag_check_a_check from public.flag_check',
-      },
-      {
-        kind: 'skip',
-        code: 'unsupported-statement',
-        object: 'public.flag_excl',
-        message: 'skipped exclusion constraint flag_excl_during_excl',
       },
       {
         kind: 'flag',
@@ -5668,12 +5704,6 @@ const constraintBackedIndexCommentsScene = (): LiveScene => {
           code: 'unsupported-attribute',
           object: 'public.cbu_a_key',
           message: 'dropped comment from public.cbu_a_key',
-        },
-        {
-          kind: 'skip',
-          code: 'unsupported-statement',
-          object: 'public.cbx',
-          message: 'skipped exclusion constraint cbx_a_excl',
         },
         {
           kind: 'flag',
