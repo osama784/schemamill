@@ -22,9 +22,18 @@ Add the entry under `[Unreleased]` in the right category, on the feature branch,
 
 With the `dev` → `main` release PR:
 
-1. Rename `[Unreleased]` → `[<version>] - YYYY-MM-DD` and add a fresh empty `[Unreleased]` above it.
-2. Commit `chore(release): add CHANGELOG.md for v<version>` and push `dev`.
-3. The release PR body carries that version's section; after merge, tag `v<version>` and create the GitHub release with the same notes.
+1. Bump the release/package version in all seven fields together in a single commit using the exact message form `chore(release): bump the version to <X.Y.Z>`; the seven fields, in the order defined by `.github/scripts/release-check.mjs:23-56`, are:
+   1. root `package.json`
+   2. `packages/core/package.json`
+   3. `packages/postgres/package.json`
+   4. `packages/cli/package.json`
+   5. `packages/server/package.json`
+   6. `packages/core/src/index.ts` version literal
+   7. `packages/postgres/src/index.ts` version literal
+   Both this bump and the `CHANGELOG.md` cut below must land on `dev` before any tag: `.github/scripts/release-check.mjs:138-150` requires all seven fields and the newest dated `CHANGELOG.md` header to agree simultaneously, so a bump-only commit leaves the gate red.
+2. Rename `[Unreleased]` → `[<version>] - YYYY-MM-DD` and add a fresh empty `[Unreleased]` above it.
+3. Commit `chore(release): add CHANGELOG.md for v<version>` and push `dev`.
+4. The release PR body carries that version's section; after merge, pull `main` and run `pnpm release:check` immediately before `git tag`, then tag `v<version>` and create the GitHub release with the same notes.
 
 ## Semver
 
