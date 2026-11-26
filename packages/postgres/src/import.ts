@@ -3985,25 +3985,14 @@ export function parseExclusionDefinition(
   let where: string | undefined;
   const after = skipTrivia(sql, close + 1);
   if (isKeywordAt(sql, after, 'WHERE')) {
+    // PostgreSQL requires the predicate in parentheses, so the matching `)` is the boundary:
+    // keywords such as NOT are ordinary predicate operators, and an inline declaration's next
+    // table element must never be read into the clause.
     const start = skipTrivia(sql, after + 'WHERE'.length);
-    const terminator = statementTerminator(sql, start);
-    let end = terminator;
-    for (let index = start; index < terminator; index += 1) {
-      const skipped = skipLexicalSpan(sql, index);
-      if (skipped !== undefined && skipped > index) {
-        index = skipped - 1;
-        continue;
-      }
-      if (
-        isKeywordAt(sql, index, 'DEFERRABLE') ||
-        isKeywordAt(sql, index, 'INITIALLY') ||
-        isKeywordAt(sql, index, 'NOT')
-      ) {
-        end = index;
-        break;
-      }
-    }
-    where = normalizeSourceText(sql.slice(start, end));
+    if (sql[start] !== '(') return undefined;
+    const closeWhere = matchingParen(sql, start);
+    if (closeWhere === null) return undefined;
+    where = normalizeSourceText(sql.slice(start, closeWhere + 1));
     if (where === '') return undefined;
   }
 

@@ -1977,6 +1977,31 @@ test('models catalog exclusion clauses identically to the dump canonicalization'
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('models catalog exclusion WHERE predicates that contain NOT as an operator', async () => {
+  const predicates = [
+    { definition: '(a IS NOT NULL)', expected: '(a IS NOT NULL)' },
+    { definition: '(a NOT IN (1, 2))', expected: '(a NOT IN(1,2))' },
+  ];
+  for (const { definition, expected } of predicates) {
+    const read = await mapCatalog(
+      payload({
+        tables: [table('public', 't')],
+        columns: [column('public', 't', 1, 'a')],
+        constraints: [
+          exclusionConstraint('public', 't', 't_excl', {
+            definition: `EXCLUDE USING gist (a WITH =) WHERE ${definition}`,
+          }),
+        ],
+      }),
+    );
+
+    assert.deepEqual(read.model.tables[0]?.exclusionConstraints, [
+      { name: 't_excl', elements: 'a WITH =', where: expected },
+    ]);
+    assert.deepEqual(read.diagnostics, []);
+  }
+});
+
 test('skips an exclusion row whose definition is absent or unparseable', async () => {
   for (const definition of [null, 'NO EXCLUSION HERE']) {
     const read = await mapCatalog(

@@ -2216,6 +2216,42 @@ test('models exclusion clauses, deferrability, and non-default operator-class te
   assert.deepEqual(diagnostics, []);
 });
 
+test('reads an exclusion WHERE predicate that contains NOT as an operator', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, b integer);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT is_not_excl EXCLUDE USING gist (a WITH =) WHERE (a IS NOT NULL);`,
+    `ALTER TABLE ONLY public.t ADD CONSTRAINT not_in_excl EXCLUDE USING gist (b WITH =) WHERE (b NOT IN (1, 2));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(table.exclusionConstraints, [
+    { name: 'is_not_excl', elements: 'a WITH =', where: '(a IS NOT NULL)' },
+    { name: 'not_in_excl', elements: 'b WITH =', where: '(b NOT IN(1,2))' },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('bounds an inline exclusion WHERE predicate before a trailing column and constraint', async () => {
+  const dump = [
+    `CREATE TABLE public.t (a integer, EXCLUDE USING gist (a WITH =) WHERE (a > 0), b integer, CHECK (b > 0));`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+  const table = model.tables.find((candidate) => candidate.name === 't');
+  assert.ok(table, 'the table is imported');
+
+  assert.deepEqual(
+    table.columns.map((candidate) => candidate.name),
+    ['a', 'b'],
+  );
+  assert.deepEqual(table.exclusionConstraints, [{ elements: 'a WITH =', where: '(a > 0)' }]);
+  assert.deepEqual(table.checkConstraints, [{ expression: 'b > 0' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
 test('models an exclusion constraint and still flags its backing-index comment', async () => {
   const dump = [
     `CREATE TABLE public.t (a integer);`,

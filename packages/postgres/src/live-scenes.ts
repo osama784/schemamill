@@ -81,8 +81,8 @@ function joinIndexElements(elements: readonly IndexElement[], separator = ','): 
  *
  * The constraint and index scenes cover this slice's shapes: named and unnamed primary-key,
  * unique, foreign-key, and check constraints on a new table (`constraint-create`), a plain and
- * a unique standalone
- * index beside a partial and an expression index the model cannot declare (`index-create`),
+ * a unique standalone index beside a partial and an expression index that now round-trip through
+ * the model (`index-create`),
  * a multi-group migration whose standalone `CREATE INDEX CONCURRENTLY` sits between
  * transactional steps (`index-concurrently`), a target whose unnamed single-column,
  * multi-column, and concurrent indexes are server-named on apply and canonicalized back to
@@ -110,7 +110,8 @@ function joinIndexElements(elements: readonly IndexElement[], separator = ','): 
  * same for the covered index surface — a constraint-backed primary-key index the read must
  * consume through `conindid`, a named index, two unnamed indexes whose tie order is the
  * stored-name order, a standalone unique index, and an unnamed index whose generated name
- * exceeds the 63-byte limit and strips only in its server form; `introspection-sequences-identity`
+ * exceeds the 63-byte limit and strips only in its server form; `introspection-index-family`
+ * does the same for the partial, expression, covering, and unnamed index family; `introspection-sequences-identity`
  * does the same for the covered sequence and identity surface — a standalone sequence with
  * non-default options including the bigint bound, an owned sequence behind a `nextval` default,
  * and both identity generation modes, the `ALWAYS` one with non-default options and a custom
@@ -123,8 +124,9 @@ function joinIndexElements(elements: readonly IndexElement[], separator = ','): 
  * PostgreSQL 18 normalized to `-1` in the physical check so one scene spans both server paths;
  * `introspection-flags` pins the
  * exact deferred-state diagnostics the read still reports (generation, the partitioned-table
- * skip, and the invalid, expression, partial, and `INCLUDE` index skips)
- * while the covered states read back instead of flagging; and
+ * skip, and the invalid-index skip)
+ * while the covered states — expression, partial, and `INCLUDE` indexes among them — read back
+ * instead of flagging; and
  * `introspection-flags-nulls-not-distinct` pins the `NULLS NOT DISTINCT` skip gated on
  * PostgreSQL 15 or newer.
  *
@@ -3947,19 +3949,21 @@ const indexCreateScene = (): LiveScene => {
     ],
     importChecks: [
       {
-        description: 'the modeled indexes round-trip and the unmodelable ones are skipped by name',
+        description: 'both imports model the partial and expression indexes without a skip',
         failure: (imported, source) => {
           const table = imported.model.tables.find((candidate) => candidate.name === 'accounts');
-          if (table === undefined) return 'accounts is not imported';
+          if (table === undefined) return `${source}: accounts is not imported`;
           const indexes = table.indexes
             .map(
               (index) =>
-                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${joinIndexElements(index.columns)}`,
+                `${index.name ?? '<unnamed>'}|${index.unique ? 'unique' : 'plain'}|${joinIndexElements(index.columns)}|${index.include?.join(',') ?? '-'}|${index.where ?? '-'}`,
             )
             .join('; ');
-          if (indexes !== '<unnamed>|plain|age; <unnamed>|unique|email') {
-            return `modeled indexes: ${indexes}`;
-          }
+          const expected =
+            source === 'applied'
+              ? '<unnamed>|plain|age|-|-; <unnamed>|unique|email|-|-'
+              : '<unnamed>|plain|age|-|-; <unnamed>|unique|email|-|-; accounts_lower_name_idx|plain|{"expression":"lower(name)"}|-|-; accounts_partial_idx|plain|age|-|(age >= 18)';
+          if (indexes !== expected) return `${source}: modeled indexes: ${indexes}`;
           const skips = imported.diagnostics
             .filter((diagnostic) => diagnostic.kind === 'skip')
             .filter(
@@ -3967,26 +3971,11 @@ const indexCreateScene = (): LiveScene => {
                 diagnostic.object === 'public.accounts_partial_idx' ||
                 diagnostic.object === 'public.accounts_lower_name_idx',
             );
-          if (source === 'applied') {
-            return skips.length === 0
-              ? undefined
-              : `the migrated database carries unmodelable indexes: ${skips
-                  .map((diagnostic) => diagnostic.object)
-                  .join(',')}`;
-          }
-          const partial = skips.find(
-            (diagnostic) => diagnostic.object === 'public.accounts_partial_idx',
-          );
-          if (partial === undefined || !partial.message.includes('(partial WHERE)')) {
-            return 'the partial index was not skipped and named';
-          }
-          const expression = skips.find(
-            (diagnostic) => diagnostic.object === 'public.accounts_lower_name_idx',
-          );
-          if (expression === undefined || !expression.message.includes('(expression element)')) {
-            return 'the expression index was not skipped and named';
-          }
-          return undefined;
+          return skips.length === 0
+            ? undefined
+            : `${source}: indexes were skipped: ${skips
+                .map((diagnostic) => diagnostic.object)
+                .join(',')}`;
         },
       },
     ],
@@ -4459,6 +4448,97 @@ const introspectionIndexesScene = (): LiveScene => {
         description: 'the standalone unique index is unique in the catalog',
         sql: indexIsUnique('accounts_email_uniq_idx'),
         expected: 't',
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+  };
+};
+
+/**
+ * The live introspection round trip for the index family the model now carries: a partial index,
+ * an expression index, a covering (`INCLUDE`) index, and an unnamed plain index whose
+ * server-generated name canonicalizes back to unnamed. The scene declares `matches-import` — no
+ * diagnostics, an empty `diff`, and a deep-equal model against the applied dump's import — and
+ * its import check pins all four shapes with no skip on either side. The catalog check proves
+ * the unnamed index really carries the server's conventional name before it is stripped.
+ */
+const introspectionIndexFamilyScene = (): LiveScene => {
+  const columns = [
+    column('a', { type: 'integer' }),
+    column('b', { type: 'integer' }),
+    column('c', { type: 'integer' }),
+  ];
+  const target = table('idx_family', {
+    columns,
+    indexes: [
+      { name: 'idx_family_partial_idx', unique: false, columns: ['a'], where: '(a > 0)' },
+      { name: 'idx_family_expr_idx', unique: false, columns: [{ expression: '(a + b)' }] },
+      { name: 'idx_family_cover_idx', unique: false, columns: ['a'], include: ['b'] },
+      { unique: false, columns: ['c'] },
+    ],
+  });
+
+  return {
+    name: 'introspection-index-family',
+    baseline: model(table('idx_family', { columns })),
+    target: model(target),
+    planChecks: [
+      {
+        description: 'the migration creates all four index shapes',
+        failure: (steps) => {
+          const kinds = steps
+            .map((step) => step.kind)
+            .sort()
+            .join(',');
+          return kinds === 'create-index,create-index,create-index,create-index'
+            ? undefined
+            : `unexpected steps: ${kinds}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the unnamed index carries its server-generated name',
+        sql:
+          "select count(*) from pg_indexes where schemaname = 'public' and tablename = 'idx_family'" +
+          " and indexname = 'idx_family_c_idx'",
+        expected: '1',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports model every index shape without a skip',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find((candidate) => candidate.name === 'idx_family');
+          if (table === undefined) return `${source}: idx_family is not imported`;
+          const skips = imported.diagnostics
+            .filter((diagnostic) => diagnostic.kind === 'skip')
+            .map((diagnostic) => diagnostic.message);
+          if (skips.length > 0) return `${source}: ${skips.join('; ')}`;
+          const shapes = new Map(
+            table.indexes.map((index) => [
+              index.name ?? '<unnamed>',
+              {
+                unique: index.unique,
+                columns: index.columns.map(serializeIndexElement),
+                ...(index.include === undefined ? {} : { include: [...index.include] }),
+                ...(index.where === undefined ? {} : { where: index.where }),
+              },
+            ]),
+          );
+          const expected = new Map<string, unknown>([
+            ['idx_family_cover_idx', { unique: false, columns: ['a'], include: ['b'] }],
+            ['idx_family_expr_idx', { unique: false, columns: ['{"expression":"(a + b)"}'] }],
+            ['idx_family_partial_idx', { unique: false, columns: ['a'], where: '(a > 0)' }],
+            ['<unnamed>', { unique: false, columns: ['c'] }],
+          ]);
+          for (const [name, shape] of expected) {
+            if (!isDeepStrictEqual(shapes.get(name), shape)) {
+              return `${source}: ${name}: ${JSON.stringify(shapes.get(name))}`;
+            }
+          }
+          return undefined;
+        },
       },
     ],
     introspection: { assert: 'matches-import' },
@@ -5062,9 +5142,9 @@ const statisticsTargetsScene = (): LiveScene => {
  * setup SQL adds an unlogged table whose persistence reads back, a generated column whose flag
  * must suppress its `atthasdef` default flag, a partitioned table with one partition — both partitioned relations skipped and
  * named, and neither mapped — and a table carrying expression, partial, and `INCLUDE` indexes
- * plus an index marked invalid by a catalog write (a model cannot declare an invalid index),
- * each outside the model's envelope and skipped whole with the read's reason. The covered
- * states produce no diagnostic, so the exact list is the pin that their flags stayed gone.
+ * that now read back with their shapes, beside an index marked invalid by a catalog write (a
+ * model cannot declare an invalid index) that stays skipped whole with the read's reason. The
+ * covered states produce no diagnostic, so the exact list is the pin that their flags stayed gone.
  */
 const introspectionFlagsScene = (): LiveScene => {
   const target = model(
@@ -5101,6 +5181,44 @@ const introspectionFlagsScene = (): LiveScene => {
     ].join('\n'),
     baseline: model(),
     target,
+    importChecks: [
+      {
+        description: 'the expression, partial, and covering indexes read back with their shapes',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find(
+            (candidate) => candidate.name === 'flag_indexed',
+          );
+          if (table === undefined) return `${source}: flag_indexed is not imported`;
+          const shapes = new Map(
+            table.indexes.map((index) => [
+              index.name ?? '<unnamed>',
+              {
+                columns: index.columns.map(serializeIndexElement),
+                ...(index.include === undefined ? {} : { include: [...index.include] }),
+                ...(index.where === undefined ? {} : { where: index.where }),
+              },
+            ]),
+          );
+          const expected = new Map<string, unknown>([
+            ['flag_expr_idx', { columns: ['{"expression":"(a + b)"}'] }],
+            ['flag_include_idx', { columns: ['a'], include: ['b'] }],
+            ['flag_partial_idx', { columns: ['a'], where: '(a > 0)' }],
+          ]);
+          for (const [name, shape] of expected) {
+            if (!isDeepStrictEqual(shapes.get(name), shape)) {
+              return `${source}: ${name}: ${JSON.stringify(shapes.get(name))}`;
+            }
+          }
+          const names = [...expected.keys()];
+          const skips = imported.diagnostics
+            .filter((diagnostic) => diagnostic.kind === 'skip')
+            .filter((diagnostic) => names.some((name) => diagnostic.object === `public.${name}`));
+          return skips.length === 0
+            ? undefined
+            : `${source}: stale skips: ${skips.map((diagnostic) => diagnostic.message).join('; ')}`;
+        },
+      },
+    ],
     introspection: {
       assert: 'flags',
       expected: [
@@ -5113,27 +5231,9 @@ const introspectionFlagsScene = (): LiveScene => {
         {
           kind: 'skip',
           code: 'unsupported-statement',
-          object: 'public.flag_expr_idx',
-          message: 'skipped CREATE INDEX public.flag_expr_idx (expression element)',
-        },
-        {
-          kind: 'skip',
-          code: 'unsupported-statement',
-          object: 'public.flag_include_idx',
-          message: 'skipped CREATE INDEX public.flag_include_idx (INCLUDE)',
-        },
-        {
-          kind: 'skip',
-          code: 'unsupported-statement',
           object: 'public.flag_invalid_idx',
           message:
             'index public.flag_invalid_idx is not valid and ready; invalid indexes are not represented yet',
-        },
-        {
-          kind: 'skip',
-          code: 'unsupported-statement',
-          object: 'public.flag_partial_idx',
-          message: 'skipped CREATE INDEX public.flag_partial_idx (partial WHERE)',
         },
         {
           kind: 'skip',
@@ -7776,6 +7876,7 @@ export const scenes: readonly LiveScene[] = [
   nonPublicIndexDropScene(),
   introspectionTracerScene(),
   introspectionIndexesScene(),
+  introspectionIndexFamilyScene(),
   introspectionSequencesIdentityScene(),
   columnAttributesScene(),
   statisticsTargetsScene(),
