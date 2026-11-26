@@ -22,16 +22,26 @@ description: Feature branches into `dev`, PRs via `gh`, releases `dev` → `main
 ## Release (dev → main)
 
 1. `git checkout dev && git pull origin dev`
-2. Cut the version in `CHANGELOG.md` (see `changelog-flow`), commit `chore(release): add CHANGELOG.md for v<version>`, push `dev`.
-3. Write the release PR body (that version's changelog section) to a temp file, then:
+2. Bump the release/package version in all seven fields together in a single commit using the exact message form `chore(release): bump the version to <X.Y.Z>`; the seven fields, in the order defined by `.github/scripts/release-check.mjs:23-56`, are:
+   1. root `package.json`
+   2. `packages/core/package.json`
+   3. `packages/postgres/package.json`
+   4. `packages/cli/package.json`
+   5. `packages/server/package.json`
+   6. `packages/core/src/index.ts` version literal
+   7. `packages/postgres/src/index.ts` version literal
+   Both this bump and the `CHANGELOG.md` cut below must land on `dev` before any tag: `.github/scripts/release-check.mjs:138-150` requires all seven fields and the newest dated `CHANGELOG.md` header to agree simultaneously, so a bump-only commit leaves the gate red.
+3. Cut the version in `CHANGELOG.md` (see `changelog-flow`), commit `chore(release): add CHANGELOG.md for v<version>`, push `dev`.
+4. Write the release PR body (that version's changelog section) to a temp file, then:
    `gh pr create --base main --head dev --title "chore(release): merge dev for v<version>" --body-file /tmp/opencode/pr-body.md`
-4. Merge:
+5. Merge:
    `gh pr merge <N> --merge --subject "chore(release): merge dev for v<version>" --body-file /tmp/opencode/pr-body.md`
-5. Tag and publish:
+6. Tag and publish:
    `git checkout main && git pull origin main`
+   With `main` pulled, run `pnpm release:check` immediately before `git tag`, then:
    `git tag v<version> && git push origin v<version>`
    Write that version's changelog section to `/tmp/opencode/release-notes.md`, then:
    `gh release create v<version> --title "v<version>" --notes-file /tmp/opencode/release-notes.md`
-6. Sync back: `git checkout dev && git merge main && git push origin dev`
+7. Sync back: `git checkout dev && git merge main && git push origin dev`
 
 CI verifies every PR; `dev` pushes are verified too.
