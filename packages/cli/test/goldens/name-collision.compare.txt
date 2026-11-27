@@ -1,0 +1,6 @@
+~ table public.t
+    + index (a)
+    + index t_a_idx (a)
+
+Hazards:
+  step 2 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.

@@ -26,6 +26,8 @@ const CLI = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 interface GoldenScene {
   readonly name: string;
   readonly planArgs?: readonly string[];
+  /** A refused plan still prints its display; its exit is 1 rather than the usual 0. */
+  readonly planCode?: number;
   /** Extra arguments passed to both commands (e.g. `--json`). */
   readonly args?: readonly string[];
   /** Golden artifact format; the human text artifact is the default. */
@@ -44,6 +46,7 @@ const SCENES: readonly GoldenScene[] = [
   { name: 'extensions' },
   { name: 'hazards' },
   { name: 'identity' },
+  { name: 'name-collision', planCode: 1 },
   { name: 'not-null-comments' },
   { name: 'object-privileges' },
   { name: 'schema-edges' },
@@ -52,7 +55,7 @@ const SCENES: readonly GoldenScene[] = [
   { name: 'json-rich', args: ['--json'], format: 'json' },
 ];
 
-/** The 15 human scenes: their stdout assertions and goldens are unchanged by the JSON scenes. */
+/** The 16 human scenes: their stdout assertions and goldens are unchanged by the JSON scenes. */
 const TEXT_SCENES = SCENES.filter((scene) => scene.format !== 'json');
 
 /** Structured-JSON scenes: rich DTO payloads with a multi-group plan. */
@@ -114,9 +117,10 @@ for (const scene of TEXT_SCENES) {
         ...(command === 'plan' ? (scene.planArgs ?? []) : []),
       );
 
+      const expectedCode = command === 'plan' ? (scene.planCode ?? 0) : 0;
       assert.equal(
         result.code,
-        0,
+        expectedCode,
         `schemamill ${command} exited ${String(result.code)}; stderr:\n${result.stderr}`,
       );
       assert.equal(result.stdout, readText(`../test/goldens/${scene.name}.${command}.txt`));

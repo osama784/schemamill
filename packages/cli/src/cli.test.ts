@@ -897,6 +897,9 @@ test('plan prints the display before a render refusal, then one stderr line, exi
       ' 1. create-index  public.t: index (a)',
       ' 2. create-index  public.t: index t_a_idx (a)',
       '',
+      'Hazards:',
+      '  step 2 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
       '',
     ].join('\n'),
   );
@@ -905,6 +908,41 @@ test('plan prints the display before a render refusal, then one stderr line, exi
     'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)\n',
   );
   assert.equal(result.code, 1);
+});
+
+test('human compare prints the render-refusal hazard without rendering or changing exit', async () => {
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('compare', baseline, target);
+
+  assert.equal(
+    result.stdout,
+    [
+      '~ table public.t',
+      '    + index (a)',
+      '    + index t_a_idx (a)',
+      '',
+      'Hazards:',
+      '  step 2 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('compare --json still carries no hazards for a colliding plan', async () => {
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('compare', baseline, target, '--json');
+
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  const document = JSON.parse(result.stdout) as JsonEnvelopeProbe;
+  assert.equal(document.command, 'compare');
+  assert.deepEqual(Object.keys(document.result), ['changes']);
 });
 
 test('plan passes the imported baseline to the render guard', async (t) => {
@@ -934,9 +972,15 @@ test('plan passes the imported baseline to the render guard', async (t) => {
 
   assert.equal(
     result.stdout,
-    ['1 step in one transaction:', ' 1. create-index  public.t: index t_a_idx (b)', '', ''].join(
-      '\n',
-    ),
+    [
+      '1 step in one transaction:',
+      ' 1. create-index  public.t: index t_a_idx (b)',
+      '',
+      'Hazards:',
+      '  step 1 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
+      '',
+    ].join('\n'),
   );
   assert.equal(
     result.stderr,
@@ -2973,6 +3017,18 @@ test('plan --json emits the document and the existing refusal line on render ref
   assert.equal(document.command, 'plan');
   assert.deepEqual(document.result.groups, [{ start: 0, end: 2, transactional: true }]);
   assert.equal(document.result.steps?.length, 2);
+  assert.deepEqual(document.result.hazards, [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['t_a_idx', 't_a_idx'],
+      },
+    },
+  ]);
   assert.equal(result.stdout.includes('BEGIN;'), false, 'the document carries no rendered SQL');
   assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
 });

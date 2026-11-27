@@ -17,6 +17,14 @@ import type {
   TableIdentity,
 } from '@schemamill/core';
 
+import {
+  collectBaselineClaims,
+  collectNameClaims,
+  nameClaimIdentity,
+  nameClaimKey,
+  releasedBaselineKeys,
+} from './name-claims.ts';
+import type { NameClaim } from './name-claims.ts';
 import { MIN_TARGET_VERSION } from './render.ts';
 
 /**
@@ -58,6 +66,14 @@ import { MIN_TARGET_VERSION } from './render.ts';
  * and reports nothing. Because the plan is the only source, a hand-built `alter-persistence`
  * step on a table absent from both models still reports.
  *
+ * The render-refusal kind is plan-local name arithmetic, not a state edge: the pure claim
+ * collector behind `renderSql`'s guard reports the same collisions here, so a caller that only
+ * analyzes (`compare`) sees what rendering would refuse. An index name is schema-wide, a
+ * constraint name table-scoped and kind-agnostic; polarity keeps a drop-then-recreate legal, and
+ * baseline occupancy is released by a same-identity drop. The optional target major reaches the
+ * collector, so an unnamed not-null claims a name only at PostgreSQL 18 or newer; without a
+ * declaring major no version-dependent refusal appears.
+ *
  * A target-only sequence attaches to its `create-sequence` step; a matched one to the first
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
  * whose bounds PostgreSQL applies; an ownership-only alter applies no options at all and so
@@ -87,8 +103,9 @@ import { MIN_TARGET_VERSION } from './render.ts';
 /**
  * The analysis: every hazard the plan's state edge carries, in plan order. An optional target
  * version is resolved and validated exactly as `renderSql` resolves its own, so a caller that
- * declares the migration's PostgreSQL major reaches the analyzer through one contract; no
- * hazard kind consumes it yet, and today's results are identical for every valid major.
+ * declares the migration's PostgreSQL major reaches the analyzer through one contract. Only
+ * `render-refusal` consumes it, when a version-dependent name claim exists; the other kinds and
+ * an absence of version-sensitive claims give identical results for every valid major.
  */
 export function analyzeHazards(
   baseline: Model,
@@ -119,7 +136,79 @@ export function analyzeHazards(
       ...(step.persistence === undefined ? {} : { persistence: step.persistence }),
     });
   }
+  hazards.push(...renderRefusalHazards(baseline, plan, options));
   return inPlanOrder(hazards);
+}
+
+/**
+ * The render-time name collisions the plan carries, reported through the hazard channel. The
+ * facts come from the same pure claim collector the render guard uses: no name resolution is
+ * repeated here. Two claims sharing a guard key (schema-wide index or table-scoped constraint,
+ * with polarity) collide, as does a create that claims a name already materialized in the
+ * baseline and not released by a same-identity drop. Each collision is reported once, against
+ * the later plan step, with both claims' as-written or predicted names.
+ *
+ * The collector's version context is the analyzer's optional target major; without one it reads
+ * the oldest supported major, where an unnamed not-null has no materialized constraint name, so
+ * no version-dependent refusal is reported.
+ */
+function renderRefusalHazards(
+  baseline: Model,
+  plan: Plan,
+  options?: HazardAnalysisOptions,
+): readonly Hazard[] {
+  const claims = collectNameClaims(plan, options);
+  const hazards: Hazard[] = [];
+  const first = new Map<string, NameClaim>();
+  const reported = new Set<string>();
+  for (const claim of claims) {
+    const key = nameClaimKey(claim);
+    const earlier = first.get(key);
+    if (earlier === undefined) {
+      first.set(key, claim);
+    } else if (!reported.has(key)) {
+      reported.add(key);
+      hazards.push(nameCollisionHazard(claim, earlier));
+    }
+  }
+  const released = releasedBaselineKeys(plan, baseline, options);
+  const occupied = new Map<string, NameClaim>();
+  for (const claim of collectBaselineClaims(baseline, options)) {
+    const identity = nameClaimIdentity(claim);
+    if (released.has(identity) || occupied.has(identity)) continue;
+    occupied.set(identity, claim);
+  }
+  const baselineReported = new Set<string>();
+  for (const claim of claims) {
+    if (claim.polarity !== 'create') continue;
+    const identity = nameClaimIdentity(claim);
+    const earlier = occupied.get(identity);
+    if (earlier === undefined || baselineReported.has(identity)) continue;
+    baselineReported.add(identity);
+    hazards.push(nameCollisionHazard(claim, earlier));
+  }
+  return hazards;
+}
+
+/** One refusal hazard: the later claim's step and the earlier-then-later pair of claim names. */
+function nameCollisionHazard(later: NameClaim, earlier: NameClaim): Hazard {
+  const names = [claimName(earlier), claimName(later)] as const;
+  const entity: HazardEntity =
+    later.scope === 'index'
+      ? { kind: 'name-collision', scope: 'index', schema: later.schema, names }
+      : {
+          kind: 'name-collision',
+          scope: 'constraint',
+          schema: later.schema,
+          table: later.table,
+          names,
+        };
+  return { kind: 'render-refusal', step: later.step, entity };
+}
+
+/** The as-written name when stated, otherwise the conventional prediction the guard compared. */
+function claimName(claim: NameClaim): string {
+  return claim.originalName ?? claim.name;
 }
 
 /** Binds `analyzeHazards` to the `HazardAnalyzer` seam. */

@@ -34,7 +34,7 @@ import type {
   ViewFieldChange,
   ViewIdentity,
 } from '@schemamill/core';
-import { serializeIndexElement } from '@schemamill/core';
+import { assertNever, serializeIndexElement } from '@schemamill/core';
 
 /**
  * Human-readable rendering of a diff and a migration plan for the terminal.
@@ -165,7 +165,8 @@ export function formatHazards(hazards: readonly Hazard[]): string {
 
 /**
  * The hazard entity's label: `schema.name` for a sequence or table, `schema.table.column` for
- * a column.
+ * a column, the schema alone for a schema-wide index collision, and `schema.table` for a
+ * table-scoped constraint collision.
  */
 function formatEntity(entity: HazardEntity): string {
   switch (entity.kind) {
@@ -175,12 +176,16 @@ function formatEntity(entity: HazardEntity): string {
       return `${formatIdentity(entity.table)}.${entity.column}`;
     case 'table':
       return formatIdentity(entity.table);
+    case 'name-collision':
+      return entity.table === undefined ? entity.schema : `${entity.schema}.${entity.table}`;
+    default:
+      return assertNever(entity, 'HazardEntity');
   }
 }
 
 /**
  * One hazard's clause: the definite failure PostgreSQL hits at apply, the conditional one it
- * may hit, or the certain cost of a table rewrite.
+ * may hit, the certain cost of a table rewrite, or the names a render guard would refuse.
  */
 function formatHazard(hazard: Hazard): string {
   switch (hazard.kind) {
@@ -200,6 +205,13 @@ function formatHazard(hazard: Hazard): string {
       return `${formatBoundField(hazard.field, true)} ${hazard.before} → ${hazard.after} — may fail at apply; PostgreSQL cross-checks the sequence's current value against the tightened bound, and sequence state is not modeled.`;
     case 'table-rewrite':
       return `${hazard.persistence === undefined ? 'SET LOGGED' : 'SET UNLOGGED'} rewrites the table under an ACCESS EXCLUSIVE lock.`;
+    case 'render-refusal': {
+      const entity = hazard.entity;
+      const [first, second] = entity.names;
+      return `${entity.scope === 'index' ? 'index' : 'constraint'} names ${JSON.stringify(first)} and ${JSON.stringify(second)} would share a ${entity.scope === 'index' ? 'schema-wide' : 'table-scoped'} name — PostgreSQL rejects this at apply; rendering refuses this plan.`;
+    }
+    default:
+      return assertNever(hazard, 'Hazard');
   }
 }
 
