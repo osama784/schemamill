@@ -2830,7 +2830,10 @@ const sequenceToIdentityScene = (): LiveScene => {
  * imports back with the constraints intact: `pg_constraint` spot-checks the conventional names
  * PostgreSQL assigned, and the import check proves those names came back unnamed, the
  * constraint-backed indexes are not modeled as standalone `Index` entries, and the known miss
- * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name.
+ * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name. The other
+ * multi-column check is explicitly named: the lexical scan predicts `accounts_check` for it
+ * and for the formula miss, and two unnamed claims on one name are refused before render
+ * because the server's collision suffix cannot be predicted offline.
  *
  * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
  * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
@@ -2855,7 +2858,12 @@ const constraintCreateScene = (): LiveScene => {
     ],
     checkConstraints: [
       { name: 'accounts_age_check', expression: 'age >= 0' },
-      { expression: 'age >= 0 AND char_length(name) > 0' },
+      // The best-effort check-name scan predicts `accounts_check` for this expression and for
+      // the EXTRACT one below, whose name it misreads. Two unnamed claims on one predicted
+      // name are refused before render, since the server's collision suffix is not knowable
+      // offline; give this check a distinct explicit name so only the formula miss stays
+      // unnamed and keeps its live round-trip evidence.
+      { name: 'accounts_age_name_check', expression: 'age >= 0 AND char_length(name) > 0' },
       { expression: 'char_length(email) > 0' },
       { expression: 'EXTRACT(epoch FROM created_at) = 0' },
     ],
@@ -2914,7 +2922,7 @@ const constraintCreateScene = (): LiveScene => {
             .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
             .join(' ');
           const expectedChecks =
-            '<unnamed>:((age >= 0) AND(char_length(name) > 0))' +
+            'accounts_age_name_check:((age >= 0) AND(char_length(name) > 0))' +
             ' accounts_created_at_check:(EXTRACT(epoch FROM created_at) =(0)::numeric)' +
             ' <unnamed>:(age >= 0) <unnamed>:(char_length(email) > 0)';
           if (checks !== expectedChecks) return `check constraints: ${checks}`;
@@ -2940,10 +2948,10 @@ const constraintCreateScene = (): LiveScene => {
         expected: 'accounts_email_key,accounts_tenant_name_key',
       },
       {
-        description: 'check constraint names, assigned by PostgreSQL',
+        description: 'check constraint names, assigned by PostgreSQL or stated by the model',
         sql: constraintNames('accounts', 'c'),
         expected:
-          'accounts_age_check,accounts_check,accounts_created_at_check,accounts_email_check',
+          'accounts_age_check,accounts_age_name_check,accounts_created_at_check,accounts_email_check',
       },
       {
         description: 'the unnamed primary-key definition',
@@ -2971,8 +2979,8 @@ const constraintCreateScene = (): LiveScene => {
         expected: 'CHECK ((char_length(email) > 0))',
       },
       {
-        description: 'the unnamed multi-column check definition',
-        sql: constraintDef('accounts_check'),
+        description: 'the explicitly named multi-column check definition',
+        sql: constraintDef('accounts_age_name_check'),
         expected: 'CHECK (((age >= 0) AND (char_length(name) > 0)))',
       },
       {
@@ -8148,14 +8156,17 @@ const baselineIndexOccupancyScene = (): LiveScene => {
     ],
     importChecks: [
       {
-        description: 'both imports carry the kept index unnamed and the new one named',
+        description: 'both imports carry both indexes unnamed',
         failure: (imported, source) => {
           const entry = imported.model.tables.find((candidate) => candidate.name === 't');
           if (entry === undefined) return `${source}: t is not imported`;
           const indexes = entry.indexes
             .map((index) => `${joinIndexElements(index.columns)}|${index.name ?? '<unnamed>'}`)
             .join('; ');
-          return indexes === 'a|<unnamed>; b|t_b_idx'
+          // `t_b_idx` is exactly the conventional name PostgreSQL gives an index on (b), so
+          // the importer canonicalizes it back to unnamed on both sides. The catalog check
+          // above still pins the server-side name; this check pins the modeled shape.
+          return indexes === 'a|<unnamed>; b|<unnamed>'
             ? undefined
             : `${source}: indexes: ${indexes}`;
         },
