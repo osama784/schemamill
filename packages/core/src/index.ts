@@ -12,7 +12,7 @@ export {
   sameDefaultPrivileges,
   sameGrants,
 } from './privileges.ts';
-export { assertNever, plan, SequenceOwnershipError } from './plan.ts';
+export { assertNever, DefaultPrivilegeRevokeError, plan, SequenceOwnershipError } from './plan.ts';
 export type { TransactionGroup } from './plan.ts';
 export {
   defaultSequenceMax,

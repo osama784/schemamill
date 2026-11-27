@@ -227,7 +227,8 @@ const CHANGES: readonly Change[] = [
   },
   {
     kind: 'default-privileges-changed',
-    defaultPrivileges: [DEFAULT_PRIVILEGE],
+    before: [],
+    after: [DEFAULT_PRIVILEGE],
   },
   { kind: 'view-added', view: VIEW },
   { kind: 'view-removed', view: VIEW },
@@ -475,7 +476,7 @@ const CHANGE_KEYS: Record<Change['kind'], readonly string[]> = {
   'extension-added': ['kind', 'extension'],
   'extension-removed': ['kind', 'extension'],
   'extension-changed': ['kind', 'extension', 'changes'],
-  'default-privileges-changed': ['kind', 'defaultPrivileges'],
+  'default-privileges-changed': ['kind', 'before', 'after'],
   'comment-changed': ['kind', 'target', 'before?', 'after?'],
 };
 

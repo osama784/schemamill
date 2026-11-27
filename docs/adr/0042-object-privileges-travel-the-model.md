@@ -41,11 +41,15 @@ and the guard validates only references inside it. A plan-time `RoleExistenceErr
 it would require cluster knowledge the tool does not hold.
 
 The diff adds `owner-changed` and `privileges-changed` table members, `owner`/`privileges` sequence
-fields, and one outer `default-privileges-changed` carrying the target's canonical scopes. The plan
-adds four transactional step kinds at exact phases: **table phase 3b** `revoke`, immediately after
+fields, and one outer `default-privileges-changed` carrying both sides' canonical scopes as
+`before`/`after`, so a removed scope can be revoked rather than silently left behind. A baseline
+REVOKE scope the target drops — or grants it no longer revokes — is refused by name
+(`DefaultPrivilegeRevokeError`), because undoing a REVOKE would need server-default knowledge the
+model does not carry. The plan adds four transactional step kinds at exact phases: **table phase 3b** `revoke`, immediately after
 the phase-3a exclusion drops and before phase 4; **table phase 18b** `grant` then `alter-owner`,
-after phase 18's foreign-key adds; **global phase 8a** `alter-default-privileges`, after phase 8's
-ownership attaches and before phase 9's sequence option alters. Revokes for removed objects are
+after phase 18's foreign-key adds; **global phase 8a** `alter-default-privileges`, one step per changed grant after phase 8's
+ownership attaches and before phase 9's sequence option alters, revoking baseline-only grants
+before granting target additions. Revokes for removed objects are
 suppressed because removal emits a drop, not a table change; dependent grant-option chains are not
 reconstructed. Importer state tracks `SET SESSION AUTHORIZATION`; a GRANT/REVOKE with a stated
 non-owner grantor is skipped with the pinned diagnostic `skipped GRANT statement (non-owner

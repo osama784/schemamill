@@ -1629,6 +1629,7 @@ function renderObjectPrivileges(
  * One default-privilege scope as one statement per grant: PostgreSQL accepts one grantee per
  * statement, and a scope may carry several grants with different privilege lists. The revoke
  * scopes arrive before the grant scopes in canonical order, so a REVOKE never erases its GRANT.
+ * `WITH GRANT OPTION` belongs to GRANT only; a REVOKE statement cannot carry it.
  */
 function renderDefaultPrivileges(privilege: DefaultPrivilege): string {
   const roles =
@@ -1639,12 +1640,13 @@ function renderDefaultPrivileges(privilege: DefaultPrivilege): string {
     privilege.schemas === undefined
       ? ''
       : ` IN SCHEMA ${privilege.schemas.map(quoteIdentifier).join(', ')}`;
-  const action = privilege.kind === 'grant' ? 'GRANT' : 'REVOKE';
-  const preposition = privilege.kind === 'grant' ? 'TO' : 'FROM';
+  const isGrant = privilege.kind === 'grant';
+  const action = isGrant ? 'GRANT' : 'REVOKE';
+  const preposition = isGrant ? 'TO' : 'FROM';
   const on = privilege.objectType === 'table' ? 'TABLES' : 'SEQUENCES';
   return privilege.grants
     .map((grant) => {
-      const option = grant.grantOption === true ? ' WITH GRANT OPTION' : '';
+      const option = isGrant && grant.grantOption === true ? ' WITH GRANT OPTION' : '';
       return (
         `ALTER DEFAULT PRIVILEGES${roles}${schemas} ${action} ${renderPrivilegeList(grant)}` +
         ` ON ${on} ${preposition} ${renderGrantee(grant.grantee)}${option};`

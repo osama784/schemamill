@@ -536,25 +536,66 @@ function grantsFromStatement(statement: GrantStmt, grantOption: boolean): readon
   return canonicalGrants(grants);
 }
 
-/** Applies a grant or revoke to a draft's canonical list; `ALL` clears a whole grantee. */
+/**
+ * Compares a grant's grantee, privilege spelling, and columns, ignoring `WITH GRANT OPTION`.
+ * PostgreSQL matches a REVOKE on that triad whether or not the held grant carries the option.
+ */
+function sameGrantPrivileges(left: Grant, right: Grant): boolean {
+  return compareGrants({ ...left, grantOption: false }, { ...right, grantOption: false }) === 0;
+}
+
+/** A grant without its `WITH GRANT OPTION`, keeping the base privilege. */
+function withoutGrantOption(grant: Grant): Grant {
+  return {
+    grantee: grant.grantee,
+    privileges: grant.privileges === 'ALL' ? 'ALL' : [...grant.privileges],
+    ...(grant.columns === undefined ? {} : { columns: [...grant.columns] }),
+  };
+}
+
+/**
+ * Applies a grant or revoke to a draft's canonical list. A plain REVOKE matches on
+ * (grantee, privileges, columns) regardless of grant option and removes the grant entirely;
+ * `REVOKE GRANT OPTION FOR` clears the option but keeps the base grant; a plain GRANT coalesces
+ * with an existing option-bearing grant for the same triad instead of adding a twin. `ALL` on a
+ * plain REVOKE clears a whole grantee.
+ */
 function applyGrants(
   existing: readonly Grant[] | undefined,
   incoming: readonly Grant[],
   isGrant: boolean,
+  revokeOptionOnly = false,
 ): readonly Grant[] {
   let result = canonicalGrants(existing ?? []);
   for (const grant of incoming) {
     if (isGrant) {
-      if (!result.some((candidate) => compareGrants(candidate, grant) === 0)) {
-        result = canonicalGrants([...result, grant]);
+      const index = result.findIndex((candidate) => sameGrantPrivileges(candidate, grant));
+      if (index === -1) {
+        result = [...result, grant];
+      } else if (grant.grantOption === true && result[index]!.grantOption !== true) {
+        result = [
+          ...result.slice(0, index),
+          { ...result[index]!, grantOption: true },
+          ...result.slice(index + 1),
+        ];
       }
+    } else if (revokeOptionOnly) {
+      result = result.map((candidate) => {
+        const matches =
+          grant.privileges === 'ALL'
+            ? candidate.grantee === grant.grantee
+            : sameGrantPrivileges(candidate, grant);
+        return matches && candidate.grantOption === true
+          ? withoutGrantOption(candidate)
+          : candidate;
+      });
     } else if (grant.privileges === 'ALL') {
       result = result.filter((candidate) => candidate.grantee !== grant.grantee);
     } else {
-      result = result.filter((candidate) => compareGrants(candidate, grant) !== 0);
+      result = result.filter((candidate) => !sameGrantPrivileges(candidate, grant));
     }
   }
-  return result;
+  return canonicalGrants(result);
 }
 
 /**
@@ -599,7 +640,12 @@ function translateGrantStatement(
     diagnostics.push(skipStatement(statement, description, object));
     return;
   }
-  draft.privileges = applyGrants(draft.privileges, grants, isGrant);
+  draft.privileges = applyGrants(
+    draft.privileges,
+    grants,
+    isGrant,
+    !isGrant && grant.grant_option === true,
+  );
 }
 
 /** The role names in a `FOR ROLE ...` default-privilege option. */

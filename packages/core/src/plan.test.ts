@@ -3,7 +3,10 @@ import { test } from 'node:test';
 
 import {
   assertNever,
+  canonicalDefaultPrivileges,
   canonicalIntType,
+  compareGrants,
+  DefaultPrivilegeRevokeError,
   diff,
   effectiveIdentity,
   effectiveSequence,
@@ -1283,9 +1286,30 @@ const applyStep = (state: SimulatedState, step: Step): void => {
       const index = state.defaultPrivileges.findIndex(
         (candidate) => defaultPrivilegeScope(candidate) === scope,
       );
-      const copy = structuredClone(step.privilege);
-      if (index === -1) state.defaultPrivileges.push(copy);
-      else state.defaultPrivileges[index] = copy;
+      const grants = structuredClone(step.privilege.grants);
+      if (step.privilege.kind === 'grant' || index !== -1) {
+        if (index === -1) {
+          state.defaultPrivileges.push(structuredClone(step.privilege));
+        } else {
+          const found = state.defaultPrivileges[index]!;
+          found.grants = [...found.grants, ...grants];
+        }
+        return;
+      }
+      // A REVOKE step with no matching revoke scope undoes grants of the baseline grant scope.
+      const grantScope = defaultPrivilegeScope({ ...step.privilege, kind: 'grant' });
+      const grantIndex = state.defaultPrivileges.findIndex(
+        (candidate) => defaultPrivilegeScope(candidate) === grantScope,
+      );
+      if (grantIndex === -1) {
+        state.defaultPrivileges.push(structuredClone(step.privilege));
+        return;
+      }
+      const held = state.defaultPrivileges[grantIndex]!;
+      held.grants = held.grants.filter(
+        (grant) => !grants.some((other) => JSON.stringify(grant) === JSON.stringify(other)),
+      );
+      if (held.grants.length === 0) state.defaultPrivileges.splice(grantIndex, 1);
       return;
     }
     case 'comment': {
@@ -1416,7 +1440,7 @@ const assertSameState = (state: SimulatedState, target: Model): void => {
     );
   }
   assert.deepStrictEqual(
-    state.defaultPrivileges,
+    canonicalDefaultPrivileges(state.defaultPrivileges),
     target.defaultPrivileges ?? [],
     'default privileges',
   );
@@ -5752,7 +5776,8 @@ test('applyChange writes each outer change kind into its buckets', () => {
       name: 'default-privileges-changed',
       change: {
         kind: 'default-privileges-changed',
-        defaultPrivileges: [
+        before: [],
+        after: [
           {
             objectType: 'table',
             kind: 'grant',
@@ -6817,9 +6842,31 @@ const expectedWrites = (changes: readonly Change[]): ExpectedWrites => {
       case 'extension-changed':
         if (change.changes.length > 0) count('extensionAlters');
         break;
-      case 'default-privileges-changed':
-        counts.defaultPrivilegeSteps += change.defaultPrivileges.length;
+      case 'default-privileges-changed': {
+        const before = new Map(
+          change.before.map((scope) => [defaultPrivilegeScope(scope), scope] as const),
+        );
+        const after = new Map(
+          change.after.map((scope) => [defaultPrivilegeScope(scope), scope] as const),
+        );
+        for (const key of new Set([...before.keys(), ...after.keys()])) {
+          const initial = before.get(key);
+          const final = after.get(key);
+          if (initial === undefined) {
+            counts.defaultPrivilegeSteps += final!.grants.length;
+          } else if (final === undefined) {
+            counts.defaultPrivilegeSteps += initial.grants.length;
+          } else {
+            counts.defaultPrivilegeSteps += initial.grants.filter(
+              (grant) => !final.grants.some((other) => compareGrants(grant, other) === 0),
+            ).length;
+            counts.defaultPrivilegeSteps += final.grants.filter(
+              (grant) => !initial.grants.some((other) => compareGrants(grant, other) === 0),
+            ).length;
+          }
+        }
         break;
+      }
       case 'comment-changed':
         count('comments');
         break;
@@ -9039,6 +9086,89 @@ test('default privileges land in phase 8a, after ownership attaches and before o
     sequence: identity('s'),
     fields: [{ field: 'increment', before: '1', after: '5' }],
   });
+});
+
+test('removing a default-privilege grant scope emits a converging revoke step', () => {
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'grant',
+        grants: [grant('app_user', ['SELECT'])],
+      },
+    ],
+  };
+
+  const steps = plan(baseline, model()).steps;
+  assert.equal(steps.length, 1);
+  assert.deepStrictEqual(steps[0], {
+    kind: 'alter-default-privileges',
+    privilege: {
+      roles: ['postgres'],
+      schemas: ['app'],
+      objectType: 'table',
+      kind: 'revoke',
+      grants: [grant('app_user', ['SELECT'])],
+    },
+  });
+});
+
+test('a changed default-privilege scope revokes removed grants and grants additions', () => {
+  const scope = (kind: 'grant' | 'revoke', privileges: readonly Grant[]): DefaultPrivilege => ({
+    roles: ['postgres'],
+    schemas: ['app'],
+    objectType: 'table',
+    kind,
+    grants: privileges,
+  });
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [scope('grant', [grant('app_user', ['SELECT'])])],
+  };
+  const target: Model = {
+    ...model(),
+    defaultPrivileges: [scope('grant', [grant('app_user', ['INSERT'])])],
+  };
+
+  const steps = plan(baseline, target).steps;
+  assert.equal(steps.length, 2);
+  assert.deepStrictEqual(steps[0], {
+    kind: 'alter-default-privileges',
+    privilege: scope('revoke', [grant('app_user', ['SELECT'])]),
+  });
+  assert.deepStrictEqual(steps[1], {
+    kind: 'alter-default-privileges',
+    privilege: scope('grant', [grant('app_user', ['INSERT'])]),
+  });
+});
+
+test('a removed default-privilege revoke scope is refused with a named error', () => {
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'revoke',
+        grants: [grant('app_user', 'ALL')],
+      },
+    ],
+  };
+
+  assert.throws(
+    () => plan(baseline, model()),
+    (error: unknown) => {
+      assert.ok(error instanceof DefaultPrivilegeRevokeError, 'the refusal is named and exported');
+      assert.equal(error.name, 'DefaultPrivilegeRevokeError');
+      assert.match(error.message, /default privilege REVOKE scope/);
+      assert.deepStrictEqual(error.privilege, baseline.defaultPrivileges![0]!);
+      return true;
+    },
+  );
 });
 
 test('a revoke and a grant of different spellings are both emitted', () => {

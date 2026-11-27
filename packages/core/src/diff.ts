@@ -169,9 +169,11 @@ import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
  *    target name order and the removed entries baseline name order, so a model's array order
  *    never leaks into the result.
  * 6a. Cluster-wide default privileges are compared as one canonical array after every extension
- *    change: a differing array yields one `default-privileges-changed` carrying the target's
- *    canonically ordered scopes, each scope's REVOKE before its GRANT. Source order never
- *    matters, and `ALL` never compares equal to an explicit list.
+ *    change: a differing array yields one `default-privileges-changed` carrying both sides'
+ *    canonically ordered scopes as `before` and `after`, each side's REVOKE before its GRANT.
+ *    The plan needs both sides to revoke a scope the target removes; carrying only the target
+ *    would emit zero steps and leave the grant in the database. Source order never matters, and
+ *    `ALL` never compares equal to an explicit list.
  * 7. Comment changes are walked over the target model, after every extension change, and
  *    reported as a group in target identity order: the schema-qualified relation, then the
  *    target kind, then the member's name or identity. An entity the target removes contributes
@@ -248,11 +250,15 @@ export type Change =
       changes: readonly ExtensionFieldChange[];
     }
   /**
-   * Cluster-wide default privileges differ. The payload is the target's canonically ordered
-   * scopes: the plan emits one statement per scope, with REVOKE before GRANT, and no baseline
-   * lookup is needed.
+   * Cluster-wide default privileges differ. Both sides' canonically ordered scopes travel as
+   * `before` and `after`: the plan revokes baseline-only grants as well as applying target-only
+   * ones, and an empty side is carried as an empty array rather than omitted.
    */
-  | { kind: 'default-privileges-changed'; defaultPrivileges: readonly DefaultPrivilege[] }
+  | {
+      kind: 'default-privileges-changed';
+      before: readonly DefaultPrivilege[];
+      after: readonly DefaultPrivilege[];
+    }
   /**
    * A comment differs, or the entity is new: `before`/`after` are the stored texts, a side
    * that states none omitted (a removal is `COMMENT … IS NULL`). Comment changes come last, in
@@ -667,19 +673,15 @@ function diffExtensionFields(baseline: Extension, target: Extension): ExtensionF
 
 /**
  * Cluster-wide default privileges compare as one canonical array. Absence on both sides is no
- * change; any difference emits one entry carrying the target's canonically ordered scopes.
+ * change; any difference emits one entry carrying both sides' canonically ordered scopes, so a
+ * removed scope can be revoked instead of silently left behind in the database.
  */
 function diffDefaultPrivileges(baseline: Model, target: Model): readonly Change[] {
-  const before = baseline.defaultPrivileges ?? [];
-  const after = target.defaultPrivileges ?? [];
+  const before = canonicalDefaultPrivileges(baseline.defaultPrivileges ?? []);
+  const after = canonicalDefaultPrivileges(target.defaultPrivileges ?? []);
   return sameDefaultPrivileges(before, after)
     ? []
-    : [
-        {
-          kind: 'default-privileges-changed',
-          defaultPrivileges: canonicalDefaultPrivileges(after),
-        },
-      ];
+    : [{ kind: 'default-privileges-changed', before, after }];
 }
 
 /** A `comment-changed` entry, as the comment pass emits it. */

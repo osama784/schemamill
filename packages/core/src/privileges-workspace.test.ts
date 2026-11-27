@@ -239,6 +239,10 @@ test('resolveWorkspace fails closed on unknown and malformed privilege fields', 
       },
       'invalid model: defaultPrivileges[0].objectType is not a valid default privilege object type',
     ],
+    [
+      { ...populated, defaultPrivileges: [{ ...populated.defaultPrivileges[0], grants: [] }] },
+      'invalid model: defaultPrivileges[0].grants is not a non-empty list',
+    ],
   ];
   for (const [index, [payload, expected]] of cases.entries()) {
     const dir = await workspaceWith(t, JSON.stringify(payload));

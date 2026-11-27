@@ -6431,6 +6431,44 @@ test('REVOKE ALL and an absent privilege list import as the ALL marker', async (
   assert.deepEqual(model.tables[0]!.privileges, [{ grantee: 'app_user', privileges: ['select'] }]);
 });
 
+test('a plain REVOKE removes a WITH GRANT OPTION grant entirely', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `REVOKE SELECT ON TABLE app.t FROM app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, undefined);
+});
+
+test('REVOKE GRANT OPTION FOR clears the option but keeps the base grant', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `REVOKE GRANT OPTION FOR SELECT ON TABLE app.t FROM app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [{ grantee: 'app_user', privileges: ['select'] }]);
+});
+
+test('a plain GRANT coalesces with an existing option-bearing grant', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `GRANT SELECT ON TABLE app.t TO app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [
+    { grantee: 'app_user', privileges: ['select'], grantOption: true },
+  ]);
+});
+
 test('an explicit complete-looking privilege list never collapses to ALL', async () => {
   const { model } = await importDump(
     [

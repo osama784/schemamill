@@ -260,11 +260,16 @@ function formatChange(change: Change): string {
       return formatExtension('-', change.extension);
     case 'extension-changed':
       return formatExtensionChange(change.extension, change.changes);
-    case 'default-privileges-changed':
+    case 'default-privileges-changed': {
+      const afterScopes = new Set(change.after.map(defaultPrivilegeScopeKey));
       return [
         '~ default privileges',
-        ...change.defaultPrivileges.map((privilege) => `    ${formatDefaultPrivilege(privilege)}`),
+        ...change.before
+          .filter((privilege) => !afterScopes.has(defaultPrivilegeScopeKey(privilege)))
+          .map((privilege) => `    - ${formatDefaultPrivilege(privilege)}`),
+        ...change.after.map((privilege) => `    ${formatDefaultPrivilege(privilege)}`),
       ].join('\n');
+    }
     case 'comment-changed':
       return formatCommentChange(change.target, change.before, change.after);
   }
@@ -549,6 +554,16 @@ function formatGrant(grant: Grant): string {
 /** The table or sequence a privilege step addresses. */
 function formatPrivilegeObject(object: ObjectPrivilegeTarget): string {
   return `${object.kind} ${formatIdentity(object.kind === 'table' ? object.table : object.sequence)}`;
+}
+
+/** A default-privilege scope identity, for pairing before and after scopes in the text report. */
+function defaultPrivilegeScopeKey(privilege: DefaultPrivilege): string {
+  return JSON.stringify([
+    privilege.roles ?? null,
+    privilege.schemas ?? null,
+    privilege.objectType,
+    privilege.kind,
+  ]);
 }
 
 /** One default-privilege scope, with its roles, schemas, action, object type, and grants. */

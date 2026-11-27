@@ -1090,6 +1090,8 @@ function parseDefaultPrivilege(value: unknown, path: string): Parsed<DefaultPriv
     if (!kind.ok) return kind;
     const grants = parseArrayOf(object.grants, fieldPath(path, 'grants'), parseGrant);
     if (!grants.ok) return grants;
+    if (grants.value.length === 0)
+      return invalid(`${fieldPath(path, 'grants')} is not a non-empty list`);
     return parsed({
       ...(roles.value === undefined ? {} : { roles: roles.value }),
       ...(schemas.value === undefined ? {} : { schemas: schemas.value }),

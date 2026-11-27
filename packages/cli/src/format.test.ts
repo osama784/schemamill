@@ -74,6 +74,23 @@ test('an as-written sequence bound prints without the converted mark', () => {
   );
 });
 
+test('a removed default-privilege scope prints as a minus line', () => {
+  const scope = {
+    roles: ['postgres'],
+    objectType: 'table' as const,
+    kind: 'grant' as const,
+    grants: [{ grantee: 'app_user', privileges: 'ALL' as const }],
+  };
+  const changes: readonly Change[] = [
+    { kind: 'default-privileges-changed', before: [scope], after: [] },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    ['~ default privileges', '    - grant for postgres on tables: app_user: ALL', ''].join('\n'),
+  );
+});
+
 test('an identity change prints after the column fields, one sub-line per field', () => {
   const changes: readonly Change[] = [
     {

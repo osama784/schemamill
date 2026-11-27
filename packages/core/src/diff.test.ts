@@ -5481,11 +5481,28 @@ test('default privileges are one canonical entry after extension changes', () =>
   assertDiff(baseline, target, [
     {
       kind: 'default-privileges-changed',
-      defaultPrivileges: [scope('revoke', 'ALL'), scope('grant', ['SELECT'])],
+      before: [scope('grant', ['SELECT'])],
+      after: [scope('revoke', 'ALL'), scope('grant', ['SELECT'])],
     },
   ]);
   assertDiff(target, { ...target, defaultPrivileges: [...target.defaultPrivileges].reverse() }, []);
   assertDiff(baseline, baseline, []);
+});
+
+test('a removed default-privilege scope is carried on the before side', () => {
+  const before = {
+    roles: ['postgres'],
+    objectType: 'table' as const,
+    kind: 'grant' as const,
+    grants: [{ grantee: 'app_user', privileges: ['select'] }],
+  };
+  const baseline = { ...model(), defaultPrivileges: [before] };
+
+  // Untyped expected payload: the change must carry both sides, so a plan can revoke what the
+  // target no longer declares instead of emitting zero steps.
+  assert.deepStrictEqual(diff(baseline, model()), [
+    { kind: 'default-privileges-changed', before: [before], after: [] },
+  ]);
 });
 
 test('owner and privileges follow persistence in the changed table order', () => {

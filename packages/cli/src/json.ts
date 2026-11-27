@@ -681,7 +681,8 @@ function mapChange(change: Change): object {
     case 'default-privileges-changed':
       return {
         kind: 'default-privileges-changed',
-        defaultPrivileges: change.defaultPrivileges.map(mapDefaultPrivilege),
+        before: change.before.map(mapDefaultPrivilege),
+        after: change.after.map(mapDefaultPrivilege),
       };
     case 'comment-changed':
       return {

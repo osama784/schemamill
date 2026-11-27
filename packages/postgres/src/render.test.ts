@@ -4412,6 +4412,27 @@ test('default privileges render revoke before grant with roles and schemas quote
   );
 });
 
+test('removing default privileges renders the converging REVOKE', () => {
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'grant',
+        grants: [{ grantee: 'app_user', privileges: ['select'] }],
+      },
+    ],
+  };
+  const sql = renderSql(plan(baseline, model()));
+  assert.ok(sql.includes('REVOKE'), `rendered SQL must revoke the removed default: ${sql}`);
+  assert.match(
+    sql,
+    /ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE select ON TABLES FROM app_user;/,
+  );
+});
+
 test('created tables and sequences carry their grants and owner after the create', () => {
   const baseline = model();
   const target: Model = {
