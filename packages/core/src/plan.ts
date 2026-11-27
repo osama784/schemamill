@@ -130,9 +130,10 @@ import type {
  *
  * Cluster-wide default privileges map to one `alter-default-privileges` step per grant, in scope
  * order: a baseline-only grant scope is revoked, a target-only scope is emitted as declared, and
- * a scope on both sides revokes grants the target drops and grants the additions. Removing a
- * baseline REVOKE scope is refused with `DefaultPrivilegeRevokeError`: undoing a REVOKE needs the
- * server's built-in defaults, which the model does not carry. Roles are opaque names the plan
+ * a scope on both sides revokes grants the target drops and grants the additions. Dropping or
+ * narrowing a baseline REVOKE scope is a no-op: PostgreSQL's default is no grant, so there is no
+ * server-default knowledge to restore. This matters for pg_dump input, which emits a REVOKE
+ * before its GRANT for the same scope. Roles are opaque names the plan
  * does not validate; a missing role fails at apply with PostgreSQL's error, consistent with the
  * plan's other in-model assumptions.
  *
@@ -682,29 +683,6 @@ export class SequenceOwnershipError extends Error {
 }
 
 /**
- * Thrown by `plan` when a baseline `ALTER DEFAULT PRIVILEGES ... REVOKE` scope is absent from the
- * target, or loses grants there. Undoing a REVOKE would require granting back whatever the server
- * defaults were before it, which the model does not carry; emitting no step would silently leave
- * the revoke in the database. The plan refuses loudly instead, naming the scope it cannot undo.
- *
- * `privilege` is an independent copy of the baseline scope.
- */
-export class DefaultPrivilegeRevokeError extends Error {
-  /** The baseline revoke scope the plan cannot converge, copied. */
-  readonly privilege: DefaultPrivilege;
-
-  constructor(privilege: DefaultPrivilege) {
-    const roles = privilege.roles === undefined ? 'the current role' : privilege.roles.join(', ');
-    const schemas = privilege.schemas === undefined ? 'every schema' : privilege.schemas.join(', ');
-    super(
-      `default privilege REVOKE scope for roles [${roles}] in schemas [${schemas}] on ${privilege.objectType}s cannot be removed: restoring the server defaults would need knowledge the model does not carry`,
-    );
-    this.name = 'DefaultPrivilegeRevokeError';
-    this.privilege = copyStepPayload(privilege);
-  }
-}
-
-/**
  * Throws `SequenceOwnershipError` unless every target sequence's `ownedBy` resolves against the
  * target model: the owner table first, by schema and name, then the owner column on it. The
  * sequences are walked in identity order, so the reported offender is the smallest dangling
@@ -732,8 +710,7 @@ function assertTargetOwnership(target: Model): void {
  * independent copies: mutating them never affects the caller's models, and neither input is
  * mutated. Every target sequence's `ownedBy` is validated against the target model before the
  * diff runs; a dangling owner throws `SequenceOwnershipError`. A baseline default-privilege
- * REVOKE scope the target removes throws `DefaultPrivilegeRevokeError`, since undoing it would
- * need server-default knowledge the model does not carry.
+ * REVOKE scope the target drops or narrows is a no-op: PostgreSQL's default is no grant.
  */
 export function plan(baseline: Model, target: Model): Plan {
   assertTargetOwnership(target);
@@ -1137,8 +1114,7 @@ function defaultPrivilegeStep(
  * The phase-8a steps that converge baseline default privileges to the target. A baseline-only
  * grant scope is revoked one grant at a time; a target-only scope is emitted as declared; a scope
  * on both sides revokes removed grants before granting additions. A baseline REVOKE scope that the
- * target drops — or grants it no longer revokes — is refused, because undoing it needs server
- * knowledge the model does not carry.
+ * target drops — or grants it no longer revokes — is skipped: there is no server default to undo.
  */
 function defaultPrivilegeSteps(
   before: readonly DefaultPrivilege[],
@@ -1168,9 +1144,10 @@ function defaultPrivilegeSteps(
       continue;
     }
     if (initial !== undefined && final === undefined) {
-      if (initial.kind === 'revoke') throw new DefaultPrivilegeRevokeError(initial);
-      for (const grant of initial.grants)
-        steps.push(defaultPrivilegeStep(initial, 'revoke', grant));
+      if (initial.kind === 'grant') {
+        for (const grant of initial.grants)
+          steps.push(defaultPrivilegeStep(initial, 'revoke', grant));
+      }
       continue;
     }
     if (initial === undefined || final === undefined) continue;
@@ -1181,10 +1158,9 @@ function defaultPrivilegeSteps(
     const added = final.grants.filter(
       (grant) => !initial.grants.some((other) => compareGrants(grant, other) === 0),
     );
-    if (initial.kind === 'revoke' && removed.length > 0) {
-      throw new DefaultPrivilegeRevokeError(initial);
+    if (initial.kind === 'grant') {
+      for (const grant of removed) steps.push(defaultPrivilegeStep(initial, 'revoke', grant));
     }
-    for (const grant of removed) steps.push(defaultPrivilegeStep(initial, 'revoke', grant));
     for (const grant of added) steps.push(defaultPrivilegeStep(final, final.kind, grant));
   }
   return steps;

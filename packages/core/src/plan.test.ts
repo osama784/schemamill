@@ -6,7 +6,6 @@ import {
   canonicalDefaultPrivileges,
   canonicalIntType,
   compareGrants,
-  DefaultPrivilegeRevokeError,
   diff,
   effectiveIdentity,
   effectiveSequence,
@@ -9145,7 +9144,7 @@ test('a changed default-privilege scope revokes removed grants and grants additi
   });
 });
 
-test('a removed default-privilege revoke scope is refused with a named error', () => {
+test('a removed default-privilege revoke scope is a no-op', () => {
   const baseline: Model = {
     ...model(),
     defaultPrivileges: [
@@ -9159,16 +9158,55 @@ test('a removed default-privilege revoke scope is refused with a named error', (
     ],
   };
 
-  assert.throws(
-    () => plan(baseline, model()),
-    (error: unknown) => {
-      assert.ok(error instanceof DefaultPrivilegeRevokeError, 'the refusal is named and exported');
-      assert.equal(error.name, 'DefaultPrivilegeRevokeError');
-      assert.match(error.message, /default privilege REVOKE scope/);
-      assert.deepStrictEqual(error.privilege, baseline.defaultPrivileges![0]!);
-      return true;
+  const steps = plan(baseline, model()).steps;
+  assert.deepStrictEqual(steps, []);
+});
+
+test('a narrowed default-privilege revoke scope emits no step for the dropped grants', () => {
+  const scope = (grants: readonly Grant[]): DefaultPrivilege => ({
+    roles: ['postgres'],
+    schemas: ['app'],
+    objectType: 'table',
+    kind: 'revoke',
+    grants,
+  });
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [scope([grant('app_user', 'ALL'), grant('reader', ['SELECT'])])],
+  };
+  const target: Model = { ...model(), defaultPrivileges: [scope([grant('app_user', 'ALL')])] };
+
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(steps, []);
+});
+
+test('a dump-shaped default-privilege removal emits the grant scope converging revoke', () => {
+  const scope = (kind: 'grant' | 'revoke', grants: readonly Grant[]): DefaultPrivilege => ({
+    roles: ['postgres'],
+    schemas: ['app'],
+    objectType: 'table',
+    kind,
+    grants,
+  });
+  const baseline: Model = {
+    ...model(),
+    defaultPrivileges: [
+      scope('revoke', [grant('PUBLIC', 'ALL')]),
+      scope('grant', [grant('app_user', ['SELECT'])]),
+    ],
+  };
+
+  // The pg_dump-shaped REVOKE needs no undo: PostgreSQL's default is no grant. The GRANT scope is
+  // still live in the database, so this step renders as
+  // `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE SELECT ON TABLES FROM app_user;`.
+  const steps = plan(baseline, model()).steps;
+  assert.ok(steps.length > 0, 'the plan converges instead of throwing');
+  assert.deepStrictEqual(steps, [
+    {
+      kind: 'alter-default-privileges',
+      privilege: scope('revoke', [grant('app_user', ['SELECT'])]),
     },
-  );
+  ]);
 });
 
 test('a revoke and a grant of different spellings are both emitted', () => {
