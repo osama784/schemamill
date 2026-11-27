@@ -257,8 +257,8 @@ async function runScene(
     }
     await assertChecks(appliedUrl, scene.checks ?? []);
 
-    const appliedDump = await dump(appliedUrl);
-    const targetDump = await dump(targetUrl);
+    const appliedDump = await dump(appliedUrl, scene.dumpArgs);
+    const targetDump = await dump(targetUrl, scene.dumpArgs);
     await writeFile(files.appliedDump, appliedDump, 'utf8');
     await writeFile(files.targetDump, targetDump, 'utf8');
 
@@ -425,7 +425,7 @@ async function assertRollbackLeavesNoPartialEffect(
       'utf8',
     );
     await applyFile(url, baselineFile);
-    const baseline = await importDump(await dump(url));
+    const baseline = await importDump(await dump(url, scene.dumpArgs));
     assertNoErrors(`${database}: the baseline before the corrupted migration`, baseline);
 
     const corrupted = corruptLastStatement(scene, MISSING_RELATION, serverMajor);
@@ -437,7 +437,7 @@ async function assertRollbackLeavesNoPartialEffect(
       `${database}: the apply failed for the wrong reason: ${failure}`,
     );
 
-    const after = await importDump(await dump(url));
+    const after = await importDump(await dump(url, scene.dumpArgs));
     assertNoErrors(`${database}: the redump after the failed migration`, after);
     assert.deepEqual(
       diff(baseline.model, after.model),
@@ -1067,12 +1067,14 @@ async function dropDatabase(baseUrl: string, database: string): Promise<void> {
 }
 
 /**
- * `pg_dump --schema-only --no-owner --no-privileges`, as text. Windows `pg_dump` writes stdout
- * in text mode like `psql`, so an embedded LF inside a comment literal arrives as CRLF; the
+ * `pg_dump` with the corpus's `--schema-only --no-owner --no-privileges` flags by default, or a
+ * scene's explicit `dumpArgs` when it needs owners and ACLs. Windows `pg_dump` writes stdout in
+ * text mode like `psql`, so an embedded LF inside a comment literal arrives as CRLF; the
  * server-side value is unchanged, so normalize it back before the dump is imported.
  */
-async function dump(url: string): Promise<string> {
-  const text = await run('pg_dump', ['--schema-only', '--no-owner', '--no-privileges', '-d', url]);
+async function dump(url: string, args?: readonly string[]): Promise<string> {
+  const flags = args ?? ['--schema-only', '--no-owner', '--no-privileges'];
+  const text = await run('pg_dump', [...flags, '-d', url]);
   return text.replace(/\r\n/g, '\n');
 }
 

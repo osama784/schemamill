@@ -1,3 +1,4 @@
+import { assertNever } from '@schemamill/core';
 import type {
   CheckConstraint,
   Column,
@@ -7,11 +8,14 @@ import type {
   ColumnStorage,
   CommentTarget,
   ConstraintEnforcement,
+  DefaultPrivilege,
   ExclusionConstraint,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
+  ObjectPrivilegeTarget,
   Identity,
   IdentityFieldChange,
   Index,
@@ -60,7 +64,11 @@ import {
  * them with one blank line; single-group output is unchanged. `create-table` is the one
  * multi-line statement: its columns go one per line, indented four spaces, and its primary
  * key, when present, is the trailing line. A table with neither columns nor a primary key
- * renders on one line as `CREATE TABLE <q> ();`.
+ * renders on one line as `CREATE TABLE <q> ();`. Created tables and sequences also carry their
+ * declared grants and role owner as post-create statements, grants before the owner. Privilege
+ * steps render `GRANT`/`REVOKE`/`ALTER … OWNER TO` and `ALTER DEFAULT PRIVILEGES`, quoting every
+ * identifier except the literal `PUBLIC` and rendering `ALL` as the marker it is; no grantor
+ * wrapper or version floor is introduced.
  *
  * `create-schema` renders `CREATE SCHEMA IF NOT EXISTS <schema>;`. Schemas are not modeled, so
  * a namespace the target database already carries is not a difference; the guard keeps that
@@ -501,6 +509,10 @@ function indexStatement(step: Step): IndexStatement | undefined {
     case 'create-extension':
     case 'alter-extension':
     case 'drop-extension':
+    case 'alter-owner':
+    case 'grant':
+    case 'revoke':
+    case 'alter-default-privileges':
     case 'create-view':
     case 'drop-view':
     case 'replace-view':
@@ -795,6 +807,12 @@ function stepPrincipalTable(step: Step): TableIdentity | undefined {
     case 'create-index-concurrently':
     case 'drop-index-concurrently':
       return step.owner.kind === 'table' ? step.owner.table : undefined;
+    case 'alter-owner':
+    case 'grant':
+    case 'revoke':
+      return step.object.kind === 'table' ? step.object.table : undefined;
+    case 'alter-default-privileges':
+      return undefined;
     case 'create-schema':
     case 'create-sequence':
     case 'drop-sequence':
@@ -927,6 +945,14 @@ function renderStep(step: Step, targetVersion: number): string {
       return step.materialized
         ? `DROP MATERIALIZED VIEW ${renderTable(step.view)};`
         : `DROP VIEW ${renderTable(step.view)};`;
+    case 'alter-owner':
+      return renderAlterOwner(step.object, step.owner);
+    case 'grant':
+      return renderObjectPrivilege(step.object, step.grant, true);
+    case 'revoke':
+      return renderObjectPrivilege(step.object, step.grant, false);
+    case 'alter-default-privileges':
+      return renderDefaultPrivileges(step.privilege);
     case 'comment':
       return renderComment(step.target, step.text);
   }
@@ -1054,15 +1080,20 @@ function renderCreateTable(table: Table, targetVersion: number): string {
   const persistence = table.persistence === 'unlogged' ? 'UNLOGGED ' : '';
   const lines = table.columns.map((column) => `    ${renderColumn(column)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${renderPrimaryKey(table.primaryKey)}`);
-  if (lines.length === 0) return `CREATE ${persistence}TABLE ${renderTable(table)} ();`;
-
   const body = lines
     .map((line, index) => (index === lines.length - 1 ? line : `${line},`))
     .join('\n');
-  const statements = [`CREATE ${persistence}TABLE ${renderTable(table)} (\n${body}\n);`];
+  const statements = [
+    lines.length === 0
+      ? `CREATE ${persistence}TABLE ${renderTable(table)} ();`
+      : `CREATE ${persistence}TABLE ${renderTable(table)} (\n${body}\n);`,
+  ];
   for (const column of table.columns) {
     statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
   }
+  statements.push(
+    ...renderObjectPrivileges({ kind: 'table', table }, table.privileges, table.owner),
+  );
   return statements.join('\n');
 }
 
@@ -1545,6 +1576,85 @@ function renderSequence(identity: SequenceIdentity): string {
   return renderTable(identity);
 }
 
+/** `ALTER TABLE|SEQUENCE <qname> OWNER TO <role>`; role names are opaque quoted identifiers. */
+function renderAlterOwner(object: ObjectPrivilegeTarget, owner: string): string {
+  return `ALTER ${renderPrivilegeObject(object)} OWNER TO ${quoteIdentifier(owner)};`;
+}
+
+/** The object a grant, revoke, or owner alter addresses, in PostgreSQL's object grammar. */
+function renderPrivilegeObject(object: ObjectPrivilegeTarget): string {
+  return object.kind === 'table'
+    ? `TABLE ${renderTable(object.table)}`
+    : `SEQUENCE ${renderSequence(object.sequence)}`;
+}
+
+/** `PUBLIC` is SQL's keyword and stays bare; every other grantee is a quoted role name. */
+function renderGrantee(grantee: string): string {
+  return grantee === 'PUBLIC' ? 'PUBLIC' : quoteIdentifier(grantee);
+}
+
+/** The privilege list as declared: `ALL` stays the marker, explicit names render as written. */
+function renderPrivilegeList(grant: Grant): string {
+  const privileges = grant.privileges === 'ALL' ? 'ALL' : grant.privileges.join(', ');
+  return grant.columns === undefined
+    ? privileges
+    : `${privileges} (${grant.columns.map(quoteIdentifier).join(', ')})`;
+}
+
+/** One `GRANT` or `REVOKE` on a table or sequence, with `WITH GRANT OPTION` only on grants. */
+function renderObjectPrivilege(
+  object: ObjectPrivilegeTarget,
+  grant: Grant,
+  isGrant: boolean,
+): string {
+  const action = isGrant ? 'GRANT' : 'REVOKE';
+  const preposition = isGrant ? 'TO' : 'FROM';
+  const option = isGrant && grant.grantOption === true ? ' WITH GRANT OPTION' : '';
+  return `${action} ${renderPrivilegeList(grant)} ON ${renderPrivilegeObject(object)} ${preposition} ${renderGrantee(grant.grantee)}${option};`;
+}
+
+/** A created object's grants, then its role owner: both are post-create statements. */
+function renderObjectPrivileges(
+  object: ObjectPrivilegeTarget,
+  privileges: readonly Grant[] | undefined,
+  owner: string | undefined,
+): readonly string[] {
+  return [
+    ...(privileges ?? []).map((grant) => renderObjectPrivilege(object, grant, true)),
+    ...(owner === undefined ? [] : [renderAlterOwner(object, owner)]),
+  ];
+}
+
+/**
+ * One default-privilege scope as one statement per grant: PostgreSQL accepts one grantee per
+ * statement, and a scope may carry several grants with different privilege lists. The revoke
+ * scopes arrive before the grant scopes in canonical order, so a REVOKE never erases its GRANT.
+ * `WITH GRANT OPTION` belongs to GRANT only; a REVOKE statement cannot carry it.
+ */
+function renderDefaultPrivileges(privilege: DefaultPrivilege): string {
+  const roles =
+    privilege.roles === undefined
+      ? ''
+      : ` FOR ROLE ${privilege.roles.map(quoteIdentifier).join(', ')}`;
+  const schemas =
+    privilege.schemas === undefined
+      ? ''
+      : ` IN SCHEMA ${privilege.schemas.map(quoteIdentifier).join(', ')}`;
+  const isGrant = privilege.kind === 'grant';
+  const action = isGrant ? 'GRANT' : 'REVOKE';
+  const preposition = isGrant ? 'TO' : 'FROM';
+  const on = privilege.objectType === 'table' ? 'TABLES' : 'SEQUENCES';
+  return privilege.grants
+    .map((grant) => {
+      const option = isGrant && grant.grantOption === true ? ' WITH GRANT OPTION' : '';
+      return (
+        `ALTER DEFAULT PRIVILEGES${roles}${schemas} ${action} ${renderPrivilegeList(grant)}` +
+        ` ON ${on} ${preposition} ${renderGrantee(grant.grantee)}${option};`
+      );
+    })
+    .join('\n');
+}
+
 /**
  * `CREATE EXTENSION <name> WITH SCHEMA <schema>`, both identifiers quoted by need. The name is
  * never schema-qualified and the statement never states `IF NOT EXISTS`: a create applies to a
@@ -1585,12 +1695,16 @@ function renderDropExtension(extension: ExtensionIdentity): string {
 /** `CREATE SEQUENCE` in canonical full-explicit form, every effective option stated. */
 function renderCreateSequence(sequence: Sequence): string {
   const cycle = sequence.cycle ? 'CYCLE' : 'NO CYCLE';
-  return (
+  const statements = [
     `CREATE SEQUENCE ${renderSequence(sequence)} AS ${sequence.dataType}` +
-    ` INCREMENT BY ${sequence.increment} MINVALUE ${sequence.minValue}` +
-    ` MAXVALUE ${sequence.maxValue} START WITH ${sequence.start}` +
-    ` CACHE ${sequence.cache} ${cycle};`
+      ` INCREMENT BY ${sequence.increment} MINVALUE ${sequence.minValue}` +
+      ` MAXVALUE ${sequence.maxValue} START WITH ${sequence.start}` +
+      ` CACHE ${sequence.cache} ${cycle};`,
+  ];
+  statements.push(
+    ...renderObjectPrivileges({ kind: 'sequence', sequence }, sequence.privileges, sequence.owner),
   );
+  return statements.join('\n');
 }
 
 /** One `ALTER SEQUENCE` statement carrying one clause per changed field, in field order. */
@@ -1623,5 +1737,9 @@ function renderSequenceAlteration(field: SequenceFieldChange): string {
       return field.after === undefined
         ? 'OWNED BY NONE'
         : `OWNED BY ${renderTable(field.after.table)}.${quoteIdentifier(field.after.column)}`;
+    case 'owner':
+    case 'privileges':
+      // Role owners and grants travel as their own steps; the plan never puts them here.
+      return assertNever(field as never, 'sequence field');
   }
 }

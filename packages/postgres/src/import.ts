@@ -153,10 +153,12 @@ import type {
   ColumnStorage,
   ConstraintEnforcement,
   DdlImporter,
+  DefaultPrivilege,
   Diagnostic,
   ExclusionConstraint,
   Extension,
   ForeignKey,
+  Grant,
   Identity,
   IdentityGeneration,
   IdentityInput,
@@ -182,17 +184,23 @@ import type {
   ViewCheckOption,
 } from '@schemamill/core';
 import {
+  canonicalDefaultPrivileges,
+  canonicalGrants,
   canonicalIntType,
+  compareGrants,
   defaultSequenceMax,
   defaultSequenceMin,
   effectiveIdentity,
   effectiveSequence,
   indexElementsKey,
+  mergeDefaultPrivilege,
   sameIndexElements,
   sequenceTypeBounds,
   sequenceTypeChange,
 } from '@schemamill/core';
 import type {
+  AccessPriv,
+  AlterDefaultPrivilegesStmt,
   AlterSeqStmt,
   AlterTableCmd,
   AlterTableStmt,
@@ -205,11 +213,14 @@ import type {
   CreateStmt,
   CreateTableAsStmt,
   DefElem,
+  GrantStmt,
   IndexElem,
   IndexStmt,
   Node,
   RangeVar,
+  RoleSpec,
   SelectStmt,
+  VariableSetStmt,
   ViewStmt,
 } from 'libpg-query';
 
@@ -249,6 +260,10 @@ interface TableDraft {
   persistence?: TablePersistence;
   /** The table's comment; a repeated `CREATE TABLE` replaces it wholesale. */
   comment?: string;
+  /** The role-level owner from `ALTER … OWNER TO`, when the dump states one. */
+  owner?: string;
+  /** Object grants in canonical order; a repeated grantee merges by privilege list. */
+  privileges: Grant[];
 }
 
 /** A sequence being assembled: effective values, mutated as `ALTER SEQUENCE` options arrive. */
@@ -267,6 +282,14 @@ type ExtensionDraft = Mutable<Extension>;
 interface PositionedDiagnostic {
   readonly offset: number;
   readonly diagnostic: Diagnostic;
+}
+
+/** Cluster-wide privilege state that accumulates across statements in dump order. */
+interface PrivilegeState {
+  /** Default-privilege scopes, merged by scope and action as statements arrive. */
+  defaultPrivileges: readonly DefaultPrivilege[];
+  /** The active `SET SESSION AUTHORIZATION` role, used to judge non-owner grantors. */
+  sessionAuthorization: string | undefined;
 }
 
 /** Per-statement ALTER TABLE state: `SET DEFAULT` keywords are consumed in source order. */
@@ -319,6 +342,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
   const ownerPositions = new Map<string, SourcePosition>();
   const sequenceFindings = new Map<string, PositionedDiagnostic[]>();
   const partitionedTables = new Set<string>();
+  const privilegeState: PrivilegeState = { defaultPrivileges: [], sessionAuthorization: undefined };
   for (const statement of parsed.statements) {
     translateStatement(
       statement,
@@ -330,6 +354,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
       ownerPositions,
       sequenceFindings,
       partitionedTables,
+      privilegeState,
     );
   }
 
@@ -350,6 +375,9 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
       sequences: [...sequences.values()].sort(compareSequences),
       views: [...views.values()].map(finalizeView).sort(compareViews),
       extensions: [...extensions.values()].sort(compareExtensions),
+      ...(privilegeState.defaultPrivileges.length === 0
+        ? {}
+        : { defaultPrivileges: canonicalDefaultPrivileges(privilegeState.defaultPrivileges) }),
     },
     diagnostics: diagnostics.map((entry) => entry.diagnostic),
   };
@@ -441,6 +469,251 @@ function fromParseFailure(failure: ParseFailure): Diagnostic {
   };
 }
 
+/** The concrete role name a `RoleSpec` states, with `PUBLIC` as the literal marker. */
+function roleSpecName(role: RoleSpec | undefined): string | undefined {
+  if (role === undefined) return undefined;
+  if (role.roletype === 'ROLESPEC_PUBLIC') return 'PUBLIC';
+  return role.rolename;
+}
+
+/** The role named by `SET SESSION AUTHORIZATION`, or `undefined` when it is reset or unreadable. */
+function sessionAuthorizationName(statement: VariableSetStmt): string | undefined {
+  if (statement.name !== 'session_authorization' || statement.kind !== 'VAR_SET_VALUE') {
+    return undefined;
+  }
+  for (const argument of statement.args ?? []) {
+    if ('A_Const' in argument && argument.A_Const.sval?.sval !== undefined) {
+      return argument.A_Const.sval.sval;
+    }
+    if ('String' in argument && argument.String.sval !== undefined) return argument.String.sval;
+  }
+  return undefined;
+}
+
+/** One grant shape per `AccessPriv`, combined with each grantee into a model `Grant`. */
+function grantShapes(privileges: readonly Node[] | undefined): ReadonlyArray<{
+  readonly privileges: readonly string[] | 'ALL';
+  readonly columns?: readonly string[];
+}> {
+  if (privileges === undefined) return [{ privileges: 'ALL' }];
+  const shapes: Array<{
+    privileges: readonly string[] | 'ALL';
+    columns?: readonly string[];
+  }> = [];
+  for (const node of privileges) {
+    if (!('AccessPriv' in node)) continue;
+    const accessPriv: AccessPriv = node.AccessPriv;
+    const name = accessPriv.priv_name;
+    if (name === undefined || name === '') continue;
+    const columns = (accessPriv.cols ?? []).flatMap((column) =>
+      'String' in column && column.String.sval !== undefined ? [column.String.sval] : [],
+    );
+    shapes.push({
+      privileges: [name],
+      ...(columns.length > 0 ? { columns } : {}),
+    });
+  }
+  return shapes;
+}
+
+/** The grants a `GrantStmt` declares: one per grantee and privilege shape, in canonical order. */
+function grantsFromStatement(statement: GrantStmt, grantOption: boolean): readonly Grant[] {
+  const grantees = (statement.grantees ?? []).flatMap((node) =>
+    'RoleSpec' in node ? (roleSpecName(node.RoleSpec) ?? []) : [],
+  );
+  const shapes = grantShapes(statement.privileges);
+  const grants: Grant[] = [];
+  for (const grantee of grantees) {
+    for (const shape of shapes) {
+      grants.push({
+        grantee,
+        privileges: shape.privileges,
+        ...(shape.columns === undefined ? {} : { columns: shape.columns }),
+        ...(grantOption ? { grantOption: true } : {}),
+      });
+    }
+  }
+  return canonicalGrants(grants);
+}
+
+/**
+ * Compares a grant's grantee, privilege spelling, and columns, ignoring `WITH GRANT OPTION`.
+ * PostgreSQL matches a REVOKE on that triad whether or not the held grant carries the option.
+ */
+function sameGrantPrivileges(left: Grant, right: Grant): boolean {
+  return compareGrants({ ...left, grantOption: false }, { ...right, grantOption: false }) === 0;
+}
+
+/** A grant without its `WITH GRANT OPTION`, keeping the base privilege. */
+function withoutGrantOption(grant: Grant): Grant {
+  return {
+    grantee: grant.grantee,
+    privileges: grant.privileges === 'ALL' ? 'ALL' : [...grant.privileges],
+    ...(grant.columns === undefined ? {} : { columns: [...grant.columns] }),
+  };
+}
+
+/**
+ * Applies a grant or revoke to a draft's canonical list. A plain REVOKE matches on
+ * (grantee, privileges, columns) regardless of grant option and removes the grant entirely;
+ * `REVOKE GRANT OPTION FOR` clears the option but keeps the base grant; a plain GRANT coalesces
+ * with an existing option-bearing grant for the same triad instead of adding a twin. `ALL` on a
+ * plain REVOKE clears a whole grantee.
+ */
+function applyGrants(
+  existing: readonly Grant[] | undefined,
+  incoming: readonly Grant[],
+  isGrant: boolean,
+  revokeOptionOnly = false,
+): readonly Grant[] {
+  let result = canonicalGrants(existing ?? []);
+  for (const grant of incoming) {
+    if (isGrant) {
+      const index = result.findIndex((candidate) => sameGrantPrivileges(candidate, grant));
+      if (index === -1) {
+        result = [...result, grant];
+      } else if (grant.grantOption === true && result[index]!.grantOption !== true) {
+        result = [
+          ...result.slice(0, index),
+          { ...result[index]!, grantOption: true },
+          ...result.slice(index + 1),
+        ];
+      }
+    } else if (revokeOptionOnly) {
+      result = result.map((candidate) => {
+        const matches =
+          grant.privileges === 'ALL'
+            ? candidate.grantee === grant.grantee
+            : sameGrantPrivileges(candidate, grant);
+        return matches && candidate.grantOption === true
+          ? withoutGrantOption(candidate)
+          : candidate;
+      });
+    } else if (grant.privileges === 'ALL') {
+      result = result.filter((candidate) => candidate.grantee !== grant.grantee);
+    } else {
+      result = result.filter((candidate) => !sameGrantPrivileges(candidate, grant));
+    }
+  }
+  return canonicalGrants(result);
+}
+
+/**
+ * A GRANT or REVOKE on a modeled table or sequence. Unmodeled object types fall back to the
+ * describer's exact skip wording; a stated non-owner grantor is skipped and named, never silent.
+ */
+function translateGrantStatement(
+  statement: ParsedStatement,
+  grant: GrantStmt,
+  tables: Map<string, TableDraft>,
+  sequences: Map<string, SequenceDraft>,
+  diagnostics: PositionedDiagnostic[],
+  privilegeState: PrivilegeState,
+): void {
+  const isGrant = grant.is_grant === true;
+  const description = isGrant ? 'GRANT statement' : 'REVOKE statement';
+  const object = isGrant ? 'GRANT' : 'REVOKE';
+  const modeled = grant.targtype === 'ACL_TARGET_OBJECT';
+  const sequence = grant.objtype === 'OBJECT_SEQUENCE';
+  if (!modeled || (!sequence && grant.objtype !== 'OBJECT_TABLE')) {
+    diagnostics.push(skipStatement(statement, description, object));
+    return;
+  }
+  const relation = grant.objects?.find((node) => 'RangeVar' in node)?.RangeVar;
+  const schema = relation?.schemaname ?? 'public';
+  const name = relation?.relname ?? '';
+  const draft = sequence
+    ? sequences.get(tableKey(schema, name))
+    : tables.get(tableKey(schema, name));
+  if (draft === undefined) {
+    diagnostics.push(skipStatement(statement, description, object));
+    return;
+  }
+  const grantor = grant.grantor === undefined ? undefined : roleSpecName(grant.grantor);
+  const owner = draft.owner ?? privilegeState.sessionAuthorization;
+  if (grantor !== undefined && grantor !== owner) {
+    diagnostics.push(skipStatement(statement, `${description} (non-owner grantor)`, object));
+    return;
+  }
+  const grants = grantsFromStatement(grant, grant.grant_option === true);
+  if (grants.length === 0) {
+    diagnostics.push(skipStatement(statement, description, object));
+    return;
+  }
+  draft.privileges = applyGrants(
+    draft.privileges,
+    grants,
+    isGrant,
+    !isGrant && grant.grant_option === true,
+  );
+}
+
+/** The role names in a `FOR ROLE ...` default-privilege option. */
+function defaultPrivilegeRoles(
+  statement: AlterDefaultPrivilegesStmt,
+): readonly string[] | undefined {
+  const option = statement.options?.find(
+    (node) => 'DefElem' in node && node.DefElem.defname === 'roles',
+  );
+  if (option === undefined || !('DefElem' in option)) return undefined;
+  const arg = option.DefElem.arg;
+  if (arg === undefined || !('List' in arg)) return undefined;
+  return (arg.List.items ?? []).flatMap((node) =>
+    'RoleSpec' in node ? (roleSpecName(node.RoleSpec) ?? []) : [],
+  );
+}
+
+/** The schema names in an `IN SCHEMA ...` default-privilege option. */
+function defaultPrivilegeSchemas(
+  statement: AlterDefaultPrivilegesStmt,
+): readonly string[] | undefined {
+  const option = statement.options?.find(
+    (node) => 'DefElem' in node && node.DefElem.defname === 'schemas',
+  );
+  if (option === undefined || !('DefElem' in option)) return undefined;
+  const arg = option.DefElem.arg;
+  if (arg === undefined || !('List' in arg)) return undefined;
+  return (arg.List.items ?? []).flatMap((node) =>
+    'String' in node && node.String.sval !== undefined ? [node.String.sval] : [],
+  );
+}
+
+/** `ALTER DEFAULT PRIVILEGES` on tables or sequences; repeated scopes merge their grants. */
+function translateDefaultPrivileges(
+  statement: ParsedStatement,
+  node: Node,
+  alter: AlterDefaultPrivilegesStmt,
+  privilegeState: PrivilegeState,
+  diagnostics: PositionedDiagnostic[],
+): void {
+  const action = alter.action;
+  const sequence = action?.objtype === 'OBJECT_SEQUENCE';
+  if (
+    action === undefined ||
+    action.targtype !== 'ACL_TARGET_DEFAULTS' ||
+    (!sequence && action.objtype !== 'OBJECT_TABLE')
+  ) {
+    const { description, object } = describeStatement(node);
+    diagnostics.push(skipStatement(statement, description, object));
+    return;
+  }
+  const grants = grantsFromStatement(action, action.grant_option === true);
+  if (grants.length === 0) {
+    const { description, object } = describeStatement(node);
+    diagnostics.push(skipStatement(statement, description, object));
+    return;
+  }
+  const roles = defaultPrivilegeRoles(alter);
+  const schemas = defaultPrivilegeSchemas(alter);
+  privilegeState.defaultPrivileges = mergeDefaultPrivilege(privilegeState.defaultPrivileges, {
+    ...(roles === undefined || roles.length === 0 ? {} : { roles }),
+    ...(schemas === undefined || schemas.length === 0 ? {} : { schemas }),
+    objectType: sequence ? 'sequence' : 'table',
+    kind: action.is_grant === true ? 'grant' : 'revoke',
+    grants,
+  });
+}
+
 function translateStatement(
   statement: ParsedStatement,
   tables: Map<string, TableDraft>,
@@ -451,6 +724,7 @@ function translateStatement(
   ownerPositions: Map<string, SourcePosition>,
   sequenceFindings: Map<string, PositionedDiagnostic[]>,
   partitionedTables: Set<string>,
+  privilegeState: PrivilegeState,
 ): void {
   const node = statement.result.stmts?.[0]?.stmt;
   if (node === undefined) {
@@ -471,7 +745,7 @@ function translateStatement(
     return;
   }
   if ('AlterTableStmt' in node) {
-    translateAlterTable(statement, node.AlterTableStmt, tables, diagnostics);
+    translateAlterTable(statement, node.AlterTableStmt, tables, sequences, diagnostics);
     return;
   }
   if ('CreateSeqStmt' in node) {
@@ -503,6 +777,31 @@ function translateStatement(
   }
   if ('CreateExtensionStmt' in node) {
     translateCreateExtension(statement, node.CreateExtensionStmt, extensions, diagnostics);
+    return;
+  }
+  if ('VariableSetStmt' in node && node.VariableSetStmt.name === 'session_authorization') {
+    privilegeState.sessionAuthorization = sessionAuthorizationName(node.VariableSetStmt);
+    return;
+  }
+  if ('AlterDefaultPrivilegesStmt' in node) {
+    translateDefaultPrivileges(
+      statement,
+      node,
+      node.AlterDefaultPrivilegesStmt,
+      privilegeState,
+      diagnostics,
+    );
+    return;
+  }
+  if ('GrantStmt' in node) {
+    translateGrantStatement(
+      statement,
+      node.GrantStmt,
+      tables,
+      sequences,
+      diagnostics,
+      privilegeState,
+    );
     return;
   }
   if ('CommentStmt' in node && MODELED_COMMENT_OBJECTS.has(node.CommentStmt.objtype ?? '')) {
@@ -2372,29 +2671,88 @@ function translateAlterTable(
   statement: ParsedStatement,
   alter: AlterTableStmt,
   tables: Map<string, TableDraft>,
+  sequences: Map<string, SequenceDraft>,
   diagnostics: PositionedDiagnostic[],
 ): void {
   const schema = alter.relation?.schemaname ?? 'public';
   const name = alter.relation?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
+  let sequence = alter.objtype === 'OBJECT_SEQUENCE';
 
-  if (alter.objtype !== undefined && alter.objtype !== 'OBJECT_TABLE') {
+  if (
+    alter.objtype !== undefined &&
+    alter.objtype !== 'OBJECT_TABLE' &&
+    alter.objtype !== 'OBJECT_SEQUENCE'
+  ) {
     diagnostics.push(
       skipStatement(statement, `ALTER ${alterObjectKind(alter.objtype)} ${identity}`, identity),
     );
     return;
   }
 
-  const draft = tables.get(tableKey(schema, name));
+  let draft = sequence ? sequences.get(tableKey(schema, name)) : tables.get(tableKey(schema, name));
+  // pg_dump 13 rewrites `SEQUENCE` to `TABLE` in owner statements; pg_dump 18 keeps `SEQUENCE`.
+  // Tables and sequences share PostgreSQL's relation namespace, so when the table lookup misses
+  // an owner-only statement can resolve against the sequence map without ambiguity. Any other
+  // shape keeps the original lookup and skip, including unresolvable role specs.
+  if (draft === undefined && !sequence) {
+    const commands = alter.cmds ?? [];
+    if (
+      commands.length > 0 &&
+      commands.every(
+        (node) =>
+          'AlterTableCmd' in node &&
+          node.AlterTableCmd.subtype === 'AT_ChangeOwner' &&
+          roleSpecName(node.AlterTableCmd.newowner) !== undefined,
+      )
+    ) {
+      draft = sequences.get(tableKey(schema, name));
+      sequence = draft !== undefined;
+    }
+  }
   if (draft === undefined) {
     diagnostics.push(
-      skipStatement(statement, `ALTER TABLE ${identity} (table not imported)`, identity),
+      skipStatement(
+        statement,
+        sequence ? `ALTER SEQUENCE ${identity}` : `ALTER TABLE ${identity} (table not imported)`,
+        identity,
+      ),
     );
     return;
   }
 
-  const context: AlterTableContext = { defaultSearchFrom: 0 };
+  // `ALTER … OWNER TO` parses as an AlterTableCmd on both tables and sequences. It is the role
+  // owner, distinct from a sequence's `OWNED BY`; every other action keeps its existing path.
+  const remaining: Node[] = [];
   for (const command of alter.cmds ?? []) {
+    if ('AlterTableCmd' in command && command.AlterTableCmd.subtype === 'AT_ChangeOwner') {
+      const role = roleSpecName(command.AlterTableCmd.newowner);
+      if (role === undefined) {
+        diagnostics.push(
+          skipStatement(
+            statement,
+            alterTableActionDescription(command.AlterTableCmd.subtype, identity),
+            identity,
+          ),
+        );
+      } else {
+        draft.owner = role;
+      }
+      continue;
+    }
+    remaining.push(command);
+  }
+
+  if (sequence) {
+    if (remaining.length > 0) {
+      diagnostics.push(skipStatement(statement, `ALTER SEQUENCE ${identity}`, identity));
+    }
+    return;
+  }
+
+  const tableDraft = draft as TableDraft;
+  const context: AlterTableContext = { defaultSearchFrom: 0 };
+  for (const command of remaining) {
     if (!('AlterTableCmd' in command)) {
       diagnostics.push(
         skipStatement(statement, `ALTER TABLE ${identity} (unrecognized command)`, identity),
@@ -2405,7 +2763,7 @@ function translateAlterTable(
       statement,
       command.AlterTableCmd,
       identity,
-      draft,
+      tableDraft,
       diagnostics,
       context,
     );
@@ -4656,6 +5014,7 @@ function getOrCreateTable(
     exclusionConstraints: [],
     indexes: [],
     exclusionBackingNames: new Set<string>(),
+    privileges: [],
   };
   tables.set(key, draft);
   return draft;
@@ -4862,6 +5221,8 @@ function finalizeTable(draft: TableDraft): Table {
   };
   if (draft.primaryKey !== undefined) table.primaryKey = draft.primaryKey;
   if (draft.persistence !== undefined) table.persistence = draft.persistence;
+  if (draft.owner !== undefined) table.owner = draft.owner;
+  if (draft.privileges.length > 0) table.privileges = canonicalGrants(draft.privileges);
   if (draft.comment !== undefined) table.comment = draft.comment;
   return table;
 }

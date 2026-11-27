@@ -5358,3 +5358,189 @@ test('an expression index rename removes then adds its full shape', () => {
     ],
   );
 });
+
+/** A grant with the given grantee and privilege spelling. */
+const grant = (grantee: string, privileges: readonly string[] | 'ALL') => ({ grantee, privileges });
+
+/** A table payload carrying an owner and a grant list. */
+const ownedTable = (
+  name: string,
+  fields: {
+    readonly owner?: string;
+    readonly privileges?: readonly ReturnType<typeof grant>[];
+  } = {},
+) => ({ ...table(name), ...fields });
+
+test('a table owner change reports the owner-changed member', () => {
+  const before = model(ownedTable('t', { owner: 'postgres' }));
+  const after = model(ownedTable('t', { owner: 'Priv App User' }));
+
+  assertDiff(before, after, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'owner-changed', before: 'postgres', after: 'Priv App User' }],
+    },
+  ]);
+  assertDiff(after, before, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [{ kind: 'owner-changed', before: 'Priv App User', after: 'postgres' }],
+    },
+  ]);
+  assertDiff(after, after, []);
+});
+
+test('a table privileges change reports the privileges-changed member', () => {
+  const before = model(ownedTable('t', { privileges: [grant('app_user', ['SELECT'])] }));
+  const after = model(
+    ownedTable('t', { privileges: [grant('app_user', ['SELECT']), grant('PUBLIC', 'ALL')] }),
+  );
+
+  assertDiff(before, after, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'privileges-changed',
+          before: [grant('app_user', ['SELECT'])],
+          after: [grant('PUBLIC', 'ALL'), grant('app_user', ['SELECT'])],
+        },
+      ],
+    },
+  ]);
+  assertDiff(after, after, []);
+});
+
+test('canonical grant order makes source order irrelevant and ALL distinct from a list', () => {
+  const first = model(
+    ownedTable('t', { privileges: [grant('b', ['SELECT']), grant('a', ['UPDATE'])] }),
+  );
+  const second = model(
+    ownedTable('t', { privileges: [grant('a', ['UPDATE']), grant('b', ['SELECT'])] }),
+  );
+  assertDiff(first, second, []);
+
+  const all = model(ownedTable('t', { privileges: [grant('a', 'ALL')] }));
+  const explicit = model(
+    ownedTable('t', { privileges: [grant('a', ['SELECT', 'INSERT', 'UPDATE', 'DELETE'])] }),
+  );
+  assertDiff(all, explicit, [
+    {
+      kind: 'table-changed',
+      table: identity('t'),
+      changes: [
+        {
+          kind: 'privileges-changed',
+          before: [grant('a', 'ALL')],
+          after: [grant('a', ['SELECT', 'INSERT', 'UPDATE', 'DELETE'])],
+        },
+      ],
+    },
+  ]);
+});
+
+test('a sequence role owner and its privileges report sequence fields', () => {
+  const before = sequenceModel([{ ...sequence('s'), owner: 'postgres' }]);
+  const after = sequenceModel([
+    {
+      ...sequence('s'),
+      owner: 'Priv App User',
+      privileges: [grant('app_user', ['USAGE'])],
+    },
+  ]);
+
+  assertDiff(before, after, [
+    {
+      kind: 'sequence-changed',
+      sequence: identity('s'),
+      changes: [
+        { field: 'owner', before: 'postgres', after: 'Priv App User' },
+        { field: 'privileges', after: [grant('app_user', ['USAGE'])] },
+      ],
+    },
+  ]);
+});
+
+test('default privileges are one canonical entry after extension changes', () => {
+  const scope = (kind: 'grant' | 'revoke', privileges: readonly string[] | 'ALL') => ({
+    roles: ['postgres'],
+    schemas: ['app'],
+    objectType: 'table' as const,
+    kind,
+    grants: [grant('app_user', privileges)],
+  });
+  const baseline = { ...model(), defaultPrivileges: [scope('grant', ['SELECT'])] };
+  const target = {
+    ...model(),
+    defaultPrivileges: [scope('revoke', 'ALL'), scope('grant', ['SELECT'])],
+  };
+
+  assertDiff(baseline, target, [
+    {
+      kind: 'default-privileges-changed',
+      before: [scope('grant', ['SELECT'])],
+      after: [scope('revoke', 'ALL'), scope('grant', ['SELECT'])],
+    },
+  ]);
+  assertDiff(target, { ...target, defaultPrivileges: [...target.defaultPrivileges].reverse() }, []);
+  assertDiff(baseline, baseline, []);
+});
+
+test('a removed default-privilege scope is carried on the before side', () => {
+  const before = {
+    roles: ['postgres'],
+    objectType: 'table' as const,
+    kind: 'grant' as const,
+    grants: [{ grantee: 'app_user', privileges: ['select'] }],
+  };
+  const baseline = { ...model(), defaultPrivileges: [before] };
+
+  // Untyped expected payload: the change must carry both sides, so a plan can revoke what the
+  // target no longer declares instead of emitting zero steps.
+  assert.deepStrictEqual(diff(baseline, model()), [
+    { kind: 'default-privileges-changed', before: [before], after: [] },
+  ]);
+});
+
+test('owner and privileges follow persistence in the changed table order', () => {
+  const before = ownedTable('t', { owner: 'postgres', privileges: [grant('a', ['SELECT'])] });
+  const after = {
+    ...ownedTable('t', {
+      owner: 'app',
+      privileges: [grant('a', ['SELECT']), grant('b', ['UPDATE'])],
+    }),
+    persistence: 'unlogged' as const,
+  };
+
+  const changes = diff(model(before), model(after));
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0]!.kind, 'table-changed');
+  if (changes[0]!.kind !== 'table-changed') throw new Error('expected a changed table');
+  assert.deepStrictEqual(
+    changes[0]!.changes.map((change) => change.kind),
+    ['persistence-changed', 'owner-changed', 'privileges-changed'],
+  );
+});
+
+test('changed owner and privilege payloads are independent copies', () => {
+  const privileges = [grant('app_user', ['SELECT'])];
+  const before = model(ownedTable('t', { owner: 'postgres', privileges }));
+  const after = model(
+    ownedTable('t', { owner: 'app', privileges: [grant('app_user', ['UPDATE'])] }),
+  );
+  const changes = diff(before, after);
+  assert.equal(changes.length, 1);
+  const changed = changes[0]!;
+  if (changed.kind !== 'table-changed') throw new Error('expected a changed table');
+  const ownerChange = changed.changes[0]!;
+  const privilegeChange = changed.changes[1]!;
+  assert.equal(ownerChange.kind, 'owner-changed');
+  assert.equal(privilegeChange.kind, 'privileges-changed');
+  if (privilegeChange.kind !== 'privileges-changed') throw new Error('expected privileges');
+  assert.notStrictEqual(privilegeChange.before, privileges);
+  assert.notStrictEqual(privilegeChange.before![0], privileges[0]);
+  assert.notStrictEqual(privilegeChange.before![0]!.privileges, privileges[0]!.privileges);
+});

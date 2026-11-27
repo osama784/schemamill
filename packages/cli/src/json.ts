@@ -6,12 +6,15 @@ import type {
   ColumnAttributes,
   ColumnFieldChange,
   CommentTarget,
+  DefaultPrivilege,
   ExclusionConstraint,
   Diagnostic,
   Extension,
   ExtensionFieldChange,
   ExtensionIdentity,
   ForeignKey,
+  Grant,
+  ObjectPrivilegeTarget,
   Hazard,
   HazardEntity,
   Identity,
@@ -387,6 +390,8 @@ function mapSequence(sequence: Sequence): object {
     cache: sequence.cache,
     cycle: sequence.cycle,
     ...(sequence.ownedBy === undefined ? {} : { ownedBy: mapOwner(sequence.ownedBy) }),
+    ...(sequence.owner === undefined ? {} : { owner: sequence.owner }),
+    ...(sequence.privileges === undefined ? {} : { privileges: sequence.privileges.map(mapGrant) }),
     ...(sequence.comment === undefined ? {} : { comment: sequence.comment }),
   };
 }
@@ -427,8 +432,38 @@ function mapTable(table: Table): object {
       : { exclusionConstraints: table.exclusionConstraints.map(mapExclusionConstraint) }),
     indexes: table.indexes.map(mapIndex),
     ...(table.persistence === undefined ? {} : { persistence: table.persistence }),
+    ...(table.owner === undefined ? {} : { owner: table.owner }),
+    ...(table.privileges === undefined ? {} : { privileges: table.privileges.map(mapGrant) }),
     ...(table.comment === undefined ? {} : { comment: table.comment }),
   };
+}
+
+/** One grant: the `ALL` marker or an explicit list, then columns and the grant option. */
+function mapGrant(grant: Grant): object {
+  return {
+    grantee: grant.grantee,
+    privileges: grant.privileges === 'ALL' ? 'ALL' : [...grant.privileges],
+    ...(grant.columns === undefined ? {} : { columns: [...grant.columns] }),
+    ...(grant.grantOption === undefined ? {} : { grantOption: grant.grantOption }),
+  };
+}
+
+/** One default-privilege scope, with roles, schemas, action, object type, and grants. */
+function mapDefaultPrivilege(privilege: DefaultPrivilege): object {
+  return {
+    ...(privilege.roles === undefined ? {} : { roles: [...privilege.roles] }),
+    ...(privilege.schemas === undefined ? {} : { schemas: [...privilege.schemas] }),
+    objectType: privilege.objectType,
+    kind: privilege.kind,
+    grants: privilege.grants.map(mapGrant),
+  };
+}
+
+/** The table or sequence a privilege step addresses. */
+function mapPrivilegeObject(object: ObjectPrivilegeTarget): object {
+  return object.kind === 'table'
+    ? { kind: 'table', table: mapTableIdentity(object.table) }
+    : { kind: 'sequence', sequence: mapSequenceIdentity(object.sequence) };
 }
 
 function mapIndexOwner(owner: IndexOwner): object {
@@ -473,6 +508,13 @@ function mapIdentityFieldChange(change: IdentityFieldChange): object {
 }
 
 function mapSequenceFieldChange(change: SequenceFieldChange): object {
+  if (change.field === 'privileges') {
+    return {
+      field: 'privileges',
+      ...(change.before === undefined ? {} : { before: change.before.map(mapGrant) }),
+      ...(change.after === undefined ? {} : { after: change.after.map(mapGrant) }),
+    };
+  }
   return mapFieldPair(
     change.field,
     change.before,
@@ -636,6 +678,12 @@ function mapChange(change: Change): object {
         extension: mapExtensionIdentity(change.extension),
         changes: change.changes.map(mapExtensionFieldChange),
       };
+    case 'default-privileges-changed':
+      return {
+        kind: 'default-privileges-changed',
+        before: change.before.map(mapDefaultPrivilege),
+        after: change.after.map(mapDefaultPrivilege),
+      };
     case 'comment-changed':
       return {
         kind: 'comment-changed',
@@ -747,6 +795,18 @@ function mapTableChange(change: TableChange): object {
         kind: 'persistence-changed',
         ...(change.before === undefined ? {} : { before: change.before }),
         ...(change.after === undefined ? {} : { after: change.after }),
+      };
+    case 'owner-changed':
+      return {
+        kind: 'owner-changed',
+        ...(change.before === undefined ? {} : { before: change.before }),
+        ...(change.after === undefined ? {} : { after: change.after }),
+      };
+    case 'privileges-changed':
+      return {
+        kind: 'privileges-changed',
+        ...(change.before === undefined ? {} : { before: change.before.map(mapGrant) }),
+        ...(change.after === undefined ? {} : { after: change.after.map(mapGrant) }),
       };
     default:
       return assertNever(change, 'TableChange');
@@ -951,6 +1011,29 @@ function mapStep(step: Step): object {
       };
     case 'replace-view':
       return { kind: 'replace-view', view: mapView(step.view) };
+    case 'alter-owner':
+      return {
+        kind: 'alter-owner',
+        object: mapPrivilegeObject(step.object),
+        owner: step.owner,
+      };
+    case 'grant':
+      return {
+        kind: 'grant',
+        object: mapPrivilegeObject(step.object),
+        grant: mapGrant(step.grant),
+      };
+    case 'revoke':
+      return {
+        kind: 'revoke',
+        object: mapPrivilegeObject(step.object),
+        grant: mapGrant(step.grant),
+      };
+    case 'alter-default-privileges':
+      return {
+        kind: 'alter-default-privileges',
+        privilege: mapDefaultPrivilege(step.privilege),
+      };
     case 'comment':
       return {
         kind: 'comment',

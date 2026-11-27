@@ -216,6 +216,8 @@ const EXPECTED_MODEL: Model = {
       uniqueConstraints: [{ columns: ['email'] }],
       checkConstraints: [{ expression: '(age >= 0)' }],
       indexes: [{ name: 'idx_users_email', unique: false, columns: ['email'] }],
+      owner: 'app',
+      privileges: [{ grantee: 'app', privileges: ['select'] }],
       comment: 'people',
     },
   ],
@@ -241,8 +243,6 @@ const EXPECTED_DIAGNOSTICS = [
   { kind: 'skip', code: 'unsupported-statement', object: 'statement_timeout' },
   { kind: 'skip', code: 'unsupported-statement', object: 'client_encoding' },
   { kind: 'skip', code: 'unsupported-statement', object: 'app' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'public.users' },
-  { kind: 'skip', code: 'unsupported-statement', object: 'GRANT' },
   { kind: 'skip', code: 'unsupported-statement', object: 'SELECT' },
   { kind: 'error', code: 'parse-failure' },
   { kind: 'skip', code: 'copy-data', object: 'COPY public.users' },
@@ -396,24 +396,6 @@ const LONG_TAIL_DIAGNOSTICS = [
     message: 'skipped COMMENT ON FOREIGN TABLE app.ft',
   },
   {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'GRANT',
-    message: 'skipped GRANT statement',
-  },
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'REVOKE',
-    message: 'skipped REVOKE statement',
-  },
-  {
-    kind: 'skip',
-    code: 'unsupported-statement',
-    object: 'REVOKE',
-    message: 'skipped REVOKE statement',
-  },
-  {
     kind: 'flag',
     code: 'unsupported-attribute',
     object: 'app.like',
@@ -522,7 +504,11 @@ test('reports skips, flags, and failures in dump order', async () => {
     diagnostics.find((diagnostic) => diagnostic.message.includes(fragment));
 
   assert.match(byMessage('consumed 2 data lines')?.message ?? '', /terminating/);
-  assert.match(byMessage('AT_ChangeOwner')?.message ?? '', /ALTER TABLE action/);
+  assert.equal(
+    byMessage('AT_ChangeOwner'),
+    undefined,
+    'ALTER TABLE OWNER TO attaches instead of being skipped',
+  );
   assert.equal(
     byMessage('AT_ColumnDefault'),
     undefined,
@@ -6390,4 +6376,208 @@ test('an IF NOT EXISTS expression index is imported and its clause is flagged', 
       message: 'dropped IF NOT EXISTS from public.t_expr_idx',
     },
   ]);
+});
+
+/** The four dump forms from the #92 fact report, with a modeled table and sequence. */
+const PRIVILEGE_DUMP = [
+  `CREATE TABLE app.t (id integer, email text);`,
+  `CREATE SEQUENCE app.s AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;`,
+  `ALTER TABLE app.t OWNER TO postgres;`,
+  `ALTER SEQUENCE app.s OWNER TO postgres;`,
+  `GRANT SELECT ON TABLE app.t TO app_user;`,
+  `GRANT UPDATE(email) ON TABLE app.t TO app_user;`,
+  `GRANT USAGE ON SEQUENCE app.s TO PUBLIC;`,
+  `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app GRANT SELECT ON TABLES TO app_user;`,
+].join('\n');
+
+test('imports the four live dump forms as owner, grants, and default privileges', async () => {
+  const { model, diagnostics } = await importDump(PRIVILEGE_DUMP);
+
+  assert.deepEqual(diagnostics, []);
+  const table = model.tables.find((entry) => entry.schema === 'app' && entry.name === 't');
+  assert.ok(table !== undefined, 'app.t is imported');
+  assert.equal(table.owner, 'postgres');
+  assert.deepEqual(table.privileges, [
+    { grantee: 'app_user', privileges: ['select'] },
+    { grantee: 'app_user', privileges: ['update'], columns: ['email'] },
+  ]);
+
+  const sequence = model.sequences.find((entry) => entry.schema === 'app' && entry.name === 's');
+  assert.ok(sequence !== undefined, 'app.s is imported');
+  assert.equal(sequence.owner, 'postgres');
+  assert.deepEqual(sequence.privileges, [{ grantee: 'PUBLIC', privileges: ['usage'] }]);
+
+  assert.deepEqual(model.defaultPrivileges, [
+    {
+      roles: ['postgres'],
+      schemas: ['app'],
+      objectType: 'table',
+      kind: 'grant',
+      grants: [{ grantee: 'app_user', privileges: ['select'] }],
+    },
+  ]);
+});
+
+test('imports a PG13-style ALTER TABLE sequence owner statement', async () => {
+  // pg_dump 13 emits `ALTER TABLE … OWNER TO` for sequences; pg_dump 18 emits `ALTER SEQUENCE`.
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE SEQUENCE app.s AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;`,
+      `ALTER TABLE app.s OWNER TO "Priv App User";`,
+    ].join('\n'),
+  );
+
+  assert.deepEqual(diagnostics, []);
+  const sequence = model.sequences.find((entry) => entry.schema === 'app' && entry.name === 's');
+  assert.ok(sequence !== undefined, 'app.s is imported');
+  assert.equal(sequence.owner, 'Priv App User');
+});
+
+test('REVOKE ALL and an absent privilege list import as the ALL marker', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT ALL ON TABLE app.t TO app_user;`,
+      `REVOKE ALL ON TABLE app.t FROM app_user;`,
+      `GRANT SELECT ON TABLE app.t TO app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [{ grantee: 'app_user', privileges: ['select'] }]);
+});
+
+test('a plain REVOKE removes a WITH GRANT OPTION grant entirely', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `REVOKE SELECT ON TABLE app.t FROM app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, undefined);
+});
+
+test('REVOKE GRANT OPTION FOR clears the option but keeps the base grant', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `REVOKE GRANT OPTION FOR SELECT ON TABLE app.t FROM app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [{ grantee: 'app_user', privileges: ['select'] }]);
+});
+
+test('a plain GRANT coalesces with an existing option-bearing grant', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user WITH GRANT OPTION;`,
+      `GRANT SELECT ON TABLE app.t TO app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [
+    { grantee: 'app_user', privileges: ['select'], grantOption: true },
+  ]);
+});
+
+test('an explicit complete-looking privilege list never collapses to ALL', async () => {
+  const { model } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE app.t TO app_user;`,
+    ].join('\n'),
+  );
+  const privileges = model.tables[0]!.privileges ?? [];
+  assert.equal(privileges.length, 7);
+  assert.equal(
+    privileges.every((grant) => grant.privileges !== 'ALL' && grant.privileges.length === 1),
+    true,
+  );
+});
+
+test('a same-grantee default REVOKE merges before its GRANT in one scope', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app GRANT SELECT ON TABLES TO app_user;`,
+      `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE ALL ON TABLES FROM app_user;`,
+      `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app GRANT SELECT ON TABLES TO app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.defaultPrivileges, [
+    {
+      roles: ['postgres'],
+      schemas: ['app'],
+      objectType: 'table',
+      kind: 'revoke',
+      grants: [{ grantee: 'app_user', privileges: 'ALL' }],
+    },
+    {
+      roles: ['postgres'],
+      schemas: ['app'],
+      objectType: 'table',
+      kind: 'grant',
+      grants: [
+        { grantee: 'app_user', privileges: ['select'] },
+        { grantee: 'app_user', privileges: ['select'] },
+      ],
+    },
+  ]);
+});
+
+test('a non-owner grantor is skipped with a pinned diagnostic', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user GRANTED BY other;`,
+      `ALTER TABLE app.t OWNER TO postgres;`,
+      `GRANT SELECT ON TABLE app.t TO app_user GRANTED BY other;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    ['skipped GRANT statement (non-owner grantor)', 'skipped GRANT statement (non-owner grantor)'],
+  );
+  assert.deepEqual(model.tables[0]!.privileges, undefined);
+});
+
+test('SET SESSION AUTHORIZATION supplies the owner for grantor checks', async () => {
+  const { model, diagnostics } = await importDump(
+    [
+      `SET SESSION AUTHORIZATION postgres;`,
+      `CREATE TABLE app.t (id integer);`,
+      `GRANT SELECT ON TABLE app.t TO app_user GRANTED BY postgres;`,
+      `RESET SESSION AUTHORIZATION;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(model.tables[0]!.privileges, [{ grantee: 'app_user', privileges: ['select'] }]);
+});
+
+test('keeps named skips for unmodeled grant families and grant-role statements', async () => {
+  const { diagnostics } = await importDump(
+    [
+      `CREATE TABLE app.t (id integer);`,
+      `CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;`,
+      `GRANT EXECUTE ON FUNCTION app.f() TO app_user;`,
+      `REVOKE EXECUTE ON FUNCTION app.f() FROM app_user;`,
+      `GRANT app_user TO reader;`,
+      `ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO app_user;`,
+    ].join('\n'),
+  );
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.message),
+    [
+      'skipped CREATE FUNCTION app.f',
+      'skipped GRANT statement',
+      'skipped REVOKE statement',
+      'skipped GrantRoleStmt statement',
+      'skipped AlterDefaultPrivilegesStmt statement',
+    ],
+  );
 });

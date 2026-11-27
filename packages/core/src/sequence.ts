@@ -1,4 +1,11 @@
-import type { Sequence, SequenceDataType, SequenceIdentity, SequenceOwner } from './model.ts';
+import type {
+  Grant,
+  Sequence,
+  SequenceDataType,
+  SequenceIdentity,
+  SequenceOwner,
+} from './model.ts';
+import { canonicalGrants } from './privileges.ts';
 
 /**
  * Sequence option normalization: raw options, as an import or a hand-built model may carry
@@ -111,6 +118,10 @@ export interface SequenceOptions {
   readonly cycle?: boolean;
   /** The owning table and column, when the source states one. */
   readonly ownedBy?: SequenceOwner;
+  /** The sequence's role-level owner, when the source states one. */
+  readonly owner?: string;
+  /** The sequence's object privileges, when the source states any. */
+  readonly privileges?: readonly Grant[];
 }
 
 /** A sequence identity plus as-stated options: what `effectiveSequence` accepts. */
@@ -143,6 +154,8 @@ export function effectiveSequence(input: SequenceInput): Sequence {
     cache,
     cycle,
     ...(input.ownedBy === undefined ? {} : { ownedBy: copyOwner(input.ownedBy) }),
+    ...(input.owner === undefined ? {} : { owner: input.owner }),
+    ...(input.privileges === undefined ? {} : { privileges: canonicalGrants(input.privileges) }),
   };
 }
 

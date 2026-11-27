@@ -142,6 +142,17 @@ const DANGLING_COLUMN_ERROR =
   'schemamill: sequence public.s is owned by public.t.id, but the target model has no column id on table public.t\n';
 
 /**
+ * The pg_dump-shaped default-privilege pair: a REVOKE before the GRANT for the same scope (brief
+ * D1/D9). With a target that carries no default privileges, the REVOKE needs no undo — PostgreSQL's
+ * default is no grant — while the GRANT must be revoked for the plan to converge.
+ */
+const DEFAULT_PRIVILEGES_DUMP = [
+  'ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE ALL ON TABLES FROM app_user;',
+  'ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app GRANT SELECT ON TABLES TO app_user;',
+  '',
+].join('\n');
+
+/**
  * A workspace model whose only index is named the empty string: the reader must reject it before
  * any command formats or renders it, because `CREATE INDEX ""` cannot execute.
  */
@@ -2182,6 +2193,23 @@ test('export refuses a plan whose index creates share a name, with empty stdout,
  * not resolve is refused by core's `plan()` before any step, and the CLI reports it as exactly
  * one `schemamill:` line on stderr with empty stdout and exit 1 — never a stack trace.
  */
+test('plan converges a dump-shaped default-privilege removal with the GRANT scope revoke', async (t) => {
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(dir, 'baseline.sql', DEFAULT_PRIVILEGES_DUMP);
+  const empty = await writeDump(dir, 'empty.sql', '');
+
+  const result = await runCli('plan', baseline, empty);
+
+  assert.equal(result.code, 0);
+  assert.equal(result.stderr, '');
+  assert.ok(
+    result.stdout.includes(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA app REVOKE select ON TABLES FROM app_user;',
+    ),
+    `expected the GRANT scope converging REVOKE in stdout, got:\n${result.stdout}`,
+  );
+});
+
 test('plan --target-workspace refuses a dangling target owner on one stderr line, exit 1', async (t) => {
   const root = await fixtureDir(t);
   await writeWorkspaceModel(root, DANGLING_TABLE_MODEL);

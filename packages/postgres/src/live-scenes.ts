@@ -14,6 +14,7 @@ import type {
   ExclusionConstraint,
   Extension,
   ForeignKey,
+  Grant,
   Identity,
   IdentityInput,
   Index,
@@ -232,6 +233,8 @@ interface TableParts {
   checkConstraints?: readonly CheckConstraint[];
   exclusionConstraints?: readonly ExclusionConstraint[];
   indexes?: readonly Index[];
+  owner?: string;
+  privileges?: readonly Grant[];
 }
 
 /** A table with the given identity: empty unless parts are supplied. */
@@ -249,6 +252,8 @@ const table = (name: string, parts: TableParts = {}): Table => ({
     ? {}
     : { exclusionConstraints: parts.exclusionConstraints }),
   indexes: parts.indexes ?? [],
+  ...(parts.owner === undefined ? {} : { owner: parts.owner }),
+  ...(parts.privileges === undefined ? {} : { privileges: parts.privileges }),
 });
 
 /** A foreign key on `columns`: unnamed with no referenced columns unless overridden. */
@@ -424,6 +429,12 @@ export interface LiveScene {
    * scene qualifies.
    */
   readonly setupSql?: string;
+  /**
+   * `pg_dump` flags for this scene's dumps. Absent means the corpus default
+   * `--schema-only --no-owner --no-privileges`; a privilege scene passes `['--schema-only']` so
+   * owners and ACLs are dumped and imported. The harness applies the same flags to both sides.
+   */
+  readonly dumpArgs?: readonly string[];
   /**
    * Raw SQL appended to the target database's build, for objects the model cannot declare.
    * The plan, built from the model, never renders them; the target dump carries them, and the
@@ -7868,6 +7879,178 @@ const exportRoundTripScene = (): LiveScene => {
   };
 };
 
+/**
+ * Object privileges in the pg_dump forms #92 captured live. The scene dumps with `--schema-only`
+ * alone so owners and ACLs survive; the setup SQL creates one mixed-case role idempotently because
+ * it is applied to both databases. The model's role names stay opaque — no role objects are
+ * modeled — and introspection deliberately does not run on this privilege-bearing model (#71).
+ */
+const objectPrivilegesScene = (): LiveScene => {
+  const columns = [column('id', { type: 'integer', notNull: true })];
+  const baseline = withSequences(
+    [
+      table('priv_t', {
+        schema: 'app',
+        columns,
+        owner: 'postgres',
+        privileges: [{ grantee: 'PUBLIC', privileges: 'ALL' }],
+      }),
+    ],
+    [
+      sequence('priv_s', {
+        schema: 'app',
+        dataType: 'integer',
+        owner: 'postgres',
+        privileges: [{ grantee: 'PUBLIC', privileges: 'ALL' }],
+      }),
+    ],
+  );
+  const target: Model = {
+    ...withSequences(
+      [
+        table('priv_t', {
+          schema: 'app',
+          columns,
+          owner: 'Priv App User',
+          privileges: [{ grantee: 'PUBLIC', privileges: ['select'] }],
+        }),
+      ],
+      [
+        sequence('priv_s', {
+          schema: 'app',
+          dataType: 'integer',
+          owner: 'Priv App User',
+          privileges: [{ grantee: 'PUBLIC', privileges: ['usage'] }],
+        }),
+      ],
+    ),
+    defaultPrivileges: [
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'revoke',
+        grants: [{ grantee: 'PUBLIC', privileges: 'ALL' }],
+      },
+      {
+        roles: ['postgres'],
+        schemas: ['app'],
+        objectType: 'table',
+        kind: 'grant',
+        grants: [{ grantee: 'PUBLIC', privileges: ['select'] }],
+      },
+    ],
+  };
+  return {
+    name: 'object-privileges',
+    setupSql: [
+      'DO $$ BEGIN',
+      "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'Priv App User') THEN",
+      '    CREATE ROLE "Priv App User";',
+      '  END IF;',
+      'END $$;',
+    ].join('\n'),
+    dumpArgs: ['--schema-only'],
+    baseline,
+    target,
+    importChecks: [
+      {
+        description: 'the import carries the target role owner and explicit grants on both objects',
+        failure: (imported, source) => {
+          const table = imported.model.tables.find(
+            (candidate) => candidate.schema === 'app' && candidate.name === 'priv_t',
+          );
+          if (table === undefined) return `${source}: app.priv_t is not imported`;
+          if (table.owner !== 'Priv App User')
+            return `${source}: table owner ${table.owner ?? '(none)'}`;
+          const names = (table.privileges ?? []).flatMap((privilege) =>
+            privilege.grantee === 'PUBLIC' && typeof privilege.privileges !== 'string'
+              ? [...privilege.privileges]
+              : [],
+          );
+          if (!names.includes('select'))
+            return `${source}: table privileges ${JSON.stringify(table.privileges)}`;
+          const sequence = imported.model.sequences.find(
+            (candidate) => candidate.schema === 'app' && candidate.name === 'priv_s',
+          );
+          if (sequence === undefined) return `${source}: app.priv_s is not imported`;
+          if (sequence.owner !== 'Priv App User') {
+            return `${source}: sequence owner ${sequence.owner ?? '(none)'}`;
+          }
+          const usages = (sequence.privileges ?? []).flatMap((privilege) =>
+            privilege.grantee === 'PUBLIC' && typeof privilege.privileges !== 'string'
+              ? [...privilege.privileges]
+              : [],
+          );
+          return usages.includes('usage')
+            ? undefined
+            : `${source}: sequence privileges ${JSON.stringify(sequence.privileges)}`;
+        },
+      },
+      {
+        description: 'the import carries the default grant, with any revoke before it',
+        failure: (imported, source) => {
+          const scopes = imported.model.defaultPrivileges ?? [];
+          const grant = scopes.find(
+            (scope) =>
+              scope.kind === 'grant' &&
+              scope.objectType === 'table' &&
+              scope.grants.some(
+                (privilege) =>
+                  privilege.grantee === 'PUBLIC' &&
+                  typeof privilege.privileges !== 'string' &&
+                  privilege.privileges.includes('select'),
+              ),
+          );
+          if (grant === undefined) return `${source}: default scopes ${JSON.stringify(scopes)}`;
+          const revoke = scopes.find((scope) => scope.kind === 'revoke');
+          return revoke !== undefined && scopes.indexOf(revoke) > scopes.indexOf(grant)
+            ? `${source}: a grant scope precedes its revoke`
+            : undefined;
+        },
+      },
+      {
+        description: 'the import reports no owner, grant, or default-privilege skips',
+        failure: (imported, source) => {
+          const unexpected = imported.diagnostics
+            .filter((diagnostic) => diagnostic.kind === 'skip')
+            .map((diagnostic) => diagnostic.message)
+            .filter((message) =>
+              /GRANT|REVOKE|DEFAULT PRIVILEGES|ALTER (TABLE|SEQUENCE) .* OWNER/i.test(message),
+            );
+          return unexpected.length === 0 ? undefined : `${source}: ${unexpected.join(', ')}`;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'both dumps carry the same owner, grant, and default-privilege shapes',
+        failure: (applied, expected) => {
+          const shape = (model: Model) =>
+            JSON.stringify({
+              tables: model.tables.map((entry) => [
+                entry.schema,
+                entry.name,
+                entry.owner,
+                entry.privileges,
+              ]),
+              sequences: model.sequences.map((entry) => [
+                entry.schema,
+                entry.name,
+                entry.owner,
+                entry.privileges,
+              ]),
+              defaultPrivileges: model.defaultPrivileges,
+            });
+          return shape(applied.model) === shape(expected.model)
+            ? undefined
+            : `applied: ${shape(applied.model)}\ntarget: ${shape(expected.model)}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -7925,4 +8108,5 @@ export const scenes: readonly LiveScene[] = [
   commentRoundTripScene(),
   extensionRoundTripScene(),
   exportRoundTripScene(),
+  objectPrivilegesScene(),
 ];

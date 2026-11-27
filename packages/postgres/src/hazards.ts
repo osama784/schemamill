@@ -397,6 +397,10 @@ function findIdentityStep(
       case 'create-view':
       case 'drop-view':
       case 'replace-view':
+      case 'alter-owner':
+      case 'grant':
+      case 'revoke':
+      case 'alter-default-privileges':
       case 'comment':
       default:
         return false;
