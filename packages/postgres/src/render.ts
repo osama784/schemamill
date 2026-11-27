@@ -33,6 +33,8 @@ import type {
   View,
 } from '@schemamill/core';
 
+import { collectNameClaims, nameClaimKey } from './name-claims.ts';
+import type { ConstraintClaimDetail, NameClaim } from './name-claims.ts';
 import {
   synthesizedCheckConstraintName,
   synthesizedExclusionConstraintName,
@@ -41,7 +43,6 @@ import {
   synthesizedNotNullName,
   synthesizedPrimaryKeyName,
   synthesizedUniqueConstraintName,
-  truncateIdentifier,
 } from './names.ts';
 
 /**
@@ -54,11 +55,12 @@ import {
  * plan renders as the empty string. The plan's groups must partition its steps — non-empty
  * half-open ranges that tile `[0, steps.length)` in order, with no groups when there are no
  * steps; `plan()` guarantees this contract, and a malformed partition throws before any SQL is
- * rendered, naming the violated invariant and the offending indices. A plan that renders two
- * index statements of one polarity on one table under one server-form name is refused with
- * `RenderRefusalError` before anything renders: the second create could not claim the name,
- * and the second drop would already be gone. A drop and a create of one name are different
- * statements — `index-changed` decomposes that way — and render. `renderSql` walks the plan's
+ * rendered, naming the violated invariant and the offending indices. A plan whose claims
+ * collide in either guard namespace is refused with `RenderRefusalError` before anything
+ * renders: index names are schema-wide across all owners and constraint names are table-scoped
+ * across all kinds, so a second create could not claim the name and a second drop would already
+ * be gone. A drop and a create of one name are different statements — `index-changed`
+ * decomposes that way — and render. `renderSql` walks the plan's
  * transaction groups in order: a transactional group is wrapped in `BEGIN;` and `COMMIT;`, and
  * a standalone group renders its statements bare. A plan with more than one group separates
  * them with one blank line; single-group output is unchanged. `create-table` is the one
@@ -331,10 +333,11 @@ export interface RenderOptions {
 }
 
 /**
- * Thrown by `renderSql` when a plan cannot render soundly: two index statements of one polarity
- * on one table resolve to the same name, a comment carries NUL, a materialized view is asked to
- * be replaced, or a renderer-synthesized reset statement needs a newer target than the declared
- * one. Callers that report the refusal instead of crashing — the CLI — catch exactly this class.
+ * Thrown by `renderSql` when a plan cannot render soundly: a claim collides in either guard
+ * namespace (a schema-wide index name or a table-scoped constraint name), a comment carries NUL,
+ * a materialized view is asked to be replaced, or a renderer-synthesized reset statement needs a
+ * newer target than the declared one. Callers that report the refusal instead of crashing — the
+ * CLI — catch exactly this class.
  */
 export class RenderRefusalError extends Error {
   constructor(message: string) {
@@ -346,8 +349,8 @@ export class RenderRefusalError extends Error {
 /**
  * The migration SQL for `plan`, deterministic in the plan and the declared target.
  * `plan.groups` must tile `[0, plan.steps.length)`; a malformed partition throws before
- * anything renders, and so does a plan whose index statements of one table and polarity would
- * share a name. `options.targetVersion` is the PostgreSQL major the SQL is generated for,
+ * anything renders, and so does a plan whose name claims collide in either guard namespace.
+ * `options.targetVersion` is the PostgreSQL major the SQL is generated for,
  * defaulting to `MIN_TARGET_VERSION`; a renderer-synthesized reset form below its floor refuses
  * with `RenderRefusalError`, while a declaration the model carries renders as declared at every
  * target. A target that is not an integer major at or above `MIN_TARGET_VERSION` is a caller
@@ -361,12 +364,14 @@ export function renderSql(plan: Plan, options?: RenderOptions): string {
     );
   }
   assertGroupsTileSteps(plan);
-  assertIndexNamesUnique(plan);
-  if (plan.steps.length === 0) return '';
+  // Malformed-plan checks come first: an ambiguous enforcement flip is a plain Error, not a
+  // name refusal, even when the hand-built pair also collides in the constraint namespace.
   const collapsed =
     targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
       ? collapseEnforcementFlips(plan)
       : undefined;
+  assertNamesUnique(plan);
+  if (plan.steps.length === 0) return '';
   const groups: string[] = [];
   for (const group of plan.groups) {
     const lines: string[] = [];
@@ -422,126 +427,104 @@ function assertGroupsTileSteps(plan: Plan): void {
 }
 
 /**
- * Refuses a plan that renders two index statements of one polarity on one owner under one
- * server-form name — an explicit name clipped by PostgreSQL's 63-byte identifier limit, the
- * conventional prediction for an unnamed one. Two creates would collide at apply time, and
- * two drops would drop one name twice, so the SQL cannot satisfy the plan;
- * explicit-vs-explicit duplicates are refused too. A drop and a create of one name are
- * different statements — `index-changed` decomposes that way — and render. Only same-table
- * groups are considered: a named index's uniqueness spans its schema, which the plan does not
- * model. A refusal whose unnamed claimant predicted a longer, untruncated name shows that
- * prediction beside the claimant, so a truncation collapse is visible.
+ * Refuses a plan whose claims collide in either guard namespace. The collector supplies every
+ * claimant — standalone indexes on tables and materialized views, PK/unique/exclusion backing
+ * indexes, and table-scoped constraints from every add/drop step and inline declaration — so
+ * the guard runs once, before any SQL is rendered. Two creates would collide at apply time and
+ * two drops would drop one name twice; polarity is part of the key, so a drop and a create of
+ * one name still coexist. Index keys are `[schema, name, polarity]` across all owners, and
+ * constraint keys are `[schema, table, name, polarity]` across all kinds. A collision is
+ * reported once, for the first pair in plan order.
  */
-function assertIndexNamesUnique(plan: Plan): void {
-  const claimed = new Map<string, IndexStatement>();
-  for (const step of plan.steps) {
-    const statement = indexStatement(step);
-    if (statement === undefined) continue;
-    const { owner, index, polarity } = statement;
-    const relation = owner.kind === 'table' ? owner.table : owner.view;
-    const name = serverIndexName(relation, index);
-    const key = JSON.stringify([owner.kind, relation.schema, relation.name, polarity, name]);
+function assertNamesUnique(plan: Plan): void {
+  const claimed = new Map<string, NameClaim>();
+  for (const claim of collectNameClaims(plan)) {
+    const key = nameClaimKey(claim);
     const previous = claimed.get(key);
     if (previous !== undefined) {
-      const previousRelation =
-        previous.owner.kind === 'table' ? previous.owner.table : previous.owner.view;
-      throw new RenderRefusalError(
-        `refusing to render: index ${polarity} on ${renderTable(relation)} would share the name ` +
-          `${JSON.stringify(name)}: ${describeIndex(previousRelation, previous.index, name)} and ` +
-          `${describeIndex(relation, index, name)}`,
-      );
+      throw new RenderRefusalError(nameCollisionMessage(claim, previous));
     }
-    claimed.set(key, statement);
+    claimed.set(key, claim);
   }
 }
 
 /**
- * The server form of an index statement's name: an explicit name clipped by PostgreSQL's
- * 63-byte identifier limit, an unnamed one predicted by the conventional-name mirror.
+ * The refusal message shape, shared by both namespaces:
+ *
+ * `refusing to render: <scope> <creates|drops> on <qualified relation> would share the name
+ * "<stored name>": <earlier claimant> and <later claimant>`
+ *
+ * The scope is `index` for schema-wide relation names and `constraint` for table-scoped ones;
+ * the relation is the later claimant's owner (table or materialized view for an index, table
+ * for a constraint). The stored name is the explicit name clipped to 63 bytes or the
+ * conventional prediction; an explicit claimant is described by its stated name, so an
+ * over-long name is visible in full. An unnamed index whose prediction clipped also shows the
+ * untruncated prediction. The existing index wording is preserved byte-for-byte.
  */
-function serverIndexName(table: TableIdentity, index: Index): string {
-  return index.name === undefined
-    ? synthesizedIndexName(table, index)
-    : truncateIdentifier(index.name);
+function nameCollisionMessage(later: NameClaim, earlier: NameClaim): string {
+  const polarity = later.polarity === 'create' ? 'creates' : 'drops';
+  const location =
+    later.scope === 'index' ? renderTable(later.relation) : renderTable(later.tableIdentity);
+  return (
+    `refusing to render: ${later.scope} ${polarity} on ${location} would share the name ` +
+    `${JSON.stringify(later.name)}: ${describeNameClaim(earlier)} and ${describeNameClaim(later)}`
+  );
 }
 
-/** One index statement's owner, index, and polarity, for the duplicate-name guard. */
-interface IndexStatement {
-  readonly owner: IndexOwner;
-  readonly index: Index;
-  readonly polarity: 'creates' | 'drops';
-}
-
-/** The index payload of an index step, or `undefined` for every other kind. */
-function indexStatement(step: Step): IndexStatement | undefined {
-  switch (step.kind) {
-    case 'create-index':
-    case 'create-index-concurrently':
-      return { owner: step.owner, index: step.index, polarity: 'creates' };
-    case 'drop-index':
-    case 'drop-index-concurrently':
-      return { owner: step.owner, index: step.index, polarity: 'drops' };
-    case 'create-schema':
-    case 'create-table':
-    case 'drop-table':
-    case 'add-column':
-    case 'drop-column':
-    case 'alter-column':
-    case 'drop-not-null':
-    case 'add-not-null':
-    case 'alter-persistence':
-    case 'add-identity':
-    case 'drop-identity':
-    case 'alter-identity':
-    case 'add-primary-key':
-    case 'drop-primary-key':
-    case 'add-foreign-key':
-    case 'drop-foreign-key':
-    case 'add-unique-constraint':
-    case 'drop-unique-constraint':
-    case 'add-check-constraint':
-    case 'drop-check-constraint':
-    case 'add-exclusion-constraint':
-    case 'drop-exclusion-constraint':
-    case 'create-sequence':
-    case 'drop-sequence':
-    case 'alter-sequence':
-    case 'create-extension':
-    case 'alter-extension':
-    case 'drop-extension':
-    case 'alter-owner':
-    case 'grant':
-    case 'revoke':
-    case 'alter-default-privileges':
-    case 'create-view':
-    case 'drop-view':
-    case 'replace-view':
-    case 'comment':
-    default:
-      return undefined;
+/** A claimant fragment for a refusal message: an index or a constraint of any kind. */
+function describeNameClaim(claim: NameClaim): string {
+  if (claim.scope === 'constraint') {
+    return describeConstraint(claim.detail, claim.originalName, claim.synthesized);
   }
-}
-
-/**
- * A refusal-message fragment naming one index by its columns and, when stated, its name. When
- * an unnamed index's conventional prediction was truncated to the shared server-form name,
- * the fragment also shows the untruncated prediction, so the reader can see why two
- * structurally different indexes collapsed onto one name; a stated name is already displayed,
- * so it needs no repetition.
- */
-function describeIndex(table: TableIdentity, index: Index, serverName: string): string {
-  const elements = index.columns.map(describeIndexElement).join(', ');
-  const include = index.include === undefined ? '' : ` INCLUDE (${index.include.join(', ')})`;
-  const where = index.where === undefined ? '' : ` WHERE ${index.where}`;
-  const description =
-    index.name === undefined
-      ? `an unnamed index on (${elements})${include}${where}`
-      : `an index named ${JSON.stringify(index.name)} on (${elements})${include}${where}`;
-  if (index.name !== undefined) return description;
-  const prediction = untruncatedIndexName(table, index);
-  return prediction === serverName
+  if (claim.index === undefined) {
+    // The constraint that owns this backing index is itself the claimant's description.
+    return `the backing index of ${describeConstraint(
+      claim.detail!,
+      claim.originalName,
+      claim.synthesized,
+    )}`;
+  }
+  const elements = claim.index.columns.map(describeIndexElement).join(', ');
+  const include =
+    claim.index.include === undefined ? '' : ` INCLUDE (${claim.index.include.join(', ')})`;
+  const where = claim.index.where === undefined ? '' : ` WHERE ${claim.index.where}`;
+  const description = claim.synthesized
+    ? `an unnamed index on (${elements})${include}${where}`
+    : `an index named ${JSON.stringify(claim.originalName)} on (${elements})${include}${where}`;
+  if (!claim.synthesized) return description;
+  const prediction = untruncatedIndexName(claim.relation, claim.index);
+  return prediction === claim.name
     ? description
     : `${description} (predicting ${JSON.stringify(prediction)})`;
+}
+
+/** A constraint claimant fragment, naming the kind, optional stated name, and its payload. */
+function describeConstraint(
+  detail: ConstraintClaimDetail,
+  originalName: string | undefined,
+  synthesized: boolean,
+): string {
+  const named = synthesized ? '' : ` named ${JSON.stringify(originalName)}`;
+  switch (detail.kind) {
+    case 'primary-key':
+    case 'foreign-key':
+    case 'unique': {
+      const noun =
+        detail.kind === 'primary-key'
+          ? 'primary key'
+          : detail.kind === 'foreign-key'
+            ? 'foreign key'
+            : 'unique constraint';
+      const columns = detail.columns.map(quoteIdentifier).join(', ');
+      return `a ${noun}${named} on (${columns})`;
+    }
+    case 'check':
+      return `a check constraint${named} on (${detail.expression})`;
+    case 'exclusion':
+      return `an exclusion constraint${named} on (${detail.elements})`;
+    case 'not-null':
+      return `a not-null constraint${named} on column ${quoteIdentifier(detail.column)}`;
+  }
 }
 
 /** A display element: a quoted column name, or the expression's raw authored text. */

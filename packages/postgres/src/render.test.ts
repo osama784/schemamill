@@ -768,35 +768,35 @@ test('quotes the identifiers a not-null step carries', () => {
 test('renders add-primary-key deferrability, named or unnamed', () => {
   // Only a true `deferrable` or `initiallyDeferred` states a word; `false` and absent render
   // nothing, `NOT DEFERRABLE` being PostgreSQL's default. A stated `initiallyDeferred` implies
-  // deferrable and emits both words.
+  // deferrable and emits both words. Each variant is its own plan: all three claim `t_pkey`
+  // on one table (the unnamed one synthesizes it), which the widened guard refuses together.
+  const deferred = {
+    kind: 'add-primary-key' as const,
+    table: identity('t'),
+    primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
+  };
+  const implicit = {
+    kind: 'add-primary-key' as const,
+    table: identity('t'),
+    primaryKey: { columns: ['a', 'b'], initiallyDeferred: true },
+  };
+  const immediate = {
+    kind: 'add-primary-key' as const,
+    table: identity('t'),
+    primaryKey: { name: 't_pkey_immediate', columns: ['id'], deferrable: false },
+  };
+
   assert.equal(
-    renderSql(
-      planOf(
-        {
-          kind: 'add-primary-key',
-          table: identity('t'),
-          primaryKey: { name: 't_pkey', columns: ['id'], deferrable: true },
-        },
-        {
-          kind: 'add-primary-key',
-          table: identity('t'),
-          primaryKey: { columns: ['a', 'b'], initiallyDeferred: true },
-        },
-        {
-          kind: 'add-primary-key',
-          table: identity('t'),
-          primaryKey: { name: 't_pkey_immediate', columns: ['id'], deferrable: false },
-        },
-      ),
-    ),
-    [
-      'BEGIN;',
-      'ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE;',
-      'ALTER TABLE public.t ADD PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED;',
-      'ALTER TABLE public.t ADD CONSTRAINT t_pkey_immediate PRIMARY KEY (id);',
-      'COMMIT;',
-      '',
-    ].join('\n'),
+    renderSql(planOf(deferred)),
+    'BEGIN;\nALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE;\nCOMMIT;\n',
+  );
+  assert.equal(
+    renderSql(planOf(implicit)),
+    'BEGIN;\nALTER TABLE public.t ADD PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED;\nCOMMIT;\n',
+  );
+  assert.equal(
+    renderSql(planOf(immediate)),
+    'BEGIN;\nALTER TABLE public.t ADD CONSTRAINT t_pkey_immediate PRIMARY KEY (id);\nCOMMIT;\n',
   );
 });
 
@@ -1320,31 +1320,30 @@ test('a diff-produced columns change alongside enforcement keeps drop and add', 
 });
 
 test('renders check-constraint enforcement after the expression', () => {
+  // The two variants are separate plans: the unnamed one on `age` synthesizes `t_age_check`,
+  // which collides with the named one under the table-scoped constraint guard.
   assert.equal(
     renderSql(
-      planOf(
-        {
-          kind: 'add-check-constraint',
-          table: identity('t'),
-          checkConstraint: checkConstraint('age >= 0', {
-            name: 't_age_check',
-            enforcement: 'not-valid',
-          }),
-        },
-        {
-          kind: 'add-check-constraint',
-          table: identity('t'),
-          checkConstraint: checkConstraint('age <= 150', { enforcement: 'not-enforced' }),
-        },
-      ),
+      planOf({
+        kind: 'add-check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('age >= 0', {
+          name: 't_age_check',
+          enforcement: 'not-valid',
+        }),
+      }),
     ),
-    [
-      'BEGIN;',
-      'ALTER TABLE public.t ADD CONSTRAINT t_age_check CHECK (age >= 0) NOT VALID;',
-      'ALTER TABLE public.t ADD CHECK (age <= 150) NOT ENFORCED;',
-      'COMMIT;',
-      '',
-    ].join('\n'),
+    'BEGIN;\nALTER TABLE public.t ADD CONSTRAINT t_age_check CHECK (age >= 0) NOT VALID;\nCOMMIT;\n',
+  );
+  assert.equal(
+    renderSql(
+      planOf({
+        kind: 'add-check-constraint',
+        table: identity('t'),
+        checkConstraint: checkConstraint('age <= 150', { enforcement: 'not-enforced' }),
+      }),
+    ),
+    'BEGIN;\nALTER TABLE public.t ADD CHECK (age <= 150) NOT ENFORCED;\nCOMMIT;\n',
   );
 });
 
@@ -1980,31 +1979,27 @@ test('renders index statements on a materialized view using its schema and name'
 });
 
 test('the duplicate-name guard keys on the owner, not the relation text alone', () => {
-  // A table and a materialized view under one name are different owners; the schema-wide
-  // guard is #102. Both statements render against public.t here, which pins that the guard
-  // distinguishes them by owner kind rather than by rendered relation text.
-  assert.equal(
-    renderSql(
-      planOf(
-        {
-          kind: 'create-index',
-          owner: { kind: 'table', table: identity('t') },
-          index: tableIndex(['a'], { name: 't_a_idx' }),
-        },
-        {
-          kind: 'create-index',
-          owner: { kind: 'materialized-view', view: identity('t') },
-          index: tableIndex(['b'], { name: 't_a_idx' }),
-        },
+  // This test used to pin that a table and a materialized view under one name were two
+  // different owners, with the schema-wide guard named as #102 deferred. #102 is built: an
+  // index name is schema-wide, so the second create now refuses even though the owners
+  // differ in kind and render against the same relation text.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['a'], { name: 't_a_idx' }),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'materialized-view', view: identity('t') },
+            index: tableIndex(['b'], { name: 't_a_idx' }),
+          },
+        ),
       ),
-    ),
-    [
-      'BEGIN;',
-      'CREATE INDEX t_a_idx ON public.t USING btree (a);',
-      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
-      'COMMIT;',
-      '',
-    ].join('\n'),
+    'refusing to render: index creates on public.t would share the name "t_a_idx": an index named "t_a_idx" on (a) and an index named "t_a_idx" on (b)',
   );
 });
 
@@ -2064,6 +2059,287 @@ test('the duplicate-name guard shows raw expression text in untruncated predicti
         ),
       ),
     'refusing to render: index creates on public.t would share the name "t_expr_idx": an unnamed index on (a + 1) (predicting "t_a + 1_idx") and an unnamed index on (a + 2) (predicting "t_a + 2_idx")',
+  );
+});
+
+test('refuses two tables in one schema that claim the same index name', () => {
+  // An index name is schema-wide, not owner-scoped: a create on public.u cannot reuse a name
+  // already claimed by a create on public.t, even though the two owners differ.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['a'], { name: 'shared_idx' }),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('u') },
+            index: tableIndex(['b'], { name: 'shared_idx' }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.u would share the name "shared_idx": an index named "shared_idx" on (a) and an index named "shared_idx" on (b)',
+  );
+});
+
+test('refuses same-kind constraint twins: unnamed beside the explicit conventional name', () => {
+  // PostgreSQL names the first unnamed unique on (a) `t_a_key`, then rejects the second
+  // constraint that claims the same table-scoped name.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-unique-constraint',
+            table: identity('t'),
+            uniqueConstraint: uniqueConstraint(['a']),
+          },
+          {
+            kind: 'add-unique-constraint',
+            table: identity('t'),
+            uniqueConstraint: uniqueConstraint(['b'], { name: 't_a_key' }),
+          },
+        ),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "t_a_key": a unique constraint on (a) and a unique constraint named "t_a_key" on (b)',
+  );
+});
+
+test('refuses cross-kind constraint twins: a check beside a unique of the same name', () => {
+  // Constraint names are table-scoped and kind-agnostic: a named check and a synthesized
+  // unique on another column still collide when both resolve to one name on one table.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-unique-constraint',
+            table: identity('t'),
+            uniqueConstraint: uniqueConstraint(['a']),
+          },
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('b > 0', { name: 't_a_key' }),
+          },
+        ),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "t_a_key": a unique constraint on (a) and a check constraint named "t_a_key" on (b > 0)',
+  );
+});
+
+test('refuses two explicit constraints sharing one name on one table', () => {
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('a > 0', { name: 'ck' }),
+          },
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('b > 0', { name: 'ck' }),
+          },
+        ),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "ck": a check constraint named "ck" on (a > 0) and a check constraint named "ck" on (b > 0)',
+  );
+});
+
+test('create-table inline primary keys claim both constraint and index names', () => {
+  // The inline PK of a created table owns `t_pkey` in the constraint namespace and in the
+  // schema-wide index namespace (through its backing index). A later named PK claims both.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-table',
+            table: table('t', {
+              columns: [column('a')],
+              primaryKey: { columns: ['a'] },
+            }),
+          },
+          {
+            kind: 'add-primary-key',
+            table: identity('t'),
+            primaryKey: { columns: ['b'], name: 't_pkey' },
+          },
+        ),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "t_pkey": a primary key on (a) and a primary key named "t_pkey" on (b)',
+  );
+});
+
+test('create-table inline notNullName claims the constraint namespace', () => {
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'create-table',
+          table: table('t', {
+            columns: [
+              column('c', { notNull: true, notNullName: 'nn_c' }),
+              column('d', { notNull: true, notNullName: 'nn_c' }),
+            ],
+          }),
+        }),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "nn_c": a not-null constraint named "nn_c" on column c and a not-null constraint named "nn_c" on column d',
+  );
+});
+
+test('add-column inline notNullName claims the constraint namespace', () => {
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-column',
+            table: identity('t'),
+            column: column('c', { notNull: true, notNullName: 'nn_c' }),
+          },
+          { kind: 'add-not-null', table: identity('t'), column: 'd', name: 'nn_c' },
+        ),
+      ),
+    'refusing to render: constraint creates on public.t would share the name "nn_c": a not-null constraint named "nn_c" on column c and a not-null constraint named "nn_c" on column d',
+  );
+});
+
+test('a constraint add claims its backing index in the schema-wide namespace', () => {
+  // A unique constraint creates a backing index named after the constraint, so that name
+  // cannot also be claimed by a standalone create-index on the same schema.
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-unique-constraint',
+            table: identity('t'),
+            uniqueConstraint: uniqueConstraint(['a']),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['b'], { name: 't_a_key' }),
+          },
+        ),
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_key": the backing index of a unique constraint on (a) and an index named "t_a_key" on (b)',
+  );
+});
+
+test('explicit constraint names that clip to one server form collide', () => {
+  // The guard compares the stored form, so two over-long explicit names with the same first
+  // 63 bytes collide; the full stated names stay visible in the refusal.
+  const first = `${'x'.repeat(70)}a`;
+  const second = `${'x'.repeat(70)}b`;
+  const server = 'x'.repeat(63);
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('a > 0', { name: first }),
+          },
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('b > 0', { name: second }),
+          },
+        ),
+      ),
+    `refusing to render: constraint creates on public.t would share the name "${server}": ` +
+      `a check constraint named "${first}" on (a > 0) and ` +
+      `a check constraint named "${second}" on (b > 0)`,
+  );
+});
+
+test('over-long explicit index names on two tables clip onto one schema-wide name', () => {
+  const first = `${'y'.repeat(70)}a`;
+  const second = `${'y'.repeat(70)}b`;
+  const server = 'y'.repeat(63);
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['a'], { name: first }),
+          },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('u') },
+            index: tableIndex(['b'], { name: second }),
+          },
+        ),
+      ),
+    `refusing to render: index creates on public.u would share the name "${server}": ` +
+      `an index named "${first}" on (a) and an index named "${second}" on (b)`,
+  );
+});
+
+test('a drop and a create of one constraint name coexist across the polarity', () => {
+  // Polarity is part of both claim keys: a constraint recreated under one name still renders.
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('a > 0', { name: 'ck' }),
+        },
+        {
+          kind: 'add-check-constraint',
+          table: identity('t'),
+          checkConstraint: checkConstraint('b > 0', { name: 'ck' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP CONSTRAINT ck;',
+      'ALTER TABLE public.t ADD CONSTRAINT ck CHECK (b > 0);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('a dropped index and a created index of one name coexist across tables', () => {
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['a'], { name: 'shared_idx' }),
+        },
+        {
+          kind: 'create-index',
+          owner: { kind: 'table', table: identity('u') },
+          index: tableIndex(['b'], { name: 'shared_idx' }),
+        },
+      ),
+    ),
+    [
+      'BEGIN;',
+      'DROP INDEX public.shared_idx;',
+      'CREATE INDEX shared_idx ON public.u USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
   );
 });
 
