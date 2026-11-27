@@ -6418,6 +6418,21 @@ test('imports the four live dump forms as owner, grants, and default privileges'
   ]);
 });
 
+test('imports a PG13-style ALTER TABLE sequence owner statement', async () => {
+  // pg_dump 13 emits `ALTER TABLE … OWNER TO` for sequences; pg_dump 18 emits `ALTER SEQUENCE`.
+  const { model, diagnostics } = await importDump(
+    [
+      `CREATE SEQUENCE app.s AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;`,
+      `ALTER TABLE app.s OWNER TO "Priv App User";`,
+    ].join('\n'),
+  );
+
+  assert.deepEqual(diagnostics, []);
+  const sequence = model.sequences.find((entry) => entry.schema === 'app' && entry.name === 's');
+  assert.ok(sequence !== undefined, 'app.s is imported');
+  assert.equal(sequence.owner, 'Priv App User');
+});
+
 test('REVOKE ALL and an absent privilege list import as the ALL marker', async () => {
   const { model, diagnostics } = await importDump(
     [

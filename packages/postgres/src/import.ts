@@ -2677,7 +2677,7 @@ function translateAlterTable(
   const schema = alter.relation?.schemaname ?? 'public';
   const name = alter.relation?.relname ?? '';
   const identity = tableIdentityName({ schema, name });
-  const sequence = alter.objtype === 'OBJECT_SEQUENCE';
+  let sequence = alter.objtype === 'OBJECT_SEQUENCE';
 
   if (
     alter.objtype !== undefined &&
@@ -2690,9 +2690,26 @@ function translateAlterTable(
     return;
   }
 
-  const draft = sequence
-    ? sequences.get(tableKey(schema, name))
-    : tables.get(tableKey(schema, name));
+  let draft = sequence ? sequences.get(tableKey(schema, name)) : tables.get(tableKey(schema, name));
+  // pg_dump 13 rewrites `SEQUENCE` to `TABLE` in owner statements; pg_dump 18 keeps `SEQUENCE`.
+  // Tables and sequences share PostgreSQL's relation namespace, so when the table lookup misses
+  // an owner-only statement can resolve against the sequence map without ambiguity. Any other
+  // shape keeps the original lookup and skip, including unresolvable role specs.
+  if (draft === undefined && !sequence) {
+    const commands = alter.cmds ?? [];
+    if (
+      commands.length > 0 &&
+      commands.every(
+        (node) =>
+          'AlterTableCmd' in node &&
+          node.AlterTableCmd.subtype === 'AT_ChangeOwner' &&
+          roleSpecName(node.AlterTableCmd.newowner) !== undefined,
+      )
+    ) {
+      draft = sequences.get(tableKey(schema, name));
+      sequence = draft !== undefined;
+    }
+  }
   if (draft === undefined) {
     diagnostics.push(
       skipStatement(
