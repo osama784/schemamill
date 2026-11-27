@@ -250,8 +250,16 @@ _Avoid_: batch, transaction block, commit point
 A migration-plan step whose statement PostgreSQL refuses to run inside a transaction. It stands alone, unwrapped; the concurrent index builds — `create-index-concurrently` and `drop-index-concurrently` — are the only such kinds.
 _Avoid_: unsafe step, autocommit step
 
+**Guard**:
+A check run before an artifact is produced that refuses an input it cannot express rather than emitting something PostgreSQL would reject. `renderSql` runs a name guard: its **guard namespace** is the scope in which claims share a name — index names schema-wide across tables and materialized views, constraint names table-scoped and kind-agnostic — and a create against a name a supplied baseline occupies is refused unless a same-identity drop releases it. `plan()`'s ownership check is a separate plan-time guard; see Guard's refusal in Refusal and the annotation in Hazard.
+_Avoid_: check, assertion
+
+**Refusal**:
+A loud rejection of an input no sound artifact can represent: the surface emits no artifact, names the offender in one line, and exits 1 from the CLI. `RenderRefusalError` is the renderer's refusal and `SequenceOwnershipError` is `plan()`'s; both keep their one-line CLI diagnostic. A refusal is also reported as a hazard fact so `compare` can show it without rendering, but the hazard annotates while the refusal stops production. See Guard, Hazard, Diagnostic.
+_Avoid_: warning, soft failure
+
 **Hazard**:
-A risk annotation on a migration plan. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled. A certain-cost hazard — a persistence flip — rewrites the table under an ACCESS EXCLUSIVE lock at apply.
+A risk annotation on a migration plan, produced before rendering and attached to a step. A definite hazard is a self-inconsistent target PostgreSQL rejects at apply, regardless of stored state; a state-dependent hazard — a bound the plan tightens — may fail depending on the sequence's stored value, which is not modeled. A certain-cost hazard — a persistence flip — rewrites the table under an ACCESS EXCLUSIVE lock at apply. A pre-render name-collision fact — two claims sharing a guard namespace, or a create against occupied baseline state — is a `render-refusal` hazard: the same fact the render guard refuses, reported so `plan` and human `compare` can show it without rendering. A hazard annotates; it never changes a step. See Guard, Refusal, Migration plan.
 _Avoid_: warning, danger
 
 **Expand/contract**:
