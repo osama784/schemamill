@@ -1076,6 +1076,42 @@ test('a table-rewrite hazard labels the table and states the certain cost in bot
   );
 });
 
+test('a render-refusal hazard names both colliding claims and the guard scope', () => {
+  const hazards: readonly Hazard[] = [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['shared_idx', 'shared_idx'],
+      },
+    },
+    {
+      kind: 'render-refusal',
+      step: 0,
+      entity: {
+        kind: 'name-collision',
+        scope: 'constraint',
+        schema: 'public',
+        table: 't',
+        names: ['t_a_key', 't_a_key'],
+      },
+    },
+  ];
+
+  assert.equal(
+    formatHazards(hazards),
+    [
+      'Hazards:',
+      '  step 2 render-refusal public: index names "shared_idx" and "shared_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '  step 1 render-refusal public.t: constraint names "t_a_key" and "t_a_key" would share a table-scoped name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('view additions and removals print as a view line', () => {
   const changes: readonly Change[] = [
     {

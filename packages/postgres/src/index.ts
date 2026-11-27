@@ -11,6 +11,21 @@ export const coreVersionUsed = coreVersion;
 
 export { analyzeHazards, hazardAnalyzer } from './hazards.ts';
 export { catalogReader } from './catalog.ts';
+export {
+  collectBaselineClaims,
+  collectNameClaims,
+  nameClaimIdentity,
+  nameClaimKey,
+  releasedBaselineKeys,
+} from './name-claims.ts';
+export type {
+  ConstraintClaimDetail,
+  ConstraintNameClaim,
+  IndexNameClaim,
+  NameClaim,
+  NameClaimOptions,
+  NameClaimPolarity,
+} from './name-claims.ts';
 export { ddlImporter, importDump } from './import.ts';
 export {
   MAX_TARGET_VERSION,

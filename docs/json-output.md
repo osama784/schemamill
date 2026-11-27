@@ -172,8 +172,9 @@ A `table`, `sequence`, `view`, or `extension` field on a create step carries the
 | `bound-out-of-type-range` | `step`, `entity`, `dataType`, `field`, `value` |
 | `bound-tightened` | `step`, `entity`, `field`, `before`, `after` |
 | `table-rewrite` | `step`, `entity`, `persistence?` |
+| `render-refusal` | `step`, `entity` |
 
-The `entity` payload is one of `kind: "sequence"` (`sequence`), `kind: "identity-column"` (`table`, `column`), or `kind: "table"` (`table`). Hazard kinds and wording are unchanged from the human command; the document only projects them.
+The `entity` payload is one of `kind: "sequence"` (`sequence`), `kind: "identity-column"` (`table`, `column`), `kind: "table"` (`table`), or `kind: "name-collision"` (`scope` as `"index"` or `"constraint"`, `schema`, `table?` for constraint-scoped collisions, and `names` holding the two clashing names in earlier-then-later order). A `render-refusal`'s `step` is the later colliding step; its human clause is `index|constraint names "<earlier>" and "<later>" would share a schema-wide|table-scoped name — PostgreSQL rejects this at apply; rendering refuses this plan.` Hazard kinds and wording are the human command's; the document only projects them. `render-refusal` was added in [#102](https://github.com/osama784/schemamill/issues/102) as an additive enumerated value with no envelope-shape change, so `schemaVersion` stays 1 ([ADR 0043](./adr/0043-render-refusals-are-reported-hazards.md)); compare's document still carries no hazards.
 
 ### Diagnostic
 
@@ -202,7 +203,7 @@ Three values are machine-specific and therefore normalized only when a golden is
 
 ## Versioning
 
-`schemaVersion` is the integer `1`. It bumps when a field is removed or renamed, a field's type or meaning changes, an enumerated value's meaning changes, or the envelope's required shape changes. It does not bump for an additive optional field or an additive new `command` value. Consumers must ignore unknown keys: additive changes are compatible, and a breaking change is a new integer, never a silent reshape of version 1. Consumers should branch on `command` before reading `result`, since the result shape is command-specific.
+`schemaVersion` is the integer `1`. It bumps when a field is removed or renamed, a field's type or meaning changes, an enumerated value's meaning changes, or the envelope's required shape changes. It does not bump for an additive optional field or an additive new `command` value. Adding the `render-refusal` hazard kind did not bump: no existing value changed meaning and no required shape changed ([ADR 0043](./adr/0043-render-refusals-are-reported-hazards.md)). Consumers must ignore unknown keys: additive changes are compatible, and a breaking change is a new integer, never a silent reshape of version 1. Consumers should branch on `command` before reading `result`, since the result shape is command-specific.
 
 This rule applies to the `compare` and `plan` documents only. The `export --format json` projection stays bare canonical model bytes with no envelope or version ([ADR 0023](./adr/0023-export-projects-the-model.md)); [ADR 0033](./adr/0033-json-output-envelope.md) records the decision.
 
@@ -219,4 +220,4 @@ With `--json`, stdout carries exactly one document plus its trailing newline and
 | Plan's rendered SQL is refused (the document omits SQL) | one document | existing `schemamill: refusing to render …` line | 1 | Yes |
 | Clean success | one document | unchanged diagnostic lines | 0 (from the imported pair) | Yes |
 
-The exit status on a successful document is the imported pair's status: 1 when either side reported an `error` finding, otherwise 0; a render refusal overrides it with 1. `plan` still calls `renderSql` for validation even though the document does not embed the SQL, so a refusal cannot disappear under `--json`. The no-document paths are handled at the top of each action before the human path runs; without `--json`, that human path — including where each stderr line is written — is unchanged.
+The exit status on a successful document is the imported pair's status: 1 when either side reported an `error` finding, otherwise 0; a render refusal overrides it with 1. `plan` still calls `renderSql` for validation even though the document does not embed the SQL, so a refusal cannot disappear under `--json`. `compare --target-version` now validates the same 13–18 span on both paths, but only human `compare` consumes the major for version-aware hazards: its document has no `hazards` or `targetVersion` field. The no-document paths are handled at the top of each action before the human path runs; without `--json`, that human path — including where each stderr line is written — is unchanged.

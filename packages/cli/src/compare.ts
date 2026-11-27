@@ -5,6 +5,7 @@ import type { Command } from 'commander';
 import { formatChanges, formatHazards } from './format.ts';
 import { buildJsonDocument, stringifyJsonDocument } from './json.ts';
 import { importPair, mapSides, planOrReport } from './run.ts';
+import { validateTargetVersion } from './target-version.ts';
 
 /**
  * The `compare` command: read two schema sides — DDL dumps, with the workspace model filling
@@ -13,8 +14,10 @@ import { importPair, mapSides, planOrReport } from './run.ts';
  *
  * Wiring only — the side mapping and the read/import plumbing come from `run.ts`, the diff and
  * plan from `@schemamill/core`, the hazards from `@schemamill/postgres`, and the human wording
- * from `format.ts`. Usage errors are emitted through commander's error machinery before any
- * filesystem access. The hazard step numbers are indices into the migration plan's step order;
+ * from `format.ts`. `--target-version` declares the PostgreSQL major the version-aware hazard
+ * analysis reads; it shares `plan`'s 13–18 validation before any filesystem access, while the
+ * JSON path still emits no hazards. Usage errors are emitted through commander's error machinery
+ * before any filesystem access. The hazard step numbers are indices into the migration plan's step order;
  * `compare` prints no step list, so a line's `step <n>` refers to the step `schemamill plan`
  * would number `<n>`. Each hazard line also names the entity it belongs to, so compare lines
  * are self-attributing. An `error` diagnostic makes the exit code 1, but the diff is still
@@ -26,6 +29,7 @@ interface CompareOptions {
   readonly verbose?: boolean;
   readonly baselineWorkspace?: boolean;
   readonly targetWorkspace?: boolean;
+  readonly targetVersion: string;
   readonly json?: boolean;
 }
 
@@ -39,6 +43,7 @@ export function registerCompare(program: Command): void {
     .option('--baseline-workspace', 'resolve the baseline from the workspace')
     .option('--target-workspace', 'resolve the target from the workspace')
     .option('--verbose', 'list every import diagnostic')
+    .option('--target-version <major>', 'PostgreSQL major (13-18)', '13')
     .option('--json', 'emit a structured JSON document')
     .addHelpText('after', '\nA single path is the target; the workspace fills the baseline.')
     .action(
@@ -48,6 +53,7 @@ export function registerCompare(program: Command): void {
         options: CompareOptions,
         command: Command,
       ) => {
+        validateTargetVersion(command, options.targetVersion);
         const sides = mapSides({
           baseline,
           target,
@@ -84,7 +90,9 @@ export function registerCompare(program: Command): void {
         }
         const planned = planOrReport(() => plan(imported.baseline, imported.target));
         if (planned === undefined) return;
-        const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+        const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned, {
+          targetVersion: Number(options.targetVersion),
+        });
         const hazardsBlock = hazards.length > 0 ? `\n${formatHazards(hazards)}` : '';
         process.stdout.write(
           `${formatChanges(diff(imported.baseline, imported.target))}${hazardsBlock}`,

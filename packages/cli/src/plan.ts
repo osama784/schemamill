@@ -75,11 +75,16 @@ export function registerPlan(program: Command): void {
           }
           const planned = planOrReport(() => plan(imported.baseline, imported.target));
           if (planned === undefined) return;
-          const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+          const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned, {
+            targetVersion: Number(options.targetVersion),
+          });
           let refusal: string | undefined;
           if (planned.steps.length > 0) {
             try {
-              renderSql(planned, { targetVersion: Number(options.targetVersion) });
+              renderSql(planned, {
+                targetVersion: Number(options.targetVersion),
+                baseline: imported.baseline,
+              });
             } catch (error) {
               if (!(error instanceof RenderRefusalError)) throw error;
               refusal = error.message;
@@ -110,7 +115,9 @@ export function registerPlan(program: Command): void {
         }
         const planned = planOrReport(() => plan(imported.baseline, imported.target));
         if (planned === undefined) return;
-        const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+        const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned, {
+          targetVersion: Number(options.targetVersion),
+        });
         const hazardsBlock = hazards.length > 0 ? `${formatHazards(hazards)}\n` : '';
         if (planned.steps.length === 0) {
           process.stdout.write(formatPlan(planned));
@@ -118,7 +125,10 @@ export function registerPlan(program: Command): void {
           process.stdout.write(`${formatPlan(planned)}\n${hazardsBlock}`);
           try {
             process.stdout.write(
-              renderSql(planned, { targetVersion: Number(options.targetVersion) }),
+              renderSql(planned, {
+                targetVersion: Number(options.targetVersion),
+                baseline: imported.baseline,
+              }),
             );
           } catch (error) {
             if (!(error instanceof RenderRefusalError)) throw error;

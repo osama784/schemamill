@@ -102,6 +102,29 @@ test('binds the HazardAnalyzer seam and reports nothing for a clean plan', () =>
   assert.deepEqual(hazardAnalyzer.analyze(baseline, target, planned), []);
 });
 
+test('the analyzer accepts an optional target version without changing today’s hazards', () => {
+  const baseline = model(table('t'));
+  const target = model({ ...table('t'), persistence: 'unlogged' });
+  const planned = plan(baseline, target);
+  const expected: readonly Hazard[] = [
+    {
+      kind: 'table-rewrite',
+      step: 0,
+      entity: { kind: 'table', table: identity('t') },
+      persistence: 'unlogged',
+    },
+  ];
+
+  for (const options of [undefined, { targetVersion: 13 }, { targetVersion: 18 }]) {
+    const direct =
+      options === undefined
+        ? analyzeHazards(baseline, target, planned)
+        : analyzeHazards(baseline, target, planned, options);
+    assert.deepEqual(direct, expected);
+    assert.deepEqual(hazardAnalyzer.analyze(baseline, target, planned, options), expected);
+  }
+});
+
 test('a logged-to-unlogged flip reports a table rewrite on its alter-persistence step', () => {
   const baseline = model(table('t'));
   const target = model({ ...table('t'), persistence: 'unlogged' });
@@ -1504,4 +1527,152 @@ test('model array order never affects the hazards', () => {
 
   assert.notEqual(firstHazards.length, 0);
   assert.deepEqual(firstHazards, secondHazards);
+});
+
+// --- Render refusal surfacing -------------------------------------------------------------------
+
+/** A plan of hand-written steps, so refusal collisions need no target-model round trip. */
+const planOf = (...steps: readonly Step[]): Plan => ({
+  steps,
+  groups: steps.length === 0 ? [] : [{ start: 0, end: steps.length, transactional: true }],
+});
+
+/** A named standalone index create on `public.t`. */
+const createIndex = (name: string, column: string): Step => ({
+  kind: 'create-index',
+  owner: { kind: 'table', table: identity('t') },
+  index: { name, unique: false, columns: [column] },
+});
+
+/** A named standalone index drop on `public.t`. */
+const dropIndex = (name: string): Step => ({
+  kind: 'drop-index',
+  owner: { kind: 'table', table: identity('t') },
+  index: { name, unique: false, columns: ['a'] },
+});
+
+/** A named unique-constraint add on `public.t`. */
+const addUnique = (name: string, column: string): Step => ({
+  kind: 'add-unique-constraint',
+  table: identity('t'),
+  uniqueConstraint: { name, columns: [column] },
+});
+
+test('colliding index claims report a schema-scoped render-refusal hazard at the later step', () => {
+  const planned = planOf(createIndex('shared_idx', 'a'), createIndex('shared_idx', 'b'));
+
+  assert.deepEqual(analyzeHazards(model(), model(), planned), [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['shared_idx', 'shared_idx'],
+      },
+    },
+  ]);
+});
+
+test('colliding constraint claims report a table-scoped render-refusal hazard at the later step', () => {
+  const planned = planOf(addUnique('t_a_key', 'a'), addUnique('t_a_key', 'b'));
+
+  // A unique constraint also claims its backing index in the schema-wide namespace, so the
+  // pair collides twice: once as table-scoped constraints, once as schema-wide indexes.
+  assert.deepEqual(analyzeHazards(model(), model(), planned), [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'constraint',
+        schema: 'public',
+        table: 't',
+        names: ['t_a_key', 't_a_key'],
+      },
+    },
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['t_a_key', 't_a_key'],
+      },
+    },
+  ]);
+});
+
+test('a create that collides with a baseline-materialized name reports a refusal hazard', () => {
+  const baseline = model({
+    ...table('t', [column('a')]),
+    indexes: [{ name: 't_a_idx', unique: false, columns: ['a'] }],
+  });
+
+  assert.deepEqual(analyzeHazards(baseline, model(), planOf(createIndex('t_a_idx', 'b'))), [
+    {
+      kind: 'render-refusal',
+      step: 0,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['t_a_idx', 't_a_idx'],
+      },
+    },
+  ]);
+});
+
+test('a drop then create of one name reports no render-refusal hazard', () => {
+  const baseline = model({
+    ...table('t', [column('a')]),
+    indexes: [{ name: 't_a_idx', unique: false, columns: ['a'] }],
+  });
+  const steps = planOf(dropIndex('t_a_idx'), createIndex('t_a_idx', 'a'));
+
+  assert.deepEqual(analyzeHazards(model(), model(), steps), []);
+  assert.deepEqual(analyzeHazards(baseline, model(), steps), []);
+});
+
+test('an unnamed not-null collision reports a hazard only with a declaring target version', () => {
+  const addNotNull = (): Step => ({ kind: 'add-not-null', table: identity('t'), column: 'c' });
+  const planned = planOf(addNotNull(), addNotNull());
+  const expected: readonly Hazard[] = [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'constraint',
+        schema: 'public',
+        table: 't',
+        names: ['t_c_not_null', 't_c_not_null'],
+      },
+    },
+  ];
+
+  assert.deepEqual(analyzeHazards(model(), model(), planned), [], 'no version: no claim');
+  assert.deepEqual(analyzeHazards(model(), model(), planned, { targetVersion: 13 }), []);
+  assert.deepEqual(analyzeHazards(model(), model(), planned, { targetVersion: 18 }), expected);
+});
+
+test('a refusal hazard names both as-written claims that clip to one stored name', () => {
+  const first = `${'x'.repeat(63)}first`;
+  const second = `${'x'.repeat(63)}second`;
+  const planned = planOf(createIndex(first, 'a'), createIndex(second, 'b'));
+
+  assert.deepEqual(analyzeHazards(model(), model(), planned), [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: [first, second],
+      },
+    },
+  ]);
 });

@@ -28,11 +28,25 @@ export interface SqlRenderer<Plan> {
   render(plan: Plan): string;
 }
 
+/**
+ * Optional analysis context: the PostgreSQL major the plan will be applied to, when the caller
+ * has declared one. Absent means the oldest supported major, so existing 3-argument callers
+ * keep their results; a version-sensitive hazard reads this value when there is one.
+ */
+export interface HazardAnalysisOptions {
+  readonly targetVersion?: number;
+}
+
 /** Planned changes → hazard annotations. Hazards belong to the plan. */
 export interface HazardAnalyzer<Model, Plan, Hazard> {
   /**
    * The baseline and target join the plan because a step carries only its changed fields,
    * while a hazard is a fact about the target or the change.
    */
-  analyze(baseline: Model, target: Model, plan: Plan): readonly Hazard[];
+  analyze(
+    baseline: Model,
+    target: Model,
+    plan: Plan,
+    options?: HazardAnalysisOptions,
+  ): readonly Hazard[];
 }

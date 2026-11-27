@@ -608,6 +608,14 @@ function mapHazardEntity(entity: HazardEntity): object {
       };
     case 'table':
       return { kind: 'table', table: mapTableIdentity(entity.table) };
+    case 'name-collision':
+      return {
+        kind: 'name-collision',
+        scope: entity.scope,
+        schema: entity.schema,
+        ...(entity.table === undefined ? {} : { table: entity.table }),
+        names: [entity.names[0], entity.names[1]],
+      };
     default:
       return assertNever(entity, 'HazardEntity');
   }
@@ -1099,6 +1107,8 @@ function mapHazard(hazard: Hazard): object {
         entity,
         ...(hazard.persistence === undefined ? {} : { persistence: hazard.persistence }),
       };
+    case 'render-refusal':
+      return { kind: 'render-refusal', step: hazard.step, entity };
     default:
       return assertNever(hazard, 'Hazard');
   }

@@ -591,15 +591,16 @@ const COMPARE_HELP = [
   'Print the diff and any hazards between a baseline and a target.',
   '',
   'Arguments:',
-  '  baseline              path to the baseline DDL dump',
-  '  target                path to the target DDL dump',
+  '  baseline                  path to the baseline DDL dump',
+  '  target                    path to the target DDL dump',
   '',
   'Options:',
-  '  --baseline-workspace  resolve the baseline from the workspace',
-  '  --target-workspace    resolve the target from the workspace',
-  '  --verbose             list every import diagnostic',
-  '  --json                emit a structured JSON document',
-  '  -h, --help            display help for command',
+  '  --baseline-workspace      resolve the baseline from the workspace',
+  '  --target-workspace        resolve the target from the workspace',
+  '  --verbose                 list every import diagnostic',
+  '  --target-version <major>  PostgreSQL major (13-18) (default: "13")',
+  '  --json                    emit a structured JSON document',
+  '  -h, --help                display help for command',
   '',
   'A single path is the target; the workspace fills the baseline.',
   '',
@@ -896,12 +897,94 @@ test('plan prints the display before a render refusal, then one stderr line, exi
       ' 1. create-index  public.t: index (a)',
       ' 2. create-index  public.t: index t_a_idx (a)',
       '',
+      'Hazards:',
+      '  step 2 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
       '',
     ].join('\n'),
   );
   assert.equal(
     result.stderr,
     'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx": an unnamed index on (a) and an index named "t_a_idx" on (a)\n',
+  );
+  assert.equal(result.code, 1);
+});
+
+test('human compare prints the render-refusal hazard without rendering or changing exit', async () => {
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('compare', baseline, target);
+
+  assert.equal(
+    result.stdout,
+    [
+      '~ table public.t',
+      '    + index (a)',
+      '    + index t_a_idx (a)',
+      '',
+      'Hazards:',
+      '  step 2 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+});
+
+test('compare --json still carries no hazards for a colliding plan', async () => {
+  const baseline = fixturePath('index-name-twin.baseline.sql');
+  const target = fixturePath('index-name-twin.target.sql');
+
+  const result = await runCli('compare', baseline, target, '--json');
+
+  assert.equal(result.stderr, '');
+  assert.equal(result.code, 0);
+  const document = JSON.parse(result.stdout) as JsonEnvelopeProbe;
+  assert.equal(document.command, 'compare');
+  assert.deepEqual(Object.keys(document.result), ['changes']);
+});
+
+test('plan passes the imported baseline to the render guard', async (t) => {
+  // The baseline's unnamed index is materialized as `t_a_idx`; the target adds an explicit twin
+  // but no drop, so only the baseline occupancy can expose the collision. Without the baseline
+  // option the single create renders and this test would see a clean plan.
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(
+    dir,
+    'baseline.sql',
+    ['CREATE TABLE public.t (a integer, b integer);', 'CREATE INDEX ON public.t (a);', ''].join(
+      '\n',
+    ),
+  );
+  const target = await writeDump(
+    dir,
+    'target.sql',
+    [
+      'CREATE TABLE public.t (a integer, b integer);',
+      'CREATE INDEX ON public.t (a);',
+      'CREATE INDEX t_a_idx ON public.t (b);',
+      '',
+    ].join('\n'),
+  );
+
+  const result = await runCli('plan', baseline, target);
+
+  assert.equal(
+    result.stdout,
+    [
+      '1 step in one transaction:',
+      ' 1. create-index  public.t: index t_a_idx (b)',
+      '',
+      'Hazards:',
+      '  step 1 render-refusal public: index names "t_a_idx" and "t_a_idx" would share a schema-wide name — PostgreSQL rejects this at apply; rendering refuses this plan.',
+      '',
+      '',
+    ].join('\n'),
+  );
+  assert.equal(
+    result.stderr,
+    'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)\n',
   );
   assert.equal(result.code, 1);
 });
@@ -986,16 +1069,31 @@ test('an explicit target never changes the output of a reset-free plan', async (
   assert.equal(explicit.stdout, implicit.stdout);
 });
 
-test('compare takes no --target-version', async () => {
-  // `compare` renders nothing, so the flag is deliberately absent and Commander rejects it.
+test('compare accepts a validated --target-version', async () => {
+  // Human `compare` now takes the major for version-aware hazards; the JSON path still has no
+  // hazards, but the flag is validated before either path touches the filesystem.
   const baseline = fixturePath('column-attributes.baseline.sql');
   const target = fixturePath('column-attributes.target.sql');
 
-  const result = await runCli('compare', baseline, target, '--target-version', '13');
+  const accepted = await runCli('compare', baseline, target, '--target-version', '18');
+  assert.notEqual(accepted.stdout, '');
+  assert.equal(accepted.code, 0);
 
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr, "error: unknown option '--target-version'\n");
-  assert.equal(result.code, 1);
+  for (const value of ['12', '19', '13.4', 'abc']) {
+    const invalid = await runCli(
+      'compare',
+      'definitely-missing-baseline.sql',
+      'definitely-missing-target.sql',
+      '--target-version',
+      value,
+    );
+    assert.equal(invalid.stdout, '');
+    assert.equal(
+      invalid.stderr,
+      'error: --target-version must be a PostgreSQL major from 13 to 18\n',
+    );
+    assert.equal(invalid.code, 1);
+  }
 });
 
 test('a missing baseline is one stderr line naming the path and reason, exit 1', async (t) => {
@@ -2919,6 +3017,18 @@ test('plan --json emits the document and the existing refusal line on render ref
   assert.equal(document.command, 'plan');
   assert.deepEqual(document.result.groups, [{ start: 0, end: 2, transactional: true }]);
   assert.equal(document.result.steps?.length, 2);
+  assert.deepEqual(document.result.hazards, [
+    {
+      kind: 'render-refusal',
+      step: 1,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['t_a_idx', 't_a_idx'],
+      },
+    },
+  ]);
   assert.equal(result.stdout.includes('BEGIN;'), false, 'the document carries no rendered SQL');
   assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
 });

@@ -4,6 +4,7 @@ import {
   diff,
   effectiveIdentity,
   effectiveSequence,
+  plan,
   serializeIndexElement,
 } from '@schemamill/core';
 import type {
@@ -35,7 +36,8 @@ import type {
   View,
 } from '@schemamill/core';
 
-import { renderSql } from './render.ts';
+import { RenderRefusalError, renderSql } from './render.ts';
+import type { RenderOptions } from './render.ts';
 
 /** The one display/join rule for index elements: plain columns and `{"expression": …}` text. */
 function joinIndexElements(elements: readonly IndexElement[], separator = ','): string {
@@ -353,11 +355,18 @@ export interface SceneCheck {
  * `serverMajor` is the major of the server the harness applies the SQL to. A check that
  * renders the plan passes it through as `renderSql`'s `targetVersion`, so the probe sees the
  * same SQL the server will, and a synthesized form the server cannot accept refuses here
- * rather than on apply.
+ * rather than on apply. The optional fourth argument carries the full render options — the
+ * server major beside the scene's baseline — so a refusal scene can render with the same
+ * occupancy guard the harness applies to its migration.
  */
 export interface ScenePlanCheck {
   readonly description: string;
-  readonly failure: (steps: readonly Step[], plan: Plan, serverMajor: number) => string | undefined;
+  readonly failure: (
+    steps: readonly Step[],
+    plan: Plan,
+    serverMajor: number,
+    options?: RenderOptions,
+  ) => string | undefined;
 }
 
 /**
@@ -2821,7 +2830,10 @@ const sequenceToIdentityScene = (): LiveScene => {
  * imports back with the constraints intact: `pg_constraint` spot-checks the conventional names
  * PostgreSQL assigned, and the import check proves those names came back unnamed, the
  * constraint-backed indexes are not modeled as standalone `Index` entries, and the known miss
- * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name.
+ * of the best-effort check formula (`EXTRACT(epoch FROM …)`) keeps its server name. The other
+ * multi-column check is explicitly named: the lexical scan predicts `accounts_check` for it
+ * and for the formula miss, and two unnamed claims on one name are refused before render
+ * because the server's collision suffix cannot be predicted offline.
  *
  * PostgreSQL 14 changed `EXTRACT` to numeric and added reverse compilation; PostgreSQL 13
  * returns `double precision` and deparses as `date_part('epoch'::text, …)`, so this
@@ -2846,7 +2858,12 @@ const constraintCreateScene = (): LiveScene => {
     ],
     checkConstraints: [
       { name: 'accounts_age_check', expression: 'age >= 0' },
-      { expression: 'age >= 0 AND char_length(name) > 0' },
+      // The best-effort check-name scan predicts `accounts_check` for this expression and for
+      // the EXTRACT one below, whose name it misreads. Two unnamed claims on one predicted
+      // name are refused before render, since the server's collision suffix is not knowable
+      // offline; give this check a distinct explicit name so only the formula miss stays
+      // unnamed and keeps its live round-trip evidence.
+      { name: 'accounts_age_name_check', expression: 'age >= 0 AND char_length(name) > 0' },
       { expression: 'char_length(email) > 0' },
       { expression: 'EXTRACT(epoch FROM created_at) = 0' },
     ],
@@ -2905,7 +2922,7 @@ const constraintCreateScene = (): LiveScene => {
             .map((constraint) => `${constraint.name ?? '<unnamed>'}:${constraint.expression}`)
             .join(' ');
           const expectedChecks =
-            '<unnamed>:((age >= 0) AND(char_length(name) > 0))' +
+            'accounts_age_name_check:((age >= 0) AND(char_length(name) > 0))' +
             ' accounts_created_at_check:(EXTRACT(epoch FROM created_at) =(0)::numeric)' +
             ' <unnamed>:(age >= 0) <unnamed>:(char_length(email) > 0)';
           if (checks !== expectedChecks) return `check constraints: ${checks}`;
@@ -2931,10 +2948,10 @@ const constraintCreateScene = (): LiveScene => {
         expected: 'accounts_email_key,accounts_tenant_name_key',
       },
       {
-        description: 'check constraint names, assigned by PostgreSQL',
+        description: 'check constraint names, assigned by PostgreSQL or stated by the model',
         sql: constraintNames('accounts', 'c'),
         expected:
-          'accounts_age_check,accounts_check,accounts_created_at_check,accounts_email_check',
+          'accounts_age_check,accounts_age_name_check,accounts_created_at_check,accounts_email_check',
       },
       {
         description: 'the unnamed primary-key definition',
@@ -2962,8 +2979,8 @@ const constraintCreateScene = (): LiveScene => {
         expected: 'CHECK ((char_length(email) > 0))',
       },
       {
-        description: 'the unnamed multi-column check definition',
-        sql: constraintDef('accounts_check'),
+        description: 'the explicitly named multi-column check definition',
+        sql: constraintDef('accounts_age_name_check'),
         expected: 'CHECK (((age >= 0) AND (char_length(name) > 0)))',
       },
       {
@@ -8051,6 +8068,209 @@ const objectPrivilegesScene = (): LiveScene => {
   };
 };
 
+/**
+ * The target the baseline-occupancy scene refuses: PostgreSQL names the baseline's unnamed index
+ * on `a` as `t_a_idx`, and this target adds an explicit index of that name on `b` without
+ * dropping the original. The accepted scene instead names the new index `t_b_idx`.
+ */
+export const baselineOccupancyRefusedTarget = (): Model =>
+  model(
+    table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+      indexes: [
+        { unique: false, columns: ['a'] },
+        { unique: false, columns: ['b'], name: 't_a_idx' },
+      ],
+    }),
+  );
+
+/**
+ * Baseline occupancy: the baseline builds an unnamed index that the server materializes as
+ * `t_a_idx`. The accepted target adds `t_b_idx` and round-trips; a plan check proves the explicit
+ * twin at `t_a_idx` is refused against the baseline, and a harness falsification proves the same
+ * twin would fail at apply without the guard.
+ */
+const baselineIndexOccupancyScene = (): LiveScene => {
+  const columns = [column('a', { type: 'integer' }), column('b', { type: 'integer' })];
+  const baseline = model(table('t', { columns, indexes: [{ unique: false, columns: ['a'] }] }));
+  const target = model(
+    table('t', {
+      columns,
+      indexes: [
+        { unique: false, columns: ['a'] },
+        { unique: false, columns: ['b'], name: 't_b_idx' },
+      ],
+    }),
+  );
+
+  return {
+    name: 'baseline-index-occupancy',
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the unnamed baseline index is materialized as t_a_idx',
+        sql: indexesOf('t'),
+        expected: 't_a_idx',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the accepted plan creates only the non-colliding explicit index',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'create-index') return `unexpected steps: ${kinds}`;
+          const names = steps
+            .map((step) => (step.kind === 'create-index' ? (step.index.name ?? '<unnamed>') : ''))
+            .join(',');
+          if (names !== 't_b_idx') return `created: ${names}`;
+          return plan.groups.length === 1 && plan.groups[0]?.transactional === true
+            ? undefined
+            : 'the accepted plan must be one transactional group';
+        },
+      },
+      {
+        description: 'the explicit twin is refused against the baseline unnamed index',
+        failure: (_steps, _plan, serverMajor, options) => {
+          const twin = baselineOccupancyRefusedTarget();
+          let refusal: string | undefined;
+          try {
+            renderSql(plan(baseline, twin), { ...options, baseline, targetVersion: serverMajor });
+          } catch (error) {
+            if (!(error instanceof RenderRefusalError)) throw error;
+            refusal = error.message;
+          }
+          const expected =
+            'refusing to render: index creates on public.t would share the name "t_a_idx"' +
+            ' with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)';
+          return refusal === expected ? undefined : `refusal: ${String(refusal)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database carries both the server-named and the explicit index',
+        sql: indexesOf('t'),
+        expected: 't_a_idx,t_b_idx',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry both indexes unnamed',
+        failure: (imported, source) => {
+          const entry = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (entry === undefined) return `${source}: t is not imported`;
+          const indexes = entry.indexes
+            .map((index) => `${joinIndexElements(index.columns)}|${index.name ?? '<unnamed>'}`)
+            .join('; ');
+          // `t_b_idx` is exactly the conventional name PostgreSQL gives an index on (b), so
+          // the importer canonicalizes it back to unnamed on both sides. The catalog check
+          // above still pins the server-side name; this check pins the modeled shape.
+          return indexes === 'a|<unnamed>; b|<unnamed>'
+            ? undefined
+            : `${source}: indexes: ${indexes}`;
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * PostgreSQL 18 unnamed not-null occupancy. The baseline's plain `NOT NULL` on `a` is
+ * materialized by the server as `t_a_not_null`; a target giving `b` an explicit not-null
+ * constraint of that name is refused at major 18 and accepted below it, because earlier servers
+ * keep no `pg_constraint` row for the plain fact. The accepted target uses `t_b_nn_custom`, so it
+ * applies and both constraints survive the round trip. The twin's refusal is a plan fact with a
+ * version-specific expectation; only the accepted migration is applied to the live database.
+ */
+const unnamedNotNullOccupancyScene = (): LiveScene => {
+  const a = column('a', { type: 'integer', notNull: true });
+  const baseline = model(table('t', { columns: [a, column('b', { type: 'integer' })] }));
+  const named = (name: string): Model =>
+    model(
+      table('t', {
+        columns: [a, column('b', { type: 'integer', notNull: true, notNullName: name })],
+      }),
+    );
+  const target = named('t_b_nn_custom');
+  const twin = named('t_a_not_null');
+
+  return {
+    name: 'unnamed-not-null-occupancy',
+    minServerMajor: 18,
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the baseline plain NOT NULL is materialized as t_a_not_null',
+        sql: constraintNames('t', 'n'),
+        expected: 't_a_not_null',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the accepted plan adds only the non-colliding named not-null',
+        failure: (steps, migration, serverMajor) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'add-not-null') return `unexpected steps: ${kinds}`;
+          const sql = renderSql(migration, { targetVersion: serverMajor, baseline });
+          const expected = [
+            'BEGIN;',
+            'ALTER TABLE public.t ADD CONSTRAINT t_b_nn_custom NOT NULL b;',
+            'COMMIT;',
+            '',
+          ].join('\n');
+          return sql === expected ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'a twin of the synthesized name is refused on 18 and accepted below',
+        failure: (_steps, _migration, serverMajor) => {
+          let refusal: string | undefined;
+          try {
+            renderSql(plan(baseline, twin), { baseline, targetVersion: serverMajor });
+          } catch (error) {
+            if (!(error instanceof RenderRefusalError)) throw error;
+            refusal = error.message;
+          }
+          const expected =
+            serverMajor >= 18
+              ? 'refusing to render: constraint creates on public.t would share the name ' +
+                '"t_a_not_null" with a baseline constraint: a not-null constraint on column a ' +
+                'and a not-null constraint named "t_a_not_null" on column b'
+              : undefined;
+          return refusal === expected ? undefined : `refusal: ${String(refusal)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database carries both not-null constraints',
+        sql: constraintNames('t', 'n'),
+        expected: 't_a_not_null,t_b_nn_custom',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps carry the plain fact unnamed and the explicit one named',
+        failure: (imported, source) => {
+          const entry = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (entry === undefined) return `${source}: t is not imported`;
+          const facts = entry.columns
+            .map(
+              (entryColumn) =>
+                `${entryColumn.name}:${String(entryColumn.notNull)}:${String(entryColumn.notNullName)}`,
+            )
+            .join(' ');
+          return facts === 'a:true:undefined b:true:t_b_nn_custom'
+            ? undefined
+            : `${source}: columns: ${facts}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -8087,6 +8307,8 @@ export const scenes: readonly LiveScene[] = [
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
+  baselineIndexOccupancyScene(),
+  unnamedNotNullOccupancyScene(),
   introspectionTracerScene(),
   introspectionIndexesScene(),
   introspectionIndexFamilyScene(),

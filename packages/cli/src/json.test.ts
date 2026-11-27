@@ -335,8 +335,21 @@ const STEPS: readonly Step[] = [
 const SEQUENCE_ENTITY: HazardEntity = { kind: 'sequence', sequence: SEQUENCE_ID };
 const IDENTITY_ENTITY: HazardEntity = { kind: 'identity-column', table: TABLE_ID, column: 'id' };
 const TABLE_ENTITY: HazardEntity = { kind: 'table', table: TABLE_ID };
+const INDEX_COLLISION_ENTITY: HazardEntity = {
+  kind: 'name-collision',
+  scope: 'index',
+  schema: 'public',
+  names: ['shared_idx', 'shared_idx'],
+};
+const CONSTRAINT_COLLISION_ENTITY: HazardEntity = {
+  kind: 'name-collision',
+  scope: 'constraint',
+  schema: 'public',
+  table: 't',
+  names: ['t_a_key', 't_a_key'],
+};
 
-/** One instance of every `Hazard` kind, spanning all three `HazardEntity` kinds. */
+/** One instance of every `Hazard` kind, spanning every `HazardEntity` kind. */
 const HAZARDS: readonly Hazard[] = [
   { kind: 'increment-zero', step: 0, entity: SEQUENCE_ENTITY, increment: '0' },
   { kind: 'cache-nonpositive', step: 1, entity: IDENTITY_ENTITY, cache: '0' },
@@ -366,6 +379,8 @@ const HAZARDS: readonly Hazard[] = [
     after: '5',
   },
   { kind: 'table-rewrite', step: 6, entity: TABLE_ENTITY, persistence: 'unlogged' },
+  { kind: 'render-refusal', step: 7, entity: INDEX_COLLISION_ENTITY },
+  { kind: 'render-refusal', step: 8, entity: CONSTRAINT_COLLISION_ENTITY },
 ];
 
 const GROUPS: readonly TransactionGroup[] = [
@@ -558,6 +573,7 @@ const HAZARD_KEYS: Record<Hazard['kind'], readonly string[]> = {
   'bound-out-of-type-range': ['kind', 'step', 'entity', 'dataType', 'field', 'value'],
   'bound-tightened': ['kind', 'step', 'entity', 'field', 'before', 'after'],
   'table-rewrite': ['kind', 'step', 'entity', 'persistence?'],
+  'render-refusal': ['kind', 'step', 'entity'],
 };
 
 const COMMENT_TARGET_KEYS: Record<CommentTarget['kind'], readonly string[]> = {
@@ -579,6 +595,7 @@ const HAZARD_ENTITY_KEYS: Record<HazardEntity['kind'], readonly string[]> = {
   sequence: ['kind', 'sequence'],
   'identity-column': ['kind', 'table', 'column'],
   table: ['kind', 'table'],
+  'name-collision': ['kind', 'scope', 'schema', 'table?', 'names'],
 };
 
 const INDEX_OWNER_KEYS: Record<IndexOwner['kind'], readonly string[]> = {
@@ -748,6 +765,8 @@ const ALLOWED_KEYS = new Set<string>([
   'extension',
   'entity',
   'step',
+  'scope',
+  'names',
   'value',
   'text',
 ]);
