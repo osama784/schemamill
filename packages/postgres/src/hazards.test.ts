@@ -102,6 +102,29 @@ test('binds the HazardAnalyzer seam and reports nothing for a clean plan', () =>
   assert.deepEqual(hazardAnalyzer.analyze(baseline, target, planned), []);
 });
 
+test('the analyzer accepts an optional target version without changing today’s hazards', () => {
+  const baseline = model(table('t'));
+  const target = model({ ...table('t'), persistence: 'unlogged' });
+  const planned = plan(baseline, target);
+  const expected: readonly Hazard[] = [
+    {
+      kind: 'table-rewrite',
+      step: 0,
+      entity: { kind: 'table', table: identity('t') },
+      persistence: 'unlogged',
+    },
+  ];
+
+  for (const options of [undefined, { targetVersion: 13 }, { targetVersion: 18 }]) {
+    const direct =
+      options === undefined
+        ? analyzeHazards(baseline, target, planned)
+        : analyzeHazards(baseline, target, planned, options);
+    assert.deepEqual(direct, expected);
+    assert.deepEqual(hazardAnalyzer.analyze(baseline, target, planned, options), expected);
+  }
+});
+
 test('a logged-to-unlogged flip reports a table rewrite on its alter-persistence step', () => {
   const baseline = model(table('t'));
   const target = model({ ...table('t'), persistence: 'unlogged' });

@@ -386,7 +386,7 @@ export function renderSql(plan: Plan, options?: RenderOptions): string {
     targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
       ? collapseEnforcementFlips(plan)
       : undefined;
-  assertNamesUnique(plan, options?.baseline);
+  assertNamesUnique(plan, options?.baseline, targetVersion);
   if (plan.steps.length === 0) return '';
   const groups: string[] = [];
   for (const group of plan.groups) {
@@ -450,10 +450,13 @@ function assertGroupsTileSteps(plan: Plan): void {
  * two drops would drop one name twice; polarity is part of the key, so a drop and a create of
  * one name still coexist. Index keys are `[schema, name, polarity]` across all owners, and
  * constraint keys are `[schema, table, name, polarity]` across all kinds. A collision is
- * reported once, for the first pair in plan order.
+ * reported once, for the first pair in plan order. `targetVersion` supplies the collector's
+ * version context: at 18 or newer an unnamed not-null fact occupies the name the server would
+ * store, both in the plan and in a supplied baseline.
  */
-function assertNamesUnique(plan: Plan, baseline?: Model): void {
-  const claims = collectNameClaims(plan);
+function assertNamesUnique(plan: Plan, baseline: Model | undefined, targetVersion: number): void {
+  const version = { targetVersion };
+  const claims = collectNameClaims(plan, version);
   const claimed = new Map<string, NameClaim>();
   for (const claim of claims) {
     const key = nameClaimKey(claim);
@@ -464,9 +467,9 @@ function assertNamesUnique(plan: Plan, baseline?: Model): void {
     claimed.set(key, claim);
   }
   if (baseline === undefined) return;
-  const released = releasedBaselineKeys(plan, baseline);
+  const released = releasedBaselineKeys(plan, baseline, version);
   const occupied = new Map<string, NameClaim>();
-  for (const claim of collectBaselineClaims(baseline)) {
+  for (const claim of collectBaselineClaims(baseline, version)) {
     const identity = nameClaimIdentity(claim);
     if (released.has(identity)) continue;
     if (!occupied.has(identity)) occupied.set(identity, claim);

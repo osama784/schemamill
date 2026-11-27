@@ -13,6 +13,7 @@ import {
   chooseNameAddition,
   indexElementNames,
   makeObjectName,
+  pg18NotNullName,
   synthesizedCheckConstraintName,
   synthesizedForeignKeyName,
   synthesizedIndexName,
@@ -147,6 +148,37 @@ test('synthesized names predict the server form for long inputs', () => {
     `${'t'.repeat(55)}_a_check`,
   );
   assert.equal(synthesizedNotNullName(long, 'a'), `${'t'.repeat(52)}_a_not_null`);
+});
+
+test('the PostgreSQL 18 not-null formula agrees with the import formula under UTF-8', () => {
+  // PostgreSQL 18's ChooseConstraintName joins the unqualified relation name, the column, and
+  // `not_null`, clipping both name parts at UTF-8 boundaries. The import formula mirrors the same
+  // budget, so a name the server generates is the name the importer canonicalizes away.
+  const pairs: readonly (readonly [string, string])[] = [
+    ['t', 'c'],
+    ['Mixed Case', 'café'],
+    ['t'.repeat(70), 'a'],
+    ['t', 'a'.repeat(70)],
+    ['t'.repeat(40), 'a'.repeat(40)],
+    ['é'.repeat(40), 'ß'.repeat(20)],
+    ['t'.repeat(52), '🙂'.repeat(20)],
+  ];
+  for (const [tableName, column] of pairs) {
+    assert.equal(pg18NotNullName(tableName, column), synthesizedNotNullName(tableName, column));
+  }
+});
+
+test('the PostgreSQL 18 not-null name spends 53 bytes on the relation and column, never the label', () => {
+  assert.equal(pg18NotNullName('t', 'c'), 't_c_not_null');
+  assert.equal(pg18NotNullName('t'.repeat(70), 'a'), `${'t'.repeat(52)}_a_not_null`);
+  assert.equal(pg18NotNullName('t', 'a'.repeat(70)), `t_${'a'.repeat(52)}_not_null`);
+  // The longer part shrinks first; a tie alternates, ending one byte shorter on the relation.
+  assert.equal(
+    pg18NotNullName('x'.repeat(30), 'y'.repeat(30)),
+    `${'x'.repeat(27)}_${'y'.repeat(26)}_not_null`,
+  );
+  // A multibyte character is never split: 52 of the 53 available bytes fits 26 two-byte letters.
+  assert.equal(pg18NotNullName('é'.repeat(40), 'z'), `${'é'.repeat(26)}_z_not_null`);
 });
 
 test('indexElementNames labels columns, function calls, nullif, and opaque expressions', () => {

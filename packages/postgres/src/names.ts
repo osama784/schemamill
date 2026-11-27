@@ -19,7 +19,10 @@ import type {
  * loop — faithfully, including PostgreSQL's 63-byte identifier limit: an explicit identifier
  * is clipped to its server form by `truncateIdentifier`, and a generated name is assembled
  * exactly as `makeObjectName` assembles it, so a name longer than 63 bytes predicts the name
- * PostgreSQL would store rather than an over-long one. The mirror assumes a UTF-8 database:
+ * PostgreSQL would store rather than an over-long one. The PostgreSQL 18 not-null helper below
+ * mirrors `ChooseConstraintName` for the name the server materializes when it stores an unnamed
+ * not-null constraint; import canonicalization keeps using the conventional formula here.
+ * The mirror assumes a UTF-8 database:
  * `pg_mbcliplen` clips at character boundaries of the database encoding, and this module
  * clips at UTF-8 boundaries; any other encoding is a named residual.
  *
@@ -360,6 +363,31 @@ export function synthesizedUniqueConstraintName(
  */
 export function synthesizedNotNullName(table: string, column: string): string {
   return makeObjectName(table, column, 'not_null');
+}
+
+/**
+ * PostgreSQL 18's `ChooseConstraintName` for an unnamed not-null fact the server stores in
+ * `pg_constraint`: the unqualified relation name, the column name, and the `not_null` label.
+ * Both name parts arrive as stored identifiers (at most 63 bytes each) and share the 53 bytes
+ * left after the two separators and the eight-byte label; the longer part shrinks first, a tie
+ * shrinks the column, each part clips at a UTF-8 character boundary, and the label is never
+ * truncated. This is the name an occupancy guard must reserve at target 18 or newer — before 18
+ * an unnamed not-null has no constraint row and claims nothing. Collision suffixes
+ * (`not_null1`, …) depend on the catalog's current names and stay offline-unpredictable, so a
+ * suffixed name remains named in the model instead of being synthesized here.
+ */
+export function pg18NotNullName(table: string, column: string): string {
+  const label = 'not_null';
+  const first = truncateIdentifier(table);
+  const second = truncateIdentifier(column);
+  const available = IDENTIFIER_BYTE_LIMIT - utf8Length(label) - 2;
+  let firstBytes = utf8Length(first);
+  let secondBytes = utf8Length(second);
+  while (firstBytes + secondBytes > available) {
+    if (firstBytes > secondBytes) firstBytes -= 1;
+    else secondBytes -= 1;
+  }
+  return `${clipToBytes(first, firstBytes)}_${clipToBytes(second, secondBytes)}_${label}`;
 }
 
 /**

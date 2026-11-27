@@ -8164,6 +8164,102 @@ const baselineIndexOccupancyScene = (): LiveScene => {
   };
 };
 
+/**
+ * PostgreSQL 18 unnamed not-null occupancy. The baseline's plain `NOT NULL` on `a` is
+ * materialized by the server as `t_a_not_null`; a target giving `b` an explicit not-null
+ * constraint of that name is refused at major 18 and accepted below it, because earlier servers
+ * keep no `pg_constraint` row for the plain fact. The accepted target uses `t_b_nn_custom`, so it
+ * applies and both constraints survive the round trip. The twin's refusal is a plan fact with a
+ * version-specific expectation; only the accepted migration is applied to the live database.
+ */
+const unnamedNotNullOccupancyScene = (): LiveScene => {
+  const a = column('a', { type: 'integer', notNull: true });
+  const baseline = model(table('t', { columns: [a, column('b', { type: 'integer' })] }));
+  const named = (name: string): Model =>
+    model(
+      table('t', {
+        columns: [a, column('b', { type: 'integer', notNull: true, notNullName: name })],
+      }),
+    );
+  const target = named('t_b_nn_custom');
+  const twin = named('t_a_not_null');
+
+  return {
+    name: 'unnamed-not-null-occupancy',
+    minServerMajor: 18,
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the baseline plain NOT NULL is materialized as t_a_not_null',
+        sql: constraintNames('t', 'n'),
+        expected: 't_a_not_null',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the accepted plan adds only the non-colliding named not-null',
+        failure: (steps, migration, serverMajor) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'add-not-null') return `unexpected steps: ${kinds}`;
+          const sql = renderSql(migration, { targetVersion: serverMajor, baseline });
+          const expected = [
+            'BEGIN;',
+            'ALTER TABLE public.t ADD CONSTRAINT t_b_nn_custom NOT NULL b;',
+            'COMMIT;',
+            '',
+          ].join('\n');
+          return sql === expected ? undefined : `sql: ${JSON.stringify(sql)}`;
+        },
+      },
+      {
+        description: 'a twin of the synthesized name is refused on 18 and accepted below',
+        failure: (_steps, _migration, serverMajor) => {
+          let refusal: string | undefined;
+          try {
+            renderSql(plan(baseline, twin), { baseline, targetVersion: serverMajor });
+          } catch (error) {
+            if (!(error instanceof RenderRefusalError)) throw error;
+            refusal = error.message;
+          }
+          const expected =
+            serverMajor >= 18
+              ? 'refusing to render: constraint creates on public.t would share the name ' +
+                '"t_a_not_null" with a baseline constraint: a not-null constraint on column a ' +
+                'and a not-null constraint named "t_a_not_null" on column b'
+              : undefined;
+          return refusal === expected ? undefined : `refusal: ${String(refusal)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database carries both not-null constraints',
+        sql: constraintNames('t', 'n'),
+        expected: 't_a_not_null,t_b_nn_custom',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps carry the plain fact unnamed and the explicit one named',
+        failure: (imported, source) => {
+          const entry = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (entry === undefined) return `${source}: t is not imported`;
+          const facts = entry.columns
+            .map(
+              (entryColumn) =>
+                `${entryColumn.name}:${String(entryColumn.notNull)}:${String(entryColumn.notNullName)}`,
+            )
+            .join(' ');
+          return facts === 'a:true:undefined b:true:t_b_nn_custom'
+            ? undefined
+            : `${source}: columns: ${facts}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -8201,6 +8297,7 @@ export const scenes: readonly LiveScene[] = [
   unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
   baselineIndexOccupancyScene(),
+  unnamedNotNullOccupancyScene(),
   introspectionTracerScene(),
   introspectionIndexesScene(),
   introspectionIndexFamilyScene(),

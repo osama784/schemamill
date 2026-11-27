@@ -75,7 +75,9 @@ export function registerPlan(program: Command): void {
           }
           const planned = planOrReport(() => plan(imported.baseline, imported.target));
           if (planned === undefined) return;
-          const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned);
+          const hazards = hazardAnalyzer.analyze(imported.baseline, imported.target, planned, {
+            targetVersion: Number(options.targetVersion),
+          });
           let refusal: string | undefined;
           if (planned.steps.length > 0) {
             try {

@@ -2531,6 +2531,177 @@ test('an absent baseline leaves rendering byte-identical', () => {
   );
 });
 
+test('PostgreSQL 18 claims unnamed not-null columns in create-table and add-column', () => {
+  // PG18 materializes an unnamed NOT NULL as `<table>_<column>_not_null`. An explicit constraint
+  // that takes the same table-scoped name must therefore be refused; below 18 there is no row.
+  const message =
+    'refusing to render: constraint creates on public.t would share the name "t_c_not_null": ' +
+    'a not-null constraint on column c and a not-null constraint named "t_c_not_null" on column d';
+
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf({
+          kind: 'create-table',
+          table: table('t', {
+            columns: [
+              column('c', { notNull: true }),
+              column('d', { notNull: true, notNullName: 't_c_not_null' }),
+            ],
+          }),
+        }),
+        { targetVersion: 18 },
+      ),
+    message,
+  );
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'add-column', table: identity('t'), column: column('c', { notNull: true }) },
+          {
+            kind: 'add-not-null',
+            table: identity('t'),
+            column: 'd',
+            name: 't_c_not_null',
+          },
+        ),
+        { targetVersion: 18 },
+      ),
+    message,
+  );
+});
+
+test('PostgreSQL 18 claims unnamed add-not-null and drop-not-null facts', () => {
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'add-not-null', table: identity('t'), column: 'c' },
+          {
+            kind: 'add-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('c > 0', { name: 't_c_not_null' }),
+          },
+        ),
+        { targetVersion: 18 },
+      ),
+    'refusing to render: constraint creates on public.t would share the name "t_c_not_null": ' +
+      'a not-null constraint on column c and a check constraint named "t_c_not_null" on (c > 0)',
+  );
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'drop-not-null', table: identity('t'), column: 'c' },
+          {
+            kind: 'drop-check-constraint',
+            table: identity('t'),
+            checkConstraint: checkConstraint('c > 0', { name: 't_c_not_null' }),
+          },
+        ),
+        { targetVersion: 18 },
+      ),
+    'refusing to render: constraint drops on public.t would share the name "t_c_not_null": ' +
+      'a not-null constraint on column c and a check constraint named "t_c_not_null" on (c > 0)',
+  );
+});
+
+test('before PostgreSQL 18 an unnamed not-null fact claims no name', () => {
+  const steps: Step[] = [
+    { kind: 'add-column', table: identity('t'), column: column('c', { notNull: true }) },
+    { kind: 'add-not-null', table: identity('t'), column: 'd', name: 't_c_not_null' },
+  ];
+  const expected = [
+    'BEGIN;',
+    'ALTER TABLE public.t ADD COLUMN c text NOT NULL;',
+    'ALTER TABLE public.t ADD CONSTRAINT t_c_not_null NOT NULL d;',
+    'COMMIT;',
+    '',
+  ].join('\n');
+
+  assert.equal(renderSql(planOf(...steps)), expected);
+  assert.equal(renderSql(planOf(...steps), { targetVersion: 13 }), expected);
+  assert.equal(renderSql(planOf(...steps), { targetVersion: 17 }), expected);
+});
+
+test('PostgreSQL 18 baseline occupancy releases a synthesized not-null name on drop-column', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a', { type: 'integer', notNull: true }), column('b', { type: 'integer' })],
+    }),
+  );
+  const steps: Step[] = [
+    { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) },
+    { kind: 'add-not-null', table: identity('t'), column: 'b', name: 't_a_not_null' },
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline, targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP COLUMN a;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_not_null NOT NULL b;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control puts the synthesized name on the column the plan keeps: dropping `a` releases
+  // `t_a_not_null`, not `t_b_not_null`, so the create must still be refused.
+  const retained = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'integer' }),
+        column('b', { type: 'integer', notNull: true }),
+        column('c', { type: 'integer' }),
+      ],
+    }),
+  );
+  const retainedSteps: Step[] = [
+    { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) },
+    { kind: 'add-not-null', table: identity('t'), column: 'c', name: 't_b_not_null' },
+  ];
+  assertRefusal(
+    () => renderSql(planOf(...retainedSteps), { baseline: retained, targetVersion: 18 }),
+    'refusing to render: constraint creates on public.t would share the name "t_b_not_null" ' +
+      'with a baseline constraint: a not-null constraint on column b and ' +
+      'a not-null constraint named "t_b_not_null" on column c',
+  );
+  // Below 18 the baseline has no not-null constraint row, so nothing is occupied.
+  assert.doesNotThrow(() =>
+    renderSql(planOf(...retainedSteps), { baseline: retained, targetVersion: 13 }),
+  );
+});
+
+test('PostgreSQL 18 baseline occupancy releases a synthesized not-null name on drop-table', () => {
+  const baseline = model(
+    table('t', { columns: [column('a', { type: 'integer', notNull: true })] }),
+  );
+  const steps: Step[] = [
+    { kind: 'drop-table', table: identity('t') },
+    {
+      kind: 'create-table',
+      table: table('t', {
+        columns: [column('b', { type: 'integer', notNull: true, notNullName: 't_a_not_null' })],
+      }),
+    },
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline, targetVersion: 18 }),
+    [
+      'BEGIN;',
+      'DROP TABLE public.t;',
+      'CREATE TABLE public.t (',
+      '    b integer CONSTRAINT t_a_not_null NOT NULL',
+      ');',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('index drops are schema-qualified, named or synthesized, both kinds', () => {
   // A bare `DROP INDEX` name resolves through `search_path`, so an index on a non-public
   // table must be dropped as `<schema>.<name>`; the name is synthesized when absent, exactly

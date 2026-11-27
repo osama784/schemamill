@@ -2,6 +2,7 @@ import { assertNever } from '@schemamill/core';
 import type { Index, IndexOwner, Model, Plan, Table, TableIdentity } from '@schemamill/core';
 
 import {
+  pg18NotNullName,
   synthesizedCheckConstraintName,
   synthesizedExclusionConstraintName,
   synthesizedForeignKeyName,
@@ -10,6 +11,17 @@ import {
   synthesizedUniqueConstraintName,
   truncateIdentifier,
 } from './names.ts';
+
+/** The first PostgreSQL major that stores an unnamed not-null fact in `pg_constraint`. */
+const PG18_NOT_NULL_MIN_MAJOR = 18;
+
+/**
+ * The target context a collector reads. Absent means the oldest supported major: no version-
+ * sensitive claim is made, which keeps every 3-argument caller byte-identical.
+ */
+export interface NameClaimOptions {
+  readonly targetVersion?: number;
+}
 
 /**
  * The pure claim collector behind the render guard (and, later, refusal hazards).
@@ -32,13 +44,15 @@ import {
  * - every add/drop constraint step, including named `add-not-null`/`drop-not-null`;
  * - the backing index of a PK/unique/exclusion add or drop, named exactly as the drop paths
  *   in `render.ts` resolve it — the constraint's own name;
- * - create-table's inline primary key, in both namespaces, and its columns' inline
- *   `notNullName` in the constraint namespace;
- * - add-column's inline `notNullName` in the constraint namespace.
+ * - create-table's inline primary key, in both namespaces, and its columns' inline not-null
+ *   facts (a stated `notNullName`, or a PG18 synthesized name) in the constraint namespace;
+ * - add-column's inline not-null fact, the same way.
  *
- * An unnamed not-null step claims nothing here: before PostgreSQL 18 an unnamed not-null fact
- * has no `pg_constraint` row. Its version-aware occupancy belongs to a later workstream.
- * `drop-table` and `drop-column` release names from a baseline rather than adding claims.
+ * An unnamed not-null step claims nothing before PostgreSQL 18, where the fact has no
+ * `pg_constraint` row. At 18 or newer it claims the table-scoped name `ChooseConstraintName`
+ * materializes — `<table>_<column>_not_null` — through {@link pg18NotNullName}; a collision
+ * suffix such as `not_null1` stays a named residual. `drop-table` and `drop-column` release
+ * names from a baseline rather than adding claims.
  *
  * No object is claimed twice through separate steps: each step contributes at most one claim
  * per object per namespace. When two different objects do resolve to one key, the guard reports
@@ -139,8 +153,33 @@ function statedName(explicit: string): ResolvedName {
   return { name: truncateIdentifier(explicit), synthesized: false, originalName: explicit };
 }
 
+/**
+ * The server form of an unnamed not-null fact, or `undefined` below PostgreSQL 18 where the
+ * server stores no constraint row and no name is occupied. The relation name is unqualified:
+ * the helper takes the table's name, not its identity, just as `ChooseConstraintName` takes the
+ * relation name and the namespace separately.
+ */
+function unnamedNotNullName(
+  table: string,
+  column: string,
+  options?: NameClaimOptions,
+): ResolvedName | undefined {
+  if ((options?.targetVersion ?? 0) < PG18_NOT_NULL_MIN_MAJOR) return undefined;
+  return { name: pg18NotNullName(table, column), synthesized: true };
+}
+
+/** An inline not-null fact: stated when named, otherwise PG18's synthesized name when it has one. */
+function notNullColumnName(
+  table: string,
+  column: string,
+  explicit: string | undefined,
+  options?: NameClaimOptions,
+): ResolvedName | undefined {
+  return explicit === undefined ? unnamedNotNullName(table, column, options) : statedName(explicit);
+}
+
 /** All name claims the plan makes, in plan order, with at most one per object per namespace. */
-export function collectNameClaims(plan: Plan): readonly NameClaim[] {
+export function collectNameClaims(plan: Plan, options?: NameClaimOptions): readonly NameClaim[] {
   const claims: NameClaim[] = [];
   for (const [index, step] of plan.steps.entries()) {
     switch (step.kind) {
@@ -239,16 +278,18 @@ export function collectNameClaims(plan: Plan): readonly NameClaim[] {
       }
       case 'add-not-null':
       case 'drop-not-null': {
-        // An unnamed not-null fact has no constraint row before PostgreSQL 18; version-aware
-        // occupancy for it is a later workstream. A stated name is an explicit constraint.
-        if (step.name === undefined) break;
+        const resolved =
+          step.name === undefined
+            ? unnamedNotNullName(step.table.name, step.column, options)
+            : statedName(step.name);
+        if (resolved === undefined) break;
         pushConstraint(
           claims,
           step.table,
           { kind: 'not-null', column: step.column },
           index,
           step.kind === 'add-not-null' ? 'create' : 'drop',
-          statedName(step.name),
+          resolved,
         );
         break;
       }
@@ -267,14 +308,17 @@ export function collectNameClaims(plan: Plan): readonly NameClaim[] {
         }
         for (const column of table.columns) {
           // `renderColumn` states an inline constraint only when the column is not null.
-          if (column.notNull && column.notNullName !== undefined) {
+          const resolved = column.notNull
+            ? notNullColumnName(table.name, column.name, column.notNullName, options)
+            : undefined;
+          if (resolved !== undefined) {
             pushConstraint(
               claims,
               table,
               { kind: 'not-null', column: column.name },
               index,
               'create',
-              statedName(column.notNullName),
+              resolved,
             );
           }
         }
@@ -282,14 +326,17 @@ export function collectNameClaims(plan: Plan): readonly NameClaim[] {
       }
       case 'add-column': {
         // `renderColumn` states an inline constraint only when the column is not null.
-        if (step.column.notNull && step.column.notNullName !== undefined) {
+        const resolved = step.column.notNull
+          ? notNullColumnName(step.table.name, step.column.name, step.column.notNullName, options)
+          : undefined;
+        if (resolved !== undefined) {
           pushConstraint(
             claims,
             step.table,
             { kind: 'not-null', column: step.column.name },
             index,
             'create',
-            statedName(step.column.notNullName),
+            resolved,
           );
         }
         break;
@@ -401,12 +448,15 @@ function pushIndexClaim(
  * server form as the plan claims: an explicit name clipped to 63 bytes, an unnamed one predicted
  * by the conventional formula. A baseline object occupies its identity as if it were a create;
  * the guard checks plan creates against these claims, never baseline against baseline (the
- * baseline is an existing, valid schema). An unnamed not-null fact claims nothing before
- * PostgreSQL 18; its version-aware occupancy belongs to a later workstream.
+ * baseline is an existing, valid schema). At PostgreSQL 18 or newer an unnamed not-null column
+ * also occupies the name the server materialized, so a later plan cannot claim it.
  */
-export function collectBaselineClaims(baseline: Model): readonly NameClaim[] {
+export function collectBaselineClaims(
+  baseline: Model,
+  options?: NameClaimOptions,
+): readonly NameClaim[] {
   const claims: NameClaim[] = [];
-  for (const table of baseline.tables) collectTableClaims(claims, table);
+  for (const table of baseline.tables) collectTableClaims(claims, table, options);
   for (const view of baseline.views) {
     if (!view.materialized || view.indexes === undefined) continue;
     for (const index of view.indexes) {
@@ -425,7 +475,7 @@ export function collectBaselineClaims(baseline: Model): readonly NameClaim[] {
 }
 
 /** Every named object one baseline table materializes, in both guard namespaces. */
-function collectTableClaims(claims: NameClaim[], table: Table): void {
+function collectTableClaims(claims: NameClaim[], table: Table, options?: NameClaimOptions): void {
   if (table.primaryKey !== undefined) {
     const resolved = resolveName(table.primaryKey.name, () => synthesizedPrimaryKeyName(table));
     const detail: ConstraintClaimDetail = {
@@ -486,15 +536,18 @@ function collectTableClaims(claims: NameClaim[], table: Table): void {
     );
   }
   for (const column of table.columns) {
-    // An unnamed not-null fact has no pg_constraint row before PostgreSQL 18.
-    if (column.notNull && column.notNullName !== undefined) {
+    // The baseline's unnamed not-null has a pg_constraint row only at PostgreSQL 18 or newer.
+    const resolved = column.notNull
+      ? notNullColumnName(table.name, column.name, column.notNullName, options)
+      : undefined;
+    if (resolved !== undefined) {
       pushConstraint(
         claims,
         table,
         { kind: 'not-null', column: column.name },
         -1,
         'create',
-        statedName(column.notNullName),
+        resolved,
         true,
       );
     }
@@ -505,12 +558,17 @@ function collectTableClaims(claims: NameClaim[], table: Table): void {
  * The baseline identities the plan frees. A drop-polarity claim releases the same identity in
  * either namespace, so a drop-then-recreate of one name is not refused. A `drop-table` releases
  * every name its baseline table materialized; a `drop-column` releases the baseline constraints
- * and indexes that involve that column, since PostgreSQL drops them with it. Constraints whose
- * payload is opaque text (check and exclusion) are never guessed from an expression.
+ * and indexes that involve that column, since PostgreSQL drops them with it — including a
+ * PostgreSQL 18 unnamed not-null's synthesized constraint name. Constraints whose payload is
+ * opaque text (check and exclusion) are never guessed from an expression.
  */
-export function releasedBaselineKeys(plan: Plan, baseline: Model): ReadonlySet<string> {
+export function releasedBaselineKeys(
+  plan: Plan,
+  baseline: Model,
+  options?: NameClaimOptions,
+): ReadonlySet<string> {
   const released = new Set<string>();
-  for (const claim of collectNameClaims(plan)) {
+  for (const claim of collectNameClaims(plan, options)) {
     if (claim.polarity === 'drop') released.add(nameClaimIdentity(claim));
   }
   const tables = new Map<string, Table>();
@@ -520,7 +578,7 @@ export function releasedBaselineKeys(plan: Plan, baseline: Model): ReadonlySet<s
     const table = tables.get(tableKey(step.table));
     if (table === undefined) continue;
     const claims: NameClaim[] = [];
-    collectTableClaims(claims, table);
+    collectTableClaims(claims, table, options);
     for (const claim of claims) {
       if (step.kind === 'drop-table' || involvesColumn(claim, step.column.name)) {
         released.add(nameClaimIdentity(claim));

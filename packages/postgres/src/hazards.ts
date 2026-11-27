@@ -2,6 +2,7 @@ import { canonicalIntType, sequenceTypeBounds, sequenceTypeChange } from '@schem
 import type {
   Column,
   Hazard,
+  HazardAnalysisOptions,
   HazardAnalyzer,
   HazardEntity,
   Identity,
@@ -15,6 +16,8 @@ import type {
   Table,
   TableIdentity,
 } from '@schemamill/core';
+
+import { MIN_TARGET_VERSION } from './render.ts';
 
 /**
  * PostgreSQL hazard analysis: the state edge of a migration plan.
@@ -81,8 +84,24 @@ import type {
  * `hazardAnalyzer` binds `analyzeHazards` to core's `HazardAnalyzer` seam.
  */
 
-/** The analysis: every hazard the plan's state edge carries, in plan order. */
-export function analyzeHazards(baseline: Model, target: Model, plan: Plan): readonly Hazard[] {
+/**
+ * The analysis: every hazard the plan's state edge carries, in plan order. An optional target
+ * version is resolved and validated exactly as `renderSql` resolves its own, so a caller that
+ * declares the migration's PostgreSQL major reaches the analyzer through one contract; no
+ * hazard kind consumes it yet, and today's results are identical for every valid major.
+ */
+export function analyzeHazards(
+  baseline: Model,
+  target: Model,
+  plan: Plan,
+  options?: HazardAnalysisOptions,
+): readonly Hazard[] {
+  const targetVersion = options?.targetVersion ?? MIN_TARGET_VERSION;
+  if (!Number.isInteger(targetVersion) || targetVersion < MIN_TARGET_VERSION) {
+    throw new Error(
+      `targetVersion must be a PostgreSQL major of ${MIN_TARGET_VERSION} or newer, got ${String(targetVersion)}`,
+    );
+  }
   const steps = plan.steps;
   const hazards: Hazard[] = [];
   for (const entry of sequenceEntries(baseline, target)) {
