@@ -64,7 +64,7 @@ An extension a default dump installs keeps its name, install schema, and comment
 
 ## Evidence
 
-The package suites pin model and workspace read/write, import forms and every diagnostic, value-carrying field order and copy isolation, phase placement and transaction classification, render grammar and quoting, and the CLI and SQL goldens. On the local PostgreSQL 16.2 scratch server the gated suite is 619 tests across 61 scenes, 614 pass and 5 skipped — the five PostgreSQL 18 scenes, skipped by name — and all 61 run on the CI's PostgreSQL 18. The live scene fails loudly if `hstore`, `pgcrypto`, or `citext` is unavailable or the relocatable schema move is refused. `pnpm docs:counts --check` reports no stale claim, and the five gates are green on the final tree.
+The package suites pin model and workspace read/write, import forms and every diagnostic, value-carrying field order and copy isolation, phase placement and transaction classification, render grammar and quoting, and the CLI and SQL goldens. The corpus is 557 postgres tests + 61 scenes + 4 always-on live subtests = 622 tests across 61 scenes, and the five PostgreSQL 18 scenes are floored with 5 skipped by name. No local `SCHEMAMILL_TEST_PG_URL` was configured, so live pass/skip counts come from CI only, where all 61 run on PostgreSQL 18. The live scene fails loudly if `hstore`, `pgcrypto`, or `citext` is unavailable or the relocatable schema move is refused. `pnpm docs:counts --check` reports no stale claim, and the five gates are green on the final tree.
 
 ## Acceptance
 

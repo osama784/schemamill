@@ -2,6 +2,7 @@ import { assertNever } from '@schemamill/core';
 import type { Index, IndexOwner, Model, Plan, Table, TableIdentity } from '@schemamill/core';
 
 import {
+  expressionColumnIdentifiers,
   pg18NotNullName,
   synthesizedCheckConstraintName,
   synthesizedExclusionConstraintName,
@@ -559,8 +560,9 @@ function collectTableClaims(claims: NameClaim[], table: Table, options?: NameCla
  * either namespace, so a drop-then-recreate of one name is not refused. A `drop-table` releases
  * every name its baseline table materialized; a `drop-column` releases the baseline constraints
  * and indexes that involve that column, since PostgreSQL drops them with it — including a
- * PostgreSQL 18 unnamed not-null's synthesized constraint name. Constraints whose payload is
- * opaque text (check and exclusion) are never guessed from an expression.
+ * PostgreSQL 18 unnamed not-null's synthesized constraint name. A check or exclusion constraint
+ * and an index expression element involve the column when the same lexical scan `names.ts` uses
+ * for conventional names reads the column out of the opaque text.
  */
 export function releasedBaselineKeys(
   plan: Plan,
@@ -596,11 +598,20 @@ function tableKey(table: TableIdentity): string {
 /** Whether a baseline claim belongs to a column PostgreSQL drops with the table's column. */
 function involvesColumn(claim: NameClaim, column: string): boolean {
   if (claim.scope === 'constraint') return detailInvolvesColumn(claim.detail, column);
+  // A constraint's backing index is tied to the column through the constraint's payload.
   if (claim.detail !== undefined) return detailInvolvesColumn(claim.detail, column);
   return (
-    (claim.index?.columns.some((element) => element === column) ?? false) ||
+    (claim.index?.columns.some((element) => indexElementInvolvesColumn(element, column)) ??
+      false) ||
     (claim.index?.include?.includes(column) ?? false)
   );
+}
+
+/** Whether an index element is the column itself or an expression that reads it. */
+function indexElementInvolvesColumn(element: Index['columns'][number], column: string): boolean {
+  return typeof element === 'string'
+    ? element === column
+    : expressionColumnIdentifiers(element.expression).has(column);
 }
 
 /** Whether a constraint's payload is structurally tied to the dropped column. */
@@ -609,8 +620,9 @@ function detailInvolvesColumn(detail: ConstraintClaimDetail, column: string): bo
     case 'not-null':
       return detail.column === column;
     case 'check':
+      return expressionColumnIdentifiers(detail.expression).has(column);
     case 'exclusion':
-      return false;
+      return expressionColumnIdentifiers(detail.elements).has(column);
     case 'primary-key':
     case 'foreign-key':
     case 'unique':

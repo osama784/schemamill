@@ -465,12 +465,12 @@ const IDENTIFIER_CONTINUATION = /[A-Za-z0-9_$\u0080-\uffff]/;
 const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
 
 /**
- * The column a check expression references, when it references exactly one, for PostgreSQL's
- * conventional constraint name. The scan is lexical and best-effort: it counts bare and quoted
- * identifiers that are not function names, type names after `::`, `CAST` aliases, or key
- * words. `undefined` when the expression references zero or several columns.
+ * The distinct bare and quoted identifiers in an opaque expression that read as column
+ * references. The scan is lexical and best-effort: it skips string and dollar-quoted text,
+ * function names, cast types after `::`, `CAST` aliases, and key words. The conventional-name
+ * prediction and baseline release share this rule so they agree on what an expression mentions.
  */
-function checkExpressionColumn(expression: string): string | undefined {
+export function expressionColumnIdentifiers(expression: string): ReadonlySet<string> {
   const columns = new Set<string>();
   let index = 0;
   while (index < expression.length) {
@@ -507,6 +507,16 @@ function checkExpressionColumn(expression: string): string | undefined {
     }
     index += 1;
   }
+  return columns;
+}
+
+/**
+ * The column a check expression references, when it references exactly one, for PostgreSQL's
+ * conventional constraint name. `undefined` when the expression references zero or several
+ * columns — that ambiguity is the best-effort scan's fail-safe, unchanged by the shared helper.
+ */
+function checkExpressionColumn(expression: string): string | undefined {
+  const columns = expressionColumnIdentifiers(expression);
   return columns.size === 1 ? [...columns][0] : undefined;
 }
 

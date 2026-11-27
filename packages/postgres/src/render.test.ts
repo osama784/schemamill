@@ -2508,6 +2508,128 @@ test('drop-column releases the column constraints and indexes of the baseline', 
   );
 });
 
+test('drop-column releases a baseline check constraint that references the column', () => {
+  // PostgreSQL drops a check constraint with the column its expression references, so its name
+  // is free for a new check on the column the plan keeps.
+  const baseline = model(
+    table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+      checkConstraints: [checkConstraint('a > 0', { name: 't_a_ck' })],
+    }),
+  );
+  const steps = [
+    { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) } as Step,
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('b > 0', { name: 't_a_ck' }),
+    } as Step,
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP COLUMN a;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_ck CHECK (b > 0);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control keeps the baseline check on the surviving column, so the release is load-bearing.
+  const retained = model(
+    table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+      checkConstraints: [checkConstraint('b > 0', { name: 't_a_ck' })],
+    }),
+  );
+  assertRefusal(
+    () => renderSql(planOf(...steps), { baseline: retained }),
+    'refusing to render: constraint creates on public.t would share the name "t_a_ck" with a baseline constraint: a check constraint named "t_a_ck" on (b > 0) and a check constraint named "t_a_ck" on (b > 0)',
+  );
+});
+
+test('drop-column releases a baseline exclusion constraint and its backing index', () => {
+  const baseline = model({
+    ...table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+    }),
+    exclusionConstraints: [exclusionConstraint('a WITH =', { name: 't_a_excl' })],
+  });
+  const steps = [
+    { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) } as Step,
+    {
+      kind: 'add-exclusion-constraint',
+      table: identity('t'),
+      exclusionConstraint: exclusionConstraint('b WITH =', { name: 't_a_excl' }),
+    } as Step,
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP COLUMN a;',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (b WITH =);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control puts the baseline exclusion on the surviving column, so nothing is released.
+  const retained = model({
+    ...table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+    }),
+    exclusionConstraints: [exclusionConstraint('b WITH =', { name: 't_a_excl' })],
+  });
+  assertRefusal(
+    () => renderSql(planOf(...steps), { baseline: retained }),
+    'refusing to render: constraint creates on public.t would share the name "t_a_excl" with a baseline constraint: an exclusion constraint named "t_a_excl" on (b WITH =) and an exclusion constraint named "t_a_excl" on (b WITH =)',
+  );
+});
+
+test('drop-column releases a baseline expression index that references the column', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a', { type: 'text' }), column('b', { type: 'text' })],
+      indexes: [tableIndex([{ expression: 'lower(a)' }], { name: 't_a_expr_idx' })],
+    }),
+  );
+  const steps = [
+    { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'text' }) } as Step,
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('t') },
+      index: tableIndex(['b'], { name: 't_a_expr_idx' }),
+    } as Step,
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline }),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP COLUMN a;',
+      'CREATE INDEX t_a_expr_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control keeps the expression on the surviving column, so nothing is released.
+  const retained = model(
+    table('t', {
+      columns: [column('a', { type: 'text' }), column('b', { type: 'text' })],
+      indexes: [tableIndex([{ expression: 'lower(b)' }], { name: 't_a_expr_idx' })],
+    }),
+  );
+  assertRefusal(
+    () => renderSql(planOf(...steps), { baseline: retained }),
+    'refusing to render: index creates on public.t would share the name "t_a_expr_idx" with a baseline index: an index named "t_a_expr_idx" on (lower(b)) and an index named "t_a_expr_idx" on (b)',
+  );
+});
+
 test('an absent baseline leaves rendering byte-identical', () => {
   const columns = [column('a', { type: 'integer' }), column('b', { type: 'integer' })];
   const baseline = model(table('t', { columns, indexes: [tableIndex(['a'])] }));
