@@ -76,6 +76,7 @@ export function registerExport(program: Command): void {
       try {
         sql = renderSql(projectable, {
           targetVersion: Number(options.targetVersion),
+          baseline: EMPTY_MODEL,
         });
       } catch (error) {
         if (!(error instanceof RenderRefusalError)) throw error;

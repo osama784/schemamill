@@ -1,5 +1,5 @@
 import { assertNever } from '@schemamill/core';
-import type { Index, IndexOwner, Plan, Table, TableIdentity } from '@schemamill/core';
+import type { Index, IndexOwner, Model, Plan, Table, TableIdentity } from '@schemamill/core';
 
 import {
   synthesizedCheckConstraintName,
@@ -68,6 +68,8 @@ interface ClaimBase {
   readonly originalName?: string;
   /** True when the name was predicted by a conventional formula. */
   readonly synthesized: boolean;
+  /** True for a claim describing an object already materialized in a baseline model. */
+  readonly baseline?: true;
 }
 
 /** A claim on the schema-wide index namespace. */
@@ -107,6 +109,17 @@ export function nameClaimKey(claim: NameClaim): string {
     : JSON.stringify(['constraint', claim.schema, claim.table, claim.name, claim.polarity]);
 }
 
+/**
+ * The part of a claim's key that survives polarity: `[schema, name]` for an index and
+ * `[schema, table, name]` for a constraint. A baseline object occupies this identity; a plan's
+ * drop claim for the same identity releases it, and a create claim for it then collides.
+ */
+export function nameClaimIdentity(claim: NameClaim): string {
+  return claim.scope === 'index'
+    ? JSON.stringify(['index', claim.schema, claim.name])
+    : JSON.stringify(['constraint', claim.schema, claim.table, claim.name]);
+}
+
 /** The result of resolving an explicit-or-unnamed name into its server form. */
 interface ResolvedName {
   readonly name: string;
@@ -139,18 +152,16 @@ export function collectNameClaims(plan: Plan): readonly NameClaim[] {
         const resolved = resolveName(step.index.name, () =>
           synthesizedIndexName(relation, step.index),
         );
-        claims.push({
-          scope: 'index',
-          schema: relation.schema,
+        pushIndexClaim(
+          claims,
           relation,
-          index: step.index,
-          step: index,
-          polarity:
-            step.kind === 'create-index' || step.kind === 'create-index-concurrently'
-              ? 'create'
-              : 'drop',
-          ...resolved,
-        });
+          step.index,
+          index,
+          step.kind === 'create-index' || step.kind === 'create-index-concurrently'
+            ? 'create'
+            : 'drop',
+          resolved,
+        );
         break;
       }
       case 'add-primary-key':
@@ -326,6 +337,7 @@ function pushConstraint(
   step: number,
   polarity: NameClaimPolarity,
   resolved: ResolvedName,
+  baseline?: true,
 ): void {
   claims.push({
     scope: 'constraint',
@@ -336,6 +348,7 @@ function pushConstraint(
     step,
     polarity,
     ...resolved,
+    ...(baseline === undefined ? {} : { baseline }),
   });
 }
 
@@ -347,6 +360,7 @@ function pushBackingIndex(
   step: number,
   polarity: NameClaimPolarity,
   resolved: ResolvedName,
+  baseline?: true,
 ): void {
   claims.push({
     scope: 'index',
@@ -356,5 +370,194 @@ function pushBackingIndex(
     step,
     polarity,
     ...resolved,
+    ...(baseline === undefined ? {} : { baseline }),
   });
+}
+
+/** Pushes one standalone-index claim, on a table or a materialized view. */
+function pushIndexClaim(
+  claims: NameClaim[],
+  relation: TableIdentity,
+  index: Index,
+  step: number,
+  polarity: NameClaimPolarity,
+  resolved: ResolvedName,
+  baseline?: true,
+): void {
+  claims.push({
+    scope: 'index',
+    schema: relation.schema,
+    relation,
+    index,
+    step,
+    polarity,
+    ...resolved,
+    ...(baseline === undefined ? {} : { baseline }),
+  });
+}
+
+/**
+ * The names a baseline model has already materialized, in the same two namespaces and the same
+ * server form as the plan claims: an explicit name clipped to 63 bytes, an unnamed one predicted
+ * by the conventional formula. A baseline object occupies its identity as if it were a create;
+ * the guard checks plan creates against these claims, never baseline against baseline (the
+ * baseline is an existing, valid schema). An unnamed not-null fact claims nothing before
+ * PostgreSQL 18; its version-aware occupancy belongs to a later workstream.
+ */
+export function collectBaselineClaims(baseline: Model): readonly NameClaim[] {
+  const claims: NameClaim[] = [];
+  for (const table of baseline.tables) collectTableClaims(claims, table);
+  for (const view of baseline.views) {
+    if (!view.materialized || view.indexes === undefined) continue;
+    for (const index of view.indexes) {
+      pushIndexClaim(
+        claims,
+        view,
+        index,
+        -1,
+        'create',
+        resolveName(index.name, () => synthesizedIndexName(view, index)),
+        true,
+      );
+    }
+  }
+  return claims;
+}
+
+/** Every named object one baseline table materializes, in both guard namespaces. */
+function collectTableClaims(claims: NameClaim[], table: Table): void {
+  if (table.primaryKey !== undefined) {
+    const resolved = resolveName(table.primaryKey.name, () => synthesizedPrimaryKeyName(table));
+    const detail: ConstraintClaimDetail = {
+      kind: 'primary-key',
+      columns: table.primaryKey.columns,
+    };
+    pushConstraint(claims, table, detail, -1, 'create', resolved, true);
+    pushBackingIndex(claims, table, detail, -1, 'create', resolved, true);
+  }
+  for (const foreignKey of table.foreignKeys) {
+    pushConstraint(
+      claims,
+      table,
+      { kind: 'foreign-key', columns: foreignKey.columns },
+      -1,
+      'create',
+      resolveName(foreignKey.name, () => synthesizedForeignKeyName(table, foreignKey)),
+      true,
+    );
+  }
+  for (const unique of table.uniqueConstraints) {
+    const resolved = resolveName(unique.name, () => synthesizedUniqueConstraintName(table, unique));
+    const detail: ConstraintClaimDetail = { kind: 'unique', columns: unique.columns };
+    pushConstraint(claims, table, detail, -1, 'create', resolved, true);
+    pushBackingIndex(claims, table, detail, -1, 'create', resolved, true);
+  }
+  for (const check of table.checkConstraints) {
+    pushConstraint(
+      claims,
+      table,
+      { kind: 'check', expression: check.expression },
+      -1,
+      'create',
+      resolveName(check.name, () => synthesizedCheckConstraintName(table, check)),
+      true,
+    );
+  }
+  for (const exclusion of table.exclusionConstraints ?? []) {
+    const resolved = resolveName(exclusion.name, () =>
+      synthesizedExclusionConstraintName(table, exclusion),
+    );
+    const detail: ConstraintClaimDetail = {
+      kind: 'exclusion',
+      elements: exclusion.elements,
+    };
+    pushConstraint(claims, table, detail, -1, 'create', resolved, true);
+    pushBackingIndex(claims, table, detail, -1, 'create', resolved, true);
+  }
+  for (const index of table.indexes) {
+    pushIndexClaim(
+      claims,
+      table,
+      index,
+      -1,
+      'create',
+      resolveName(index.name, () => synthesizedIndexName(table, index)),
+      true,
+    );
+  }
+  for (const column of table.columns) {
+    // An unnamed not-null fact has no pg_constraint row before PostgreSQL 18.
+    if (column.notNull && column.notNullName !== undefined) {
+      pushConstraint(
+        claims,
+        table,
+        { kind: 'not-null', column: column.name },
+        -1,
+        'create',
+        statedName(column.notNullName),
+        true,
+      );
+    }
+  }
+}
+
+/**
+ * The baseline identities the plan frees. A drop-polarity claim releases the same identity in
+ * either namespace, so a drop-then-recreate of one name is not refused. A `drop-table` releases
+ * every name its baseline table materialized; a `drop-column` releases the baseline constraints
+ * and indexes that involve that column, since PostgreSQL drops them with it. Constraints whose
+ * payload is opaque text (check and exclusion) are never guessed from an expression.
+ */
+export function releasedBaselineKeys(plan: Plan, baseline: Model): ReadonlySet<string> {
+  const released = new Set<string>();
+  for (const claim of collectNameClaims(plan)) {
+    if (claim.polarity === 'drop') released.add(nameClaimIdentity(claim));
+  }
+  const tables = new Map<string, Table>();
+  for (const table of baseline.tables) tables.set(tableKey(table), table);
+  for (const step of plan.steps) {
+    if (step.kind !== 'drop-table' && step.kind !== 'drop-column') continue;
+    const table = tables.get(tableKey(step.table));
+    if (table === undefined) continue;
+    const claims: NameClaim[] = [];
+    collectTableClaims(claims, table);
+    for (const claim of claims) {
+      if (step.kind === 'drop-table' || involvesColumn(claim, step.column.name)) {
+        released.add(nameClaimIdentity(claim));
+      }
+    }
+  }
+  return released;
+}
+
+/** The schema-qualified identity used to find a baseline table for a drop step. */
+function tableKey(table: TableIdentity): string {
+  return JSON.stringify([table.schema, table.name]);
+}
+
+/** Whether a baseline claim belongs to a column PostgreSQL drops with the table's column. */
+function involvesColumn(claim: NameClaim, column: string): boolean {
+  if (claim.scope === 'constraint') return detailInvolvesColumn(claim.detail, column);
+  if (claim.detail !== undefined) return detailInvolvesColumn(claim.detail, column);
+  return (
+    (claim.index?.columns.some((element) => element === column) ?? false) ||
+    (claim.index?.include?.includes(column) ?? false)
+  );
+}
+
+/** Whether a constraint's payload is structurally tied to the dropped column. */
+function detailInvolvesColumn(detail: ConstraintClaimDetail, column: string): boolean {
+  switch (detail.kind) {
+    case 'not-null':
+      return detail.column === column;
+    case 'check':
+    case 'exclusion':
+      return false;
+    case 'primary-key':
+    case 'foreign-key':
+    case 'unique':
+      return detail.columns.includes(column);
+    default:
+      assertNever(detail, 'name-claims column involvement');
+  }
 }

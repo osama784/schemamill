@@ -20,6 +20,7 @@ import type {
   IdentityFieldChange,
   Index,
   IndexOwner,
+  Model,
   Plan,
   PrimaryKey,
   Sequence,
@@ -33,7 +34,13 @@ import type {
   View,
 } from '@schemamill/core';
 
-import { collectNameClaims, nameClaimKey } from './name-claims.ts';
+import {
+  collectBaselineClaims,
+  collectNameClaims,
+  nameClaimIdentity,
+  nameClaimKey,
+  releasedBaselineKeys,
+} from './name-claims.ts';
 import type { ConstraintClaimDetail, NameClaim } from './name-claims.ts';
 import {
   synthesizedCheckConstraintName,
@@ -330,6 +337,14 @@ export interface RenderOptions {
    * a major newer than `MAX_TARGET_VERSION` is accepted and behaves like the newest one.
    */
   readonly targetVersion?: number;
+  /**
+   * The model the plan starts from, when the caller has one. A baseline object already occupies
+   * its server-form name, so a create claim that collides with it is refused before any SQL is
+   * emitted; a same-identity drop in the plan releases the name first, so drop-then-recreate of
+   * one name still renders. Absent, rendering stays plan-local: only claims made by the plan are
+   * checked, and the output is byte-identical to a call without this option.
+   */
+  readonly baseline?: Model;
 }
 
 /**
@@ -349,7 +364,8 @@ export class RenderRefusalError extends Error {
 /**
  * The migration SQL for `plan`, deterministic in the plan and the declared target.
  * `plan.groups` must tile `[0, plan.steps.length)`; a malformed partition throws before
- * anything renders, and so does a plan whose name claims collide in either guard namespace.
+ * anything renders, and so does a plan whose name claims collide in either guard namespace —
+ * including a create that collides with a name an `options.baseline` object already occupies.
  * `options.targetVersion` is the PostgreSQL major the SQL is generated for,
  * defaulting to `MIN_TARGET_VERSION`; a renderer-synthesized reset form below its floor refuses
  * with `RenderRefusalError`, while a declaration the model carries renders as declared at every
@@ -370,7 +386,7 @@ export function renderSql(plan: Plan, options?: RenderOptions): string {
     targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
       ? collapseEnforcementFlips(plan)
       : undefined;
-  assertNamesUnique(plan);
+  assertNamesUnique(plan, options?.baseline);
   if (plan.steps.length === 0) return '';
   const groups: string[] = [];
   for (const group of plan.groups) {
@@ -436,15 +452,31 @@ function assertGroupsTileSteps(plan: Plan): void {
  * constraint keys are `[schema, table, name, polarity]` across all kinds. A collision is
  * reported once, for the first pair in plan order.
  */
-function assertNamesUnique(plan: Plan): void {
+function assertNamesUnique(plan: Plan, baseline?: Model): void {
+  const claims = collectNameClaims(plan);
   const claimed = new Map<string, NameClaim>();
-  for (const claim of collectNameClaims(plan)) {
+  for (const claim of claims) {
     const key = nameClaimKey(claim);
     const previous = claimed.get(key);
     if (previous !== undefined) {
       throw new RenderRefusalError(nameCollisionMessage(claim, previous));
     }
     claimed.set(key, claim);
+  }
+  if (baseline === undefined) return;
+  const released = releasedBaselineKeys(plan, baseline);
+  const occupied = new Map<string, NameClaim>();
+  for (const claim of collectBaselineClaims(baseline)) {
+    const identity = nameClaimIdentity(claim);
+    if (released.has(identity)) continue;
+    if (!occupied.has(identity)) occupied.set(identity, claim);
+  }
+  for (const claim of claims) {
+    if (claim.polarity !== 'create') continue;
+    const earlier = occupied.get(nameClaimIdentity(claim));
+    if (earlier !== undefined) {
+      throw new RenderRefusalError(baselineCollisionMessage(claim, earlier));
+    }
   }
 }
 
@@ -468,6 +500,21 @@ function nameCollisionMessage(later: NameClaim, earlier: NameClaim): string {
   return (
     `refusing to render: ${later.scope} ${polarity} on ${location} would share the name ` +
     `${JSON.stringify(later.name)}: ${describeNameClaim(earlier)} and ${describeNameClaim(later)}`
+  );
+}
+
+/**
+ * The baseline-occupancy refusal shape: the same prefix as a plan-local collision, with the
+ * existing object named as a baseline one. The earlier claimant is the materialized baseline
+ * object; the later one is the plan create that cannot claim the name at apply time.
+ */
+function baselineCollisionMessage(later: NameClaim, earlier: NameClaim): string {
+  const location =
+    later.scope === 'index' ? renderTable(later.relation) : renderTable(later.tableIdentity);
+  return (
+    `refusing to render: ${later.scope} creates on ${location} would share the name ` +
+    `${JSON.stringify(later.name)} with a baseline ${later.scope}: ` +
+    `${describeNameClaim(earlier)} and ${describeNameClaim(later)}`
   );
 }
 

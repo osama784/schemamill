@@ -79,7 +79,10 @@ export function registerPlan(program: Command): void {
           let refusal: string | undefined;
           if (planned.steps.length > 0) {
             try {
-              renderSql(planned, { targetVersion: Number(options.targetVersion) });
+              renderSql(planned, {
+                targetVersion: Number(options.targetVersion),
+                baseline: imported.baseline,
+              });
             } catch (error) {
               if (!(error instanceof RenderRefusalError)) throw error;
               refusal = error.message;
@@ -118,7 +121,10 @@ export function registerPlan(program: Command): void {
           process.stdout.write(`${formatPlan(planned)}\n${hazardsBlock}`);
           try {
             process.stdout.write(
-              renderSql(planned, { targetVersion: Number(options.targetVersion) }),
+              renderSql(planned, {
+                targetVersion: Number(options.targetVersion),
+                baseline: imported.baseline,
+              }),
             );
           } catch (error) {
             if (!(error instanceof RenderRefusalError)) throw error;

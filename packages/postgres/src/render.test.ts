@@ -2343,6 +2343,194 @@ test('a dropped index and a created index of one name coexist across tables', ()
   );
 });
 
+test('a target explicit twin refuses against a baseline-materialized unnamed index', () => {
+  // The baseline's unnamed index is materialized by PostgreSQL as `t_a_idx`. The target keeps it
+  // and adds an explicit index named `t_a_idx`, so the plan's create would collide at apply.
+  const columns = [column('a', { type: 'integer' }), column('b', { type: 'integer' })];
+  const baseline = model(table('t', { columns, indexes: [tableIndex(['a'])] }));
+  const target = model(
+    table('t', { columns, indexes: [tableIndex(['a']), tableIndex(['b'], { name: 't_a_idx' })] }),
+  );
+
+  assertRefusal(
+    () => renderSql(plan(baseline, target), { baseline }),
+    'refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)',
+  );
+});
+
+test('a drop then recreate of one baseline name is accepted', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+      indexes: [tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf(
+        {
+          kind: 'drop-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['a'], { name: 't_a_idx' }),
+        },
+        {
+          kind: 'create-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['b'], { name: 't_a_idx' }),
+        },
+      ),
+      { baseline },
+    ),
+    [
+      'BEGIN;',
+      'DROP INDEX public.t_a_idx;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('drop-table releases the baseline indexes and constraints of the removed table', () => {
+  const baseline = model(
+    table('t', {
+      columns: [column('id', { type: 'integer' })],
+      indexes: [tableIndex(['id'], { name: 't_id_idx' })],
+      checkConstraints: [checkConstraint('id > 0', { name: 't_id_ck' })],
+    }),
+  );
+  const recreated = table('t', {
+    columns: [column('id', { type: 'integer' })],
+    primaryKey: { name: 't_id_idx', columns: ['id'] },
+  });
+  const steps = [
+    { kind: 'drop-table', table: identity('t') } as Step,
+    { kind: 'create-table', table: recreated } as Step,
+    {
+      kind: 'add-check-constraint',
+      table: identity('t'),
+      checkConstraint: checkConstraint('id > 0', { name: 't_id_ck' }),
+    } as Step,
+  ];
+
+  assert.equal(
+    renderSql(planOf(...steps), { baseline }),
+    [
+      'BEGIN;',
+      'DROP TABLE public.t;',
+      'CREATE TABLE public.t (',
+      '    id integer,',
+      '    CONSTRAINT t_id_idx PRIMARY KEY (id)',
+      ');',
+      'ALTER TABLE public.t ADD CONSTRAINT t_id_ck CHECK (id > 0);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control keeps both names on a surviving table, so the drop releases nothing and the
+  // same recreated names must be refused — the release above is load-bearing.
+  const retained = model(
+    table('u', {
+      columns: [column('id', { type: 'integer' })],
+      indexes: [tableIndex(['id'], { name: 't_id_idx' })],
+      checkConstraints: [checkConstraint('id > 0', { name: 't_id_ck' })],
+    }),
+  );
+  assertRefusal(
+    () => renderSql(planOf(...steps), { baseline: retained }),
+    'refusing to render: index creates on public.t would share the name "t_id_idx" with a baseline index: an index named "t_id_idx" on (id) and the backing index of a primary key named "t_id_idx" on (id)',
+  );
+});
+
+test('drop-column releases the column constraints and indexes of the baseline', () => {
+  // Both names belong to column `a`, which the plan drops: PostgreSQL drops its named not-null
+  // constraint and its index with the column, so neither name is occupied afterwards.
+  const baseline = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'integer', notNull: true, notNullName: 't_a_nn' }),
+        column('b', { type: 'integer' }),
+      ],
+      indexes: [tableIndex(['a'], { name: 't_a_idx' })],
+    }),
+  );
+
+  assert.equal(
+    renderSql(
+      planOf(
+        { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) },
+        {
+          kind: 'create-index',
+          owner: { kind: 'table', table: identity('t') },
+          index: tableIndex(['b'], { name: 't_a_idx' }),
+        },
+        { kind: 'add-not-null', table: identity('t'), column: 'b', name: 't_a_nn' },
+      ),
+      { baseline },
+    ),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.t DROP COLUMN a;',
+      'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+      'ALTER TABLE public.t ADD CONSTRAINT t_a_nn NOT NULL b;',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
+
+  // The control puts both names on the column the plan keeps, so drop-column releases nothing.
+  const retained = model(
+    table('t', {
+      columns: [
+        column('a', { type: 'integer' }),
+        column('b', { type: 'integer', notNull: true, notNullName: 't_a_nn' }),
+      ],
+      indexes: [tableIndex(['b'], { name: 't_a_idx' })],
+    }),
+  );
+  assertRefusal(
+    () =>
+      renderSql(
+        planOf(
+          { kind: 'drop-column', table: identity('t'), column: column('a', { type: 'integer' }) },
+          {
+            kind: 'create-index',
+            owner: { kind: 'table', table: identity('t') },
+            index: tableIndex(['b'], { name: 't_a_idx' }),
+          },
+          { kind: 'add-not-null', table: identity('t'), column: 'b', name: 't_a_nn' },
+        ),
+        { baseline: retained },
+      ),
+    'refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an index named "t_a_idx" on (b) and an index named "t_a_idx" on (b)',
+  );
+});
+
+test('an absent baseline leaves rendering byte-identical', () => {
+  const columns = [column('a', { type: 'integer' }), column('b', { type: 'integer' })];
+  const baseline = model(table('t', { columns, indexes: [tableIndex(['a'])] }));
+  const target = model(
+    table('t', { columns, indexes: [tableIndex(['a']), tableIndex(['b'], { name: 't_a_idx' })] }),
+  );
+  const planned = plan(baseline, target);
+  const expected = [
+    'BEGIN;',
+    'CREATE INDEX t_a_idx ON public.t USING btree (b);',
+    'COMMIT;',
+    '',
+  ].join('\n');
+
+  assert.equal(renderSql(planned), expected);
+  assert.equal(renderSql(planned, {}), expected);
+  assert.equal(renderSql(planned, { baseline: undefined }), expected);
+  assertRefusal(
+    () => renderSql(planned, { baseline }),
+    'refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)',
+  );
+});
+
 test('index drops are schema-qualified, named or synthesized, both kinds', () => {
   // A bare `DROP INDEX` name resolves through `search_path`, so an index on a non-public
   // table must be dropped as `<schema>.<name>`; the name is synthesized when absent, exactly

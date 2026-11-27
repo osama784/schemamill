@@ -21,7 +21,7 @@ import type {
 } from '@schemamill/core';
 
 import { catalogReader, importDump, renderSql } from './index.ts';
-import { scenes } from './live-scenes.ts';
+import { baselineOccupancyRefusedTarget, scenes } from './live-scenes.ts';
 import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts';
 
 /**
@@ -76,6 +76,9 @@ const pgUrl = process.env.SCHEMAMILL_TEST_PG_URL || undefined;
  */
 const runToken = randomBytes(4).toString('hex');
 
+/** The empty baseline of every build render: a build projects a model onto an empty database. */
+const EMPTY_MODEL: Model = { tables: [], sequences: [], views: [], extensions: [] };
+
 test(
   'live PostgreSQL: build, migrate, dump, import, compare',
   { skip: pgUrl === undefined ? 'SCHEMAMILL_TEST_PG_URL is not set' : false },
@@ -120,6 +123,12 @@ test(
         'falsification: wrapping the standalone concurrent build is refused',
         async () => {
           await assertConcurrentBuildRejectsWrapping(baseUrl, workDir, serverMajor);
+        },
+      );
+      await t.test(
+        'baseline occupancy: the colliding twin fails at apply, the accepted plan applies',
+        async () => {
+          await assertBaselineOccupancyRefusal(baseUrl, workDir, serverMajor);
         },
       );
     } finally {
@@ -368,6 +377,7 @@ function corruptLastStatement(
 
   const lines = renderSql(plan(scene.baseline, scene.target), {
     targetVersion: serverMajor,
+    baseline: scene.baseline,
   }).split('\n');
   const commit = lines.lastIndexOf('COMMIT;');
   assert.ok(commit > 0, `${scene.name}: the rendered migration must end with COMMIT;`);
@@ -419,8 +429,9 @@ async function assertRollbackLeavesNoPartialEffect(
     const baselineFile = join(workDir, 'rollback.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+      renderSql(plan(EMPTY_MODEL, scene.baseline), {
         targetVersion: serverMajor,
+        baseline: EMPTY_MODEL,
       }),
       'utf8',
     );
@@ -473,8 +484,9 @@ async function assertStrippedWrappersLeavePartialEffect(
     const baselineFile = join(workDir, 'stripped.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+      renderSql(plan(EMPTY_MODEL, scene.baseline), {
         targetVersion: serverMajor,
+        baseline: EMPTY_MODEL,
       }),
       'utf8',
     );
@@ -545,8 +557,9 @@ async function assertConcurrentBuildRejectsWrapping(
     const baselineFile = join(workDir, 'concurrent.baseline.sql');
     await writeFile(
       baselineFile,
-      renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+      renderSql(plan(EMPTY_MODEL, scene.baseline), {
         targetVersion: serverMajor,
+        baseline: EMPTY_MODEL,
       }),
       'utf8',
     );
@@ -554,6 +567,7 @@ async function assertConcurrentBuildRejectsWrapping(
 
     const lines = renderSql(plan(scene.baseline, scene.target), {
       targetVersion: serverMajor,
+      baseline: scene.baseline,
     }).split('\n');
     const concurrent = lines.filter((line) => line.startsWith('CREATE INDEX CONCURRENTLY '));
     assert.equal(concurrent.length, 1, `${scene.name}: exactly one concurrent statement renders`);
@@ -607,6 +621,85 @@ async function assertConcurrentBuildRejectsWrapping(
   }
 }
 
+/**
+ * Baseline occupancy against a real server: build the scene's baseline so PostgreSQL
+ * materializes its unnamed index as `t_a_idx`, then apply the twin plan rendered *without* the
+ * guard — the name must fail at apply with a duplicate relation. The accepted plan, rendered with
+ * the baseline, must then apply to the same database and leave both indexes in place.
+ */
+async function assertBaselineOccupancyRefusal(
+  baseUrl: string,
+  workDir: string,
+  serverMajor: number,
+): Promise<void> {
+  const scene = scenes.find((candidate) => candidate.name === 'baseline-index-occupancy');
+  assert.ok(scene !== undefined, 'the baseline-index-occupancy scene is part of the live corpus');
+  const database = `schemamill_w6_baseline_occupancy_${runToken}`;
+  const url = withDatabase(baseUrl, database);
+  const indexes = () =>
+    query(
+      url,
+      "select coalesce(string_agg(indexname, ',' order by indexname), '') from pg_indexes" +
+        " where schemaname = 'public' and tablename = 't'",
+    );
+
+  try {
+    await dropDatabase(baseUrl, database);
+    await createDatabase(baseUrl, database);
+
+    const baselineFile = join(workDir, 'baseline-occupancy.baseline.sql');
+    await writeFile(
+      baselineFile,
+      renderSql(plan(EMPTY_MODEL, scene.baseline), {
+        targetVersion: serverMajor,
+        baseline: EMPTY_MODEL,
+      }),
+      'utf8',
+    );
+    await applyFile(url, baselineFile);
+    assert.equal(
+      await indexes(),
+      't_a_idx',
+      `${database}: the baseline must materialize the unnamed index as t_a_idx`,
+    );
+
+    // Rendering without a baseline is the pre-guard behavior: the twin's create reaches psql.
+    const twin = baselineOccupancyRefusedTarget();
+    const twinSql = renderSql(plan(scene.baseline, twin), { targetVersion: serverMajor });
+    assert.match(twinSql, /CREATE INDEX t_a_idx ON public\.t USING btree \(b\);/u);
+    const twinFile = join(workDir, 'baseline-occupancy.twin.sql');
+    await writeFile(twinFile, twinSql, 'utf8');
+    const failure = await applyExpectingFailure(url, twinFile);
+    assert.ok(
+      failure.includes('relation "t_a_idx" already exists'),
+      `${database}: the twin failed for the wrong reason: ${failure}`,
+    );
+    assert.equal(
+      await indexes(),
+      't_a_idx',
+      `${database}: the refused twin must leave the baseline index untouched`,
+    );
+
+    const acceptedFile = join(workDir, 'baseline-occupancy.accepted.sql');
+    await writeFile(
+      acceptedFile,
+      renderSql(plan(scene.baseline, scene.target), {
+        targetVersion: serverMajor,
+        baseline: scene.baseline,
+      }),
+      'utf8',
+    );
+    await applyFile(url, acceptedFile);
+    assert.equal(
+      await indexes(),
+      't_a_idx,t_b_idx',
+      `${database}: the accepted plan must apply and leave both indexes`,
+    );
+  } finally {
+    await dropDatabase(baseUrl, database);
+  }
+}
+
 /** The SQL files one scene runs through, and where its dumps land for inspection. */
 interface SceneFiles {
   /** Raw setup SQL applied to both databases before their builds, when the scene declares it. */
@@ -632,20 +725,24 @@ async function writeSceneFiles(
   const migration = join(workDir, `${slug}.migrate.sql`);
   await writeFile(
     baselineBuild,
-    renderSql(plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.baseline), {
+    renderSql(plan(EMPTY_MODEL, scene.baseline), {
       targetVersion: serverMajor,
+      baseline: EMPTY_MODEL,
     }),
     'utf8',
   );
-  const targetSql = renderSql(
-    plan({ tables: [], sequences: [], views: [], extensions: [] }, scene.target),
-    { targetVersion: serverMajor },
-  );
+  const targetSql = renderSql(plan(EMPTY_MODEL, scene.target), {
+    targetVersion: serverMajor,
+    baseline: EMPTY_MODEL,
+  });
   const targetExtras = scene.targetExtraSql === undefined ? '' : `${scene.targetExtraSql}\n`;
   await writeFile(targetBuild, `${targetSql}${targetExtras}`, 'utf8');
   await writeFile(
     migration,
-    renderSql(plan(scene.baseline, scene.target), { targetVersion: serverMajor }),
+    renderSql(plan(scene.baseline, scene.target), {
+      targetVersion: serverMajor,
+      baseline: scene.baseline,
+    }),
     'utf8',
   );
   return {
@@ -673,7 +770,10 @@ async function assertChecks(url: string, checks: readonly SceneCheck[]): Promise
 function assertPlanChecks(scene: LiveScene, serverMajor: number): void {
   const migration = plan(scene.baseline, scene.target);
   for (const check of scene.planChecks ?? []) {
-    const failure = check.failure(migration.steps, migration, serverMajor);
+    const failure = check.failure(migration.steps, migration, serverMajor, {
+      targetVersion: serverMajor,
+      baseline: scene.baseline,
+    });
     assert.ok(
       failure === undefined,
       `${scene.name}: ${check.description}${failure === undefined ? '' : `: ${failure}`}`,

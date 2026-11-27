@@ -4,6 +4,7 @@ import {
   diff,
   effectiveIdentity,
   effectiveSequence,
+  plan,
   serializeIndexElement,
 } from '@schemamill/core';
 import type {
@@ -35,7 +36,8 @@ import type {
   View,
 } from '@schemamill/core';
 
-import { renderSql } from './render.ts';
+import { RenderRefusalError, renderSql } from './render.ts';
+import type { RenderOptions } from './render.ts';
 
 /** The one display/join rule for index elements: plain columns and `{"expression": …}` text. */
 function joinIndexElements(elements: readonly IndexElement[], separator = ','): string {
@@ -353,11 +355,18 @@ export interface SceneCheck {
  * `serverMajor` is the major of the server the harness applies the SQL to. A check that
  * renders the plan passes it through as `renderSql`'s `targetVersion`, so the probe sees the
  * same SQL the server will, and a synthesized form the server cannot accept refuses here
- * rather than on apply.
+ * rather than on apply. The optional fourth argument carries the full render options — the
+ * server major beside the scene's baseline — so a refusal scene can render with the same
+ * occupancy guard the harness applies to its migration.
  */
 export interface ScenePlanCheck {
   readonly description: string;
-  readonly failure: (steps: readonly Step[], plan: Plan, serverMajor: number) => string | undefined;
+  readonly failure: (
+    steps: readonly Step[],
+    plan: Plan,
+    serverMajor: number,
+    options?: RenderOptions,
+  ) => string | undefined;
 }
 
 /**
@@ -8051,6 +8060,110 @@ const objectPrivilegesScene = (): LiveScene => {
   };
 };
 
+/**
+ * The target the baseline-occupancy scene refuses: PostgreSQL names the baseline's unnamed index
+ * on `a` as `t_a_idx`, and this target adds an explicit index of that name on `b` without
+ * dropping the original. The accepted scene instead names the new index `t_b_idx`.
+ */
+export const baselineOccupancyRefusedTarget = (): Model =>
+  model(
+    table('t', {
+      columns: [column('a', { type: 'integer' }), column('b', { type: 'integer' })],
+      indexes: [
+        { unique: false, columns: ['a'] },
+        { unique: false, columns: ['b'], name: 't_a_idx' },
+      ],
+    }),
+  );
+
+/**
+ * Baseline occupancy: the baseline builds an unnamed index that the server materializes as
+ * `t_a_idx`. The accepted target adds `t_b_idx` and round-trips; a plan check proves the explicit
+ * twin at `t_a_idx` is refused against the baseline, and a harness falsification proves the same
+ * twin would fail at apply without the guard.
+ */
+const baselineIndexOccupancyScene = (): LiveScene => {
+  const columns = [column('a', { type: 'integer' }), column('b', { type: 'integer' })];
+  const baseline = model(table('t', { columns, indexes: [{ unique: false, columns: ['a'] }] }));
+  const target = model(
+    table('t', {
+      columns,
+      indexes: [
+        { unique: false, columns: ['a'] },
+        { unique: false, columns: ['b'], name: 't_b_idx' },
+      ],
+    }),
+  );
+
+  return {
+    name: 'baseline-index-occupancy',
+    baseline,
+    target,
+    baselineChecks: [
+      {
+        description: 'the unnamed baseline index is materialized as t_a_idx',
+        sql: indexesOf('t'),
+        expected: 't_a_idx',
+      },
+    ],
+    planChecks: [
+      {
+        description: 'the accepted plan creates only the non-colliding explicit index',
+        failure: (steps, plan) => {
+          const kinds = steps.map((step) => step.kind).join(',');
+          if (kinds !== 'create-index') return `unexpected steps: ${kinds}`;
+          const names = steps
+            .map((step) => (step.kind === 'create-index' ? (step.index.name ?? '<unnamed>') : ''))
+            .join(',');
+          if (names !== 't_b_idx') return `created: ${names}`;
+          return plan.groups.length === 1 && plan.groups[0]?.transactional === true
+            ? undefined
+            : 'the accepted plan must be one transactional group';
+        },
+      },
+      {
+        description: 'the explicit twin is refused against the baseline unnamed index',
+        failure: (_steps, _plan, serverMajor, options) => {
+          const twin = baselineOccupancyRefusedTarget();
+          let refusal: string | undefined;
+          try {
+            renderSql(plan(baseline, twin), { ...options, baseline, targetVersion: serverMajor });
+          } catch (error) {
+            if (!(error instanceof RenderRefusalError)) throw error;
+            refusal = error.message;
+          }
+          const expected =
+            'refusing to render: index creates on public.t would share the name "t_a_idx"' +
+            ' with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)';
+          return refusal === expected ? undefined : `refusal: ${String(refusal)}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the migrated database carries both the server-named and the explicit index',
+        sql: indexesOf('t'),
+        expected: 't_a_idx,t_b_idx',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both imports carry the kept index unnamed and the new one named',
+        failure: (imported, source) => {
+          const entry = imported.model.tables.find((candidate) => candidate.name === 't');
+          if (entry === undefined) return `${source}: t is not imported`;
+          const indexes = entry.indexes
+            .map((index) => `${joinIndexElements(index.columns)}|${index.name ?? '<unnamed>'}`)
+            .join('; ');
+          return indexes === 'a|<unnamed>; b|t_b_idx'
+            ? undefined
+            : `${source}: indexes: ${indexes}`;
+        },
+      },
+    ],
+  };
+};
+
 /** Every scene, in the order the harness runs them. */
 export const scenes: readonly LiveScene[] = [
   createTableScene(),
@@ -8087,6 +8200,7 @@ export const scenes: readonly LiveScene[] = [
   indexConcurrentlyScene(),
   unnamedIndexRoundTripScene(),
   nonPublicIndexDropScene(),
+  baselineIndexOccupancyScene(),
   introspectionTracerScene(),
   introspectionIndexesScene(),
   introspectionIndexFamilyScene(),

@@ -906,6 +906,44 @@ test('plan prints the display before a render refusal, then one stderr line, exi
   assert.equal(result.code, 1);
 });
 
+test('plan passes the imported baseline to the render guard', async (t) => {
+  // The baseline's unnamed index is materialized as `t_a_idx`; the target adds an explicit twin
+  // but no drop, so only the baseline occupancy can expose the collision. Without the baseline
+  // option the single create renders and this test would see a clean plan.
+  const dir = await fixtureDir(t);
+  const baseline = await writeDump(
+    dir,
+    'baseline.sql',
+    ['CREATE TABLE public.t (a integer, b integer);', 'CREATE INDEX ON public.t (a);', ''].join(
+      '\n',
+    ),
+  );
+  const target = await writeDump(
+    dir,
+    'target.sql',
+    [
+      'CREATE TABLE public.t (a integer, b integer);',
+      'CREATE INDEX ON public.t (a);',
+      'CREATE INDEX t_a_idx ON public.t (b);',
+      '',
+    ].join('\n'),
+  );
+
+  const result = await runCli('plan', baseline, target);
+
+  assert.equal(
+    result.stdout,
+    ['1 step in one transaction:', ' 1. create-index  public.t: index t_a_idx (b)', '', ''].join(
+      '\n',
+    ),
+  );
+  assert.equal(
+    result.stderr,
+    'schemamill: refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an unnamed index on (a) and an index named "t_a_idx" on (b)\n',
+  );
+  assert.equal(result.code, 1);
+});
+
 test('plan --target-version 13 refuses the synthesized resets, display first', async () => {
   // The display is version-free: the golden's text before its SQL carries the plan and the
   // hazards. Target 13 refuses the first reset in plan order — the storage removal on
