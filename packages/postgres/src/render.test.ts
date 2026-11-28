@@ -3099,6 +3099,45 @@ test('declarations below their floors refuse, and render as declared at 18', () 
   assert.match(at18, /NOT ENFORCED/);
 });
 
+test('a declaration-floor refusal precedes a name-collision refusal', () => {
+  // The gate runs before `assertNamesUnique`, so a plan that is both below a declaration floor and
+  // name-colliding reports the declaration; the control keeps the collision alone. Swapping the
+  // two guards would make the first assertion report the collision instead.
+  const colliding: readonly Step[] = [
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('t') },
+      index: tableIndex(['c'], { name: 't_c_idx' }),
+    },
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('t') },
+      index: tableIndex(['c'], { name: 't_c_idx' }),
+    },
+  ];
+  const declarationAndCollision = planOf(
+    {
+      kind: 'add-column',
+      table: identity('t'),
+      column: column('c', { notNull: true, notNullName: 'nn_c' }),
+    },
+    ...colliding,
+  );
+  const collisionOnly = planOf(
+    { kind: 'add-column', table: identity('t'), column: column('c') },
+    ...colliding,
+  );
+
+  assertRefusal(
+    () => renderSql(declarationAndCollision, { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: named NOT NULL on public.t column c needs PostgreSQL 18 or newer',
+  );
+  assertRefusal(
+    () => renderSql(collisionOnly, { targetVersion: 13 }),
+    'refusing to render: index creates on public.t would share the name "t_c_idx": an index named "t_c_idx" on (c) and an index named "t_c_idx" on (c)',
+  );
+});
+
 test('a reset-free plan with an explicit compression method refuses at 13', () => {
   const planned = plan(
     model(),

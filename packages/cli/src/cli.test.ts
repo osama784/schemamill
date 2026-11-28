@@ -1175,7 +1175,7 @@ test('plan passes the imported baseline to the render guard', async (t) => {
 
 test('plan --target-version 13 refuses a declaration before the synthesized resets, display first', async () => {
   // The golden's plan display is captured at target 16, so its hazards block carries only the
-  // persistence rewrites. At target 13 the same steps also carry three declaration hazards —
+  // persistence rewrites. At target 13 the same steps also carry two declaration hazards —
   // explicit compression on `fresh` and on `comp_add` — which precede the rewrites in step order.
   // The imported target model is now read by the gate, so model order picks `comp_add` as the
   // first offender before any step fact or synthesized reset.
@@ -1189,7 +1189,6 @@ test('plan --target-version 13 refuses a declaration before the synthesized rese
   assert.match(display, /steps in one transaction:/u);
   const declarationHazards = [
     '  step 1 render-refusal public.attrs: COMPRESSION needs PostgreSQL 14 or newer (target 13) — rendering refuses this plan.',
-    '  step 10 render-refusal public.attrs: COMPRESSION needs PostgreSQL 14 or newer (target 13) — rendering refuses this plan.',
     '  step 10 render-refusal public.attrs: COMPRESSION needs PostgreSQL 14 or newer (target 13) — rendering refuses this plan.',
     '',
   ].join('\n');
@@ -1267,9 +1266,9 @@ test('plan --json emits one full document with declaration hazards and one refus
         floor: scene.floor,
       },
     };
-    // A merged compression alter yields both the carrier and its field as separate facts; the
-    // hazard channel reports each fact from the shared collector, never a synthesized sentinel.
-    const hazards = scene.form === 'explicit-compression' ? [hazard, hazard] : [hazard];
+    // A standalone compression field states its own declaration; with no merged TYPE the carrier
+    // is not a fact, so one hazard is reported — never a synthesized sentinel.
+    const hazards = [hazard];
     assert.deepEqual(document.result.hazards, hazards, `${scene.form}: declaration hazard DTO`);
     assert.equal(result.stdout.includes('BEGIN;'), false, 'the document carries no rendered SQL');
     assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);

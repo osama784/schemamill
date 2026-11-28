@@ -358,8 +358,9 @@ export interface SceneCheck {
  * renders the plan passes it through as `renderSql`'s `targetVersion`, so the probe sees the
  * same SQL the server will, and a synthesized form the server cannot accept refuses here
  * rather than on apply. The optional fourth argument carries the full render options — the
- * server major beside the scene's baseline — so a refusal scene can render with the same
- * occupancy guard the harness applies to its migration.
+ * server major, the scene's baseline, and its target model — so a refusal scene can render with
+ * the same occupancy guard and declarations the harness applies to its migration. A twin that
+ * deliberately differs from the scene target must pass its own model explicitly.
  */
 export interface ScenePlanCheck {
   readonly description: string;
@@ -8401,12 +8402,24 @@ const baselineIndexOccupancyScene = (): LiveScene => {
         },
       },
       {
+        description: 'plan checks receive the target model in their render options',
+        failure: (_steps, _plan, _serverMajor, options) =>
+          options?.targetModel === target
+            ? undefined
+            : 'render options must carry the scene target model',
+      },
+      {
         description: 'the explicit twin is refused against the baseline unnamed index',
         failure: (_steps, _plan, serverMajor, options) => {
           const twin = baselineOccupancyRefusedTarget();
           let refusal: string | undefined;
           try {
-            renderSql(plan(baseline, twin), { ...options, baseline, targetVersion: serverMajor });
+            renderSql(plan(baseline, twin), {
+              ...options,
+              baseline,
+              targetVersion: serverMajor,
+              targetModel: twin,
+            });
           } catch (error) {
             if (!(error instanceof RenderRefusalError)) throw error;
             refusal = error.message;
@@ -8499,7 +8512,11 @@ const unnamedNotNullOccupancyScene = (): LiveScene => {
         failure: (_steps, _migration, serverMajor) => {
           let refusal: string | undefined;
           try {
-            renderSql(plan(baseline, twin), { baseline, targetVersion: serverMajor });
+            renderSql(plan(baseline, twin), {
+              baseline,
+              targetVersion: serverMajor,
+              targetModel: twin,
+            });
           } catch (error) {
             if (!(error instanceof RenderRefusalError)) throw error;
             refusal = error.message;

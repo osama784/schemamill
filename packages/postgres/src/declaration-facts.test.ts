@@ -287,6 +287,22 @@ test('explicit compression refuses below 14 and renders at 14, 16 and 18', () =>
   );
 });
 
+test('a carrier compression with no type or collation change never refuses', () => {
+  // Without a type or collation field the renderer emits no merged TYPE statement and ignores
+  // `attributes`, so the carrier's compression is never emitted — it must not gate either.
+  const planned = planOf({
+    kind: 'alter-column',
+    table: identity('t'),
+    name: 'c',
+    fields: [{ field: 'notNull', before: false, after: true }],
+    attributes: { type: 'text', compression: 'pglz' },
+  });
+
+  const at13 = renderSql(planned, { targetVersion: 13 });
+  assert.equal(at13, 'BEGIN;\nALTER TABLE public.t ALTER COLUMN c SET NOT NULL;\nCOMMIT;\n');
+  assert.equal(at13, renderSql(planned, { targetVersion: 14 }));
+});
+
 test('explicit storage never gates at any target', () => {
   const added = planOf({
     kind: 'add-column',

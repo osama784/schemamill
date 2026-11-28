@@ -46,7 +46,9 @@ import type {
  *
  * Every render in this file targets that major: the baseline and target builds, the plan
  * checks' probe renders, and the migration all pass `{ targetVersion: serverMajor }`, so the
- * SQL is generated for the server that will apply it. A synthesized reset form the server
+ * SQL is generated for the server that will apply it. Plan checks also receive the scene's
+ * target model in their render options, so a probe render validates the declarations the
+ * migrated target carries, not only the plan's steps. A synthesized reset form the server
  * cannot accept therefore refuses by name before any statement runs, instead of reaching
  * `psql` as SQL the server rejects.
  *
@@ -785,6 +787,7 @@ function assertPlanChecks(scene: LiveScene, serverMajor: number): void {
     const failure = check.failure(migration.steps, migration, serverMajor, {
       targetVersion: serverMajor,
       baseline: scene.baseline,
+      targetModel: scene.target,
     });
     assert.ok(
       failure === undefined,

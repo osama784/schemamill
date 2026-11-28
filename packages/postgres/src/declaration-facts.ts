@@ -248,7 +248,12 @@ function collectStepFacts(facts: DeclarationFact[], step: number, planStep: Step
     case 'alter-column': {
       // The merged `TYPE` statement restates what it resets, so the carrier's explicit method is
       // the declaration there; without a merge, each standalone compression field states its own.
-      const carrier = planStep.attributes?.compression;
+      // `renderAlterColumn` ignores `attributes` unless a type or collation field merges, so the
+      // carrier is a declaration only in that case — never for a not-null/default-only step.
+      const merged = planStep.fields.some(
+        (field) => field.field === 'type' || field.field === 'collation',
+      );
+      const carrier = merged ? planStep.attributes?.compression : undefined;
       if (carrier !== undefined) {
         facts.push({
           form: 'explicit-compression',
