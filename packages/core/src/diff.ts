@@ -28,6 +28,7 @@ import type {
   View,
   ViewCheckOption,
   ViewIdentity,
+  ViewOutputColumn,
 } from './model.ts';
 import type { CommentTarget } from './plan.ts';
 import {
@@ -37,6 +38,7 @@ import {
   sameGrants,
 } from './privileges.ts';
 import { effectiveSequence, sequenceTypeChange } from './sequence.ts';
+import { sameViewColumns, viewColumnIncompatibility } from './view-columns.ts';
 
 /**
  * The diff: what changed between a baseline model and a target model.
@@ -412,13 +414,21 @@ export type SequenceFieldChange =
 
 /**
  * One differing field of a changed view; only fields that differ are reported, in the fixed
- * order `materialized`, `definition`, `checkOption`. A `checkOption` change omits the side
- * that states none.
+ * order `materialized`, `definition`, `checkOption`, `columns`. A `checkOption` change omits the
+ * side that states none. A `columns` change carries both ordered lists and, when the core
+ * preflight found positive evidence, the offending `column` and its `reason`.
  */
 export type ViewFieldChange =
   | { field: 'materialized'; before: boolean; after: boolean }
   | { field: 'definition'; before: string; after: string }
-  | { field: 'checkOption'; before?: ViewCheckOption; after?: ViewCheckOption };
+  | { field: 'checkOption'; before?: ViewCheckOption; after?: ViewCheckOption }
+  | {
+      field: 'columns';
+      before?: readonly ViewOutputColumn[];
+      after?: readonly ViewOutputColumn[];
+      column?: string;
+      reason?: string;
+    };
 
 /**
  * One differing field of a changed extension; only fields that differ are reported. The union
@@ -605,6 +615,17 @@ function diffViewFields(baseline: View, target: View): ViewFieldChange[] {
       field: 'checkOption',
       ...(baseline.checkOption === undefined ? {} : { before: baseline.checkOption }),
       ...(target.checkOption === undefined ? {} : { after: target.checkOption }),
+    });
+  }
+  if (!sameViewColumns(baseline.columns, target.columns)) {
+    const incompatibility = viewColumnIncompatibility(baseline.columns, target.columns);
+    fields.push({
+      field: 'columns',
+      ...(baseline.columns === undefined ? {} : { before: baseline.columns.map(copyViewColumn) }),
+      ...(target.columns === undefined ? {} : { after: target.columns.map(copyViewColumn) }),
+      ...(incompatibility.kind === 'compatible'
+        ? {}
+        : { column: incompatibility.column, reason: incompatibility.reason }),
     });
   }
   return fields;
@@ -1202,10 +1223,16 @@ function copySequence(sequence: Sequence): Sequence {
   };
 }
 
-/** A copy of `view`, independent of the caller's model, including its index array. */
+/** A copy of one output column, independent of the caller's model. */
+function copyViewColumn(column: ViewOutputColumn): ViewOutputColumn {
+  return { name: column.name, type: column.type };
+}
+
+/** A copy of `view`, independent of the caller's model, including its indexes and columns. */
 function copyView(view: View): View {
   return {
     ...view,
+    ...(view.columns === undefined ? {} : { columns: view.columns.map(copyViewColumn) }),
     ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
   };
 }

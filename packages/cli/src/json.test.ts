@@ -758,6 +758,7 @@ const ALLOWED_KEYS = new Set<string>([
   'before',
   'after',
   'converted',
+  'reason',
   'table',
   'sequence',
   'view',
@@ -1148,6 +1149,65 @@ test('importPair surfaces per-side diagnostics and the workspace root without ne
     process.chdir(originalCwd);
     stream.write = originalWrite;
   }
+});
+
+test('the JSON mapper carries view output columns and their incompatibility diagnostic', () => {
+  const before: View = {
+    ...VIEW,
+    columns: [
+      { name: 'a', type: 'integer' },
+      { name: 'b', type: 'text' },
+    ],
+  };
+  const after: View = {
+    ...VIEW,
+    columns: [
+      { name: 'x', type: 'integer' },
+      { name: 'b', type: 'text' },
+    ],
+  };
+  const document = buildJsonDocument(
+    compareInput([
+      {
+        kind: 'view-changed',
+        view: VIEW_ID,
+        changes: [
+          {
+            field: 'columns',
+            before: before.columns,
+            after: after.columns,
+            column: 'a',
+            reason: 'renamed to x',
+          },
+        ],
+        before,
+        after,
+      },
+    ]),
+  );
+  const result = document.result as {
+    changes: readonly {
+      before: object;
+      after: object;
+      changes: readonly object[];
+    }[];
+  };
+
+  assert.deepEqual(result.changes[0]!.before, before);
+  assert.deepEqual(result.changes[0]!.after, after);
+  assert.deepEqual(result.changes[0]!.changes[0], {
+    field: 'columns',
+    before: [
+      { name: 'a', type: 'integer' },
+      { name: 'b', type: 'text' },
+    ],
+    after: [
+      { name: 'x', type: 'integer' },
+      { name: 'b', type: 'text' },
+    ],
+    column: 'a',
+    reason: 'renamed to x',
+  });
 });
 
 test('the JSON mapper carries expression elements, INCLUDE, and the partial WHERE', () => {

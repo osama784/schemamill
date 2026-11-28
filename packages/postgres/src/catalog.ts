@@ -78,6 +78,7 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewOutputColumn,
 } from '@schemamill/core';
 import { canonicalIntType, effectiveIdentity, effectiveSequence } from '@schemamill/core';
 import { parse, type IndexStmt } from 'libpg-query';
@@ -161,7 +162,8 @@ const CHILD_PGOPTIONS = '-c search_path= -c default_transaction_read_only=on';
  *
  * The `views` section reads every view and materialized view in the same schema scope, with
  * `pg_get_viewdef`'s definition text, the `check_option` reloption decoded to the model's
- * `local`/`cascaded` spelling (null when absent), and the relation's object description. A
+ * `local`/`cascaded` spelling (null when absent), the relation's object description, and its
+ * output columns from `pg_attribute` in `attnum` order with `format_type`'s type text. A
  * materialized view cannot carry a check option; the mapper refuses one defensively.
  *
  * The `extensions` section reads every installed extension, built-ins included — the mapper
@@ -524,7 +526,21 @@ SELECT json_build_object(
           WHEN 'check_option=local' = ANY(relation.reloptions) THEN 'local'
           WHEN 'check_option=cascaded' = ANY(relation.reloptions) THEN 'cascaded'
         END AS "checkOption",
-        pg_catalog.obj_description(relation.oid, 'pg_class') AS comment
+        pg_catalog.obj_description(relation.oid, 'pg_class') AS comment,
+        COALESCE((
+          SELECT json_agg(row_to_json(view_column_row))
+          FROM (
+            SELECT
+              attribute.attnum AS attnum,
+              attribute.attname AS name,
+              pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS type
+            FROM pg_catalog.pg_attribute AS attribute
+            WHERE attribute.attrelid = relation.oid
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum
+          ) AS view_column_row
+        ), '[]'::json) AS columns
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
       WHERE relation.relkind IN ('v', 'm')
@@ -755,8 +771,10 @@ interface SequenceRow {
 
 /**
  * One `views` row of the payload after validation: the view's identity, whether it is
- * materialized, `pg_get_viewdef`'s definition text, the decoded `check_option` reloption, and
- * the relation's object description. A materialized row never carries a check option.
+ * materialized, `pg_get_viewdef`'s definition text, the decoded `check_option` reloption, the
+ * relation's object description, and its output columns in `attnum` order. A materialized row
+ * never carries a check option. Columns are optional in the payload so older or hand-written
+ * documents without the key still read as an unknown output shape.
  */
 interface ViewRow {
   readonly schema: string;
@@ -765,6 +783,7 @@ interface ViewRow {
   readonly definition: string;
   readonly checkOption: ViewCheckOption | null;
   readonly comment: string | null;
+  readonly columns: readonly ViewOutputColumn[] | undefined;
 }
 
 /**
@@ -1505,6 +1524,9 @@ function viewFromRow(row: ViewRow): View {
     name: row.name,
     materialized: row.materialized,
     definition: viewDefinition(row.definition),
+    ...(row.columns === undefined || row.columns.length === 0
+      ? {}
+      : { columns: row.columns.map((column) => ({ name: column.name, type: column.type })) }),
     ...(row.checkOption === null ? {} : { checkOption: row.checkOption }),
     ...(row.comment === null ? {} : { comment: row.comment }),
   };
@@ -2727,11 +2749,19 @@ function parseViewRow(value: unknown, path: string): ViewRow {
     'definition',
     'checkOption',
     'comment',
+    'columns',
   ]);
   const schema = expectString(row, path, 'schema');
   const name = expectString(row, path, 'name');
   const materialized = expectBoolean(row, path, 'materialized');
   const checkOption = expectNullableString(row, path, 'checkOption');
+  const columns =
+    row.columns === undefined
+      ? undefined
+      : expectArray(row, 'columns', path)
+          .map((value, index) => parseViewColumnRow(value, `${path}.columns[${index}]`))
+          .sort((left, right) => left.attnum - right.attnum)
+          .map(({ name: columnName, type }) => ({ name: columnName, type }));
   if (checkOption !== null && checkOption !== 'local' && checkOption !== 'cascaded') {
     throw new Error(`${path}.checkOption must be "local", "cascaded", or null`);
   }
@@ -2745,6 +2775,21 @@ function parseViewRow(value: unknown, path: string): ViewRow {
     definition: expectString(row, path, 'definition'),
     checkOption,
     comment: expectNullableString(row, path, 'comment'),
+    columns,
+  };
+}
+
+/** One output-column row of a `views` payload, validated before it is sorted by `attnum`. */
+function parseViewColumnRow(
+  value: unknown,
+  path: string,
+): { readonly attnum: number; readonly name: string; readonly type: string } {
+  const row = expectObject(value, path);
+  expectFields(row, path, ['attnum', 'name', 'type']);
+  return {
+    attnum: expectInteger(row, path, 'attnum', 1),
+    name: expectString(row, path, 'name'),
+    type: expectString(row, path, 'type'),
   };
 }
 

@@ -47,6 +47,7 @@ import type {
   TablePersistence,
   UniqueConstraint,
   View,
+  ViewOutputColumn,
 } from './model.ts';
 import type {
   ChangeApplication,
@@ -236,6 +237,10 @@ const view = (
   definition: 'SELECT 1',
   ...fields,
 });
+
+/** Output columns from `[name, type]` pairs, in order. */
+const viewColumns = (...pairs: readonly (readonly [string, string])[]): ViewOutputColumn[] =>
+  pairs.map(([name, type]) => ({ name, type }));
 
 /** A model of the given views, with no tables or sequences unless they are supplied. */
 const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
@@ -7666,6 +7671,79 @@ test('a changed plain view carries the target check option into its replace', ()
     { kind: 'replace-view', view: view('v', { checkOption: 'local' }) },
   ]);
   simulate(baseline, target);
+});
+
+test('a renamed view output column drops and recreates the plain view', () => {
+  const before = view('v', { columns: viewColumns(['a', 'integer']) });
+  const after = view('v', { columns: viewColumns(['x', 'integer']) });
+
+  assertPlan(viewModel([before]), viewModel([after]), [
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+    { kind: 'create-view', view: after },
+  ]);
+  simulate(viewModel([before]), viewModel([after]));
+});
+
+test('a retyped, dropped, or reordered view output column drops and recreates the plain view', () => {
+  const cases: readonly (readonly [View, View])[] = [
+    [
+      view('v', { columns: viewColumns(['a', 'integer']) }),
+      view('v', { columns: viewColumns(['a', 'text']) }),
+    ],
+    [
+      view('v', { columns: viewColumns(['a', 'integer'], ['b', 'text']) }),
+      view('v', { columns: viewColumns(['a', 'integer']) }),
+    ],
+    [
+      view('v', { columns: viewColumns(['a', 'integer'], ['b', 'text']) }),
+      view('v', { columns: viewColumns(['b', 'text'], ['a', 'integer']) }),
+    ],
+  ];
+  for (const [before, after] of cases) {
+    assertPlan(viewModel([before]), viewModel([after]), [
+      { kind: 'drop-view', view: identity('v'), materialized: false },
+      { kind: 'create-view', view: after },
+    ]);
+    simulate(viewModel([before]), viewModel([after]));
+  }
+});
+
+test('an appended view output column keeps the plain view replace', () => {
+  const before = view('v', { columns: viewColumns(['a', 'integer']) });
+  const after = view('v', { columns: viewColumns(['a', 'integer'], ['b', 'text']) });
+
+  assertPlan(viewModel([before]), viewModel([after]), [{ kind: 'replace-view', view: after }]);
+  simulate(viewModel([before]), viewModel([after]));
+});
+
+test('an unverifiable or absent view output column list keeps the plain view replace', () => {
+  const dumpBefore = view('v', { columns: viewColumns(['a', ''], ['b', '']) });
+  const dumpAfter = view('v', { columns: viewColumns(['x', ''], ['b', '']) });
+  assertPlan(viewModel([dumpBefore]), viewModel([dumpAfter]), [
+    { kind: 'replace-view', view: dumpAfter },
+  ]);
+
+  const catalog = view('v', { columns: viewColumns(['a', 'integer']) });
+  assertPlan(viewModel([view('v')]), viewModel([catalog]), [
+    { kind: 'replace-view', view: catalog },
+  ]);
+  assertPlan(viewModel([catalog]), viewModel([view('v')]), [
+    { kind: 'replace-view', view: view('v') },
+  ]);
+});
+
+test('the change application routes an incompatible view change into drop and create buckets', () => {
+  const before = view('v', { columns: viewColumns(['a', 'integer']) });
+  const after = view('v', { columns: viewColumns(['x', 'integer']) });
+  const changes = diff(viewModel([before]), viewModel([after]));
+  const application = emptyChangeApplication();
+  for (const change of changes) applyChange(application, change);
+
+  assert.deepStrictEqual(application.viewDrops, [
+    { kind: 'drop-view', view: identity('v'), materialized: false },
+  ]);
+  assert.deepStrictEqual(application.viewCreates, [{ kind: 'create-view', view: after }]);
+  assert.deepStrictEqual(application.viewReplaces, []);
 });
 
 test('a changed materialized view is dropped before the table phases and recreated after', () => {

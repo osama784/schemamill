@@ -30,6 +30,7 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewOutputColumn,
 } from './model.ts';
 
 /**
@@ -606,12 +607,19 @@ function serializeOwner(owner: SequenceOwner): object {
   return { table: serializeName(owner.table), column: owner.column };
 }
 
+function serializeViewColumn(column: ViewOutputColumn): object {
+  return { name: column.name, type: column.type };
+}
+
 function serializeView(view: View): object {
   return {
     schema: view.schema,
     name: view.name,
     materialized: view.materialized,
     definition: view.definition,
+    ...(view.columns === undefined || view.columns.length === 0
+      ? {}
+      : { columns: view.columns.map(serializeViewColumn) }),
     ...(view.indexes === undefined || view.indexes.length === 0
       ? {}
       : { indexes: view.indexes.map(serializeIndex) }),
@@ -743,10 +751,12 @@ const VIEW_KEYS = [
   'name',
   'materialized',
   'definition',
+  'columns',
   'indexes',
   'checkOption',
   'comment',
 ] as const;
+const VIEW_COLUMN_KEYS = ['name', 'type'] as const;
 const EXTENSION_KEYS = ['schema', 'name', 'comment'] as const;
 const NAME_KEYS = ['schema', 'name'] as const;
 
@@ -1530,6 +1540,10 @@ function parseView(value: unknown, path: string): Parsed<View> {
     if (!materialized.ok) return materialized;
     const definition = parseNonEmptyString(object.definition, fieldPath(path, 'definition'));
     if (!definition.ok) return definition;
+    const columns = parseOptional(object.columns, fieldPath(path, 'columns'), (value, at) =>
+      parseArrayOf(value, at, parseViewOutputColumn),
+    );
+    if (!columns.ok) return columns;
     const indexes = parseOptional(object.indexes, fieldPath(path, 'indexes'), (value, at) =>
       parseArrayOf(value, at, parseIndex),
     );
@@ -1553,12 +1567,29 @@ function parseView(value: unknown, path: string): Parsed<View> {
       name: name.value,
       materialized: materialized.value,
       definition: definition.value,
+      ...(columns.value === undefined || columns.value.length === 0
+        ? {}
+        : { columns: columns.value }),
       ...(indexes.value === undefined || indexes.value.length === 0
         ? {}
         : { indexes: indexes.value }),
       ...(checkOption.value === undefined ? {} : { checkOption: checkOption.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
+  });
+}
+
+/**
+ * One output column: a non-empty name and a type string. An empty type is valid — importers
+ * write it when a dump carries no type — and only a verifiable list can drive the preflight.
+ */
+function parseViewOutputColumn(value: unknown, path: string): Parsed<ViewOutputColumn> {
+  return parseObject(value, path, VIEW_COLUMN_KEYS, (object) => {
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
+    if (!name.ok) return name;
+    const type = parseString(object.type, fieldPath(path, 'type'));
+    if (!type.ok) return type;
+    return parsed({ name: name.value, type: type.value });
   });
 }
 

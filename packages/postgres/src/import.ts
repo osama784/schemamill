@@ -182,6 +182,7 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewOutputColumn,
 } from '@schemamill/core';
 import {
   canonicalDefaultPrivileges,
@@ -3296,6 +3297,27 @@ type ViewDefinitionText =
     };
 
 /**
+ * Output columns stated as target aliases in a view's `SELECT`. The AST carries names but no
+ * types, so each type is `''` (unknown, never compared). A list with an unnamed target is unknown
+ * as a whole: recording only the named tail would invent a false trailing-column change. The
+ * parenthesized `ViewStmt.aliases` / `IntoClause.colNames` list is deliberately not read here —
+ * it stays flagged and discarded, as before.
+ */
+function viewOutputColumns(query: Node | undefined): readonly ViewOutputColumn[] | undefined {
+  const select = query !== undefined && 'SelectStmt' in query ? query.SelectStmt : undefined;
+  const targets = select?.targetList;
+  if (targets === undefined || targets.length === 0) return undefined;
+  const columns: ViewOutputColumn[] = [];
+  for (const target of targets) {
+    if (!('ResTarget' in target)) return undefined;
+    const name = target.ResTarget.name;
+    if (name === undefined || name === '') return undefined;
+    columns.push({ name, type: '' });
+  }
+  return columns;
+}
+
+/**
  * Imports a plain view: the definition text, the check option, and a named flag for every inline
  * attribute the model cannot carry. A recursive view is skipped whole and named; see
  * `viewDefinitionText`.
@@ -3354,6 +3376,8 @@ function translateCreateView(
     materialized: false,
     definition: extracted.definition,
   };
+  const columns = viewOutputColumns(create.query);
+  if (columns !== undefined) draft.columns = columns;
   if (checkOption !== undefined) draft.checkOption = checkOption;
   views.set(tableKey(schema, name), draft);
 }
@@ -3428,12 +3452,15 @@ function translateCreateMaterializedView(
 
   // A repeated CREATE MATERIALIZED VIEW replaces the draft wholesale, clearing any indexes the
   // earlier definition gathered; the last definition wins, as for a repeated CREATE TABLE.
-  views.set(tableKey(schema, name), {
+  const draft: ViewDraft = {
     schema,
     name,
     materialized: true,
     definition: extracted.definition,
-  });
+  };
+  const columns = viewOutputColumns(create.query);
+  if (columns !== undefined) draft.columns = columns;
+  views.set(tableKey(schema, name), draft);
 }
 
 /**
@@ -5228,9 +5255,9 @@ function finalizeTable(draft: TableDraft): Table {
 }
 
 /**
- * Finalizes a view draft: canonicalizes a materialized view's index names and sorts the indexes
- * exactly as for a table, omitting the `indexes` field when there are none so ordinary views and
- * index-less matviews keep their existing shape.
+ * Finalizes a view draft: copies any recorded output columns, canonicalizes a materialized view's
+ * index names and sorts the indexes exactly as for a table, omitting the `indexes` field when
+ * there are none so ordinary views and index-less matviews keep their existing shape.
  */
 function finalizeView(draft: ViewDraft): View {
   const indexes =
@@ -5242,6 +5269,9 @@ function finalizeView(draft: ViewDraft): View {
     materialized: draft.materialized,
     definition: draft.definition,
   };
+  if (draft.columns !== undefined) {
+    view.columns = draft.columns.map((column) => ({ name: column.name, type: column.type }));
+  }
   if (indexes !== undefined) view.indexes = [...indexes].sort(compareIndexes);
   if (draft.checkOption !== undefined) view.checkOption = draft.checkOption;
   if (draft.comment !== undefined) view.comment = draft.comment;

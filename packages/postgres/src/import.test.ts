@@ -4790,9 +4790,66 @@ test('imports plain views and materialized views, sorted by identity', async () 
       materialized: true,
       definition: 'SELECT team_id,count(*) AS n FROM app.t GROUP BY team_id',
     },
-    { schema: 'public', name: 'upper', materialized: false, definition: 'SELECT 1 AS one' },
+    {
+      schema: 'public',
+      name: 'upper',
+      materialized: false,
+      definition: 'SELECT 1 AS one',
+      columns: [{ name: 'one', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
+});
+
+test('records target-list aliases as view output columns with unknown types', async () => {
+  const dump = [
+    `CREATE VIEW app.aliased AS SELECT 1 AS one, 2 AS "Two";`,
+    `CREATE MATERIALIZED VIEW app.mv_aliased AS SELECT 3 AS three WITH NO DATA;`,
+    `CREATE VIEW app.partial AS SELECT 4 AS four, 5;`,
+    `CREATE VIEW app.parenthesized (p, q) AS SELECT 6, 7;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'aliased',
+      materialized: false,
+      definition: 'SELECT 1 AS one,2 AS "Two"',
+      columns: [
+        { name: 'one', type: '' },
+        { name: 'Two', type: '' },
+      ],
+    },
+    {
+      schema: 'app',
+      name: 'mv_aliased',
+      materialized: true,
+      definition: 'SELECT 3 AS three',
+      columns: [{ name: 'three', type: '' }],
+    },
+    {
+      schema: 'app',
+      name: 'parenthesized',
+      materialized: false,
+      definition: 'SELECT 6,7',
+    },
+    {
+      schema: 'app',
+      name: 'partial',
+      materialized: false,
+      definition: 'SELECT 4 AS four,5',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.parenthesized',
+      message: 'dropped view column list from app.parenthesized',
+    },
+  ]);
 });
 
 test('reads view check options from the clause and from a check_option reloption', async () => {
@@ -5009,6 +5066,7 @@ test('distinguishes WITH NO DATA, WITH DATA, and the implicit populated state', 
       name: 'mv_data',
       materialized: true,
       definition: "SELECT 'WITH DATA' AS note",
+      columns: [{ name: 'note', type: '' }],
     },
     { schema: 'app', name: 'mv_no_data', materialized: true, definition: 'SELECT 1' },
     { schema: 'app', name: 'mv_none', materialized: true, definition: 'SELECT 1' },
@@ -5125,6 +5183,10 @@ test('keeps the last definition of a repeated view, including the loop-repair CR
       name: 'loop',
       materialized: false,
       definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
     },
   ]);
   assert.deepEqual(diagnostics, []);
@@ -5185,6 +5247,7 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       name: 'mv_literal',
       materialized: true,
       definition: "SELECT 'WITH NO DATA' AS note",
+      columns: [{ name: 'note', type: '' }],
     },
     {
       schema: 'app',
@@ -5203,8 +5266,15 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       name: 'quoted',
       materialized: false,
       definition: 'SELECT(a + 1) AS "AS" FROM app.t',
+      columns: [{ name: 'AS', type: '' }],
     },
-    { schema: 'app', name: 'utf8', materialized: false, definition: "SELECT 'é' AS e" },
+    {
+      schema: 'app',
+      name: 'utf8',
+      materialized: false,
+      definition: "SELECT 'é' AS e",
+      columns: [{ name: 'e', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
 });
@@ -5226,6 +5296,7 @@ test('imports a materialized view index, canonicalized to unnamed', async () => 
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
       indexes: [{ unique: true, columns: ['a'] }],
     },
   ]);
@@ -5251,6 +5322,10 @@ test('imports plain, unique, unnamed, and concurrent materialized view indexes',
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
       indexes: [
         { unique: false, columns: ['a', 'b'] },
         { name: 'conc_ab', unique: false, columns: ['a', 'b'], concurrently: true },
@@ -5271,7 +5346,13 @@ test('skips an index on a plain view with the exact plain-view diagnostic', asyn
   const { model, diagnostics } = await importDump(dump);
 
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'v', materialized: false, definition: 'SELECT 1 AS a' },
+    {
+      schema: 'app',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
@@ -5311,7 +5392,13 @@ test('clears materialized view indexes on a repeated CREATE MATERIALIZED VIEW', 
 
   // The second definition replaces the whole draft, dropping the earlier index with it.
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 2 AS b' },
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 2 AS b',
+      columns: [{ name: 'b', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
 });
@@ -5346,7 +5433,16 @@ test('skips a materialized view index outside the minimal envelope', async () =>
   const { model, diagnostics } = await importDump(dump);
 
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a,2 AS b' },
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
+    },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
@@ -5374,6 +5470,7 @@ test('leaves a comment on a materialized view index flagged and deferred', async
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
       indexes: [{ unique: false, columns: ['a'] }],
     },
   ]);

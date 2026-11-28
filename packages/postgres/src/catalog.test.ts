@@ -1353,6 +1353,47 @@ test('maps plain and materialized views with normalized definitions and comments
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('maps view output columns in attnum order with their catalog type text', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'v', {
+          definition: 'SELECT 1 AS one, 2 AS two',
+          columns: [
+            { attnum: 2, name: 'two', type: 'text' },
+            { attnum: 1, name: 'one', type: 'integer' },
+          ],
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.views, [
+    {
+      schema: 'public',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT 1 AS one,2 AS two',
+      columns: [
+        { name: 'one', type: 'integer' },
+        { name: 'two', type: 'text' },
+      ],
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('refuses a view output column whose type is not a string', async () => {
+  await assert.rejects(
+    mapCatalog(
+      payload({
+        views: [viewRow('public', 'v', { columns: [{ attnum: 1, name: 'a', type: 7 }] })],
+      }),
+    ),
+    /catalog payload\.views\[0\]\.columns\[0\]\.type must be a string/,
+  );
+});
+
 test('maps view check options local and cascaded, absent when null', async () => {
   const read = await mapCatalog(
     payload({

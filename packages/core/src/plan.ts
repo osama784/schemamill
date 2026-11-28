@@ -31,7 +31,9 @@ import type {
   UniqueConstraint,
   View,
   ViewIdentity,
+  ViewOutputColumn,
 } from './model.ts';
+import { viewColumnIncompatibility } from './view-columns.ts';
 
 /**
  * The migration plan: what to change, in the order that works.
@@ -1680,8 +1682,14 @@ export function applyChange(application: ChangeApplication, change: Change): voi
       // grants, ownership, and dependent views. A materialized view cannot be replaced, and a
       // kind change is a different object, so both become a drop and a create — which leaves
       // the recreated matview unpopulated and discards its indexes and dependents (named
-      // residual, ADR 0019).
-      if (change.before.materialized === false && change.after.materialized === false) {
+      // residual, ADR 0019). The same drop+create branch handles positive evidence that the
+      // output columns were renamed, dropped, reordered, or retyped: PostgreSQL would refuse
+      // the replace. Absent or unverifiable columns keep the replace (named residual).
+      if (
+        change.before.materialized === false &&
+        change.after.materialized === false &&
+        viewColumnIncompatibility(change.before.columns, change.after.columns).kind === 'compatible'
+      ) {
         application.viewReplaces.push({ kind: 'replace-view', view: copyView(change.after) });
       } else {
         application.viewDrops.push({
@@ -1776,10 +1784,16 @@ export function applyChange(application: ChangeApplication, change: Change): voi
   }
 }
 
-/** A copy of `view`, independent of the diff's change, including its index array. */
+/** A copy of one output column, independent of the diff's change. */
+function copyViewColumn(column: ViewOutputColumn): ViewOutputColumn {
+  return { name: column.name, type: column.type };
+}
+
+/** A copy of `view`, independent of the diff's change, including its indexes and columns. */
 function copyView(view: View): View {
   return {
     ...view,
+    ...(view.columns === undefined ? {} : { columns: view.columns.map(copyViewColumn) }),
     ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
   };
 }

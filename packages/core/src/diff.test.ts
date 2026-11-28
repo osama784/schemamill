@@ -22,6 +22,7 @@ import type {
   TablePersistence,
   UniqueConstraint,
   View,
+  ViewOutputColumn,
 } from './model.ts';
 
 /**
@@ -172,6 +173,10 @@ const view = (
   definition: 'SELECT 1',
   ...fields,
 });
+
+/** Output columns from `[name, type]` pairs, in order. */
+const viewColumns = (...pairs: readonly (readonly [string, string])[]): ViewOutputColumn[] =>
+  pairs.map(([name, type]) => ({ name, type }));
 
 /** A model of the given views, with no tables or sequences unless they are supplied. */
 const viewModel = (views: readonly View[], ...tables: Table[]): Model => ({
@@ -4428,6 +4433,53 @@ test('a changed view reports its differing fields in the fixed order', () => {
         { field: 'materialized', before: false, after: true },
         { field: 'definition', before: 'SELECT 1', after: 'SELECT 2' },
         { field: 'checkOption', before: 'local' },
+      ],
+      before,
+      after,
+    },
+  ]);
+});
+
+test('a renamed view output column reports a columns field with its diagnostic', () => {
+  const before = view('v', { columns: viewColumns(['a', 'integer'], ['b', 'text']) });
+  const after = view('v', { columns: viewColumns(['x', 'integer'], ['b', 'text']) });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [
+        {
+          field: 'columns',
+          before: viewColumns(['a', 'integer'], ['b', 'text']),
+          after: viewColumns(['x', 'integer'], ['b', 'text']),
+          column: 'a',
+          reason: 'renamed to x',
+        },
+      ],
+      before,
+      after,
+    },
+  ]);
+});
+
+test('a canonical-only view column type difference reports no change', () => {
+  const before = view('v', { columns: viewColumns(['a', ' INTEGER ']) });
+  const after = view('v', { columns: viewColumns(['a', 'integer']) });
+
+  assertDiff(viewModel([before]), viewModel([after]), []);
+});
+
+test('unverifiable view columns report a columns field without a diagnostic', () => {
+  const before = view('v', { columns: viewColumns(['a', '']) });
+  const after = view('v', { columns: viewColumns(['x', '']) });
+
+  assertDiff(viewModel([before]), viewModel([after]), [
+    {
+      kind: 'view-changed',
+      view: identity('v'),
+      changes: [
+        { field: 'columns', before: viewColumns(['a', '']), after: viewColumns(['x', '']) },
       ],
       before,
       after,
