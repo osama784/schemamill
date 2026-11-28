@@ -641,6 +641,15 @@ function mapHazardEntity(entity: HazardEntity): object {
         ...(entity.table === undefined ? {} : { table: entity.table }),
         names: [entity.names[0], entity.names[1]],
       };
+    case 'unsupported-declaration':
+      return {
+        kind: 'unsupported-declaration',
+        schema: entity.schema,
+        ...(entity.table === undefined ? {} : { table: entity.table }),
+        declaration: entity.declaration,
+        targetVersion: entity.targetVersion,
+        floor: entity.floor,
+      };
     default:
       return assertNever(entity, 'HazardEntity');
   }

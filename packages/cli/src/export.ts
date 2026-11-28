@@ -21,10 +21,13 @@ import { validateTargetVersion } from './target-version.ts';
  * major the DDL is generated for and is validated against the same 13–18 span as `plan` before
  * any filesystem access. Every export step is a create, and create paths never consult the
  * target, so the projection is byte-invariant across the accepted majors today; the flag is
- * parity plumbing until a version-sensitive create form exists. `--format json` prints
- * `serializeModel(model)` byte for byte: the canonical model, bare, with no wrapper and no
- * version. `--format markdown` prints `renderMarkdown(model)`: a deterministic, readable
- * projection that sorts every collection and keeps each value on one line, with no wrapper.
+ * parity plumbing until a version-sensitive create form exists. The workspace model is also
+ * passed to the render gate, so a declaration it carries below the declared major's floor refuses
+ * the DDL artifact. `--format json` prints `serializeModel(model)` byte for byte: the canonical
+ * model, bare, with no wrapper and no version; it returns before rendering and cannot refuse.
+ * `--format markdown` prints `renderMarkdown(model)`: a deterministic, readable projection that
+ * sorts every collection and keeps each value on one line, with no wrapper, and likewise returns
+ * before rendering.
  *
  * Failures never leave partial output. An invalid `--format` or `--target-version` is a usage
  * error before any filesystem access; a workspace failure, a plan-time contract error (a target
@@ -77,6 +80,7 @@ export function registerExport(program: Command): void {
         sql = renderSql(projectable, {
           targetVersion: Number(options.targetVersion),
           baseline: EMPTY_MODEL,
+          targetModel: resolution.model,
         });
       } catch (error) {
         if (!(error instanceof RenderRefusalError)) throw error;

@@ -17,7 +17,7 @@ import type {
   TableIdentity,
 } from '@schemamill/core';
 
-import { analyzeHazards, hazardAnalyzer } from './index.ts';
+import { analyzeHazards, hazardAnalyzer, RenderRefusalError, renderSql } from './index.ts';
 
 /**
  * Tests for PostgreSQL hazard analysis: the definite checks pin every self-inconsistent shape
@@ -1672,6 +1672,152 @@ test('a refusal hazard names both as-written claims that clip to one stored name
         scope: 'index',
         schema: 'public',
         names: [first, second],
+      },
+    },
+  ]);
+});
+
+// --- Declaration refusals surfaced as hazards ---------------------------------------------------
+
+/** The refusal entity a step-backed declaration below its floor produces. */
+const declarationEntity = (
+  declaration:
+    | 'named-not-null'
+    | 'named-not-null-drop'
+    | 'not-null-comment'
+    | 'not-enforced'
+    | 'explicit-compression',
+  targetVersion: number,
+  floor: number,
+) => ({
+  kind: 'unsupported-declaration' as const,
+  schema: 'public',
+  table: 't',
+  declaration,
+  targetVersion,
+  floor,
+});
+
+test('each step-backed declaration below its floor reports an unsupported-declaration hazard', () => {
+  const cases: readonly [Step, ReturnType<typeof declarationEntity>['declaration'], number][] = [
+    [
+      { kind: 'add-not-null', table: identity('t'), column: 'c', name: 't_c_nn' },
+      'named-not-null',
+      18,
+    ],
+    [
+      { kind: 'drop-not-null', table: identity('t'), column: 'c', name: 't_c_nn' },
+      'named-not-null-drop',
+      18,
+    ],
+    [
+      {
+        kind: 'comment',
+        target: {
+          kind: 'not-null',
+          table: identity('t'),
+          column: column('c', { notNull: true, notNullName: 't_c_nn' }),
+        },
+        text: 'a note',
+      },
+      'not-null-comment',
+      18,
+    ],
+    [
+      {
+        kind: 'add-check-constraint',
+        table: identity('t'),
+        checkConstraint: { name: 'ck_c', expression: 'c > 0', enforcement: 'not-enforced' },
+      },
+      'not-enforced',
+      18,
+    ],
+    [
+      {
+        kind: 'add-foreign-key',
+        table: identity('t'),
+        foreignKey: {
+          name: 'fk_c',
+          columns: ['c'],
+          referencedTable: identity('other'),
+          referencedColumns: ['id'],
+          enforcement: 'not-enforced',
+        },
+      },
+      'not-enforced',
+      18,
+    ],
+    [
+      { kind: 'add-column', table: identity('t'), column: column('c', { compression: 'lz4' }) },
+      'explicit-compression',
+      14,
+    ],
+  ];
+
+  for (const [step, declaration, floor] of cases) {
+    const planned = planOf(step);
+    const below = floor - 1;
+    const expected: readonly Hazard[] = [
+      {
+        kind: 'render-refusal',
+        step: 0,
+        entity: declarationEntity(declaration, below, floor),
+      },
+    ];
+
+    assert.deepEqual(
+      analyzeHazards(model(), model(), planned, { targetVersion: below }),
+      expected,
+      `${declaration} below its floor`,
+    );
+    assert.deepEqual(
+      analyzeHazards(model(), model(), planned, { targetVersion: floor }),
+      [],
+      `${declaration} at its floor`,
+    );
+    assert.throws(
+      () => renderSql(planned, { targetVersion: below }),
+      RenderRefusalError,
+      `${declaration} below its floor refuses to render`,
+    );
+  }
+});
+
+test('a model-only declaration refuses to render but reports no hazard and no step sentinel', () => {
+  const baseline = model(table('keep', [column('c', { notNull: true, notNullName: 'keep_c_nn' })]));
+  const target = model(table('keep', [column('c', { notNull: true, notNullName: 'keep_c_nn' })]));
+  const planned = plan(baseline, target);
+
+  assert.equal(planned.steps.length, 0, 'the untouched declaration yields a zero-step plan');
+  assert.deepEqual(analyzeHazards(baseline, target, planned, { targetVersion: 13 }), []);
+  assert.throws(
+    () => renderSql(planned, { targetVersion: 13, targetModel: target }),
+    /named NOT NULL on public.keep column c needs PostgreSQL 18 or newer/u,
+    'the same declaration still refuses in the render path',
+  );
+});
+
+test('declaration hazards stay in step order beside name-collision hazards', () => {
+  const planned = planOf(
+    { kind: 'add-column', table: identity('t'), column: column('c', { compression: 'lz4' }) },
+    createIndex('shared_idx', 'a'),
+    createIndex('shared_idx', 'b'),
+  );
+
+  assert.deepEqual(analyzeHazards(model(), model(), planned, { targetVersion: 13 }), [
+    {
+      kind: 'render-refusal',
+      step: 0,
+      entity: declarationEntity('explicit-compression', 13, 14),
+    },
+    {
+      kind: 'render-refusal',
+      step: 2,
+      entity: {
+        kind: 'name-collision',
+        scope: 'index',
+        schema: 'public',
+        names: ['shared_idx', 'shared_idx'],
       },
     },
   ]);

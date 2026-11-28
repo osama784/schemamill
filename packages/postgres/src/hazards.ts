@@ -17,6 +17,7 @@ import type {
   TableIdentity,
 } from '@schemamill/core';
 
+import { collectDeclarationFacts } from './declaration-facts.ts';
 import {
   collectBaselineClaims,
   collectNameClaims,
@@ -66,13 +67,17 @@ import { MIN_TARGET_VERSION } from './render.ts';
  * and reports nothing. Because the plan is the only source, a hand-built `alter-persistence`
  * step on a table absent from both models still reports.
  *
- * The render-refusal kind is plan-local name arithmetic, not a state edge: the pure claim
- * collector behind `renderSql`'s guard reports the same collisions here, so a caller that only
- * analyzes (`compare`) sees what rendering would refuse. An index name is schema-wide, a
- * constraint name table-scoped and kind-agnostic; polarity keeps a drop-then-recreate legal, and
- * baseline occupancy is released by a same-identity drop. The optional target major reaches the
- * collector, so an unnamed not-null claims a name only at PostgreSQL 18 or newer; without a
- * declaring major no version-dependent refusal appears.
+ * The render-refusal kind is plan-local, not a state edge: the pure collectors behind `renderSql`'s
+ * guards report the same facts here, so a caller that only analyzes (`compare`) sees what rendering
+ * would refuse. For name collisions, an index name is schema-wide, a constraint name table-scoped
+ * and kind-agnostic; polarity keeps a drop-then-recreate legal, and baseline occupancy is released
+ * by a same-identity drop. The optional target major reaches the claim collector, so an unnamed
+ * not-null claims a name only at PostgreSQL 18 or newer; without a declaring major no
+ * version-dependent refusal appears. For unsupported declarations, the declaration-fact collector
+ * supplies the same step-backed facts the renderer gates on; only facts below their floor report,
+ * against the step that declares them. A model-carried declaration on a step-free table still
+ * refuses in `plan`/`export`, but has no step to attach to and therefore no hazard — the named
+ * asymmetry of this surface, never a sentinel step.
  *
  * A target-only sequence attaches to its `create-sequence` step; a matched one to the first
  * `alter-sequence` step carrying an option (any field but `ownedBy`), because that is the step
@@ -104,8 +109,9 @@ import { MIN_TARGET_VERSION } from './render.ts';
  * The analysis: every hazard the plan's state edge carries, in plan order. An optional target
  * version is resolved and validated exactly as `renderSql` resolves its own, so a caller that
  * declares the migration's PostgreSQL major reaches the analyzer through one contract. Only
- * `render-refusal` consumes it, when a version-dependent name claim exists; the other kinds and
- * an absence of version-sensitive claims give identical results for every valid major.
+ * `render-refusal` consumes it — for a version-dependent name claim or a step-backed declaration
+ * below its floor; the other kinds and an absence of version-sensitive facts give identical
+ * results for every valid major.
  */
 export function analyzeHazards(
   baseline: Model,
@@ -137,6 +143,7 @@ export function analyzeHazards(
     });
   }
   hazards.push(...renderRefusalHazards(baseline, plan, options));
+  hazards.push(...declarationHazards(target, plan, targetVersion));
   return inPlanOrder(hazards);
 }
 
@@ -204,6 +211,30 @@ function nameCollisionHazard(later: NameClaim, earlier: NameClaim): Hazard {
           names,
         };
   return { kind: 'render-refusal', step: later.step, entity };
+}
+
+/**
+ * The declarations the declared target cannot express, reported through the hazard channel. The
+ * facts come from the same pure collector the render gate uses; passing `target` keeps both paths
+ * reading one collection, but only `origin: 'step'` facts are reported. A model-only declaration
+ * refuses in the render path without a step to name here, so the two surfaces are deliberately
+ * asymmetric and `step` stays a real plan index on every hazard.
+ */
+function declarationHazards(target: Model, plan: Plan, targetVersion: number): readonly Hazard[] {
+  return collectDeclarationFacts(plan, { targetModel: target })
+    .filter((fact) => fact.origin === 'step' && targetVersion < fact.floor)
+    .map((fact) => ({
+      kind: 'render-refusal' as const,
+      step: fact.step,
+      entity: {
+        kind: 'unsupported-declaration' as const,
+        schema: fact.table.schema,
+        table: fact.table.name,
+        declaration: fact.form,
+        targetVersion,
+        floor: fact.floor,
+      },
+    }));
 }
 
 /** The as-written name when stated, otherwise the conventional prediction the guard compared. */

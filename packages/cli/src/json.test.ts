@@ -348,6 +348,14 @@ const CONSTRAINT_COLLISION_ENTITY: HazardEntity = {
   table: 't',
   names: ['t_a_key', 't_a_key'],
 };
+const DECLARATION_ENTITY: HazardEntity = {
+  kind: 'unsupported-declaration',
+  schema: 'public',
+  table: 't',
+  declaration: 'named-not-null',
+  targetVersion: 13,
+  floor: 18,
+};
 
 /** One instance of every `Hazard` kind, spanning every `HazardEntity` kind. */
 const HAZARDS: readonly Hazard[] = [
@@ -381,6 +389,7 @@ const HAZARDS: readonly Hazard[] = [
   { kind: 'table-rewrite', step: 6, entity: TABLE_ENTITY, persistence: 'unlogged' },
   { kind: 'render-refusal', step: 7, entity: INDEX_COLLISION_ENTITY },
   { kind: 'render-refusal', step: 8, entity: CONSTRAINT_COLLISION_ENTITY },
+  { kind: 'render-refusal', step: 9, entity: DECLARATION_ENTITY },
 ];
 
 const GROUPS: readonly TransactionGroup[] = [
@@ -596,6 +605,7 @@ const HAZARD_ENTITY_KEYS: Record<HazardEntity['kind'], readonly string[]> = {
   'identity-column': ['kind', 'table', 'column'],
   table: ['kind', 'table'],
   'name-collision': ['kind', 'scope', 'schema', 'table?', 'names'],
+  'unsupported-declaration': ['kind', 'schema', 'table?', 'declaration', 'targetVersion', 'floor'],
 };
 
 const INDEX_OWNER_KEYS: Record<IndexOwner['kind'], readonly string[]> = {
@@ -769,6 +779,8 @@ const ALLOWED_KEYS = new Set<string>([
   'step',
   'scope',
   'names',
+  'declaration',
+  'floor',
   'value',
   'text',
 ]);
