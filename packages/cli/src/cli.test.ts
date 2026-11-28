@@ -1045,10 +1045,10 @@ test('plan passes the imported baseline to the render guard', async (t) => {
   assert.equal(result.code, 1);
 });
 
-test('plan --target-version 13 refuses the synthesized resets, display first', async () => {
+test('plan --target-version 13 refuses a declaration before the synthesized resets, display first', async () => {
   // The display is version-free: the golden's text before its SQL carries the plan and the
-  // hazards. Target 13 refuses the first reset in plan order — the storage removal on
-  // `public.attrs.s_remove` — before the compression reset later in the same plan.
+  // hazards. Target 13 refuses the first declaration below its floor — explicit compression on
+  // `public.attrs.fresh` — before the synthesized resets later in the same plan.
   const baseline = fixturePath('column-attributes.baseline.sql');
   const target = fixturePath('column-attributes.target.sql');
   const golden = testText('goldens/column-attributes.plan.txt');
@@ -1063,7 +1063,7 @@ test('plan --target-version 13 refuses the synthesized resets, display first', a
   assert.equal(refused.stdout, display);
   assert.equal(
     refused.stderr,
-    'schemamill: refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.attrs column s_remove needs PostgreSQL 16 or newer\n',
+    'schemamill: refusing to render for PostgreSQL 13: COMPRESSION lz4 on public.attrs column fresh needs PostgreSQL 14 or newer\n',
   );
   assert.equal(refused.code, 1);
 
