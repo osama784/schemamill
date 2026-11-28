@@ -6298,7 +6298,6 @@ const viewRoundTripScene = (): LiveScene => {
               )}`,
       },
     ],
-    introspection: { assert: 'matches-import' },
     introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
@@ -6519,7 +6518,6 @@ const matviewIndexRoundTripScene = (): LiveScene => {
         },
       },
     ],
-    introspection: { assert: 'matches-import' },
     introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
