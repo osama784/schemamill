@@ -35,6 +35,7 @@ import type {
   TransactionGroup,
   UniqueConstraint,
   View,
+  ViewDependency,
   ViewFieldChange,
   ViewIdentity,
   ViewOutputColumn,
@@ -401,6 +402,10 @@ function mapViewOutputColumn(column: ViewOutputColumn): object {
   return { name: column.name, type: column.type };
 }
 
+function mapViewDependency(dependency: ViewDependency): object {
+  return { kind: dependency.kind, schema: dependency.schema, name: dependency.name };
+}
+
 function mapView(view: View): object {
   return {
     schema: view.schema,
@@ -410,6 +415,9 @@ function mapView(view: View): object {
     ...(view.columns === undefined || view.columns.length === 0
       ? {}
       : { columns: view.columns.map(mapViewOutputColumn) }),
+    ...(view.dependsOn === undefined || view.dependsOn.length === 0
+      ? {}
+      : { dependsOn: view.dependsOn.map(mapViewDependency) }),
     ...(view.indexes === undefined || view.indexes.length === 0
       ? {}
       : { indexes: view.indexes.map(mapIndex) }),

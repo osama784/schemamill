@@ -147,13 +147,27 @@
           "schema": "public",
           "name": "widget_names",
           "materialized": false,
-          "definition": "SELECT id,label FROM public.widgets"
+          "definition": "SELECT id,label FROM public.widgets",
+          "dependsOn": [
+            {
+              "kind": "relation",
+              "schema": "public",
+              "name": "widgets"
+            }
+          ]
         },
         "after": {
           "schema": "public",
           "name": "widget_names",
           "materialized": false,
-          "definition": "SELECT id,label,score FROM public.widgets"
+          "definition": "SELECT id,label,score FROM public.widgets",
+          "dependsOn": [
+            {
+              "kind": "relation",
+              "schema": "public",
+              "name": "widgets"
+            }
+          ]
         }
       },
       {

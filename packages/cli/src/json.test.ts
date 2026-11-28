@@ -750,6 +750,7 @@ const ALLOWED_KEYS = new Set<string>([
   'schemas',
   'materialized',
   'definition',
+  'dependsOn',
   'checkOption',
   // Field changes and change/step/hazard payloads
   'field',
@@ -1208,6 +1209,31 @@ test('the JSON mapper carries view output columns and their incompatibility diag
     column: 'a',
     reason: 'renamed to x',
   });
+});
+
+test('the JSON mapper carries view dependencies alongside output columns', () => {
+  const view: View = {
+    ...VIEW,
+    columns: [{ name: 'id', type: 'integer' }],
+    dependsOn: [
+      { kind: 'view', schema: 'public', name: 'base' },
+      { kind: 'relation', schema: 'public', name: 'events' },
+    ],
+  };
+  const document = buildJsonDocument(compareInput([{ kind: 'view-added', view }]));
+  const result = document.result as { changes: readonly { view: object }[] };
+  const mapped = result.changes[0]!.view;
+
+  assertExactKeys(
+    mapped,
+    ['schema', 'name', 'materialized', 'definition', 'columns', 'dependsOn'],
+    'view',
+  );
+  assert.deepEqual(mapped, view);
+  const bytes = stringifyJsonDocument(document);
+  assert.ok(bytes.includes('"columns": ['));
+  assert.ok(bytes.includes('"dependsOn": ['));
+  assert.deepEqual(assertNoInternalKeys(document), []);
 });
 
 test('the JSON mapper carries expression elements, INCLUDE, and the partial WHERE', () => {

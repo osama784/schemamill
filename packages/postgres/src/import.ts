@@ -274,9 +274,16 @@ type SequenceDraft = Mutable<Sequence>;
 /**
  * A view being assembled. Views need no incremental mutation: a repeated definition of one
  * identity replaces the draft wholesale, so the last definition wins — including any indexes a
- * materialized view has gathered.
+ * materialized view has gathered. Dependency identities are kept raw: `kind` is decided only after
+ * every statement has been translated, against the completed `views` map, so DDL order cannot
+ * turn a view read by an earlier statement into a `relation` fact.
  */
-type ViewDraft = Mutable<View>;
+type ViewDraft = Mutable<Omit<View, 'dependsOn'>> & {
+  dependsOn?: readonly ViewDependencyIdentity[];
+};
+
+/** A viewed relation identity recorded at translation time, before its `kind` can be known. */
+type ViewDependencyIdentity = Pick<ViewDependency, 'schema' | 'name'>;
 
 /** An extension being assembled; a repeated definition replaces it wholesale. */
 type ExtensionDraft = Mutable<Extension>;
@@ -375,7 +382,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
-      views: [...views.values()].map(finalizeView).sort(compareViews),
+      views: [...views.values()].map((draft) => finalizeView(draft, views)).sort(compareViews),
       extensions: [...extensions.values()].sort(compareExtensions),
       ...(privilegeState.defaultPrivileges.length === 0
         ? {}
@@ -3319,39 +3326,34 @@ function viewOutputColumns(query: Node | undefined): readonly ViewOutputColumn[]
 }
 
 /**
- * Range-table relations a view reads, as dependency facts. Names are taken from every `RangeVar`
- * reachable in the query tree (including `JOIN` arms and subqueries); an unqualified name is
- * qualified with the view's own schema. A name already imported as a view is a `view` dependency,
- * everything else — tables, sequences, and unmodeled relations — is a `relation` fact. Order is
- * canonical by kind then identity, and repeated references to one relation collapse. The
- * `search_path` caveat (a bare name that in DDL could resolve to another schema) is a named
- * residual: the dump's own qualification is the only evidence available here.
+ * Range-table relations a view reads, recorded as bare identities. Names are taken from every
+ * `RangeVar` reachable in the query tree (including `JOIN` arms and subqueries); an unqualified
+ * name is qualified with the view's own schema. Repeated references to one relation collapse.
+ * `kind` is deliberately not decided here: a base declared later in the dump is still a view, so
+ * classification waits for `finalizeView`'s completed `views` map. The `search_path` caveat (a bare
+ * name that in DDL could resolve to another schema) is a named residual: the dump's own
+ * qualification is the only evidence available here.
  */
 function viewDependencies(
   query: Node | undefined,
   schema: string,
-  views: ReadonlyMap<string, ViewDraft>,
-): readonly ViewDependency[] | undefined {
+): readonly ViewDependencyIdentity[] | undefined {
   if (query === undefined) return undefined;
   const relations: RangeVar[] = [];
   collectRangeVars(query, relations);
-  const unique = new Map<string, ViewDependency>();
+  const unique = new Map<string, ViewDependencyIdentity>();
   for (const relation of relations) {
     if (relation.relname === undefined || relation.relname === '') continue;
     const dependencySchema = relation.schemaname ?? schema;
-    const dependency: ViewDependency = {
-      kind: views.has(tableKey(dependencySchema, relation.relname)) ? 'view' : 'relation',
+    unique.set(tableKey(dependencySchema, relation.relname), {
       schema: dependencySchema,
       name: relation.relname,
-    };
-    unique.set(tableKey(dependencySchema, relation.relname), dependency);
+    });
   }
   if (unique.size === 0) return undefined;
   return [...unique.values()].sort(
     (left, right) =>
-      compareStrings(left.kind, right.kind) ||
-      compareStrings(left.schema, right.schema) ||
-      compareStrings(left.name, right.name),
+      compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name),
   );
 }
 
@@ -3433,7 +3435,7 @@ function translateCreateView(
   };
   const columns = viewOutputColumns(create.query);
   if (columns !== undefined) draft.columns = columns;
-  const dependsOn = viewDependencies(create.query, schema, views);
+  const dependsOn = viewDependencies(create.query, schema);
   if (dependsOn !== undefined) draft.dependsOn = dependsOn;
   if (checkOption !== undefined) draft.checkOption = checkOption;
   views.set(tableKey(schema, name), draft);
@@ -5312,11 +5314,13 @@ function finalizeTable(draft: TableDraft): Table {
 }
 
 /**
- * Finalizes a view draft: copies any recorded output columns, canonicalizes a materialized view's
- * index names and sorts the indexes exactly as for a table, omitting the `indexes` field when
- * there are none so ordinary views and index-less matviews keep their existing shape.
+ * Finalizes a view draft: copies any recorded output columns, classifies each recorded dependency
+ * against the completed `views` map so DDL order cannot mislabel a base declared later, then
+ * canonicalizes a materialized view's index names and sorts the indexes exactly as for a table,
+ * omitting the `indexes` field when there are none so ordinary views and index-less matviews keep
+ * their existing shape.
  */
-function finalizeView(draft: ViewDraft): View {
+function finalizeView(draft: ViewDraft, views: ReadonlyMap<string, ViewDraft>): View {
   const indexes =
     draft.indexes !== undefined && draft.indexes.length > 0 ? draft.indexes : undefined;
   if (indexes !== undefined) canonicalizeIndexNames(draft);
@@ -5330,7 +5334,18 @@ function finalizeView(draft: ViewDraft): View {
     view.columns = draft.columns.map((column) => ({ name: column.name, type: column.type }));
   }
   if (draft.dependsOn !== undefined) {
-    view.dependsOn = draft.dependsOn.map((dependency) => ({ ...dependency }));
+    view.dependsOn = draft.dependsOn
+      .map((dependency): ViewDependency => ({
+        kind: views.has(tableKey(dependency.schema, dependency.name)) ? 'view' : 'relation',
+        schema: dependency.schema,
+        name: dependency.name,
+      }))
+      .sort(
+        (left, right) =>
+          compareStrings(left.kind, right.kind) ||
+          compareStrings(left.schema, right.schema) ||
+          compareStrings(left.name, right.name),
+      );
   }
   if (indexes !== undefined) view.indexes = [...indexes].sort(compareIndexes);
   if (draft.checkOption !== undefined) view.checkOption = draft.checkOption;

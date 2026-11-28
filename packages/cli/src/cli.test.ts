@@ -2828,17 +2828,20 @@ const JSON_WIDGET_SEQ = {
 };
 const JSON_SCORE_INDEX = { unique: false, columns: ['score'] };
 const JSON_CONCURRENT_SCORE_INDEX = { unique: false, columns: ['score'], concurrently: true };
+const JSON_WIDGET_NAMES_DEPENDS_ON = [{ kind: 'relation', schema: 'public', name: 'widgets' }];
 const JSON_WIDGET_NAMES_BEFORE = {
   schema: 'public',
   name: 'widget_names',
   materialized: false,
   definition: 'SELECT id,label FROM public.widgets',
+  dependsOn: JSON_WIDGET_NAMES_DEPENDS_ON,
 };
 const JSON_WIDGET_NAMES_AFTER = {
   schema: 'public',
   name: 'widget_names',
   materialized: false,
   definition: 'SELECT id,label,score FROM public.widgets',
+  dependsOn: JSON_WIDGET_NAMES_DEPENDS_ON,
 };
 const JSON_WIDGET_SCORES_VIEW = {
   schema: 'public',

@@ -4840,6 +4840,41 @@ test('imports view dependencies from range tables, qualifying unqualified names 
   assert.deepEqual(diagnostics, []);
 });
 
+test('classifies a forward view dependency against the completed import, not DDL order', async () => {
+  // The dependent is declared before its base. Both facts are recorded before finalization, so
+  // `base` must still be a `view` fact and the resulting plan must create it before its dependent.
+  const dump = [
+    `CREATE VIEW public.dep AS SELECT id FROM public.base;`,
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'public',
+      name: 'base',
+      materialized: false,
+      definition: 'SELECT 1 AS id',
+      columns: [{ name: 'id', type: '' }],
+    },
+    {
+      schema: 'public',
+      name: 'dep',
+      materialized: false,
+      definition: 'SELECT id FROM public.base',
+      dependsOn: [{ kind: 'view', schema: 'public', name: 'base' }],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+
+  const emptyModel: Model = { tables: [], sequences: [], views: [], extensions: [] };
+  const created = plan(emptyModel, model).steps.flatMap((step) =>
+    step.kind === 'create-view' ? [step.view.name] : [],
+  );
+  assert.deepEqual(created, ['base', 'dep']);
+});
+
 test('imports table and sequence range dependencies as relations, deduplicated by identity', async () => {
   const dump = [
     `CREATE TABLE app.t (id integer);`,

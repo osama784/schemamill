@@ -29,7 +29,7 @@ A live, read-only PostgreSQL catalog reads back as the canonical model, such tha
 
 ## Done means
 
-- The tracer scene is green in the gated suite, and a live run summary (PostgreSQL versions, scene names, pass counts) is recorded on the slice's tracker issue — [#55](https://github.com/osama784/schemamill/issues/55) carries the local PostgreSQL 16.15 run (34 scenes at the time) and the CI `verify-postgres` run on PostgreSQL 18. The suite has since grown to 63 scenes; the corpus is 564 postgres tests + 63 scenes + 4 always-on live subtests = 631 tests, with the five PostgreSQL 18 scenes floored and 5 skipped by name, and all 63 run on the CI's PostgreSQL 18 leg, while the CI's PostgreSQL 13 leg skips the scenes floored above 13 by name. No local `SCHEMAMILL_TEST_PG_URL` was configured, so live pass/skip counts come from CI only.
+- The tracer scene is green in the gated suite, and a live run summary (PostgreSQL versions, scene names, pass counts) is recorded on the slice's tracker issue — [#55](https://github.com/osama784/schemamill/issues/55) carries the local PostgreSQL 16.15 run (34 scenes at the time) and the CI `verify-postgres` run on PostgreSQL 18. The suite has since grown to 63 scenes; the corpus is 565 postgres tests + 63 scenes + 4 always-on live subtests = 632 tests, with the five PostgreSQL 18 scenes floored and 5 skipped by name, and all 63 run on the CI's PostgreSQL 18 leg, while the CI's PostgreSQL 13 leg skips the scenes floored above 13 by name. No local `SCHEMAMILL_TEST_PG_URL` was configured, so live pass/skip counts come from CI only.
 - The five gates pass from the repo root.
 
 ## Deferred
