@@ -171,7 +171,7 @@ The internal sequence attached to an identity column. Created with `ADD GENERATE
 _Avoid_: owned sequence, serial sequence
 
 **View**:
-A named query stored in the model, identified by its schema and name, e.g. `public.active_accounts`. A view is a relation with a definition, not a table: it has no modeled columns, and a change is a `CREATE OR REPLACE` or a drop and recreate.
+A named query stored in the model, identified by its schema and name, e.g. `public.active_accounts`. A view is a relation with an opaque [View definition](#view-definition), not a table: it carries ordered [View output columns](#view-output-column) and [View dependencies](#view-dependency) when they are known, and a change is a `CREATE OR REPLACE` or a drop and recreate.
 _Avoid_: virtual table, query object
 
 **Materialized view**:
@@ -185,6 +185,14 @@ _Avoid_: view query, view SQL
 **View check option**:
 A plain view's `WITH [LOCAL|CASCADED] CHECK OPTION`: `local` or `cascaded` in the model, absent meaning none. A materialized view never carries one.
 _Avoid_: check constraint, validation rule
+
+**View output column**:
+One output column of a view or materialized view, in `attnum` order, carrying a name and a canonical `format_type` type; a dump-derived type that cannot be resolved is `''` and means unknown. Recorded to preflight `CREATE OR REPLACE`: only a list whose every entry has a name and a non-empty type is verifiable, and a rename, drop, reorder, or retype with positive evidence from two verifiable sides plans a drop and recreate instead. Absent or unverifiable means unknown, keeps `replace-view`, and PostgreSQL still validates the replace at apply.
+_Avoid_: view attribute, projected column
+
+**View dependency**:
+A relation a view reads, recorded as a `kind` of `view` or `relation` plus a schema-qualified name. A `view` dependency orders view drops and creates and gates the typed plan refusal; a `relation` dependency, including a table or sequence, is a fidelity fact that never refuses. An unmodeled dependency means specifically a scheduled `kind: 'view'` fact naming a view the model does not carry.
+_Avoid_: view link, view reference
 
 **Extension**:
 A PostgreSQL extension installed in the database, identified by its name alone: extension names are database-unique and never schema-qualified. Its install schema and comment are attributes, not identity, so moving the extension is an `ALTER EXTENSION … SET SCHEMA`, not a drop and create. The install schema is required because a dump always states it; a definition without one is skipped and named, never defaulted.
