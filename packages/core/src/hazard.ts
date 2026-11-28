@@ -18,7 +18,8 @@ import type {
  * two claims occupy one index or constraint name, so the renderer refuses before emitting SQL.
  *
  * Every hazard carries `step`: the index into `Plan.steps` of the step that carries it, and
- * `entity`: the sequence, identity column, table, or name collision the hazard belongs to.
+ * `entity`: the sequence, identity column, table, name collision, or unsupported declaration the
+ * hazard belongs to.
  */
 export type Hazard =
   /** The target's `INCREMENT BY 0` — PostgreSQL rejects it at apply (`INCREMENT must not be zero`). */
@@ -84,23 +85,41 @@ export type Hazard =
       readonly persistence?: TablePersistence;
     }
   /**
-   * The plan's name claims collide in a render guard namespace, so `renderSql` refuses it before
-   * emitting SQL. The hazard carries the later colliding step and both claimants' names;
-   * `compare` can report the same fact without rendering.
+   * The plan's name claims collide in a render guard namespace, or one of its step-backed
+   * declarations needs a newer PostgreSQL than the declared target, so `renderSql` refuses it
+   * before emitting SQL. A name collision carries the later colliding step and both claimants'
+   * names; an unsupported declaration carries the step that declares it, the declaration form,
+   * and the target and floor majors. `compare` can report either fact without rendering.
    */
   | {
       readonly kind: 'render-refusal';
       readonly step: number;
-      readonly entity: Extract<HazardEntity, { readonly kind: 'name-collision' }>;
+      readonly entity: Extract<
+        HazardEntity,
+        { readonly kind: 'name-collision' | 'unsupported-declaration' }
+      >;
     };
 
 /**
+ * A declaration form whose PostgreSQL floor the declared target does not reach. The same five
+ * forms the postgres collector reports; kept here as a plain string union so core stays
+ * framework-free ([ADR 0005](../../../docs/adr/0005-framework-free-core.md)).
+ */
+export type UnsupportedDeclarationForm =
+  | 'named-not-null'
+  | 'named-not-null-drop'
+  | 'not-null-comment'
+  | 'not-enforced'
+  | 'explicit-compression';
+
+/**
  * The model entity a hazard belongs to: a sequence, identified by schema and name; an identity
- * column, identified by its table and column name; a table, identified by schema and name; or a
- * name collision, identified by its guard scope (schema-wide index or table-scoped constraint),
- * the schema, an optional table, and the two clashing claims' names in earlier-then-later order.
- * Structured rather than a display label so identities carrying dots or other punctuation stay
- * unambiguous.
+ * column, identified by its table and column name; a table, identified by schema and name; a name
+ * collision, identified by its guard scope (schema-wide index or table-scoped constraint), the
+ * schema, an optional table, and the two clashing claims' names in earlier-then-later order; or an
+ * unsupported declaration, identified by its schema, optional table, form, declared target major,
+ * and the major its form first needs. Structured rather than a display label so identities
+ * carrying dots or other punctuation stay unambiguous.
  */
 export type HazardEntity =
   | { readonly kind: 'sequence'; readonly sequence: SequenceIdentity }
@@ -112,4 +131,12 @@ export type HazardEntity =
       readonly schema: string;
       readonly table?: string;
       readonly names: readonly [string, string];
+    }
+  | {
+      readonly kind: 'unsupported-declaration';
+      readonly schema: string;
+      readonly table?: string;
+      readonly declaration: UnsupportedDeclarationForm;
+      readonly targetVersion: number;
+      readonly floor: number;
     };

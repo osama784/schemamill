@@ -4,3 +4,9 @@
     ~ foreign key (team_id) → public.teams: enforcement not-valid → not-enforced
     ~ unique constraint (email): name (none) → (none), deferrable (none) → true
     + check constraint users_email_check_v2 CHECK (email <> '')
+
+Hazards:
+  step 4 render-refusal public.users: named NOT NULL drop needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.
+  step 5 render-refusal public.users: named NOT NULL needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.
+  step 8 render-refusal public.users: NOT ENFORCED needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.
+  step 9 render-refusal public.users: NOT ENFORCED needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.

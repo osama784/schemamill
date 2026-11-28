@@ -8,8 +8,8 @@ import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { initWorkspace, resolveWorkspace, version } from '@schemamill/core';
-import type { Model } from '@schemamill/core';
+import { initWorkspace, resolveWorkspace, serializeModel, version } from '@schemamill/core';
+import type { CheckConstraint, Column, ForeignKey, Model } from '@schemamill/core';
 import { importDump } from '@schemamill/postgres';
 
 /**
@@ -90,6 +90,103 @@ const REFUSAL_MODEL: Model = {
   views: [],
   extensions: [],
 };
+
+/** A table with no declaration below any form's floor. */
+const PLAIN_DUMP = ['CREATE TABLE public.t (c text);', ''].join('\n');
+
+/** A table carrying a named not-null fact (floor 18). */
+const NAMED_NOT_NULL_DUMP = ['CREATE TABLE public.t (c text CONSTRAINT t_c_nn NOT NULL);', ''].join(
+  '\n',
+);
+
+/** A table whose not-null fact is generated rather than named. */
+const UNNAMED_NOT_NULL_DUMP = ['CREATE TABLE public.t (c text NOT NULL);', ''].join('\n');
+
+/** The table above with a comment on its generated not-null fact (floor 18). */
+const NOT_NULL_COMMENT_DUMP = [
+  'CREATE TABLE public.t (c text NOT NULL);',
+  `COMMENT ON CONSTRAINT t_c_not_null ON public.t IS 'a note';`,
+  '',
+].join('\n');
+
+/** The same table with a check constraint declared `NOT ENFORCED` (floor 18). */
+const NOT_ENFORCED_DUMP = [
+  'CREATE TABLE public.t (c text);',
+  `ALTER TABLE public.t ADD CONSTRAINT ck_c CHECK (c <> '') NOT ENFORCED;`,
+  '',
+].join('\n');
+
+/** The same table with an explicit compression method (floor 14). */
+const COMPRESSION_DUMP = [
+  'CREATE TABLE public.t (c text);',
+  'ALTER TABLE ONLY public.t ALTER COLUMN c SET COMPRESSION lz4;',
+  '',
+].join('\n');
+
+/** One declaration scene: dumps carrying the form, its human clause, and pinned refusal line. */
+interface DeclarationScene {
+  readonly form: string;
+  readonly baseline: string;
+  readonly target: string;
+  readonly clause: string;
+  readonly declaration: string;
+  readonly floor: number;
+  readonly refusal: string;
+}
+
+/** Every declaration form, with the target above its floor removed so the plan carries it. */
+const DECLARATION_SCENES: readonly DeclarationScene[] = [
+  {
+    form: 'named-not-null',
+    baseline: '',
+    target: NAMED_NOT_NULL_DUMP,
+    clause: 'named NOT NULL',
+    declaration: 'named-not-null',
+    floor: 18,
+    refusal:
+      'schemamill: refusing to render for PostgreSQL 13: named NOT NULL on public.t column c needs PostgreSQL 18 or newer\n',
+  },
+  {
+    form: 'named-not-null-drop',
+    baseline: NAMED_NOT_NULL_DUMP,
+    target: PLAIN_DUMP,
+    clause: 'named NOT NULL drop',
+    declaration: 'named-not-null-drop',
+    floor: 18,
+    refusal:
+      'schemamill: refusing to render for PostgreSQL 13: named NOT NULL drop on public.t column c needs PostgreSQL 18 or newer\n',
+  },
+  {
+    form: 'not-null-comment',
+    baseline: UNNAMED_NOT_NULL_DUMP,
+    target: NOT_NULL_COMMENT_DUMP,
+    clause: 'NOT NULL comment',
+    declaration: 'not-null-comment',
+    floor: 18,
+    refusal:
+      'schemamill: refusing to render for PostgreSQL 13: NOT NULL comment on public.t column c needs PostgreSQL 18 or newer\n',
+  },
+  {
+    form: 'not-enforced',
+    baseline: PLAIN_DUMP,
+    target: NOT_ENFORCED_DUMP,
+    clause: 'NOT ENFORCED',
+    declaration: 'not-enforced',
+    floor: 18,
+    refusal:
+      'schemamill: refusing to render for PostgreSQL 13: NOT ENFORCED on public.t constraint ck_c needs PostgreSQL 18 or newer\n',
+  },
+  {
+    form: 'explicit-compression',
+    baseline: PLAIN_DUMP,
+    target: COMPRESSION_DUMP,
+    clause: 'COMPRESSION',
+    declaration: 'explicit-compression',
+    floor: 14,
+    refusal:
+      'schemamill: refusing to render for PostgreSQL 13: COMPRESSION lz4 on public.t column c needs PostgreSQL 14 or newer\n',
+  },
+];
 
 /**
  * A workspace model whose only sequence is owned by `public.absent.id`, a table the model does
@@ -786,6 +883,37 @@ async function exportMarkdownWorkspace(context: TestContext): Promise<string> {
   return root;
 }
 
+/**
+ * A fresh workspace holding one `public.t` table with the given columns, checks, and foreign
+ * keys, serialized through core so the declarations arrive exactly as a saved model would.
+ */
+async function declarationWorkspace(
+  context: TestContext,
+  columns: readonly Column[],
+  checkConstraints: readonly CheckConstraint[] = [],
+  foreignKeys: readonly ForeignKey[] = [],
+): Promise<string> {
+  const root = await fixtureDir(context);
+  const declared: Model = {
+    tables: [
+      {
+        schema: 'public',
+        name: 't',
+        columns: [...columns],
+        foreignKeys: [...foreignKeys],
+        uniqueConstraints: [],
+        checkConstraints: [...checkConstraints],
+        indexes: [],
+      },
+    ],
+    sequences: [],
+    views: [],
+    extensions: [],
+  };
+  await writeWorkspaceModel(root, serializeModel(declared));
+  return root;
+}
+
 interface RunOptions {
   /** Working directory for the spawned CLI; defaults to the test process's own. */
   readonly cwd?: string;
@@ -1045,10 +1173,12 @@ test('plan passes the imported baseline to the render guard', async (t) => {
   assert.equal(result.code, 1);
 });
 
-test('plan --target-version 13 refuses the synthesized resets, display first', async () => {
-  // The display is version-free: the golden's text before its SQL carries the plan and the
-  // hazards. Target 13 refuses the first reset in plan order — the storage removal on
-  // `public.attrs.s_remove` — before the compression reset later in the same plan.
+test('plan --target-version 13 refuses a declaration before the synthesized resets, display first', async () => {
+  // The golden's plan display is captured at target 16, so its hazards block carries only the
+  // persistence rewrites. At target 13 the same steps also carry two declaration hazards —
+  // explicit compression on `fresh` and on `comp_add` — which precede the rewrites in step order.
+  // The imported target model is now read by the gate, so model order picks `comp_add` as the
+  // first offender before any step fact or synthesized reset.
   const baseline = fixturePath('column-attributes.baseline.sql');
   const target = fixturePath('column-attributes.target.sql');
   const golden = testText('goldens/column-attributes.plan.txt');
@@ -1057,13 +1187,22 @@ test('plan --target-version 13 refuses the synthesized resets, display first', a
   const display = golden.slice(0, sqlAt);
   assert.notEqual(display, '');
   assert.match(display, /steps in one transaction:/u);
+  const declarationHazards = [
+    '  step 1 render-refusal public.attrs: COMPRESSION needs PostgreSQL 14 or newer (target 13) — rendering refuses this plan.',
+    '  step 10 render-refusal public.attrs: COMPRESSION needs PostgreSQL 14 or newer (target 13) — rendering refuses this plan.',
+    '',
+  ].join('\n');
+  const header = 'Hazards:\n';
+  const headerAt = display.indexOf(header);
+  assert.notEqual(headerAt, -1, 'the display carries a hazards block');
+  const refusedDisplay = `${display.slice(0, headerAt + header.length)}${declarationHazards}${display.slice(headerAt + header.length)}`;
 
   const refused = await runCli('plan', baseline, target, '--target-version', '13');
 
-  assert.equal(refused.stdout, display);
+  assert.equal(refused.stdout, refusedDisplay);
   assert.equal(
     refused.stderr,
-    'schemamill: refusing to render for PostgreSQL 13: SET STORAGE DEFAULT on public.attrs column s_remove needs PostgreSQL 16 or newer\n',
+    'schemamill: refusing to render for PostgreSQL 13: COMPRESSION pglz on public.attrs column comp_add needs PostgreSQL 14 or newer\n',
   );
   assert.equal(refused.code, 1);
 
@@ -1077,6 +1216,219 @@ test('plan --target-version 13 refuses the synthesized resets, display first', a
     'schemamill: refusing to render for PostgreSQL 14: SET STORAGE DEFAULT on public.attrs column s_remove needs PostgreSQL 16 or newer\n',
   );
   assert.equal(boundary.code, 1);
+});
+
+test('human plan prints its display and one refusal line for every declaration form', async (t) => {
+  const dir = await fixtureDir(t);
+  for (const scene of DECLARATION_SCENES) {
+    const baseline = await writeDump(dir, `${scene.form}.baseline.sql`, scene.baseline);
+    const target = await writeDump(dir, `${scene.form}.target.sql`, scene.target);
+
+    const result = await runCli('plan', baseline, target, '--target-version', '13');
+
+    assert.equal(result.stdout.includes('BEGIN;'), false, `${scene.form}: no SQL is emitted`);
+    assert.match(result.stdout, /^1 step in one transaction:\n/u, `${scene.form}: display first`);
+    assert.ok(
+      result.stdout.includes(
+        `  step 1 render-refusal public.t: ${scene.clause} needs PostgreSQL ${scene.floor} or newer (target 13) — rendering refuses this plan.`,
+      ),
+      `${scene.form}: the human hazard is printed`,
+    );
+    assert.equal(result.stderr, scene.refusal, `${scene.form}: one refusal line`);
+    assert.equal(result.stderr.split('\n').length, 2, `${scene.form}: no stack trace`);
+    assert.equal(result.code, 1, `${scene.form}: exit 1`);
+  }
+});
+
+test('plan --json emits one full document with declaration hazards and one refusal line', async (t) => {
+  const dir = await fixtureDir(t);
+  for (const scene of DECLARATION_SCENES) {
+    const baseline = await writeDump(dir, `${scene.form}.json.baseline.sql`, scene.baseline);
+    const target = await writeDump(dir, `${scene.form}.json.target.sql`, scene.target);
+
+    const result = await runCli('plan', baseline, target, '--json', '--target-version', '13');
+
+    assert.equal(result.stderr, scene.refusal, `${scene.form}: one refusal line`);
+    assert.equal(result.code, 1, `${scene.form}: exit 1`);
+    const document = JSON.parse(result.stdout) as JsonEnvelopeProbe;
+    assert.equal(document.command, 'plan');
+    assert.deepEqual(Object.keys(document.result), ['targetVersion', 'steps', 'groups', 'hazards']);
+    assert.equal(document.result.targetVersion, 13);
+    const hazard = {
+      kind: 'render-refusal',
+      step: 0,
+      entity: {
+        kind: 'unsupported-declaration',
+        schema: 'public',
+        table: 't',
+        declaration: scene.declaration,
+        targetVersion: 13,
+        floor: scene.floor,
+      },
+    };
+    // A standalone compression field states its own declaration; with no merged TYPE the carrier
+    // is not a fact, so one hazard is reported — never a synthesized sentinel.
+    const hazards = [hazard];
+    assert.deepEqual(document.result.hazards, hazards, `${scene.form}: declaration hazard DTO`);
+    assert.equal(result.stdout.includes('BEGIN;'), false, 'the document carries no rendered SQL');
+    assert.equal(result.stdout, `${JSON.stringify(document, null, 2)}\n`);
+  }
+});
+
+test('human compare prints every declaration hazard without rendering or refusing', async (t) => {
+  const dir = await fixtureDir(t);
+  for (const scene of DECLARATION_SCENES) {
+    const baseline = await writeDump(dir, `${scene.form}.compare.baseline.sql`, scene.baseline);
+    const target = await writeDump(dir, `${scene.form}.compare.target.sql`, scene.target);
+
+    const human = await runCli('compare', baseline, target, '--target-version', '13');
+
+    assert.equal(human.stderr, '', `${scene.form}: no refusal on the compare channel`);
+    assert.equal(human.code, 0, `${scene.form}: exit unchanged`);
+    assert.ok(
+      human.stdout.includes(
+        `  step 1 render-refusal public.t: ${scene.clause} needs PostgreSQL ${scene.floor} or newer (target 13) — rendering refuses this plan.`,
+      ),
+      `${scene.form}: the hazard is printed`,
+    );
+
+    const json = await runCli('compare', baseline, target, '--json', '--target-version', '13');
+
+    assert.equal(json.stderr, '');
+    assert.equal(json.code, 0);
+    assert.deepEqual(Object.keys((JSON.parse(json.stdout) as JsonEnvelopeProbe).result), [
+      'changes',
+    ]);
+  }
+});
+
+test('DDL export refuses every model-carried declaration with empty stdout and one stderr line', async (t) => {
+  const scenes: readonly (readonly [string, string, Promise<string>])[] = [
+    [
+      'named NOT NULL on public.t column c',
+      '18',
+      declarationWorkspace(t, [{ name: 'c', type: 'text', notNull: true, notNullName: 't_c_nn' }]),
+    ],
+    [
+      'COMPRESSION lz4 on public.t column c',
+      '14',
+      declarationWorkspace(t, [{ name: 'c', type: 'text', notNull: false, compression: 'lz4' }]),
+    ],
+    [
+      'NOT ENFORCED on public.t constraint ck_c',
+      '18',
+      declarationWorkspace(
+        t,
+        [{ name: 'c', type: 'text', notNull: false }],
+        [{ name: 'ck_c', expression: "c <> ''", enforcement: 'not-enforced' }],
+      ),
+    ],
+    [
+      'NOT ENFORCED on public.t constraint fk_c',
+      '18',
+      declarationWorkspace(
+        t,
+        [{ name: 'c', type: 'text', notNull: false }],
+        [],
+        [
+          {
+            name: 'fk_c',
+            columns: ['c'],
+            referencedTable: { schema: 'public', name: 't' },
+            referencedColumns: ['c'],
+            enforcement: 'not-enforced',
+          },
+        ],
+      ),
+    ],
+  ];
+
+  for (const [capability, floor, rootPromise] of scenes) {
+    const root = await rootPromise;
+
+    const result = await runCli('export', '--target-version', '13', { cwd: root });
+
+    assert.equal(result.stdout, '', `${capability}: no artifact`);
+    assert.equal(
+      result.stderr,
+      `schemamill: refusing to render for PostgreSQL 13: ${capability} needs PostgreSQL ${floor} or newer\n`,
+    );
+    assert.equal(result.stderr.split('\n').length, 2, `${capability}: no stack trace`);
+    assert.equal(result.code, 1, `${capability}: exit 1`);
+  }
+});
+
+test('a zero-step plan with an unsupported declaration refuses on plan and DDL export', async (t) => {
+  const root = await declarationWorkspace(t, [
+    { name: 'c', type: 'text', notNull: true, notNullName: 't_c_nn' },
+  ]);
+  const dumps = await fixtureDir(t);
+  const baseline = await writeDump(dumps, 'baseline.sql', NAMED_NOT_NULL_DUMP);
+  const refusal =
+    'schemamill: refusing to render for PostgreSQL 13: named NOT NULL on public.t column c needs PostgreSQL 18 or newer\n';
+
+  const human = await runCli('plan', '--target-workspace', baseline, '--target-version', '13', {
+    cwd: root,
+  });
+
+  assert.equal(human.stdout, 'No changes.\n');
+  assert.equal(human.stderr, refusal);
+  assert.equal(human.code, 1);
+
+  const json = await runCli(
+    'plan',
+    '--target-workspace',
+    baseline,
+    '--json',
+    '--target-version',
+    '13',
+    { cwd: root },
+  );
+
+  assert.equal(json.stderr, refusal);
+  assert.equal(json.code, 1);
+  const document = JSON.parse(json.stdout) as JsonEnvelopeProbe;
+  assert.deepEqual(document.result.steps, []);
+  assert.deepEqual(document.result.hazards, [], 'a model-only declaration has no step sentinel');
+
+  const exported = await runCli('export', '--target-version', '13', { cwd: root });
+
+  assert.equal(exported.stdout, '');
+  assert.equal(exported.stderr, refusal);
+  assert.equal(exported.code, 1);
+});
+
+test('export --format json and markdown cannot refuse a declared workspace and stay byte-identical', async (t) => {
+  // The markdown fixture carries a named NOT NULL, an explicit compression, and a NOT ENFORCED
+  // check; both projections return before rendering, so neither can refuse at any target.
+  const root = await exportMarkdownWorkspace(t);
+
+  const markdown13 = await runCli('export', '--format', 'markdown', '--target-version', '13', {
+    cwd: root,
+  });
+  const markdown18 = await runCli('export', '--format', 'markdown', '--target-version', '18', {
+    cwd: root,
+  });
+
+  assert.equal(markdown13.stdout, testText('goldens/export.markdown.txt'));
+  assert.equal(markdown13.stdout, markdown18.stdout);
+  assert.equal(markdown13.stderr, '');
+  assert.equal(markdown13.code, 0);
+
+  const json13 = await runCli('export', '--format', 'json', '--target-version', '13', {
+    cwd: root,
+  });
+  const json18 = await runCli('export', '--format', 'json', '--target-version', '18', {
+    cwd: root,
+  });
+
+  assert.equal(json13.stdout, json18.stdout);
+  assert.equal(json13.stderr, '');
+  assert.equal(json13.code, 0);
+  const resolution = await resolveWorkspace(root);
+  assert.ok(resolution.ok);
+  assert.deepEqual(JSON.parse(json13.stdout), JSON.parse(serializeModel(resolution.model)));
+  assert.equal(json13.stdout, `${JSON.stringify(JSON.parse(json13.stdout), null, 2)}\n`);
 });
 
 test('an invalid --target-version is a usage error before any filesystem access, exit 1', async () => {

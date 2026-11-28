@@ -29,6 +29,7 @@ import type {
   TableChange,
   TableIdentity,
   TablePersistence,
+  UnsupportedDeclarationForm,
   UniqueConstraint,
   View,
   ViewFieldChange,
@@ -166,8 +167,8 @@ export function formatHazards(hazards: readonly Hazard[]): string {
 
 /**
  * The hazard entity's label: `schema.name` for a sequence or table, `schema.table.column` for
- * a column, the schema alone for a schema-wide index collision, and `schema.table` for a
- * table-scoped constraint collision.
+ * a column, the schema alone for a schema-wide index collision, `schema.table` for a
+ * table-scoped constraint collision, and the declaring table for an unsupported declaration.
  */
 function formatEntity(entity: HazardEntity): string {
   switch (entity.kind) {
@@ -178,15 +179,35 @@ function formatEntity(entity: HazardEntity): string {
     case 'table':
       return formatIdentity(entity.table);
     case 'name-collision':
+    case 'unsupported-declaration':
       return entity.table === undefined ? entity.schema : `${entity.schema}.${entity.table}`;
     default:
       return assertNever(entity, 'HazardEntity');
   }
 }
 
+/** The declaration form's phrase in the refusal clause. */
+function formatDeclaration(form: UnsupportedDeclarationForm): string {
+  switch (form) {
+    case 'named-not-null':
+      return 'named NOT NULL';
+    case 'named-not-null-drop':
+      return 'named NOT NULL drop';
+    case 'not-null-comment':
+      return 'NOT NULL comment';
+    case 'not-enforced':
+      return 'NOT ENFORCED';
+    case 'explicit-compression':
+      return 'COMPRESSION';
+    default:
+      return assertNever(form, 'UnsupportedDeclarationForm');
+  }
+}
+
 /**
  * One hazard's clause: the definite failure PostgreSQL hits at apply, the conditional one it
- * may hit, the certain cost of a table rewrite, or the names a render guard would refuse.
+ * may hit, the certain cost of a table rewrite, the names a render guard would refuse, or the
+ * declaration form and floor a target cannot express.
  */
 function formatHazard(hazard: Hazard): string {
   switch (hazard.kind) {
@@ -208,6 +229,9 @@ function formatHazard(hazard: Hazard): string {
       return `${hazard.persistence === undefined ? 'SET LOGGED' : 'SET UNLOGGED'} rewrites the table under an ACCESS EXCLUSIVE lock.`;
     case 'render-refusal': {
       const entity = hazard.entity;
+      if (entity.kind === 'unsupported-declaration') {
+        return `${formatDeclaration(entity.declaration)} needs PostgreSQL ${entity.floor} or newer (target ${entity.targetVersion}) — rendering refuses this plan.`;
+      }
       const [first, second] = entity.names;
       return `${entity.scope === 'index' ? 'index' : 'constraint'} names ${JSON.stringify(first)} and ${JSON.stringify(second)} would share a ${entity.scope === 'index' ? 'schema-wide' : 'table-scoped'} name — PostgreSQL rejects this at apply; rendering refuses this plan.`;
     }

@@ -19,9 +19,11 @@ import { validateTargetVersion } from './target-version.ts';
  * and passed to the renderer. Usage errors are emitted through commander's error machinery
  * before any filesystem access. An `error` diagnostic makes the exit code 1, but the plan is
  * still printed. A plan-time contract error — a target sequence whose `ownedBy` does not
- * resolve — prints one `schemamill: …` line on stderr, no display, and exit code 1. A plan the
- * renderer refuses still prints its display, then one `schemamill: refusing to render …` line on
- * stderr and exit code 1; any other render failure is a bug and crashes.
+ * resolve — prints one `schemamill: …` line on stderr, no display, and exit code 1. The imported
+ * target model is passed to the render gate, so a declaration it carries but the declared major
+ * cannot express refuses even on a table the plan does not touch; validation runs on zero-step
+ * plans too. A refused plan still prints its display, then one `schemamill: refusing to render …`
+ * line on stderr and exit code 1; any other render failure is a bug and crashes.
  */
 
 interface PlanOptions {
@@ -79,16 +81,18 @@ export function registerPlan(program: Command): void {
             targetVersion: Number(options.targetVersion),
           });
           let refusal: string | undefined;
-          if (planned.steps.length > 0) {
-            try {
-              renderSql(planned, {
-                targetVersion: Number(options.targetVersion),
-                baseline: imported.baseline,
-              });
-            } catch (error) {
-              if (!(error instanceof RenderRefusalError)) throw error;
-              refusal = error.message;
-            }
+          // Validation runs even for a zero-step plan: a no-diff workspace can still carry an
+          // unsupported declaration, and DDL export already refuses one. The document below is
+          // written in full either way; only the stderr line and exit code change on refusal.
+          try {
+            renderSql(planned, {
+              targetVersion: Number(options.targetVersion),
+              baseline: imported.baseline,
+              targetModel: imported.target,
+            });
+          } catch (error) {
+            if (!(error instanceof RenderRefusalError)) throw error;
+            refusal = error.message;
           }
           const document = buildJsonDocument({
             command: 'plan',
@@ -119,23 +123,25 @@ export function registerPlan(program: Command): void {
           targetVersion: Number(options.targetVersion),
         });
         const hazardsBlock = hazards.length > 0 ? `${formatHazards(hazards)}\n` : '';
-        if (planned.steps.length === 0) {
-          process.stdout.write(formatPlan(planned));
-        } else {
-          process.stdout.write(`${formatPlan(planned)}\n${hazardsBlock}`);
-          try {
-            process.stdout.write(
-              renderSql(planned, {
-                targetVersion: Number(options.targetVersion),
-                baseline: imported.baseline,
-              }),
-            );
-          } catch (error) {
-            if (!(error instanceof RenderRefusalError)) throw error;
-            process.stderr.write(`schemamill: ${error.message}\n`);
-            process.exitCode = 1;
-            return;
-          }
+        process.stdout.write(
+          planned.steps.length === 0
+            ? formatPlan(planned)
+            : `${formatPlan(planned)}\n${hazardsBlock}`,
+        );
+        // The target model reaches the gate so a declaration on an untouched table refuses too;
+        // a zero-step plan has no SQL to write but is still validated, matching DDL export.
+        try {
+          const sql = renderSql(planned, {
+            targetVersion: Number(options.targetVersion),
+            baseline: imported.baseline,
+            targetModel: imported.target,
+          });
+          if (planned.steps.length > 0) process.stdout.write(sql);
+        } catch (error) {
+          if (!(error instanceof RenderRefusalError)) throw error;
+          process.stderr.write(`schemamill: ${error.message}\n`);
+          process.exitCode = 1;
+          return;
         }
         process.exitCode = imported.exitCode;
       },

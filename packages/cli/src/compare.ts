@@ -15,8 +15,9 @@ import { validateTargetVersion } from './target-version.ts';
  * Wiring only — the side mapping and the read/import plumbing come from `run.ts`, the diff and
  * plan from `@schemamill/core`, the hazards from `@schemamill/postgres`, and the human wording
  * from `format.ts`. `--target-version` declares the PostgreSQL major the version-aware hazard
- * analysis reads; it shares `plan`'s 13–18 validation before any filesystem access, while the
- * JSON path still emits no hazards. Usage errors are emitted through commander's error machinery
+ * analysis reads; it shares `plan`'s 13–18 validation before any filesystem access, and the human
+ * block now includes step-backed declaration refusals from the same collector the render gate
+ * uses, while the JSON path still emits no hazards. Usage errors are emitted through commander's error machinery
  * before any filesystem access. The hazard step numbers are indices into the migration plan's step order;
  * `compare` prints no step list, so a line's `step <n>` refers to the step `schemamill plan`
  * would number `<n>`. Each hazard line also names the entity it belongs to, so compare lines

@@ -30,3 +30,7 @@
 + comment on table public.members: (none) → "member rows"
 
 ~ comment on unique constraint public.teams (code): "team code v1" → "team code v2"
+
+Hazards:
+  step 8 render-refusal public.audit: NOT ENFORCED needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.
+  step 9 render-refusal public.audit: NOT ENFORCED needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.

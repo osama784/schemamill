@@ -3,3 +3,6 @@
 
 ~ table public.members
     ~ foreign key (team_id) → public.teams: enforcement (none) → not-enforced
+
+Hazards:
+  step 4 render-refusal public.members: NOT ENFORCED needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.

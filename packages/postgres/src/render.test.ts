@@ -729,6 +729,7 @@ test('renders the four not-null step statements, named or unnamed', () => {
         { kind: 'add-not-null', table: identity('t'), column: 'c', name: 't_c_not_null' },
         { kind: 'add-not-null', table: identity('t'), column: 'd' },
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -754,6 +755,7 @@ test('quotes the identifiers a not-null step carries', () => {
         },
         { kind: 'add-not-null', table: identity('Order', 'app'), column: 'Mixed Case' },
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -894,6 +896,7 @@ test('renders foreign-key enforcement and deferrability after its actions', () =
           foreignKey: foreignKey(['owner_id'], identity('parent'), { deferrable: true }),
         },
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -945,27 +948,32 @@ test('target 18 renders a not-enforced-to-absent flip in place', () => {
   assert.ok(!sql.includes('ADD CONSTRAINT'), 'the add half is collapsed');
 });
 
-test('targets below 18 render a pure enforcement flip as the drop and add pair', () => {
+test('targets below 18 refuse a pure enforcement flip that would state NOT ENFORCED', () => {
   const before = enforcementKey(undefined);
   const after = enforcementKey('not-enforced');
   const planned = planOf(...foreignKeyPairSteps(before, after));
-  const expected = [
-    'BEGIN;',
-    'ALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;',
-    'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) NOT ENFORCED;',
-    'COMMIT;',
-    '',
-  ].join('\n');
+  const message =
+    'refusing to render for PostgreSQL 13: NOT ENFORCED on public.child constraint child_parent_id_fkey needs PostgreSQL 18 or newer';
 
-  assert.equal(renderSql(planned), expected, 'the default target keeps the pair');
+  assertRefusal(() => renderSql(planned), message);
   for (const targetVersion of [13, 16, 17]) {
-    assert.equal(renderSql(planned, { targetVersion }), expected, `target ${targetVersion}`);
-    assert.equal(
-      renderSql(planned, { targetVersion }),
-      renderSql(planned),
-      `target ${targetVersion}`,
+    assertRefusal(
+      () => renderSql(planned, { targetVersion }),
+      message.replace('PostgreSQL 13:', `PostgreSQL ${targetVersion}:`),
     );
   }
+  // Only the relaxation direction carries NOT ENFORCED; the reverse pair has none and renders.
+  const tightening = planOf(...foreignKeyPairSteps(after, before));
+  assert.equal(
+    renderSql(tightening),
+    [
+      'BEGIN;',
+      'ALTER TABLE public.child DROP CONSTRAINT child_parent_id_fkey;',
+      'ALTER TABLE public.child ADD CONSTRAINT child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id);',
+      'COMMIT;',
+      '',
+    ].join('\n'),
+  );
 });
 
 test('target 18 keeps a deferrable tightening as drop and add', () => {
@@ -1342,6 +1350,7 @@ test('renders check-constraint enforcement after the expression', () => {
         table: identity('t'),
         checkConstraint: checkConstraint('age <= 150', { enforcement: 'not-enforced' }),
       }),
+      { targetVersion: 18 },
     ),
     'BEGIN;\nALTER TABLE public.t ADD CHECK (age <= 150) NOT ENFORCED;\nCOMMIT;\n',
   );
@@ -1357,7 +1366,7 @@ test('renders a named not-null constraint inline, unnamed unchanged', () => {
   });
 
   assert.equal(
-    renderSql(plan(model(), model(users))),
+    renderSql(plan(model(), model(users)), { targetVersion: 18 }),
     [
       'BEGIN;',
       'CREATE TABLE public.users (',
@@ -1380,6 +1389,7 @@ test('renders a named not-null constraint inline, unnamed unchanged', () => {
         },
         { kind: 'add-column', table: identity('t'), column: column('name', { notNull: true }) },
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -1408,7 +1418,7 @@ test('renders an explicit collation inline after the type, before the constraint
   });
 
   assert.equal(
-    renderSql(plan(model(), model(users))),
+    renderSql(plan(model(), model(users)), { targetVersion: 18 }),
     [
       'BEGIN;',
       'CREATE TABLE public.users (',
@@ -1469,6 +1479,7 @@ test("states a created or added column's storage and compression as post-data ON
           }),
         ),
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -1493,6 +1504,7 @@ test("states a created or added column's storage and compression as post-data ON
           compression: 'lz4',
         }),
       }),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -1518,6 +1530,7 @@ test("states a created or added column's statistics target after storage and com
           }),
         ),
       ),
+      { targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -1596,7 +1609,7 @@ test('places SET STATISTICS after SET STORAGE and SET COMPRESSION in an alter-co
   );
 
   assert.equal(
-    renderSql(plan(baseline, target)),
+    renderSql(plan(baseline, target), { targetVersion: 18 }),
     [
       'BEGIN;',
       'ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;',
@@ -1712,7 +1725,7 @@ test('restates target storage and compression after the merged TYPE statement', 
   );
 
   assert.equal(
-    renderSql(plan(baseline, target)),
+    renderSql(plan(baseline, target), { targetVersion: 18 }),
     [
       'BEGIN;',
       'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(12) COLLATE pg_catalog."C";',
@@ -1804,7 +1817,7 @@ test('orders a merged TYPE before the per-field and attribute statements', () =>
   );
 
   assert.equal(
-    renderSql(plan(baseline, target)),
+    renderSql(plan(baseline, target), { targetVersion: 18 }),
     [
       'BEGIN;',
       'ALTER TABLE public.t ALTER COLUMN c TYPE character varying(9);',
@@ -2190,6 +2203,7 @@ test('create-table inline notNullName claims the constraint namespace', () => {
             ],
           }),
         }),
+        { targetVersion: 18 },
       ),
     'refusing to render: constraint creates on public.t would share the name "nn_c": a not-null constraint named "nn_c" on column c and a not-null constraint named "nn_c" on column d',
   );
@@ -2207,6 +2221,7 @@ test('add-column inline notNullName claims the constraint namespace', () => {
           },
           { kind: 'add-not-null', table: identity('t'), column: 'd', name: 'nn_c' },
         ),
+        { targetVersion: 18 },
       ),
     'refusing to render: constraint creates on public.t would share the name "nn_c": a not-null constraint named "nn_c" on column c and a not-null constraint named "nn_c" on column d',
   );
@@ -2468,7 +2483,7 @@ test('drop-column releases the column constraints and indexes of the baseline', 
         },
         { kind: 'add-not-null', table: identity('t'), column: 'b', name: 't_a_nn' },
       ),
-      { baseline },
+      { baseline, targetVersion: 18 },
     ),
     [
       'BEGIN;',
@@ -2502,7 +2517,7 @@ test('drop-column releases the column constraints and indexes of the baseline', 
           },
           { kind: 'add-not-null', table: identity('t'), column: 'b', name: 't_a_nn' },
         ),
-        { baseline: retained },
+        { baseline: retained, targetVersion: 18 },
       ),
     'refusing to render: index creates on public.t would share the name "t_a_idx" with a baseline index: an index named "t_a_idx" on (b) and an index named "t_a_idx" on (b)',
   );
@@ -2730,21 +2745,28 @@ test('PostgreSQL 18 claims unnamed add-not-null and drop-not-null facts', () => 
 });
 
 test('before PostgreSQL 18 an unnamed not-null fact claims no name', () => {
-  const steps: Step[] = [
+  const unnamed: Step[] = [
     { kind: 'add-column', table: identity('t'), column: column('c', { notNull: true }) },
-    { kind: 'add-not-null', table: identity('t'), column: 'd', name: 't_c_not_null' },
   ];
   const expected = [
     'BEGIN;',
     'ALTER TABLE public.t ADD COLUMN c text NOT NULL;',
-    'ALTER TABLE public.t ADD CONSTRAINT t_c_not_null NOT NULL d;',
     'COMMIT;',
     '',
   ].join('\n');
 
-  assert.equal(renderSql(planOf(...steps)), expected);
-  assert.equal(renderSql(planOf(...steps), { targetVersion: 13 }), expected);
-  assert.equal(renderSql(planOf(...steps), { targetVersion: 17 }), expected);
+  for (const targetVersion of [13, 17, 18]) {
+    assert.equal(renderSql(planOf(...unnamed), { targetVersion }), expected);
+  }
+  // The named half is no longer a silent claim below 18: it refuses instead.
+  const named: Step[] = [
+    ...unnamed,
+    { kind: 'add-not-null', table: identity('t'), column: 'd', name: 't_c_not_null' },
+  ];
+  assertRefusal(
+    () => renderSql(planOf(...named), { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: named NOT NULL on public.t column d needs PostgreSQL 18 or newer',
+  );
 });
 
 test('PostgreSQL 18 baseline occupancy releases a synthesized not-null name on drop-column', () => {
@@ -2790,9 +2812,10 @@ test('PostgreSQL 18 baseline occupancy releases a synthesized not-null name on d
       'with a baseline constraint: a not-null constraint on column b and ' +
       'a not-null constraint named "t_b_not_null" on column c',
   );
-  // Below 18 the baseline has no not-null constraint row, so nothing is occupied.
+  // Below 18 the baseline has no not-null constraint row, so nothing is occupied. The named add
+  // half is declaration-gated there, so the control keeps only the drop step.
   assert.doesNotThrow(() =>
-    renderSql(planOf(...retainedSteps), { baseline: retained, targetVersion: 13 }),
+    renderSql(planOf(retainedSteps[0]!), { baseline: retained, targetVersion: 13 }),
   );
 });
 
@@ -3037,10 +3060,10 @@ test('the reset floors are PostgreSQL 14 for compression and 16 for storage', ()
   );
 });
 
-test('declarations render as declared at every target', () => {
-  // The model's declarations are stated exactly as carried — an explicit storage letter and
-  // compression method, a named not-null inline and as an added constraint, and NOT ENFORCED —
-  // even at a target below the declaration's own floor. Only synthesized resets consult it.
+test('declarations below their floors refuse, and render as declared at 18', () => {
+  // An explicit storage letter stays valid everywhere, but a named not-null (inline or added),
+  // NOT ENFORCED and explicit compression refuse below their own floors even without a target
+  // model in the options: the plan steps carry them. The first offender is the inline name.
   const declared = planOf(
     {
       kind: 'add-column',
@@ -3062,19 +3085,60 @@ test('declarations render as declared at every target', () => {
       }),
     },
   );
-  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(declared, { targetVersion }));
-
-  for (const output of outputs) {
-    assert.equal(output, outputs[0], 'declarations render identically at every target');
+  for (const targetVersion of [13, 14, 16]) {
+    assertRefusal(
+      () => renderSql(declared, { targetVersion }),
+      `refusing to render for PostgreSQL ${targetVersion}: named NOT NULL on public.t column c needs PostgreSQL 18 or newer`,
+    );
   }
-  assert.match(outputs[0]!, /SET STORAGE EXTERNAL;/);
-  assert.match(outputs[0]!, /SET COMPRESSION lz4;/);
-  assert.match(outputs[0]!, /CONSTRAINT nn_c NOT NULL/);
-  assert.match(outputs[0]!, /ADD CONSTRAINT nn_d NOT NULL d;/);
-  assert.match(outputs[0]!, /NOT ENFORCED/);
+  const at18 = renderSql(declared, { targetVersion: 18 });
+  assert.match(at18, /SET STORAGE EXTERNAL;/);
+  assert.match(at18, /SET COMPRESSION lz4;/);
+  assert.match(at18, /CONSTRAINT nn_c NOT NULL/);
+  assert.match(at18, /ADD CONSTRAINT nn_d NOT NULL d;/);
+  assert.match(at18, /NOT ENFORCED/);
 });
 
-test('a plan with no reset renders byte-identically at every target', () => {
+test('a declaration-floor refusal precedes a name-collision refusal', () => {
+  // The gate runs before `assertNamesUnique`, so a plan that is both below a declaration floor and
+  // name-colliding reports the declaration; the control keeps the collision alone. Swapping the
+  // two guards would make the first assertion report the collision instead.
+  const colliding: readonly Step[] = [
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('t') },
+      index: tableIndex(['c'], { name: 't_c_idx' }),
+    },
+    {
+      kind: 'create-index',
+      owner: { kind: 'table', table: identity('t') },
+      index: tableIndex(['c'], { name: 't_c_idx' }),
+    },
+  ];
+  const declarationAndCollision = planOf(
+    {
+      kind: 'add-column',
+      table: identity('t'),
+      column: column('c', { notNull: true, notNullName: 'nn_c' }),
+    },
+    ...colliding,
+  );
+  const collisionOnly = planOf(
+    { kind: 'add-column', table: identity('t'), column: column('c') },
+    ...colliding,
+  );
+
+  assertRefusal(
+    () => renderSql(declarationAndCollision, { targetVersion: 13 }),
+    'refusing to render for PostgreSQL 13: named NOT NULL on public.t column c needs PostgreSQL 18 or newer',
+  );
+  assertRefusal(
+    () => renderSql(collisionOnly, { targetVersion: 13 }),
+    'refusing to render: index creates on public.t would share the name "t_c_idx": an index named "t_c_idx" on (c) and an index named "t_c_idx" on (c)',
+  );
+});
+
+test('a reset-free plan with an explicit compression method refuses at 13', () => {
   const planned = plan(
     model(),
     model(
@@ -3086,10 +3150,17 @@ test('a plan with no reset renders byte-identically at every target', () => {
       }),
     ),
   );
-  const outputs = [13, 14, 16, 18].map((targetVersion) => renderSql(planned, { targetVersion }));
-
+  assertRefusal(
+    () => renderSql(planned),
+    'refusing to render for PostgreSQL 13: COMPRESSION pglz on public.t column c needs PostgreSQL 14 or newer',
+  );
+  const outputs = [14, 16, 18].map((targetVersion) => renderSql(planned, { targetVersion }));
   for (const output of outputs) {
-    assert.equal(output, outputs[0], 'a reset-free plan renders identically at every target');
+    assert.equal(
+      output,
+      outputs[0],
+      'a reset-free plan renders identically at every floor-or-newer target',
+    );
   }
 });
 
@@ -4208,6 +4279,13 @@ test('golden: renders constraint attributes in every position', () => {
     'constraint-attributes',
     model(events, users, orders),
     model(eventsTarget, usersTarget, ordersTarget),
+    { targetVersion: 18 },
+  );
+  // This golden is PG18-only now: the default target refuses its named not-null drop.
+  assertRefusal(
+    () =>
+      renderSql(plan(model(events, users, orders), model(eventsTarget, usersTarget, ordersTarget))),
+    'refusing to render for PostgreSQL 13: named NOT NULL drop on public.users column email needs PostgreSQL 18 or newer',
   );
 });
 
@@ -4646,13 +4724,14 @@ const commentStep = (target: CommentTarget, text?: string): Step => ({
 
 /**
  * The single statement one comment step renders, asserting the statement stays on one line:
- * `BEGIN;`, the statement, `COMMIT;`, and the trailing newline.
+ * `BEGIN;`, the statement, `COMMIT;`, and the trailing newline. The target is 18 so a not-null
+ * comment target can be stated at all; the gate itself is pinned by its own tests.
  */
 const commentStatement = (
   text: string | undefined,
   target: CommentTarget = { kind: 'table', table: identity('t') },
 ): string => {
-  const lines = renderSql(planOf(commentStep(target, text))).split('\n');
+  const lines = renderSql(planOf(commentStep(target, text)), { targetVersion: 18 }).split('\n');
   assert.equal(lines.length, 4, 'BEGIN, one statement, COMMIT, and the trailing newline');
   return lines[1]!;
 };
@@ -4830,31 +4909,21 @@ test('an added not-null column carries its comment through the diff into SQL', (
   );
   const bare = model(table('t', { columns: [column('c'), column('e', { notNull: true })] }));
 
-  assert.equal(
-    renderSql(plan(baseline, target)),
-    [
-      'BEGIN;',
-      'ALTER TABLE public.t ADD COLUMN e text NOT NULL;',
-      "COMMENT ON CONSTRAINT t_e_not_null ON public.t IS 'on e';",
-      'COMMIT;',
-      '',
-    ].join('\n'),
-  );
-  // A declaration the model carries renders as declared at every target (ADR 0024): a not-null
-  // comment at the PostgreSQL 13 floor still emits the statement, with no version refusal.
-  assert.equal(
-    renderSql(plan(baseline, target), { targetVersion: 13 }),
-    [
-      'BEGIN;',
-      'ALTER TABLE public.t ADD COLUMN e text NOT NULL;',
-      "COMMENT ON CONSTRAINT t_e_not_null ON public.t IS 'on e';",
-      'COMMIT;',
-      '',
-    ].join('\n'),
-    'a notNullComment renders as declared at the PostgreSQL 13 floor',
+  const expected = [
+    'BEGIN;',
+    'ALTER TABLE public.t ADD COLUMN e text NOT NULL;',
+    "COMMENT ON CONSTRAINT t_e_not_null ON public.t IS 'on e';",
+    'COMMIT;',
+    '',
+  ].join('\n');
+  assert.equal(renderSql(plan(baseline, target), { targetVersion: 18 }), expected);
+  // A not-null comment resolves through pg_constraint, which does not exist below 18.
+  assertRefusal(
+    () => renderSql(plan(baseline, target)),
+    'refusing to render for PostgreSQL 13: NOT NULL comment on public.t column e needs PostgreSQL 18 or newer',
   );
   assert.ok(
-    !renderSql(plan(baseline, bare), { targetVersion: 13 }).includes('COMMENT ON'),
+    !renderSql(plan(baseline, bare)).includes('COMMENT ON'),
     'an absent notNullComment emits no comment step at any target',
   );
 });

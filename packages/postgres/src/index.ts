@@ -12,6 +12,16 @@ export const coreVersionUsed = coreVersion;
 export { analyzeHazards, hazardAnalyzer } from './hazards.ts';
 export { catalogReader } from './catalog.ts';
 export {
+  collectDeclarationFacts,
+  COMPRESSION_DECLARATION_MIN_MAJOR,
+  NOT_NULL_DECLARATION_MIN_MAJOR,
+} from './declaration-facts.ts';
+export type {
+  DeclarationFact,
+  DeclarationFactOptions,
+  DeclarationForm,
+} from './declaration-facts.ts';
+export {
   collectBaselineClaims,
   collectNameClaims,
   nameClaimIdentity,
@@ -28,6 +38,7 @@ export type {
 } from './name-claims.ts';
 export { ddlImporter, importDump } from './import.ts';
 export {
+  assertDeclarationsSupported,
   MAX_TARGET_VERSION,
   MIN_TARGET_VERSION,
   RenderRefusalError,

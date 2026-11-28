@@ -2,3 +2,6 @@
     ~ column c: not null false → true
 
 + comment on not-null constraint public.t.c: (none) → "a generated not-null name with a comment"
+
+Hazards:
+  step 2 render-refusal public.t: NOT NULL comment needs PostgreSQL 18 or newer (target 13) — rendering refuses this plan.

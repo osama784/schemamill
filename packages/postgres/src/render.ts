@@ -35,6 +35,12 @@ import type {
 } from '@schemamill/core';
 
 import {
+  collectDeclarationFacts,
+  COMPRESSION_DECLARATION_MIN_MAJOR,
+  NOT_NULL_DECLARATION_MIN_MAJOR,
+} from './declaration-facts.ts';
+import type { DeclarationFact } from './declaration-facts.ts';
+import {
   collectBaselineClaims,
   collectNameClaims,
   nameClaimIdentity,
@@ -130,12 +136,14 @@ import {
  * stated `initiallyDeferred` emits both words; `false` and absent render nothing, `NOT
  * DEFERRABLE` and valid-and-enforced being the defaults. A not-null fact with a name renders
  * PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL` in place of the plain `NOT NULL`, in both
- * `CREATE TABLE` and `ADD COLUMN`. The declarations the model carries — that inline name, `NOT
- * ENFORCED`, an explicit storage letter, an explicit compression method — render as declared at
- * every target, even one below the form's own floor. Only the renderer's own synthesized reset
- * statements consult the declared target: `SET STORAGE DEFAULT` refuses below PostgreSQL 16 and
- * `SET COMPRESSION default` below PostgreSQL 14, rather than emit SQL the declared server would
- * reject.
+ * `CREATE TABLE` and `ADD COLUMN`. Before any SQL is emitted, the declarations the plan and the
+ * optional target model carry are collected by the pure `declaration-facts.ts` collector and
+ * checked against the declared target: a named not-null fact, a named drop or comment on one, or
+ * `NOT ENFORCED` needs PostgreSQL 18; an explicit compression method needs PostgreSQL 14. An
+ * explicit storage letter is never gated: the renderer emits `ALTER … SET STORAGE`, valid on every
+ * supported target, and never emits inline `STORAGE`. The renderer's own synthesized reset forms
+ * keep their separate gates: `SET STORAGE DEFAULT` refuses below PostgreSQL 16 and `SET
+ * COMPRESSION default` below PostgreSQL 14.
  *
  * Column attributes render in PostgreSQL's grammar order. `renderColumn` states an explicit
  * collation inline, after the type and before the constraints: `name type COLLATE <collation>
@@ -345,6 +353,13 @@ export interface RenderOptions {
    * checked, and the output is byte-identical to a call without this option.
    */
   readonly baseline?: Model;
+  /**
+   * The model the plan ends at, when the caller has one. Its carried declarations are validated
+   * against `targetVersion`, including those on tables the plan does not touch, so a declaration
+   * the target cannot express refuses even when the SQL would not mention it. Absent, only the
+   * plan's step-backed declarations are validated; rendering is otherwise unchanged.
+   */
+  readonly targetModel?: Model;
 }
 
 /**
@@ -362,15 +377,52 @@ export class RenderRefusalError extends Error {
 }
 
 /**
+ * Refuses the first declaration the declared major cannot express. The facts arrive in the pure
+ * collector's deterministic order — model order, then step index, then fact order — so callers
+ * always see the same offender. Each message names the capability and the floor, and the table is
+ * schema-qualified with identifiers quoted only as much as SQL requires.
+ */
+export function assertDeclarationsSupported(
+  facts: readonly DeclarationFact[],
+  targetVersion: number,
+): void {
+  for (const fact of facts) {
+    if (targetVersion >= fact.floor) continue;
+    throw new RenderRefusalError(declarationRefusalMessage(fact, targetVersion));
+  }
+}
+
+/** The one-line, library-level refusal message for one declaration fact. */
+function declarationRefusalMessage(fact: DeclarationFact, targetVersion: number): string {
+  const prefix = `refusing to render for PostgreSQL ${targetVersion}: `;
+  const suffix = ` needs PostgreSQL ${fact.floor} or newer`;
+  const table = renderTable(fact.table);
+  switch (fact.form) {
+    case 'named-not-null':
+      return `${prefix}named NOT NULL on ${table} column ${quoteIdentifier(fact.column)}${suffix}`;
+    case 'named-not-null-drop':
+      return `${prefix}named NOT NULL drop on ${table} column ${quoteIdentifier(fact.column)}${suffix}`;
+    case 'not-null-comment':
+      return `${prefix}NOT NULL comment on ${table} column ${quoteIdentifier(fact.column)}${suffix}`;
+    case 'not-enforced':
+      return `${prefix}NOT ENFORCED on ${table} constraint ${quoteIdentifier(fact.constraint)}${suffix}`;
+    case 'explicit-compression':
+      return `${prefix}COMPRESSION ${fact.method} on ${table} column ${quoteIdentifier(fact.column)}${suffix}`;
+    default:
+      assertNever(fact, 'declaration-facts refusal');
+  }
+}
+
+/**
  * The migration SQL for `plan`, deterministic in the plan and the declared target.
  * `plan.groups` must tile `[0, plan.steps.length)`; a malformed partition throws before
  * anything renders, and so does a plan whose name claims collide in either guard namespace —
  * including a create that collides with a name an `options.baseline` object already occupies.
  * `options.targetVersion` is the PostgreSQL major the SQL is generated for,
- * defaulting to `MIN_TARGET_VERSION`; a renderer-synthesized reset form below its floor refuses
- * with `RenderRefusalError`, while a declaration the model carries renders as declared at every
- * target. A target that is not an integer major at or above `MIN_TARGET_VERSION` is a caller
- * bug and throws a plain `Error`.
+ * defaulting to `MIN_TARGET_VERSION`; a declaration below its floor — carried by a plan step or
+ * by `options.targetModel` when supplied — refuses with `RenderRefusalError`, as does a
+ * renderer-synthesized reset form below its own floor. A target that is not an integer major at or
+ * above `MIN_TARGET_VERSION` is a caller bug and throws a plain `Error`.
  */
 export function renderSql(plan: Plan, options?: RenderOptions): string {
   const targetVersion = options?.targetVersion ?? MIN_TARGET_VERSION;
@@ -384,8 +436,14 @@ export function renderSql(plan: Plan, options?: RenderOptions): string {
   // name refusal, even when the hand-built pair also collides in the constraint namespace.
   const collapsed =
     targetVersion >= FOREIGN_KEY_ENFORCEMENT_ALTER_MIN_MAJOR
-      ? collapseEnforcementFlips(plan)
+      ? collapseEnforcementFlips(plan, targetVersion)
       : undefined;
+  // A declaration-floor refusal precedes a name-collision refusal, and the model's declarations
+  // are checked even when the plan has no steps. Without a target model, only step facts exist.
+  assertDeclarationsSupported(
+    collectDeclarationFacts(plan, { targetModel: options?.targetModel }),
+    targetVersion,
+  );
   assertNamesUnique(plan, options?.baseline, targetVersion);
   if (plan.steps.length === 0) return '';
   const groups: string[] = [];
@@ -630,10 +688,12 @@ interface EnforcementCollapse {
  * than one add, or an add matching more than one drop, is a malformed plan and throws before
  * anything renders; a lone half is normal and renders unchanged.
  *
- * The plan keeps its semantic drop+add shape — this pass reads it, never rewrites it — so
- * targets below PostgreSQL 18 run no pass at all and render exactly today's pair.
+ * The plan keeps its semantic drop+add shape — this pass reads it, never rewrites it — so targets
+ * below PostgreSQL 18 run no pass at all; a pair that would state `NOT ENFORCED` is refused by
+ * the declaration gate before any statement renders, while a pair with no such declaration
+ * keeps its drop-and-add form.
  */
-function collapseEnforcementFlips(plan: Plan): EnforcementCollapse {
+function collapseEnforcementFlips(plan: Plan, targetVersion: number): EnforcementCollapse {
   const drops: IndexedStep<ForeignKeyDropStep>[] = [];
   const adds: IndexedStep<ForeignKeyAddStep>[] = [];
   for (let index = 0; index < plan.steps.length; index += 1) {
@@ -687,7 +747,7 @@ function collapseEnforcementFlips(plan: Plan): EnforcementCollapse {
     if (enforcementPairCrowded(plan, drop, add)) continue;
     statements.set(
       drop.index,
-      renderAlterConstraint(drop.step.table, add.step.foreignKey, match.form),
+      renderAlterConstraint(drop.step.table, add.step.foreignKey, match.form, targetVersion),
     );
     suppressed.add(add.index);
   }
@@ -755,8 +815,26 @@ function renderAlterConstraint(
   table: TableIdentity,
   after: ForeignKey,
   form: ForeignKeyEnforcementForm,
+  targetVersion: number,
 ): string {
   const name = after.name ?? synthesizedForeignKeyName(table, after);
+  if (form === 'NOT ENFORCED') {
+    // A collapsed flip states NOT ENFORCED directly; it exists only from PostgreSQL 18, but the
+    // emitter consults the same gate as every other form rather than assuming its caller's floor.
+    assertDeclarationsSupported(
+      [
+        {
+          form: 'not-enforced',
+          origin: 'step',
+          step: -1,
+          table,
+          constraint: name,
+          floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+        },
+      ],
+      targetVersion,
+    );
+  }
   return `ALTER TABLE ${renderTable(table)} ALTER CONSTRAINT ${quoteIdentifier(name)} ${form};`;
 }
 
@@ -888,12 +966,42 @@ function renderStep(step: Step, targetVersion: number): string {
     case 'alter-column':
       return renderAlterColumn(step.table, step.name, step.fields, step.attributes, targetVersion);
     case 'drop-not-null':
+      if (step.name !== undefined) {
+        assertDeclarationsSupported(
+          [
+            {
+              form: 'named-not-null-drop',
+              origin: 'step',
+              step: -1,
+              table: step.table,
+              column: step.column,
+              floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+            },
+          ],
+          targetVersion,
+        );
+      }
       return step.name === undefined
         ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
             step.column,
           )} DROP NOT NULL;`
         : `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(step.name)};`;
     case 'add-not-null':
+      if (step.name !== undefined) {
+        assertDeclarationsSupported(
+          [
+            {
+              form: 'named-not-null',
+              origin: 'step',
+              step: -1,
+              table: step.table,
+              column: step.column,
+              floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+            },
+          ],
+          targetVersion,
+        );
+      }
       return step.name === undefined
         ? `ALTER TABLE ${renderTable(step.table)} ALTER COLUMN ${quoteIdentifier(
             step.column,
@@ -918,7 +1026,11 @@ function renderStep(step: Step, targetVersion: number): string {
         step.primaryKey.name ?? synthesizedPrimaryKeyName(step.table),
       )};`;
     case 'add-foreign-key':
-      return `ALTER TABLE ${renderTable(step.table)} ADD ${renderForeignKey(step.foreignKey)};`;
+      return `ALTER TABLE ${renderTable(step.table)} ADD ${renderForeignKey(
+        step.table,
+        step.foreignKey,
+        targetVersion,
+      )};`;
     case 'drop-foreign-key':
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
         step.foreignKey.name ?? synthesizedForeignKeyName(step.table, step.foreignKey),
@@ -934,7 +1046,9 @@ function renderStep(step: Step, targetVersion: number): string {
       )};`;
     case 'add-check-constraint':
       return `ALTER TABLE ${renderTable(step.table)} ADD ${renderCheckConstraint(
+        step.table,
         step.checkConstraint,
+        targetVersion,
       )};`;
     case 'drop-check-constraint':
       return `ALTER TABLE ${renderTable(step.table)} DROP CONSTRAINT ${quoteIdentifier(
@@ -987,7 +1101,7 @@ function renderStep(step: Step, targetVersion: number): string {
     case 'alter-default-privileges':
       return renderDefaultPrivileges(step.privilege);
     case 'comment':
-      return renderComment(step.target, step.text);
+      return renderComment(step.target, step.text, targetVersion);
   }
 }
 
@@ -996,7 +1110,26 @@ function renderStep(step: Step, targetVersion: number): string {
  * absent text is the removal (`IS NULL`). A carried node's own `comment` is never read, so a
  * stale node field cannot diverge from the step.
  */
-function renderComment(target: CommentTarget, text: string | undefined): string {
+function renderComment(
+  target: CommentTarget,
+  text: string | undefined,
+  targetVersion: number,
+): string {
+  if (target.kind === 'not-null') {
+    assertDeclarationsSupported(
+      [
+        {
+          form: 'not-null-comment',
+          origin: 'step',
+          step: -1,
+          table: target.table,
+          column: target.column.name,
+          floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+        },
+      ],
+      targetVersion,
+    );
+  }
   const value = text === undefined ? 'NULL' : renderCommentLiteral(text);
   return `COMMENT ON ${renderCommentTarget(target)} IS ${value};`;
 }
@@ -1111,7 +1244,7 @@ function renderCommentLiteral(text: string): string {
  */
 function renderCreateTable(table: Table, targetVersion: number): string {
   const persistence = table.persistence === 'unlogged' ? 'UNLOGGED ' : '';
-  const lines = table.columns.map((column) => `    ${renderColumn(column)}`);
+  const lines = table.columns.map((column) => `    ${renderColumn(table, column, targetVersion)}`);
   if (table.primaryKey !== undefined) lines.push(`    ${renderPrimaryKey(table.primaryKey)}`);
   const body = lines
     .map((line, index) => (index === lines.length - 1 ? line : `${line},`))
@@ -1135,7 +1268,9 @@ function renderCreateTable(table: Table, targetVersion: number): string {
  * `ALTER TABLE ONLY` statements that state them, storage before compression.
  */
 function renderAddColumn(table: TableIdentity, column: Column, targetVersion: number): string {
-  const statements = [`ALTER TABLE ${renderTable(table)} ADD COLUMN ${renderColumn(column)};`];
+  const statements = [
+    `ALTER TABLE ${renderTable(table)} ADD COLUMN ${renderColumn(table, column, targetVersion)};`,
+  ];
   statements.push(...renderColumnAttributeStatements(table, column, targetVersion));
   return statements.join('\n');
 }
@@ -1144,10 +1279,26 @@ function renderAddColumn(table: TableIdentity, column: Column, targetVersion: nu
  * One column definition: name, type, and the `COLLATE` / `NOT NULL` / `DEFAULT` clauses it
  * carries, in PostgreSQL's grammar order. An explicit collation follows the type; a not-null
  * fact the model names renders PostgreSQL 18's inline `CONSTRAINT <name> NOT NULL`, and
- * without a name it stays the plain `NOT NULL`. An identity descriptor renders nothing here:
+ * without a name it stays the plain `NOT NULL`. The named form is gated at its floor: below 18
+ * the inline name would be silently discarded. An identity descriptor renders nothing here:
  * the plan adds it with its own step. Storage and compression never render inline.
  */
-function renderColumn(column: Column): string {
+function renderColumn(table: TableIdentity, column: Column, targetVersion: number): string {
+  if (column.notNull && column.notNullName !== undefined) {
+    assertDeclarationsSupported(
+      [
+        {
+          form: 'named-not-null',
+          origin: 'step',
+          step: -1,
+          table,
+          column: column.name,
+          floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+        },
+      ],
+      targetVersion,
+    );
+  }
   const collation = column.collation === undefined ? '' : ` COLLATE ${column.collation}`;
   const notNull =
     column.notNull && column.notNullName !== undefined
@@ -1224,7 +1375,8 @@ const COMPRESSION_DEFAULT_MIN_MAJOR = 14;
  * `ONLY` form; inheritance is out of scope. `default` is a form the renderer synthesizes, not
  * one the model declares, so it consults the declared target: below PostgreSQL 14 the statement
  * does not exist and the renderer refuses rather than emit SQL the declared server would
- * reject. An explicit method renders at every target.
+ * reject. An explicit method is a declaration with the same floor of 14; the gate reports it by
+ * name before the statement is emitted.
  */
 function renderSetCompression(
   table: TableIdentity,
@@ -1237,6 +1389,22 @@ function renderSetCompression(
       `refusing to render for PostgreSQL ${targetVersion}: SET COMPRESSION default on ` +
         `${renderTable(table)} column ${quoteIdentifier(name)} needs PostgreSQL ` +
         `${COMPRESSION_DEFAULT_MIN_MAJOR} or newer`,
+    );
+  }
+  if (compression !== undefined) {
+    assertDeclarationsSupported(
+      [
+        {
+          form: 'explicit-compression',
+          origin: 'step',
+          step: -1,
+          table,
+          column: name,
+          method: compression,
+          floor: COMPRESSION_DECLARATION_MIN_MAJOR,
+        },
+      ],
+      targetVersion,
     );
   }
   const target = compression === undefined ? 'default' : compression;
@@ -1266,7 +1434,11 @@ function renderPrimaryKey(primaryKey: PrimaryKey): string {
 }
 
 /** A foreign-key constraint clause, with its name, referenced columns, actions, and attributes. */
-function renderForeignKey(foreignKey: ForeignKey): string {
+function renderForeignKey(
+  table: TableIdentity,
+  foreignKey: ForeignKey,
+  targetVersion: number,
+): string {
   const name =
     foreignKey.name === undefined ? '' : `CONSTRAINT ${quoteIdentifier(foreignKey.name)} `;
   const columns = foreignKey.columns.map((column) => quoteIdentifier(column)).join(', ');
@@ -1274,11 +1446,12 @@ function renderForeignKey(foreignKey: ForeignKey): string {
     foreignKey.referencedColumns.length === 0
       ? ''
       : `(${foreignKey.referencedColumns.map((column) => quoteIdentifier(column)).join(', ')})`;
+  const constraint = foreignKey.name ?? synthesizedForeignKeyName(table, foreignKey);
   return `${name}FOREIGN KEY (${columns}) REFERENCES ${renderTable(
     foreignKey.referencedTable,
   )}${referenced}${renderReferentialActions(foreignKey)}${renderDeferrability(
     foreignKey,
-  )}${renderEnforcement(foreignKey.enforcement)}`;
+  )}${renderEnforcement(table, constraint, foreignKey.enforcement, targetVersion)}`;
 }
 
 /**
@@ -1299,15 +1472,34 @@ function renderDeferrability(constraint: {
 /**
  * The `NOT VALID` / `NOT ENFORCED` tail of a constraint; absent means valid and enforced, the
  * default. PostgreSQL reports a `NOT ENFORCED` constraint as `NOT VALID` too, but the model
- * keeps the two states apart, and the renderer states the declaration the model carries.
+ * keeps the two states apart, and the renderer states the declaration the model carries — after
+ * checking it against the declared target, since no server below PostgreSQL 18 parses it.
  */
-function renderEnforcement(enforcement: ConstraintEnforcement | undefined): string {
+function renderEnforcement(
+  table: TableIdentity,
+  constraint: string,
+  enforcement: ConstraintEnforcement | undefined,
+  targetVersion: number,
+): string {
   switch (enforcement) {
     case undefined:
       return '';
     case 'not-valid':
       return ' NOT VALID';
     case 'not-enforced':
+      assertDeclarationsSupported(
+        [
+          {
+            form: 'not-enforced',
+            origin: 'step',
+            step: -1,
+            table,
+            constraint,
+            floor: NOT_NULL_DECLARATION_MIN_MAJOR,
+          },
+        ],
+        targetVersion,
+      );
       return ' NOT ENFORCED';
   }
 }
@@ -1333,13 +1525,21 @@ function renderUniqueConstraint(uniqueConstraint: UniqueConstraint): string {
  * A check-constraint clause, with its name when it has one and its enforcement tail; the
  * expression is opaque text.
  */
-function renderCheckConstraint(checkConstraint: CheckConstraint): string {
+function renderCheckConstraint(
+  table: TableIdentity,
+  checkConstraint: CheckConstraint,
+  targetVersion: number,
+): string {
   const name =
     checkConstraint.name === undefined
       ? ''
       : `CONSTRAINT ${quoteIdentifier(checkConstraint.name)} `;
+  const constraint = checkConstraint.name ?? synthesizedCheckConstraintName(table, checkConstraint);
   return `${name}CHECK (${checkConstraint.expression})${renderEnforcement(
+    table,
+    constraint,
     checkConstraint.enforcement,
+    targetVersion,
   )}`;
 }
 
