@@ -17,7 +17,13 @@ import type {
   TableIdentity,
 } from '@schemamill/core';
 
-import { analyzeHazards, hazardAnalyzer, RenderRefusalError, renderSql } from './index.ts';
+import {
+  analyzeHazards,
+  collectDeclarationFacts,
+  hazardAnalyzer,
+  RenderRefusalError,
+  renderSql,
+} from './index.ts';
 
 /**
  * Tests for PostgreSQL hazard analysis: the definite checks pin every self-inconsistent shape
@@ -1781,6 +1787,67 @@ test('each step-backed declaration below its floor reports an unsupported-declar
       `${declaration} below its floor refuses to render`,
     );
   }
+});
+
+test('a merged type and compression step reports one compression fact and one hazard', () => {
+  const baseline = model(table('t', [column('c', { type: 'text', compression: 'lz4' })]));
+  const target = model(table('t', [column('c', { type: 'bigint', compression: 'pglz' })]));
+  const merged = planOf({
+    kind: 'alter-column',
+    table: identity('t'),
+    name: 'c',
+    fields: [
+      { field: 'type', before: 'text', after: 'bigint' },
+      { field: 'compression', before: 'lz4', after: 'pglz' },
+    ],
+    attributes: { type: 'bigint', compression: 'pglz' },
+  });
+
+  // The merged TYPE statement emits exactly one SET COMPRESSION, so the carrier stands for the
+  // compression field and must not be collected twice: one model fact plus one step fact.
+  assert.deepEqual(
+    collectDeclarationFacts(merged, { targetModel: target }).map((fact) => [
+      fact.form,
+      fact.origin,
+      fact.step,
+      fact.form === 'explicit-compression' ? fact.method : undefined,
+    ]),
+    [
+      ['explicit-compression', 'model', -1, 'pglz'],
+      ['explicit-compression', 'step', 0, 'pglz'],
+    ],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, merged, { targetVersion: 13 }), [
+    {
+      kind: 'render-refusal',
+      step: 0,
+      entity: declarationEntity('explicit-compression', 13, 14),
+    },
+  ]);
+
+  // A standalone compression field still states its own declaration and reports once.
+  const standalone = planOf({
+    kind: 'alter-column',
+    table: identity('t'),
+    name: 'c',
+    fields: [{ field: 'compression', before: 'pglz', after: 'lz4' }],
+  });
+  assert.deepEqual(
+    collectDeclarationFacts(standalone, { targetModel: model() }).map((fact) => [
+      fact.form,
+      fact.origin,
+      fact.step,
+      fact.form === 'explicit-compression' ? fact.method : undefined,
+    ]),
+    [['explicit-compression', 'step', 0, 'lz4']],
+  );
+  assert.deepEqual(analyzeHazards(baseline, target, standalone, { targetVersion: 13 }), [
+    {
+      kind: 'render-refusal',
+      step: 0,
+      entity: declarationEntity('explicit-compression', 13, 14),
+    },
+  ]);
 });
 
 test('a model-only declaration refuses to render but reports no hazard and no step sentinel', () => {

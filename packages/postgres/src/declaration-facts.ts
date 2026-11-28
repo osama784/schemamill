@@ -266,7 +266,9 @@ function collectStepFacts(facts: DeclarationFact[], step: number, planStep: Step
         });
       }
       for (const field of planStep.fields) {
-        if (field.field !== 'compression' || field.after === undefined) continue;
+        // When the carrier already represents the merged TYPE statement, the per-field fact would
+        // duplicate the single SET COMPRESSION the renderer emits — one declaration, one fact.
+        if (merged || field.field !== 'compression' || field.after === undefined) continue;
         facts.push({
           form: 'explicit-compression',
           origin: 'step',
