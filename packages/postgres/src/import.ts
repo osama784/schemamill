@@ -224,6 +224,7 @@ import type {
   SelectStmt,
   VariableSetStmt,
   ViewStmt,
+  WithClause,
 } from 'libpg-query';
 
 import {
@@ -3328,11 +3329,13 @@ function viewOutputColumns(query: Node | undefined): readonly ViewOutputColumn[]
 /**
  * Range-table relations a view reads, recorded as bare identities. Names are taken from every
  * `RangeVar` reachable in the query tree (including `JOIN` arms and subqueries); an unqualified
- * name is qualified with the view's own schema. Repeated references to one relation collapse.
- * `kind` is deliberately not decided here: a base declared later in the dump is still a view, so
- * classification waits for `finalizeView`'s completed `views` map. The `search_path` caveat (a bare
- * name that in DDL could resolve to another schema) is a named residual: the dump's own
- * qualification is the only evidence available here.
+ * name is qualified with the view's own schema. A `RangeVar` that names a CTE alias is not a
+ * relation the view reads: `FROM base` inside `WITH base AS (…)` resolves to the CTE, so it is
+ * skipped when unqualified (CTEs cannot be schema-qualified). Repeated references to one relation
+ * collapse. `kind` is deliberately not decided here: a base declared later in the dump is still a
+ * view, so classification waits for `finalizeView`'s completed `views` map. The `search_path`
+ * caveat (a bare name that in DDL could resolve to another schema) is a named residual: the dump's
+ * own qualification is the only evidence available here.
  */
 function viewDependencies(
   query: Node | undefined,
@@ -3341,9 +3344,14 @@ function viewDependencies(
   if (query === undefined) return undefined;
   const relations: RangeVar[] = [];
   collectRangeVars(query, relations);
+  const cteAliases = new Set<string>();
+  collectCteAliases(query, cteAliases);
   const unique = new Map<string, ViewDependencyIdentity>();
   for (const relation of relations) {
     if (relation.relname === undefined || relation.relname === '') continue;
+    // A CTE alias shadows a relation of the same name only for unqualified references; a stated
+    // schema is always a real relation read, never a CTE.
+    if (relation.schemaname === undefined && cteAliases.has(relation.relname)) continue;
     const dependencySchema = relation.schemaname ?? schema;
     unique.set(tableKey(dependencySchema, relation.relname), {
       schema: dependencySchema,
@@ -3371,6 +3379,32 @@ function collectRangeVars(value: unknown, found: RangeVar[]): void {
       continue;
     }
     if (child !== null && typeof child === 'object') collectRangeVars(child, found);
+  }
+}
+
+/**
+ * Walks every AST value under `node`, collecting the aliases declared by every `WithClause`,
+ * nested ones included. The alias lives on `CommonTableExpr.ctename`; it is only a name for the
+ * CTE's own query, never a schema-qualified relation. Names are gathered tree-wide rather than
+ * per scope: an out-of-scope alias can under-report a dependency, but cannot invent a false one.
+ */
+function collectCteAliases(value: unknown, found: Set<string>): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCteAliases(item, found);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'withClause') {
+      const withClause = child as WithClause | undefined;
+      for (const cte of withClause?.ctes ?? []) {
+        if ('CommonTableExpr' in cte) {
+          const alias = cte.CommonTableExpr.ctename;
+          if (alias !== undefined && alias !== '') found.add(alias);
+        }
+      }
+    }
+    if (child !== null && typeof child === 'object') collectCteAliases(child, found);
   }
 }
 

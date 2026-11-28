@@ -4840,6 +4840,59 @@ test('imports view dependencies from range tables, qualifying unqualified names 
   assert.deepEqual(diagnostics, []);
 });
 
+test('does not record a CTE alias as a view dependency, including nested CTEs', async () => {
+  // `FROM base` inside `WITH base AS (…)` reads the CTE, not the modeled view of the same name.
+  // CTEs cannot be schema-qualified, so a qualified `public.base` still is a real dependency.
+  const dump = [
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+    `CREATE VIEW public.nested AS WITH outer_cte AS (WITH base AS (SELECT 3 AS id) SELECT id FROM base) SELECT id FROM outer_cte;`,
+    `CREATE VIEW public.qualified AS WITH base AS (SELECT 4 AS id) SELECT q.id FROM public.base q JOIN base b ON q.id = b.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const dependencies = (name: string) => model.views.find((view) => view.name === name)?.dependsOn;
+  assert.deepEqual(dependencies('base'), undefined);
+  assert.deepEqual(dependencies('dep'), undefined);
+  assert.deepEqual(dependencies('nested'), undefined);
+  assert.deepEqual(dependencies('qualified'), [{ kind: 'view', schema: 'public', name: 'base' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('a CTE alias does not make a legitimate view column rewrite refuse the plan', async () => {
+  // Both sides carry the same CTE body; only `base`'s column is renamed. With verifiable types on
+  // both sides the rename must plan a drop and recreate of `base` without a false refusal from the
+  // alias `dep` never reads as a relation.
+  const baselineDump = [
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+  ].join('\n');
+  const targetDump = [
+    `CREATE VIEW public.base AS SELECT 1 AS ident;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+  ].join('\n');
+
+  // Dump-derived columns carry an unknown type, so inject canonical types to make both sides
+  // verifiable; the dependency facts under test still come from the importer.
+  const typedBase = (model: Model, column: string): Model => ({
+    ...model,
+    views: model.views.map((view) =>
+      view.name === 'base' && view.schema === 'public'
+        ? { ...view, columns: [{ name: column, type: 'integer' }] }
+        : view,
+    ),
+  });
+  const baseline = typedBase((await importDump(baselineDump)).model, 'id');
+  const target = typedBase((await importDump(targetDump)).model, 'ident');
+
+  const steps = plan(baseline, target).steps;
+  const viewNames = (kind: 'drop-view' | 'create-view') =>
+    steps.flatMap((step) => (step.kind === kind ? [step.view.name] : []));
+  assert.deepEqual(viewNames('drop-view'), ['base']);
+  assert.deepEqual(viewNames('create-view'), ['base']);
+});
+
 test('classifies a forward view dependency against the completed import, not DDL order', async () => {
   // The dependent is declared before its base. Both facts are recorded before finalization, so
   // `base` must still be a `view` fact and the resulting plan must create it before its dependent.
@@ -5337,7 +5390,7 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       materialized: false,
       definition:
         'WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t',
-      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
+      // `FROM t` here is the recursive CTE's own alias, not a relation the view reads.
     },
     {
       schema: 'app',
