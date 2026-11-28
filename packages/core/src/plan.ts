@@ -30,8 +30,11 @@ import type {
   TablePersistence,
   UniqueConstraint,
   View,
+  ViewDependency,
   ViewIdentity,
+  ViewOutputColumn,
 } from './model.ts';
+import { viewColumnIncompatibility } from './view-columns.ts';
 
 /**
  * The migration plan: what to change, in the order that works.
@@ -682,6 +685,107 @@ export class SequenceOwnershipError extends Error {
   }
 }
 
+/** The reason a view dependency graph cannot be executed safely. */
+export type ViewDependencyErrorReason = 'blocking-dependent' | 'cycle' | 'unmodeled-view';
+
+/**
+ * Thrown by `plan` when a view's recorded dependencies make the plan unsafe to execute. Three
+ * cases share the type: a recreated view has a baseline dependent that is not scheduled for drop
+ * (`blocking-dependent`); the scheduled views form a dependency cycle (`cycle`); or a scheduled
+ * view records a `kind: 'view'` dependency that no view in that side's model resolves
+ * (`unmodeled-view`). `relation` dependencies never refuse. The message names every member in
+ * identity order; no step is emitted for a refused plan.
+ */
+export class ViewDependencyError extends Error {
+  readonly reason: ViewDependencyErrorReason;
+  /** The views named by the message, in identity order, copied from the model. */
+  readonly views: readonly ViewIdentity[];
+  /** The unmodeled facts, present only for `unmodeled-view`, copied from the model. */
+  readonly dependencies: readonly ViewDependency[];
+
+  private constructor(
+    reason: ViewDependencyErrorReason,
+    views: readonly ViewIdentity[],
+    message: string,
+    dependencies: readonly ViewDependency[] = [],
+  ) {
+    super(message);
+    this.name = 'ViewDependencyError';
+    this.reason = reason;
+    this.views = views.map(copyViewIdentity);
+    this.dependencies = dependencies.map(copyViewDependency);
+  }
+
+  /** An unchanged dependent would hold a `_RETURN` dependency while its base is dropped. */
+  static blockingDependent(
+    base: ViewIdentity,
+    dependents: readonly ViewIdentity[],
+  ): ViewDependencyError {
+    const sorted = [...dependents].sort(compareViewIdentities);
+    return new ViewDependencyError(
+      'blocking-dependent',
+      [base, ...sorted],
+      `view dependency: view ${viewName(base)} cannot be recreated while dependent views ${sorted
+        .map(viewName)
+        .join(', ')} are not scheduled for drop`,
+    );
+  }
+
+  /** The scheduled views form a dependency cycle, so no valid order exists. */
+  static cycle(members: readonly ViewIdentity[]): ViewDependencyError {
+    const sorted = [...members].sort(compareViewIdentities);
+    return new ViewDependencyError(
+      'cycle',
+      sorted,
+      `view dependency cycle among views ${sorted.map(viewName).join(', ')}`,
+    );
+  }
+
+  /** A scheduled view names a view dependency that the same side's model does not carry. */
+  static unmodeled(
+    pairs: readonly { readonly view: ViewIdentity; readonly dependency: ViewDependency }[],
+  ): ViewDependencyError {
+    const sorted = [...pairs].sort(
+      (left, right) =>
+        compareViewIdentities(left.view, right.view) ||
+        compareViewIdentities(left.dependency, right.dependency),
+    );
+    return new ViewDependencyError(
+      'unmodeled-view',
+      sorted.map((pair) => pair.view),
+      sorted
+        .map(
+          (pair) =>
+            `view dependency: view ${viewName(pair.view)} depends on unmodeled view ${viewName(
+              pair.dependency,
+            )}`,
+        )
+        .join('; '),
+      sorted.map((pair) => pair.dependency),
+    );
+  }
+}
+
+/** The schema-qualified name a view dependency diagnostic prints. */
+function viewName(identity: ViewIdentity): string {
+  return `${identity.schema}.${identity.name}`;
+}
+
+function compareViewIdentities(left: ViewIdentity, right: ViewIdentity): number {
+  return compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name);
+}
+
+/** An identity from the JSON map key shared with tables; the caller built the key with `keyOf`. */
+function identityFromViewKey(key: string): ViewIdentity {
+  const [schema, name] = JSON.parse(key) as [string, string];
+  return { schema, name };
+}
+
+/** A copy of one dependency fact, independent of the caller's model. */
+function copyViewDependency(dependency: ViewDependency): ViewDependency {
+  return { kind: dependency.kind, schema: dependency.schema, name: dependency.name };
+}
+
 /**
  * Throws `SequenceOwnershipError` unless every target sequence's `ownedBy` resolves against the
  * target model: the owner table first, by schema and name, then the owner column on it. The
@@ -703,6 +807,192 @@ function assertTargetOwnership(target: Model): void {
       throw new SequenceOwnershipError(sequence, owner, 'column');
     }
   }
+}
+
+/** The view-dependency identity keys of `view`; relation facts never participate in ordering. */
+function viewDependencyKeys(view: View): readonly string[] {
+  const keys = new Set<string>();
+  for (const dependency of view.dependsOn ?? []) {
+    if (dependency.kind === 'view') keys.add(keyOf(dependency));
+  }
+  return [...keys];
+}
+
+/** The identity carried by any of the three view steps. */
+function stepViewIdentity(step: Step): ViewIdentity {
+  if (step.kind === 'drop-view' || step.kind === 'create-view' || step.kind === 'replace-view') {
+    return step.view;
+  }
+  throw new Error(`step kind ${step.kind} is not a view step`);
+}
+
+/** Every scheduled view's `kind:'view'` fact that its own side's model does not resolve. */
+function unmodeledViewDependencies(
+  model: Model,
+  scheduled: ReadonlySet<string>,
+): readonly { readonly view: ViewIdentity; readonly dependency: ViewDependency }[] {
+  const present = new Set(model.views.map((view) => keyOf(view)));
+  const pairs: { view: ViewIdentity; dependency: ViewDependency }[] = [];
+  for (const view of model.views) {
+    if (!scheduled.has(keyOf(view))) continue;
+    for (const dependency of view.dependsOn ?? []) {
+      if (dependency.kind === 'view' && !present.has(keyOf(dependency))) {
+        pairs.push({ view, dependency });
+      }
+    }
+  }
+  return pairs;
+}
+
+/** Transitive dependents of `roots` in a baseline view graph, by identity key. */
+function transitiveViewDependents(
+  views: readonly View[],
+  roots: readonly string[],
+): ReadonlySet<string> {
+  const dependents = new Map<string, string[]>();
+  for (const view of views) {
+    const key = keyOf(view);
+    for (const dependency of viewDependencyKeys(view)) {
+      const list = dependents.get(dependency) ?? [];
+      list.push(key);
+      dependents.set(dependency, list);
+    }
+  }
+  const found = new Set<string>();
+  const stack = [...roots];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const dependent of dependents.get(current) ?? []) {
+      if (found.has(dependent)) continue;
+      found.add(dependent);
+      stack.push(dependent);
+    }
+  }
+  return found;
+}
+
+/**
+ * A stable topological order of view step identity keys. `dependents-first` places a view after
+ * every scheduled view that reads it; `dependencies-first` places a view after every scheduled
+ * view it reads. Among simultaneously ready views the smallest identity wins. Keys left over form
+ * a cycle, which the caller refuses; unscheduled views never participate.
+ */
+function orderViewKeys(
+  keys: readonly string[],
+  graph: ReadonlyMap<string, View>,
+  mode: 'dependents-first' | 'dependencies-first',
+): { readonly ordered: string[]; readonly cyclic: string[] } {
+  const compareKeys = (left: string, right: string): number =>
+    compareViewIdentities(identityFromViewKey(left), identityFromViewKey(right));
+  const remaining = new Set(keys);
+  const ordered: string[] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining].filter((key) => {
+      const view = graph.get(key);
+      if (view === undefined) return true;
+      if (mode === 'dependencies-first') {
+        return viewDependencyKeys(view).every((dependency) => !remaining.has(dependency));
+      }
+      for (const candidate of remaining) {
+        const candidateView = graph.get(candidate);
+        if (candidateView !== undefined && viewDependencyKeys(candidateView).includes(key)) {
+          return false;
+        }
+      }
+      return true;
+    });
+    if (ready.length === 0) break;
+    ready.sort(compareKeys);
+    const next = ready[0]!;
+    remaining.delete(next);
+    ordered.push(next);
+  }
+  return { ordered, cyclic: [...remaining].sort(compareKeys) };
+}
+
+/** Orders one view bucket by identity and refuses a cycle among its scheduled members. */
+function orderedViewSteps(
+  steps: readonly Step[],
+  graph: ReadonlyMap<string, View>,
+  mode: 'dependents-first' | 'dependencies-first',
+): Step[] {
+  const byKey = new Map(steps.map((step) => [keyOf(stepViewIdentity(step)), step]));
+  const { ordered, cyclic } = orderViewKeys([...byKey.keys()], graph, mode);
+  if (cyclic.length > 0) throw ViewDependencyError.cycle(cyclic.map(identityFromViewKey));
+  return ordered.map((key) => byKey.get(key)!);
+}
+
+/**
+ * The plan-time view dependency pass. Drops run dependents-first on the **baseline** graph and
+ * creates/replaces dependencies-first on the **target** graph, stable-tie-broken by identity;
+ * the index buckets are left where they are, adjacent to their view buckets. A baseline dependent
+ * of a recreated view must itself be dropped ahead of the base: one scheduled as a replace is
+ * converted to drop+create, while an unchanged one blocks the plan with a typed refusal. Cycle
+ * and unmodeled-view checks are scoped to scheduled views only.
+ */
+function orderViewPhases(
+  baseline: Model,
+  target: Model,
+  application: ChangeApplication,
+): { readonly drops: Step[]; readonly creates: Step[]; readonly replaces: Step[] } {
+  const drops: Step[] = [...application.viewDrops];
+  const creates: Step[] = [...application.viewCreates];
+  let replaces: Step[] = [...application.viewReplaces];
+
+  const baselineGraph = new Map(baseline.views.map((view) => [keyOf(view), view]));
+  const dropMap = new Map(drops.map((step) => [keyOf(stepViewIdentity(step)), step]));
+  const createKeys = new Set(creates.map((step) => keyOf(stepViewIdentity(step))));
+  const replaceMap = new Map(replaces.map((step) => [keyOf(stepViewIdentity(step)), step]));
+  const compareKeys = (left: string, right: string): number =>
+    compareViewIdentities(identityFromViewKey(left), identityFromViewKey(right));
+  const recreated = [...dropMap.keys()].filter((key) => createKeys.has(key)).sort(compareKeys);
+
+  // dependent key -> the recreated base it would keep a `_RETURN` dependency on at drop time.
+  const blocked = new Map<string, string>();
+  for (const base of recreated) {
+    for (const dependent of transitiveViewDependents(baseline.views, [base])) {
+      if (dropMap.has(dependent)) continue;
+      const replacement = replaceMap.get(dependent);
+      if (replacement !== undefined) {
+        const view = (replacement as Extract<Step, { kind: 'replace-view' }>).view;
+        replaces = replaces.filter((step) => step !== replacement);
+        replaceMap.delete(dependent);
+        const drop: Step = {
+          kind: 'drop-view',
+          view: copyViewIdentity(view),
+          materialized: view.materialized,
+        };
+        drops.push(drop);
+        dropMap.set(dependent, drop);
+        creates.push({ kind: 'create-view', view: copyView(view) });
+        continue;
+      }
+      if (!blocked.has(dependent)) blocked.set(dependent, base);
+    }
+  }
+  if (blocked.size > 0) {
+    const bases = [...new Set(blocked.values())]
+      .map(identityFromViewKey)
+      .sort(compareViewIdentities);
+    throw ViewDependencyError.blockingDependent(
+      bases[0]!,
+      [...blocked.keys()].map(identityFromViewKey),
+    );
+  }
+
+  const dropKeys = new Set(drops.map((step) => keyOf(stepViewIdentity(step))));
+  const addKeys = new Set([...creates, ...replaces].map((step) => keyOf(stepViewIdentity(step))));
+  const unmodeledBase = unmodeledViewDependencies(baseline, dropKeys);
+  if (unmodeledBase.length > 0) throw ViewDependencyError.unmodeled(unmodeledBase);
+  const unmodeledTarget = unmodeledViewDependencies(target, addKeys);
+  if (unmodeledTarget.length > 0) throw ViewDependencyError.unmodeled(unmodeledTarget);
+
+  const targetGraph = new Map(target.views.map((view) => [keyOf(view), view]));
+  return {
+    drops: orderedViewSteps(drops, baselineGraph, 'dependents-first'),
+    creates: orderedViewSteps(creates, targetGraph, 'dependencies-first'),
+    replaces: orderedViewSteps(replaces, targetGraph, 'dependencies-first'),
+  };
 }
 
 /**
@@ -832,6 +1122,7 @@ export function plan(baseline: Model, target: Model): Plan {
   }
 
   const schemaCreates = schemaSteps(baseline, target);
+  const viewPhases = orderViewPhases(baseline, target, application);
 
   const steps: Step[] = [
     ...schemaCreates,
@@ -840,7 +1131,7 @@ export function plan(baseline: Model, target: Model): Plan {
     ...application.sequenceCreates,
     ...ownershipDetaches,
     ...application.viewIndexDrops,
-    ...application.viewDrops,
+    ...viewPhases.drops,
     ...application.foreignKeyDrops,
     ...dependentKeyDrops,
     ...breaks,
@@ -867,8 +1158,8 @@ export function plan(baseline: Model, target: Model): Plan {
     ...dependentKeyAdds,
     ...application.grantSteps,
     ...application.ownerAlters,
-    ...application.viewCreates,
-    ...application.viewReplaces,
+    ...viewPhases.creates,
+    ...viewPhases.replaces,
     ...application.viewIndexCreates,
     ...ownershipAttaches,
     ...application.defaultPrivilegeSteps,
@@ -1680,8 +1971,14 @@ export function applyChange(application: ChangeApplication, change: Change): voi
       // grants, ownership, and dependent views. A materialized view cannot be replaced, and a
       // kind change is a different object, so both become a drop and a create — which leaves
       // the recreated matview unpopulated and discards its indexes and dependents (named
-      // residual, ADR 0019).
-      if (change.before.materialized === false && change.after.materialized === false) {
+      // residual, ADR 0019). The same drop+create branch handles positive evidence that the
+      // output columns were renamed, dropped, reordered, or retyped: PostgreSQL would refuse
+      // the replace. Absent or unverifiable columns keep the replace (named residual).
+      if (
+        change.before.materialized === false &&
+        change.after.materialized === false &&
+        viewColumnIncompatibility(change.before.columns, change.after.columns).kind === 'compatible'
+      ) {
         application.viewReplaces.push({ kind: 'replace-view', view: copyView(change.after) });
       } else {
         application.viewDrops.push({
@@ -1776,10 +2073,17 @@ export function applyChange(application: ChangeApplication, change: Change): voi
   }
 }
 
-/** A copy of `view`, independent of the diff's change, including its index array. */
+/** A copy of one output column, independent of the diff's change. */
+function copyViewColumn(column: ViewOutputColumn): ViewOutputColumn {
+  return { name: column.name, type: column.type };
+}
+
+/** A copy of `view`, independent of the diff's change, including its indexes and columns. */
 function copyView(view: View): View {
   return {
     ...view,
+    ...(view.columns === undefined ? {} : { columns: view.columns.map(copyViewColumn) }),
+    ...(view.dependsOn === undefined ? {} : { dependsOn: view.dependsOn.map(copyViewDependency) }),
     ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
   };
 }

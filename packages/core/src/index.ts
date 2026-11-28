@@ -12,7 +12,7 @@ export {
   sameDefaultPrivileges,
   sameGrants,
 } from './privileges.ts';
-export { assertNever, plan, SequenceOwnershipError } from './plan.ts';
+export { assertNever, plan, SequenceOwnershipError, ViewDependencyError } from './plan.ts';
 export type { TransactionGroup } from './plan.ts';
 export {
   defaultSequenceMax,
@@ -36,6 +36,13 @@ export {
   serializeIndexElement,
 } from './index-elements.ts';
 export type { IndexElement } from './model.ts';
+export {
+  canonicalViewType,
+  sameViewColumns,
+  viewColumnIncompatibility,
+  viewColumnsVerifiable,
+} from './view-columns.ts';
+export type { ViewColumnIncompatibility } from './view-columns.ts';
 export type * from './diagnostic.ts';
 export type * from './diff.ts';
 export type * from './hazard.ts';

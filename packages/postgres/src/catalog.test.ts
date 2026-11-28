@@ -1353,6 +1353,96 @@ test('maps plain and materialized views with normalized definitions and comments
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('maps view output columns in attnum order with their catalog type text', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'v', {
+          definition: 'SELECT 1 AS one, 2 AS two',
+          columns: [
+            { attnum: 2, name: 'two', type: 'text' },
+            { attnum: 1, name: 'one', type: 'integer' },
+          ],
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.views, [
+    {
+      schema: 'public',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT 1 AS one,2 AS two',
+      columns: [
+        { name: 'one', type: 'integer' },
+        { name: 'two', type: 'text' },
+      ],
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('maps view dependencies with view and relation kinds, including a sequence relation', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'dependent', {
+          definition: 'SELECT * FROM public.base',
+          dependsOn: [
+            { kind: 'view', schema: 'public', name: 'mat' },
+            { kind: 'view', schema: 'public', name: 'base' },
+            { kind: 'relation', schema: 'app', name: 'events' },
+            { kind: 'relation', schema: 'public', name: 'events_id_seq' },
+          ],
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.views, [
+    {
+      schema: 'public',
+      name: 'dependent',
+      materialized: false,
+      definition: 'SELECT * FROM public.base',
+      dependsOn: [
+        { kind: 'relation', schema: 'app', name: 'events' },
+        { kind: 'view', schema: 'public', name: 'base' },
+        { kind: 'relation', schema: 'public', name: 'events_id_seq' },
+        { kind: 'view', schema: 'public', name: 'mat' },
+      ],
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('refuses a view dependency whose kind is not view or relation', async () => {
+  await assert.rejects(
+    mapCatalog(
+      payload({
+        views: [
+          viewRow('public', 'v', {
+            dependsOn: [{ kind: 'edge', schema: 'public', name: 'base' }],
+          }),
+        ],
+      }),
+    ),
+    /catalog payload\.views\[0\]\.dependsOn\[0\]\.kind must be "view" or "relation"/,
+  );
+});
+
+test('refuses a view output column whose type is not a string', async () => {
+  await assert.rejects(
+    mapCatalog(
+      payload({
+        views: [viewRow('public', 'v', { columns: [{ attnum: 1, name: 'a', type: 7 }] })],
+      }),
+    ),
+    /catalog payload\.views\[0\]\.columns\[0\]\.type must be a string/,
+  );
+});
+
 test('maps view check options local and cascaded, absent when null', async () => {
   const read = await mapCatalog(
     payload({

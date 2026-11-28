@@ -30,6 +30,8 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewDependency,
+  ViewOutputColumn,
 } from './model.ts';
 
 /**
@@ -606,12 +608,26 @@ function serializeOwner(owner: SequenceOwner): object {
   return { table: serializeName(owner.table), column: owner.column };
 }
 
+function serializeViewColumn(column: ViewOutputColumn): object {
+  return { name: column.name, type: column.type };
+}
+
+function serializeViewDependency(dependency: ViewDependency): object {
+  return { kind: dependency.kind, schema: dependency.schema, name: dependency.name };
+}
+
 function serializeView(view: View): object {
   return {
     schema: view.schema,
     name: view.name,
     materialized: view.materialized,
     definition: view.definition,
+    ...(view.columns === undefined || view.columns.length === 0
+      ? {}
+      : { columns: view.columns.map(serializeViewColumn) }),
+    ...(view.dependsOn === undefined || view.dependsOn.length === 0
+      ? {}
+      : { dependsOn: view.dependsOn.map(serializeViewDependency) }),
     ...(view.indexes === undefined || view.indexes.length === 0
       ? {}
       : { indexes: view.indexes.map(serializeIndex) }),
@@ -743,10 +759,14 @@ const VIEW_KEYS = [
   'name',
   'materialized',
   'definition',
+  'columns',
+  'dependsOn',
   'indexes',
   'checkOption',
   'comment',
 ] as const;
+const VIEW_COLUMN_KEYS = ['name', 'type'] as const;
+const VIEW_DEPENDENCY_KEYS = ['kind', 'schema', 'name'] as const;
 const EXTENSION_KEYS = ['schema', 'name', 'comment'] as const;
 const NAME_KEYS = ['schema', 'name'] as const;
 
@@ -761,6 +781,7 @@ const SEQUENCE_DATA_TYPES: readonly SequenceDataType[] = ['smallint', 'integer',
 const IDENTITY_GENERATIONS: readonly IdentityGeneration[] = ['always', 'by default'];
 const TABLE_PERSISTENCES: readonly TablePersistence[] = ['unlogged'];
 const VIEW_CHECK_OPTIONS: readonly ViewCheckOption[] = ['local', 'cascaded'];
+const VIEW_DEPENDENCY_KINDS: readonly ViewDependency['kind'][] = ['view', 'relation'];
 const COLUMN_STORAGES: readonly ColumnStorage[] = ['plain', 'external', 'extended', 'main'];
 const COLUMN_COMPRESSIONS: readonly ColumnCompression[] = ['pglz', 'lz4'];
 const DEFAULT_PRIVILEGE_OBJECT_TYPES: readonly DefaultPrivilege['objectType'][] = [
@@ -1530,6 +1551,14 @@ function parseView(value: unknown, path: string): Parsed<View> {
     if (!materialized.ok) return materialized;
     const definition = parseNonEmptyString(object.definition, fieldPath(path, 'definition'));
     if (!definition.ok) return definition;
+    const columns = parseOptional(object.columns, fieldPath(path, 'columns'), (value, at) =>
+      parseArrayOf(value, at, parseViewOutputColumn),
+    );
+    if (!columns.ok) return columns;
+    const dependsOn = parseOptional(object.dependsOn, fieldPath(path, 'dependsOn'), (value, at) =>
+      parseArrayOf(value, at, parseViewDependency),
+    );
+    if (!dependsOn.ok) return dependsOn;
     const indexes = parseOptional(object.indexes, fieldPath(path, 'indexes'), (value, at) =>
       parseArrayOf(value, at, parseIndex),
     );
@@ -1553,12 +1582,53 @@ function parseView(value: unknown, path: string): Parsed<View> {
       name: name.value,
       materialized: materialized.value,
       definition: definition.value,
+      ...(columns.value === undefined || columns.value.length === 0
+        ? {}
+        : { columns: columns.value }),
+      ...(dependsOn.value === undefined || dependsOn.value.length === 0
+        ? {}
+        : { dependsOn: dependsOn.value }),
       ...(indexes.value === undefined || indexes.value.length === 0
         ? {}
         : { indexes: indexes.value }),
       ...(checkOption.value === undefined ? {} : { checkOption: checkOption.value }),
       ...(comment.value === undefined ? {} : { comment: comment.value }),
     });
+  });
+}
+
+/**
+ * One output column: a non-empty name and a type string. An empty type is valid — importers
+ * write it when a dump carries no type — and only a verifiable list can drive the preflight.
+ */
+function parseViewOutputColumn(value: unknown, path: string): Parsed<ViewOutputColumn> {
+  return parseObject(value, path, VIEW_COLUMN_KEYS, (object) => {
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
+    if (!name.ok) return name;
+    const type = parseString(object.type, fieldPath(path, 'type'));
+    if (!type.ok) return type;
+    return parsed({ name: name.value, type: type.value });
+  });
+}
+
+/**
+ * One dependency fact: a required discriminator, then a schema-qualified identity. The
+ * discriminator fails closed so a table dependency can never be read as an unmodeled view.
+ */
+function parseViewDependency(value: unknown, path: string): Parsed<ViewDependency> {
+  return parseObject(value, path, VIEW_DEPENDENCY_KEYS, (object) => {
+    const kind = parseEnum(
+      object.kind,
+      fieldPath(path, 'kind'),
+      VIEW_DEPENDENCY_KINDS,
+      'view dependency kind',
+    );
+    if (!kind.ok) return kind;
+    const schema = parseNonEmptyString(object.schema, fieldPath(path, 'schema'));
+    if (!schema.ok) return schema;
+    const name = parseNonEmptyString(object.name, fieldPath(path, 'name'));
+    if (!name.ok) return name;
+    return parsed({ kind: kind.value, schema: schema.value, name: name.value });
   });
 }
 

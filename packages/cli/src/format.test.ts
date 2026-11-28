@@ -1162,6 +1162,47 @@ test('a changed view appends its differing fields in the diff order', () => {
   );
 });
 
+test('a view output-column change names the incompatible column and falls back without one', () => {
+  const changes: readonly Change[] = [
+    {
+      kind: 'view-changed',
+      view: { schema: 'public', name: 'v' },
+      changes: [
+        {
+          field: 'columns',
+          before: [
+            { name: 'a', type: 'integer' },
+            { name: 'b', type: 'text' },
+          ],
+          after: [
+            { name: 'x', type: 'integer' },
+            { name: 'b', type: 'text' },
+          ],
+          column: 'a',
+          reason: 'renamed to x',
+        },
+        {
+          field: 'columns',
+          before: [{ name: 'p', type: '' }],
+          after: [{ name: 'q', type: '' }],
+        },
+      ],
+      before: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+      after: { schema: 'public', name: 'v', materialized: false, definition: 'SELECT 1' },
+    },
+  ];
+
+  assert.equal(
+    formatChanges(changes),
+    [
+      '~ view public.v',
+      '    columns a integer, b text → x integer, b text (incompatible: a renamed to x)',
+      '    columns p → q',
+      '',
+    ].join('\n'),
+  );
+});
+
 test('a check option removal prints the absent target as (none)', () => {
   const changes: readonly Change[] = [
     {

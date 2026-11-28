@@ -35,8 +35,10 @@ import type {
   TransactionGroup,
   UniqueConstraint,
   View,
+  ViewDependency,
   ViewFieldChange,
   ViewIdentity,
+  ViewOutputColumn,
 } from '@schemamill/core';
 
 import type { ImportedSideMetadata } from './run.ts';
@@ -396,12 +398,26 @@ function mapSequence(sequence: Sequence): object {
   };
 }
 
+function mapViewOutputColumn(column: ViewOutputColumn): object {
+  return { name: column.name, type: column.type };
+}
+
+function mapViewDependency(dependency: ViewDependency): object {
+  return { kind: dependency.kind, schema: dependency.schema, name: dependency.name };
+}
+
 function mapView(view: View): object {
   return {
     schema: view.schema,
     name: view.name,
     materialized: view.materialized,
     definition: view.definition,
+    ...(view.columns === undefined || view.columns.length === 0
+      ? {}
+      : { columns: view.columns.map(mapViewOutputColumn) }),
+    ...(view.dependsOn === undefined || view.dependsOn.length === 0
+      ? {}
+      : { dependsOn: view.dependsOn.map(mapViewDependency) }),
     ...(view.indexes === undefined || view.indexes.length === 0
       ? {}
       : { indexes: view.indexes.map(mapIndex) }),
@@ -524,7 +540,16 @@ function mapSequenceFieldChange(change: SequenceFieldChange): object {
 }
 
 function mapViewFieldChange(change: ViewFieldChange): object {
-  return mapFieldPair(change.field, change.before, change.after);
+  if (change.field !== 'columns') {
+    return mapFieldPair(change.field, change.before, change.after);
+  }
+  return {
+    field: 'columns',
+    ...(change.before === undefined ? {} : { before: change.before.map(mapViewOutputColumn) }),
+    ...(change.after === undefined ? {} : { after: change.after.map(mapViewOutputColumn) }),
+    ...(change.column === undefined ? {} : { column: change.column }),
+    ...(change.reason === undefined ? {} : { reason: change.reason }),
+  };
 }
 
 function mapExtensionFieldChange(change: ExtensionFieldChange): object {

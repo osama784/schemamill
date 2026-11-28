@@ -33,6 +33,7 @@ import type {
   View,
   ViewFieldChange,
   ViewIdentity,
+  ViewOutputColumn,
 } from '@schemamill/core';
 import { assertNever, serializeIndexElement } from '@schemamill/core';
 
@@ -746,6 +747,14 @@ function formatViewChange(view: ViewIdentity, changes: readonly ViewFieldChange[
   return lines.join('\n');
 }
 
+/** A view's output columns as `name type` pairs; an unknown type prints just its name. */
+function formatViewColumnList(columns: readonly ViewOutputColumn[] | undefined): string {
+  if (columns === undefined || columns.length === 0) return '(none)';
+  return columns
+    .map((column) => (column.type === '' ? column.name : `${column.name} ${column.type}`))
+    .join(', ');
+}
+
 /** One changed view field; an absent check option prints `(none)`. */
 function formatViewField(field: ViewFieldChange): string {
   switch (field.field) {
@@ -755,6 +764,12 @@ function formatViewField(field: ViewFieldChange): string {
       return `definition ${field.before} → ${field.after}`;
     case 'checkOption':
       return `checkOption ${formatOptional(field.before)} → ${formatOptional(field.after)}`;
+    case 'columns': {
+      const pair = `columns ${formatViewColumnList(field.before)} → ${formatViewColumnList(field.after)}`;
+      return field.column === undefined || field.reason === undefined
+        ? pair
+        : `${pair} (incompatible: ${field.column} ${field.reason})`;
+    }
   }
 }
 

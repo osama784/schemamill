@@ -182,6 +182,8 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewDependency,
+  ViewOutputColumn,
 } from '@schemamill/core';
 import {
   canonicalDefaultPrivileges,
@@ -222,6 +224,7 @@ import type {
   SelectStmt,
   VariableSetStmt,
   ViewStmt,
+  WithClause,
 } from 'libpg-query';
 
 import {
@@ -272,9 +275,16 @@ type SequenceDraft = Mutable<Sequence>;
 /**
  * A view being assembled. Views need no incremental mutation: a repeated definition of one
  * identity replaces the draft wholesale, so the last definition wins — including any indexes a
- * materialized view has gathered.
+ * materialized view has gathered. Dependency identities are kept raw: `kind` is decided only after
+ * every statement has been translated, against the completed `views` map, so DDL order cannot
+ * turn a view read by an earlier statement into a `relation` fact.
  */
-type ViewDraft = Mutable<View>;
+type ViewDraft = Mutable<Omit<View, 'dependsOn'>> & {
+  dependsOn?: readonly ViewDependencyIdentity[];
+};
+
+/** A viewed relation identity recorded at translation time, before its `kind` can be known. */
+type ViewDependencyIdentity = Pick<ViewDependency, 'schema' | 'name'>;
 
 /** An extension being assembled; a repeated definition replaces it wholesale. */
 type ExtensionDraft = Mutable<Extension>;
@@ -373,7 +383,7 @@ export async function importDump(ddl: string): Promise<ReadResult<Model, Diagnos
     model: {
       tables: [...tables.values()].map(finalizeTable).sort(compareTables),
       sequences: [...sequences.values()].sort(compareSequences),
-      views: [...views.values()].map(finalizeView).sort(compareViews),
+      views: [...views.values()].map((draft) => finalizeView(draft, views)).sort(compareViews),
       extensions: [...extensions.values()].sort(compareExtensions),
       ...(privilegeState.defaultPrivileges.length === 0
         ? {}
@@ -3296,6 +3306,109 @@ type ViewDefinitionText =
     };
 
 /**
+ * Output columns stated as target aliases in a view's `SELECT`. The AST carries names but no
+ * types, so each type is `''` (unknown, never compared). A list with an unnamed target is unknown
+ * as a whole: recording only the named tail would invent a false trailing-column change. The
+ * parenthesized `ViewStmt.aliases` / `IntoClause.colNames` list is deliberately not read here —
+ * it stays flagged and discarded, as before.
+ */
+function viewOutputColumns(query: Node | undefined): readonly ViewOutputColumn[] | undefined {
+  const select = query !== undefined && 'SelectStmt' in query ? query.SelectStmt : undefined;
+  const targets = select?.targetList;
+  if (targets === undefined || targets.length === 0) return undefined;
+  const columns: ViewOutputColumn[] = [];
+  for (const target of targets) {
+    if (!('ResTarget' in target)) return undefined;
+    const name = target.ResTarget.name;
+    if (name === undefined || name === '') return undefined;
+    columns.push({ name, type: '' });
+  }
+  return columns;
+}
+
+/**
+ * Range-table relations a view reads, recorded as bare identities. Names are taken from every
+ * `RangeVar` reachable in the query tree (including `JOIN` arms and subqueries); an unqualified
+ * name is qualified with the view's own schema. A `RangeVar` that names a CTE alias is not a
+ * relation the view reads: `FROM base` inside `WITH base AS (…)` resolves to the CTE, so it is
+ * skipped when unqualified (CTEs cannot be schema-qualified). Repeated references to one relation
+ * collapse. `kind` is deliberately not decided here: a base declared later in the dump is still a
+ * view, so classification waits for `finalizeView`'s completed `views` map. The `search_path`
+ * caveat (a bare name that in DDL could resolve to another schema) is a named residual: the dump's
+ * own qualification is the only evidence available here.
+ */
+function viewDependencies(
+  query: Node | undefined,
+  schema: string,
+): readonly ViewDependencyIdentity[] | undefined {
+  if (query === undefined) return undefined;
+  const relations: RangeVar[] = [];
+  collectRangeVars(query, relations);
+  const cteAliases = new Set<string>();
+  collectCteAliases(query, cteAliases);
+  const unique = new Map<string, ViewDependencyIdentity>();
+  for (const relation of relations) {
+    if (relation.relname === undefined || relation.relname === '') continue;
+    // A CTE alias shadows a relation of the same name only for unqualified references; a stated
+    // schema is always a real relation read, never a CTE.
+    if (relation.schemaname === undefined && cteAliases.has(relation.relname)) continue;
+    const dependencySchema = relation.schemaname ?? schema;
+    unique.set(tableKey(dependencySchema, relation.relname), {
+      schema: dependencySchema,
+      name: relation.relname,
+    });
+  }
+  if (unique.size === 0) return undefined;
+  return [...unique.values()].sort(
+    (left, right) =>
+      compareStrings(left.schema, right.schema) || compareStrings(left.name, right.name),
+  );
+}
+
+/** Walks every AST value under `node`, collecting relation references in source order. */
+function collectRangeVars(value: unknown, found: RangeVar[]): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectRangeVars(item, found);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'RangeVar') {
+      const relation = child as RangeVar | undefined;
+      if (relation !== undefined) found.push(relation);
+      continue;
+    }
+    if (child !== null && typeof child === 'object') collectRangeVars(child, found);
+  }
+}
+
+/**
+ * Walks every AST value under `node`, collecting the aliases declared by every `WithClause`,
+ * nested ones included. The alias lives on `CommonTableExpr.ctename`; it is only a name for the
+ * CTE's own query, never a schema-qualified relation. Names are gathered tree-wide rather than
+ * per scope: an out-of-scope alias can under-report a dependency, but cannot invent a false one.
+ */
+function collectCteAliases(value: unknown, found: Set<string>): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCteAliases(item, found);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'withClause') {
+      const withClause = child as WithClause | undefined;
+      for (const cte of withClause?.ctes ?? []) {
+        if ('CommonTableExpr' in cte) {
+          const alias = cte.CommonTableExpr.ctename;
+          if (alias !== undefined && alias !== '') found.add(alias);
+        }
+      }
+    }
+    if (child !== null && typeof child === 'object') collectCteAliases(child, found);
+  }
+}
+
+/**
  * Imports a plain view: the definition text, the check option, and a named flag for every inline
  * attribute the model cannot carry. A recursive view is skipped whole and named; see
  * `viewDefinitionText`.
@@ -3354,6 +3467,10 @@ function translateCreateView(
     materialized: false,
     definition: extracted.definition,
   };
+  const columns = viewOutputColumns(create.query);
+  if (columns !== undefined) draft.columns = columns;
+  const dependsOn = viewDependencies(create.query, schema);
+  if (dependsOn !== undefined) draft.dependsOn = dependsOn;
   if (checkOption !== undefined) draft.checkOption = checkOption;
   views.set(tableKey(schema, name), draft);
 }
@@ -3428,12 +3545,15 @@ function translateCreateMaterializedView(
 
   // A repeated CREATE MATERIALIZED VIEW replaces the draft wholesale, clearing any indexes the
   // earlier definition gathered; the last definition wins, as for a repeated CREATE TABLE.
-  views.set(tableKey(schema, name), {
+  const draft: ViewDraft = {
     schema,
     name,
     materialized: true,
     definition: extracted.definition,
-  });
+  };
+  const columns = viewOutputColumns(create.query);
+  if (columns !== undefined) draft.columns = columns;
+  views.set(tableKey(schema, name), draft);
 }
 
 /**
@@ -5228,11 +5348,13 @@ function finalizeTable(draft: TableDraft): Table {
 }
 
 /**
- * Finalizes a view draft: canonicalizes a materialized view's index names and sorts the indexes
- * exactly as for a table, omitting the `indexes` field when there are none so ordinary views and
- * index-less matviews keep their existing shape.
+ * Finalizes a view draft: copies any recorded output columns, classifies each recorded dependency
+ * against the completed `views` map so DDL order cannot mislabel a base declared later, then
+ * canonicalizes a materialized view's index names and sorts the indexes exactly as for a table,
+ * omitting the `indexes` field when there are none so ordinary views and index-less matviews keep
+ * their existing shape.
  */
-function finalizeView(draft: ViewDraft): View {
+function finalizeView(draft: ViewDraft, views: ReadonlyMap<string, ViewDraft>): View {
   const indexes =
     draft.indexes !== undefined && draft.indexes.length > 0 ? draft.indexes : undefined;
   if (indexes !== undefined) canonicalizeIndexNames(draft);
@@ -5242,6 +5364,23 @@ function finalizeView(draft: ViewDraft): View {
     materialized: draft.materialized,
     definition: draft.definition,
   };
+  if (draft.columns !== undefined) {
+    view.columns = draft.columns.map((column) => ({ name: column.name, type: column.type }));
+  }
+  if (draft.dependsOn !== undefined) {
+    view.dependsOn = draft.dependsOn
+      .map((dependency): ViewDependency => ({
+        kind: views.has(tableKey(dependency.schema, dependency.name)) ? 'view' : 'relation',
+        schema: dependency.schema,
+        name: dependency.name,
+      }))
+      .sort(
+        (left, right) =>
+          compareStrings(left.kind, right.kind) ||
+          compareStrings(left.schema, right.schema) ||
+          compareStrings(left.name, right.name),
+      );
+  }
   if (indexes !== undefined) view.indexes = [...indexes].sort(compareIndexes);
   if (draft.checkOption !== undefined) view.checkOption = draft.checkOption;
   if (draft.comment !== undefined) view.comment = draft.comment;

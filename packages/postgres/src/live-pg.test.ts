@@ -18,11 +18,17 @@ import type {
   Sequence,
   SequenceIdentity,
   SequenceOwner,
+  View,
 } from '@schemamill/core';
 
 import { catalogReader, importDump, renderSql } from './index.ts';
 import { baselineOccupancyRefusedTarget, scenes } from './live-scenes.ts';
-import type { LiveScene, SceneCheck, SceneIntrospection } from './live-scenes.ts';
+import type {
+  IntrospectionIgnore,
+  LiveScene,
+  SceneCheck,
+  SceneIntrospection,
+} from './live-scenes.ts';
 
 /**
  * The live-PostgreSQL harness: every scene is built, migrated, dumped, imported back, and
@@ -306,7 +312,13 @@ async function runScene(
     );
 
     if (scene.introspection !== undefined) {
-      await assertIntrospection(appliedUrl, scene.name, applied, scene.introspection);
+      await assertIntrospection(
+        appliedUrl,
+        scene.name,
+        applied,
+        scene.introspection,
+        scene.introspectionIgnore ?? [],
+      );
     }
   } finally {
     await dropDatabase(baseUrl, appliedDb);
@@ -837,33 +849,56 @@ function assertCrossImportChecks(
 }
 
 /**
+ * A copy of `model` with the scene's excluded view facts removed. The catalog reports typed
+ * output columns and dependency facts that a dump import cannot reproduce; a scene that declares
+ * `introspectionIgnore` makes no `matches-import` parity claim for those named fields, so both
+ * sides are normalized before the comparison. Every other field stays byte-identical.
+ */
+function withoutIgnoredViewFacts(model: Model, ignore: readonly IntrospectionIgnore[]): Model {
+  if (ignore.length === 0) return model;
+  return {
+    ...model,
+    views: model.views.map((view) => {
+      const normalized = { ...view } as { -readonly [K in keyof View]: View[K] };
+      if (ignore.includes('view.columns')) delete normalized.columns;
+      if (ignore.includes('view.dependsOn')) delete normalized.dependsOn;
+      return normalized;
+    }),
+  };
+}
+
+/**
  * The scene's live-introspection assertion, consuming the production `catalogReader` through
  * the seam type. The read runs against the migrated database; `matches-import` requires no
  * diagnostics, an empty `diff` against the applied dump's import, and a model deep-equal to
  * that import — the order-significant guard — while `flags` pins the diagnostics list exactly.
+ * `ignore` names the view facts the scene excludes from that parity, before either comparison.
  */
 async function assertIntrospection(
   appliedUrl: string,
   sceneName: string,
   applied: ReadResult<Model, Diagnostic>,
   assertion: SceneIntrospection,
+  ignore: readonly IntrospectionIgnore[],
 ): Promise<void> {
   const reader: CatalogReader<string, Model, Diagnostic> = catalogReader;
   const introspected = await reader.introspect(appliedUrl);
   if (assertion.assert === 'matches-import') {
+    const introspectedModel = withoutIgnoredViewFacts(introspected.model, ignore);
+    const appliedModel = withoutIgnoredViewFacts(applied.model, ignore);
     assert.deepEqual(
       introspected.diagnostics,
       [],
       `${sceneName}: introspection reported diagnostics for a scene the import considers clean`,
     );
     assert.deepEqual(
-      diff(introspected.model, applied.model),
+      diff(introspectedModel, appliedModel),
       [],
       `${sceneName}: the introspected model does not match the applied dump's import`,
     );
     assert.deepEqual(
-      introspected.model,
-      applied.model,
+      introspectedModel,
+      appliedModel,
       `${sceneName}: the introspected model is not deep-equal to the applied dump's import`,
     );
     return;

@@ -34,6 +34,8 @@ import type {
   TablePersistence,
   UniqueConstraint,
   View,
+  ViewDependency,
+  ViewOutputColumn,
 } from '@schemamill/core';
 
 import { RenderRefusalError, renderSql } from './render.ts';
@@ -413,6 +415,13 @@ export type SceneIntrospection =
   | { readonly assert: 'matches-import' }
   | { readonly assert: 'flags'; readonly expected: readonly Diagnostic[] };
 
+/**
+ * A view fact a scene deliberately excludes from `matches-import`: the catalog reports typed
+ * output columns and dependency facts that a dump import cannot reproduce ([#71](https://github.com/osama784/schemamill/issues/71)). Both sides are normalized before the deep-equality, so no
+ * parity is claimed for the named facts.
+ */
+export type IntrospectionIgnore = 'view.columns' | 'view.dependsOn';
+
 /** One scene of the live-PostgreSQL harness. */
 export interface LiveScene {
   /** Stable scene name; the harness derives its database names from it. */
@@ -474,6 +483,13 @@ export interface LiveScene {
    * imports and asserts the scene's claim.
    */
   readonly introspection?: SceneIntrospection;
+  /**
+   * View facts this scene deliberately excludes from `matches-import` parity. The catalog reports
+   * typed output columns and dependency facts that a dump import cannot reproduce, so the named
+   * fields are normalized out of both models before the deep-equality. A scene that declares an
+   * ignore therefore makes no parity claim for that field; it does not weaken any other check.
+   */
+  readonly introspectionIgnore?: readonly IntrospectionIgnore[];
 }
 
 /** `public` tables in name order, or the empty string when there are none. */
@@ -6282,6 +6298,7 @@ const viewRoundTripScene = (): LiveScene => {
               )}`,
       },
     ],
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
 
@@ -6501,6 +6518,7 @@ const matviewIndexRoundTripScene = (): LiveScene => {
         },
       },
     ],
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
 
@@ -6862,6 +6880,7 @@ const commentIntrospectionScene = (): LiveScene => {
       },
     ],
     introspection: { assert: 'matches-import' },
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
 
@@ -7514,6 +7533,7 @@ const commentRoundTripScene = (): LiveScene => {
       },
     ],
     introspection: { assert: 'matches-import' },
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
 
@@ -7893,6 +7913,257 @@ const exportRoundTripScene = (): LiveScene => {
         },
       },
     ],
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
+  };
+};
+
+/**
+ * The dependent-view chain: three plain views whose recorded `view` dependencies order both
+ * phases. A rename on the base view forces drop+create, and the two dependents are scheduled as
+ * replaces and converted to drop+create, so the plan drops leaf, middle, base and creates base,
+ * middle, leaf. The live apply proves that order against PostgreSQL's own `_RETURN` dependencies;
+ * the plan check names the order the round trip alone cannot see. The three refusal cases (cycle,
+ * unmodeled view, blocking dependent) are unit- and CLI-pinned only — a `plan()` throw aborts the
+ * harness before a scene's checks run — so this scene claims successful ordering only.
+ */
+const viewDependencyChainScene = (): LiveScene => {
+  const dependsOn = (name: string): ViewDependency => ({ kind: 'view', schema: 'public', name });
+  const columns = (...names: readonly string[]): readonly ViewOutputColumn[] =>
+    names.map((name) => ({ name, type: name === 'label' ? 'text' : 'integer' }));
+
+  const baseline: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('chain_base', {
+        definition: "SELECT 1 AS id, 'a'::text AS label",
+        columns: columns('id', 'label'),
+      }),
+      view('chain_mid', {
+        definition: 'SELECT id, label FROM chain_base',
+        columns: columns('id', 'label'),
+        dependsOn: [dependsOn('chain_base')],
+      }),
+      view('chain_leaf', {
+        definition: 'SELECT id FROM chain_mid',
+        columns: columns('id'),
+        dependsOn: [dependsOn('chain_mid')],
+      }),
+    ],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('chain_base', {
+        definition: "SELECT 1 AS ident, 'a'::text AS label",
+        columns: columns('ident', 'label'),
+      }),
+      view('chain_mid', {
+        definition: 'SELECT ident, label FROM chain_base',
+        columns: columns('ident', 'label'),
+        dependsOn: [dependsOn('chain_base')],
+      }),
+      view('chain_leaf', {
+        definition: 'SELECT ident FROM chain_mid',
+        columns: columns('ident'),
+        dependsOn: [dependsOn('chain_mid')],
+      }),
+    ],
+    extensions: [],
+  };
+
+  const viewNames = (steps: readonly Step[], kind: 'drop-view' | 'create-view'): string[] =>
+    steps.flatMap((step) => (step.kind === kind ? [step.view.name] : []));
+
+  return {
+    name: 'view-dependency-chain',
+    baseline,
+    target,
+    planChecks: [
+      {
+        description: 'dependents drop before their base and create after it, with no replace',
+        failure: (steps) => {
+          const drops = viewNames(steps, 'drop-view').join(',');
+          const creates = viewNames(steps, 'create-view').join(',');
+          if (drops !== 'chain_leaf,chain_mid,chain_base') return `drops: ${drops}`;
+          if (creates !== 'chain_base,chain_mid,chain_leaf') return `creates: ${creates}`;
+          const replaces = steps.filter((step) => step.kind === 'replace-view').length;
+          return replaces === 0 ? undefined : `replace steps: ${replaces}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the applied database holds all three plain views',
+        sql:
+          "select string_agg(relname, ',' order by relname) from pg_class" +
+          " where relkind = 'v' and relnamespace = 'public'::regnamespace",
+        expected: 'chain_base,chain_leaf,chain_mid',
+      },
+      {
+        description: 'the applied base view carries the renamed column',
+        sql: viewDefinitionContains('chain_base', 'ident'),
+        expected: 't',
+      },
+      {
+        description: 'the applied leaf view reads the renamed column',
+        sql: viewDefinitionContains('chain_leaf', 'ident'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import all three views with the renamed column',
+        failure: (imported, source) => {
+          const names = imported.model.views
+            .map((candidate) => candidate.name)
+            .sort()
+            .join(',');
+          if (names !== 'chain_base,chain_leaf,chain_mid') return `${source}: views: ${names}`;
+          for (const candidate of imported.model.views) {
+            if (!candidate.definition.includes('ident')) {
+              return `${source}: ${candidate.name}: ${candidate.definition}`;
+            }
+          }
+          return undefined;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'the applied and target imports are the same server-derived model',
+        failure: (applied, expected) =>
+          isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ:\n${JSON.stringify(
+                {
+                  changes: diff(applied.model, expected.model),
+                  applied: applied.model,
+                  target: expected.model,
+                },
+                null,
+                2,
+              )}`,
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
+  };
+};
+
+/**
+ * The standalone view-column rewrite: one view's only output column is renamed and another's is
+ * retyped, with no dependency facts, so both changes must take the drop+create branch rather than
+ * a `CREATE OR REPLACE` PostgreSQL would reject. The catalog's typed columns provide the positive
+ * evidence; the dump imports carry names with an unknown type, which is why this scene declares
+ * `introspectionIgnore` for `view.columns`.
+ */
+const viewColumnRewriteScene = (): LiveScene => {
+  const baseline: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('rename_view', {
+        definition: 'SELECT 1 AS id',
+        columns: [{ name: 'id', type: 'integer' }],
+      }),
+      view('retype_view', {
+        definition: 'SELECT 1::integer AS value',
+        columns: [{ name: 'value', type: 'integer' }],
+      }),
+    ],
+    extensions: [],
+  };
+  const target: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      view('rename_view', {
+        definition: 'SELECT 1 AS ident',
+        columns: [{ name: 'ident', type: 'integer' }],
+      }),
+      view('retype_view', {
+        definition: "SELECT 'x'::text AS value",
+        columns: [{ name: 'value', type: 'text' }],
+      }),
+    ],
+    extensions: [],
+  };
+
+  const viewNames = (steps: readonly Step[], kind: 'drop-view' | 'create-view'): string[] =>
+    steps.flatMap((step) => (step.kind === kind ? [step.view.name] : []));
+
+  return {
+    name: 'view-column-rewrite',
+    baseline,
+    target,
+    planChecks: [
+      {
+        description: 'both incompatible columns plan drop+create in identity order',
+        failure: (steps) => {
+          const drops = viewNames(steps, 'drop-view').join(',');
+          const creates = viewNames(steps, 'create-view').join(',');
+          if (drops !== 'rename_view,retype_view') return `drops: ${drops}`;
+          if (creates !== 'rename_view,retype_view') return `creates: ${creates}`;
+          const replaces = steps.filter((step) => step.kind === 'replace-view').length;
+          return replaces === 0 ? undefined : `replace steps: ${replaces}`;
+        },
+      },
+    ],
+    checks: [
+      {
+        description: 'the applied rename view promotes the new column name',
+        sql: viewDefinitionContains('rename_view', 'ident'),
+        expected: 't',
+      },
+      {
+        description: 'the applied retype view promotes the text type',
+        sql: viewDefinitionContains('retype_view', '::text'),
+        expected: 't',
+      },
+    ],
+    importChecks: [
+      {
+        description: 'both dumps import the renamed and retyped views',
+        failure: (imported, source) => {
+          const names = imported.model.views
+            .map((candidate) => candidate.name)
+            .sort()
+            .join(',');
+          if (names !== 'rename_view,retype_view') return `${source}: views: ${names}`;
+          const rename = imported.model.views.find((candidate) => candidate.name === 'rename_view');
+          if (!rename?.definition.includes('ident')) {
+            return `${source}: rename_view: ${JSON.stringify(rename?.definition)}`;
+          }
+          const retype = imported.model.views.find((candidate) => candidate.name === 'retype_view');
+          if (!retype?.definition.includes('::text')) {
+            return `${source}: retype_view: ${JSON.stringify(retype?.definition)}`;
+          }
+          return undefined;
+        },
+      },
+    ],
+    crossImportChecks: [
+      {
+        description: 'the applied and target imports are the same server-derived model',
+        failure: (applied, expected) =>
+          isDeepStrictEqual(applied.model, expected.model)
+            ? undefined
+            : `the server-derived imports differ:\n${JSON.stringify(
+                {
+                  changes: diff(applied.model, expected.model),
+                  applied: applied.model,
+                  target: expected.model,
+                },
+                null,
+                2,
+              )}`,
+      },
+    ],
+    introspection: { assert: 'matches-import' },
+    introspectionIgnore: ['view.columns', 'view.dependsOn'],
   };
 };
 
@@ -8330,5 +8601,7 @@ export const scenes: readonly LiveScene[] = [
   commentRoundTripScene(),
   extensionRoundTripScene(),
   exportRoundTripScene(),
+  viewDependencyChainScene(),
+  viewColumnRewriteScene(),
   objectPrivilegesScene(),
 ];

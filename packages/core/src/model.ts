@@ -516,6 +516,28 @@ export interface ViewIdentity {
 export type ViewCheckOption = 'local' | 'cascaded';
 
 /**
+ * One output column of a view or materialized view, in the order PostgreSQL reports it
+ * (`attnum`). `type` is the canonical `format_type` text the catalog stores; importers that cannot
+ * resolve a type write `''` to mean "unknown", which never drives the compatibility decision.
+ */
+export interface ViewOutputColumn {
+  /** The output column's name, as PostgreSQL names it. */
+  readonly name: string;
+  /** The canonical `format_type` text, or `''` when the type is unknown. */
+  readonly type: string;
+}
+
+/**
+ * One relation a view reads, recorded as a plan-time dependency fact. The required `kind`
+ * discriminates a view from every other relation, so a table or sequence dependency can never be
+ * mistaken for an unmodeled view. Absent from `View.dependsOn` means no facts were recorded.
+ */
+export interface ViewDependency extends ViewIdentity {
+  /** Whether the referenced relation is a view (`v`/`m`) or any other relation. */
+  readonly kind: 'view' | 'relation';
+}
+
+/**
  * A view or materialized view and its definition. One array holds both kinds and one identity
  * names either, so a view and a materialized view never coexist under one name; `materialized`
  * is the discriminator that decides how a migration recreates it.
@@ -529,6 +551,17 @@ export interface View extends ViewIdentity {
    * check expression or a default: core never parses it.
    */
   readonly definition: string;
+  /**
+   * The view's output columns in `attnum` order, each carrying a name and a canonical type.
+   * Absent means unknown: a side without verifiable columns never drives the preflight decision.
+   */
+  readonly columns?: readonly ViewOutputColumn[];
+  /**
+   * The relations this view reads, as dependency facts for plan-time ordering. `view` members
+   * order drops/creates and gate the typed refusal; `relation` members are recorded for fidelity
+   * but never refuse. Absent means no facts were recorded.
+   */
+  readonly dependsOn?: readonly ViewDependency[];
   /**
    * Standalone indexes on a materialized view, in source order; absent means none. Matviews
    * only: an ordinary view cannot own an index. An empty array normalizes to absence in a

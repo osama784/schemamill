@@ -4783,6 +4783,7 @@ test('imports plain views and materialized views, sorted by identity', async () 
       name: 'plain',
       materialized: false,
       definition: "SELECT a,b,'AS' AS label FROM app.t WHERE a <> 'x' AND b IS NOT NULL",
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',
@@ -4790,9 +4791,215 @@ test('imports plain views and materialized views, sorted by identity', async () 
       materialized: true,
       definition: 'SELECT team_id,count(*) AS n FROM app.t GROUP BY team_id',
     },
-    { schema: 'public', name: 'upper', materialized: false, definition: 'SELECT 1 AS one' },
+    {
+      schema: 'public',
+      name: 'upper',
+      materialized: false,
+      definition: 'SELECT 1 AS one',
+      columns: [{ name: 'one', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
+});
+
+test('imports view dependencies from range tables, qualifying unqualified names with the view schema', async () => {
+  const dump = [
+    `CREATE VIEW app.base AS SELECT 1 AS id;`,
+    `CREATE VIEW app.mid AS SELECT id FROM base;`,
+    `CREATE VIEW app.top AS SELECT mid.id FROM app.mid JOIN public.events e ON e.id = mid.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'base',
+      materialized: false,
+      definition: 'SELECT 1 AS id',
+      columns: [{ name: 'id', type: '' }],
+    },
+    {
+      schema: 'app',
+      name: 'mid',
+      materialized: false,
+      definition: 'SELECT id FROM base',
+      dependsOn: [{ kind: 'view', schema: 'app', name: 'base' }],
+    },
+    {
+      schema: 'app',
+      name: 'top',
+      materialized: false,
+      definition: 'SELECT mid.id FROM app.mid JOIN public.events e ON e.id = mid.id',
+      dependsOn: [
+        { kind: 'relation', schema: 'public', name: 'events' },
+        { kind: 'view', schema: 'app', name: 'mid' },
+      ],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('does not record a CTE alias as a view dependency, including nested CTEs', async () => {
+  // `FROM base` inside `WITH base AS (…)` reads the CTE, not the modeled view of the same name.
+  // CTEs cannot be schema-qualified, so a qualified `public.base` still is a real dependency.
+  const dump = [
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+    `CREATE VIEW public.nested AS WITH outer_cte AS (WITH base AS (SELECT 3 AS id) SELECT id FROM base) SELECT id FROM outer_cte;`,
+    `CREATE VIEW public.qualified AS WITH base AS (SELECT 4 AS id) SELECT q.id FROM public.base q JOIN base b ON q.id = b.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  const dependencies = (name: string) => model.views.find((view) => view.name === name)?.dependsOn;
+  assert.deepEqual(dependencies('base'), undefined);
+  assert.deepEqual(dependencies('dep'), undefined);
+  assert.deepEqual(dependencies('nested'), undefined);
+  assert.deepEqual(dependencies('qualified'), [{ kind: 'view', schema: 'public', name: 'base' }]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('a CTE alias does not make a legitimate view column rewrite refuse the plan', async () => {
+  // Both sides carry the same CTE body; only `base`'s column is renamed. With verifiable types on
+  // both sides the rename must plan a drop and recreate of `base` without a false refusal from the
+  // alias `dep` never reads as a relation.
+  const baselineDump = [
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+  ].join('\n');
+  const targetDump = [
+    `CREATE VIEW public.base AS SELECT 1 AS ident;`,
+    `CREATE VIEW public.dep AS WITH base AS (SELECT 2 AS id) SELECT id FROM base;`,
+  ].join('\n');
+
+  // Dump-derived columns carry an unknown type, so inject canonical types to make both sides
+  // verifiable; the dependency facts under test still come from the importer.
+  const typedBase = (model: Model, column: string): Model => ({
+    ...model,
+    views: model.views.map((view) =>
+      view.name === 'base' && view.schema === 'public'
+        ? { ...view, columns: [{ name: column, type: 'integer' }] }
+        : view,
+    ),
+  });
+  const baseline = typedBase((await importDump(baselineDump)).model, 'id');
+  const target = typedBase((await importDump(targetDump)).model, 'ident');
+
+  const steps = plan(baseline, target).steps;
+  const viewNames = (kind: 'drop-view' | 'create-view') =>
+    steps.flatMap((step) => (step.kind === kind ? [step.view.name] : []));
+  assert.deepEqual(viewNames('drop-view'), ['base']);
+  assert.deepEqual(viewNames('create-view'), ['base']);
+});
+
+test('classifies a forward view dependency against the completed import, not DDL order', async () => {
+  // The dependent is declared before its base. Both facts are recorded before finalization, so
+  // `base` must still be a `view` fact and the resulting plan must create it before its dependent.
+  const dump = [
+    `CREATE VIEW public.dep AS SELECT id FROM public.base;`,
+    `CREATE VIEW public.base AS SELECT 1 AS id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'public',
+      name: 'base',
+      materialized: false,
+      definition: 'SELECT 1 AS id',
+      columns: [{ name: 'id', type: '' }],
+    },
+    {
+      schema: 'public',
+      name: 'dep',
+      materialized: false,
+      definition: 'SELECT id FROM public.base',
+      dependsOn: [{ kind: 'view', schema: 'public', name: 'base' }],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+
+  const emptyModel: Model = { tables: [], sequences: [], views: [], extensions: [] };
+  const created = plan(emptyModel, model).steps.flatMap((step) =>
+    step.kind === 'create-view' ? [step.view.name] : [],
+  );
+  assert.deepEqual(created, ['base', 'dep']);
+});
+
+test('imports table and sequence range dependencies as relations, deduplicated by identity', async () => {
+  const dump = [
+    `CREATE TABLE app.t (id integer);`,
+    `CREATE VIEW app.v AS SELECT a.id FROM app.t a JOIN app.t b ON a.id = b.id, app.t_id_seq;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT a.id FROM app.t a JOIN app.t b ON a.id = b.id,app.t_id_seq',
+      dependsOn: [
+        { kind: 'relation', schema: 'app', name: 't' },
+        { kind: 'relation', schema: 'app', name: 't_id_seq' },
+      ],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('records target-list aliases as view output columns with unknown types', async () => {
+  const dump = [
+    `CREATE VIEW app.aliased AS SELECT 1 AS one, 2 AS "Two";`,
+    `CREATE MATERIALIZED VIEW app.mv_aliased AS SELECT 3 AS three WITH NO DATA;`,
+    `CREATE VIEW app.partial AS SELECT 4 AS four, 5;`,
+    `CREATE VIEW app.parenthesized (p, q) AS SELECT 6, 7;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'aliased',
+      materialized: false,
+      definition: 'SELECT 1 AS one,2 AS "Two"',
+      columns: [
+        { name: 'one', type: '' },
+        { name: 'Two', type: '' },
+      ],
+    },
+    {
+      schema: 'app',
+      name: 'mv_aliased',
+      materialized: true,
+      definition: 'SELECT 3 AS three',
+      columns: [{ name: 'three', type: '' }],
+    },
+    {
+      schema: 'app',
+      name: 'parenthesized',
+      materialized: false,
+      definition: 'SELECT 6,7',
+    },
+    {
+      schema: 'app',
+      name: 'partial',
+      materialized: false,
+      definition: 'SELECT 4 AS four,5',
+    },
+  ]);
+  assert.deepEqual(diagnostics.map(describeDiagnostic), [
+    {
+      kind: 'flag',
+      code: 'unsupported-attribute',
+      object: 'app.parenthesized',
+      message: 'dropped view column list from app.parenthesized',
+    },
+  ]);
 });
 
 test('reads view check options from the clause and from a check_option reloption', async () => {
@@ -4813,6 +5020,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'both',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'local',
     },
     {
@@ -4820,6 +5028,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'implicit',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'cascaded',
     },
     {
@@ -4827,6 +5036,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'local',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'local',
     },
     {
@@ -4834,6 +5044,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'option',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'cascaded',
     },
   ]);
@@ -4860,6 +5071,7 @@ test('flags every view reloption by name, still importing the view', async () =>
       name: 'options',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
@@ -5009,6 +5221,7 @@ test('distinguishes WITH NO DATA, WITH DATA, and the implicit populated state', 
       name: 'mv_data',
       materialized: true,
       definition: "SELECT 'WITH DATA' AS note",
+      columns: [{ name: 'note', type: '' }],
     },
     { schema: 'app', name: 'mv_no_data', materialized: true, definition: 'SELECT 1' },
     { schema: 'app', name: 'mv_none', materialized: true, definition: 'SELECT 1' },
@@ -5125,6 +5338,10 @@ test('keeps the last definition of a repeated view, including the loop-repair CR
       name: 'loop',
       materialized: false,
       definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
     },
   ]);
   assert.deepEqual(diagnostics, []);
@@ -5173,18 +5390,21 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       materialized: false,
       definition:
         'WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t',
+      // `FROM t` here is the recursive CTE's own alias, not a relation the view reads.
     },
     {
       schema: 'app',
       name: 'dollar',
       materialized: false,
       definition: 'SELECT a,(b + 1) AS c,$$WITH NO DATA$$ AS d,$tag$ ? AS ? $tag$ AS e FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',
       name: 'mv_literal',
       materialized: true,
       definition: "SELECT 'WITH NO DATA' AS note",
+      columns: [{ name: 'note', type: '' }],
     },
     {
       schema: 'app',
@@ -5203,8 +5423,16 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       name: 'quoted',
       materialized: false,
       definition: 'SELECT(a + 1) AS "AS" FROM app.t',
+      columns: [{ name: 'AS', type: '' }],
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
-    { schema: 'app', name: 'utf8', materialized: false, definition: "SELECT 'é' AS e" },
+    {
+      schema: 'app',
+      name: 'utf8',
+      materialized: false,
+      definition: "SELECT 'é' AS e",
+      columns: [{ name: 'e', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
 });
@@ -5226,6 +5454,7 @@ test('imports a materialized view index, canonicalized to unnamed', async () => 
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
       indexes: [{ unique: true, columns: ['a'] }],
     },
   ]);
@@ -5251,6 +5480,10 @@ test('imports plain, unique, unnamed, and concurrent materialized view indexes',
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
       indexes: [
         { unique: false, columns: ['a', 'b'] },
         { name: 'conc_ab', unique: false, columns: ['a', 'b'], concurrently: true },
@@ -5271,7 +5504,13 @@ test('skips an index on a plain view with the exact plain-view diagnostic', asyn
   const { model, diagnostics } = await importDump(dump);
 
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'v', materialized: false, definition: 'SELECT 1 AS a' },
+    {
+      schema: 'app',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
@@ -5311,7 +5550,13 @@ test('clears materialized view indexes on a repeated CREATE MATERIALIZED VIEW', 
 
   // The second definition replaces the whole draft, dropping the earlier index with it.
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 2 AS b' },
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 2 AS b',
+      columns: [{ name: 'b', type: '' }],
+    },
   ]);
   assert.deepEqual(diagnostics, []);
 });
@@ -5346,7 +5591,16 @@ test('skips a materialized view index outside the minimal envelope', async () =>
   const { model, diagnostics } = await importDump(dump);
 
   assert.deepEqual(model.views, [
-    { schema: 'app', name: 'mv', materialized: true, definition: 'SELECT 1 AS a,2 AS b' },
+    {
+      schema: 'app',
+      name: 'mv',
+      materialized: true,
+      definition: 'SELECT 1 AS a,2 AS b',
+      columns: [
+        { name: 'a', type: '' },
+        { name: 'b', type: '' },
+      ],
+    },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
     {
@@ -5374,6 +5628,7 @@ test('leaves a comment on a materialized view index flagged and deferred', async
       name: 'mv',
       materialized: true,
       definition: 'SELECT 1 AS a',
+      columns: [{ name: 'a', type: '' }],
       indexes: [{ unique: false, columns: ['a'] }],
     },
   ]);
