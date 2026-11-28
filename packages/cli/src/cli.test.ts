@@ -142,6 +142,62 @@ const DANGLING_COLUMN_ERROR =
   'schemamill: sequence public.s is owned by public.t.id, but the target model has no column id on table public.t\n';
 
 /**
+ * View-dependency refusal fixtures. The baseline dump carries a view chain; the workspace target
+ * recreates the base as a materialized view while leaving its dependent unchanged, so Q4's
+ * baseline graph blocks the drop. The cycle and unmodeled models fire on the target graph, which
+ * `export` also plans (empty baseline → workspace model).
+ */
+const BASELINE_VIEW_CHAIN_DUMP = [
+  `CREATE VIEW public.base AS SELECT 1 AS a;`,
+  `CREATE VIEW public.dep AS SELECT a FROM public.base;`,
+  '',
+].join('\n');
+
+const BLOCKING_DEPENDENT_MODEL = `{
+  "tables": [],
+  "sequences": [],
+  "views": [
+    { "schema": "public", "name": "base", "materialized": true, "definition": "SELECT 1 AS a",
+      "columns": [{ "name": "a", "type": "" }] },
+    { "schema": "public", "name": "dep", "materialized": false,
+      "definition": "SELECT a FROM public.base",
+      "dependsOn": [{ "kind": "view", "schema": "public", "name": "base" }] }
+  ],
+  "extensions": []
+}
+`;
+
+const VIEW_CYCLE_MODEL = `{
+  "tables": [],
+  "sequences": [],
+  "views": [
+    { "schema": "public", "name": "a", "materialized": false, "definition": "SELECT 1",
+      "dependsOn": [{ "kind": "view", "schema": "public", "name": "b" }] },
+    { "schema": "public", "name": "b", "materialized": false, "definition": "SELECT 2",
+      "dependsOn": [{ "kind": "view", "schema": "public", "name": "a" }] }
+  ],
+  "extensions": []
+}
+`;
+
+const UNMODELED_VIEW_MODEL = `{
+  "tables": [],
+  "sequences": [],
+  "views": [
+    { "schema": "public", "name": "a", "materialized": false, "definition": "SELECT 1",
+      "dependsOn": [{ "kind": "view", "schema": "public", "name": "missing" }] }
+  ],
+  "extensions": []
+}
+`;
+
+const BLOCKING_DEPENDENT_ERROR =
+  'schemamill: view dependency: view public.base cannot be recreated while dependent views public.dep are not scheduled for drop\n';
+const VIEW_CYCLE_ERROR = 'schemamill: view dependency cycle among views public.a, public.b\n';
+const UNMODELED_VIEW_ERROR =
+  'schemamill: view dependency: view public.a depends on unmodeled view public.missing\n';
+
+/**
  * The pg_dump-shaped default-privilege pair: a REVOKE before the GRANT for the same scope (brief
  * D1/D9). With a target that carries no default privileges, the REVOKE needs no undo — PostgreSQL's
  * default is no grant — while the GRANT must be revoked for the plan to converge.
@@ -2380,6 +2436,69 @@ test('export --format markdown refuses a dangling target owner on one stderr lin
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, DANGLING_TABLE_ERROR);
   assert.equal(result.code, 1);
+});
+
+test('plan and compare refuse a blocking dependent in human and JSON channels, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, BLOCKING_DEPENDENT_MODEL);
+  const dumps = await fixtureDir(t);
+  const baseline = await writeDump(dumps, 'chain.sql', BASELINE_VIEW_CHAIN_DUMP);
+
+  for (const command of ['plan', 'compare'] as const) {
+    for (const json of [[], ['--json']] as const) {
+      const result = await runCli(command, '--target-workspace', baseline, ...json, { cwd: root });
+
+      assert.equal(result.stdout, '', `${command} ${json.join(' ')} printed an artifact`);
+      assert.equal(result.stderr, BLOCKING_DEPENDENT_ERROR);
+      assert.equal(result.code, 1);
+    }
+  }
+});
+
+test('plan, compare and export refuse a view dependency cycle, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, VIEW_CYCLE_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  for (const command of ['plan', 'compare'] as const) {
+    for (const json of [[], ['--json']] as const) {
+      const result = await runCli(command, '--target-workspace', empty, ...json, { cwd: root });
+
+      assert.equal(result.stdout, '', `${command} ${json.join(' ')} printed an artifact`);
+      assert.equal(result.stderr, VIEW_CYCLE_ERROR);
+      assert.equal(result.code, 1);
+    }
+  }
+  for (const format of [[], ['--format', 'json'], ['--format', 'markdown']] as const) {
+    const result = await runCli('export', ...format, { cwd: root });
+    assert.equal(result.stdout, '', `export ${format.join(' ')} printed a document`);
+    assert.equal(result.stderr, VIEW_CYCLE_ERROR);
+    assert.equal(result.code, 1);
+  }
+});
+
+test('plan, compare and export refuse an unmodeled view dependency, exit 1', async (t) => {
+  const root = await fixtureDir(t);
+  await writeWorkspaceModel(root, UNMODELED_VIEW_MODEL);
+  const dumps = await fixtureDir(t);
+  const empty = await writeDump(dumps, 'empty.sql', '');
+
+  for (const command of ['plan', 'compare'] as const) {
+    for (const json of [[], ['--json']] as const) {
+      const result = await runCli(command, '--target-workspace', empty, ...json, { cwd: root });
+
+      assert.equal(result.stdout, '', `${command} ${json.join(' ')} printed an artifact`);
+      assert.equal(result.stderr, UNMODELED_VIEW_ERROR);
+      assert.equal(result.code, 1);
+    }
+  }
+  for (const format of [[], ['--format', 'json'], ['--format', 'markdown']] as const) {
+    const result = await runCli('export', ...format, { cwd: root });
+    assert.equal(result.stdout, '', `export ${format.join(' ')} printed a document`);
+    assert.equal(result.stderr, UNMODELED_VIEW_ERROR);
+    assert.equal(result.code, 1);
+  }
 });
 
 test('export --help documents --format and --target-version, exit 0', async () => {

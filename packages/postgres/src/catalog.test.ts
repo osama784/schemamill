@@ -1383,6 +1383,55 @@ test('maps view output columns in attnum order with their catalog type text', as
   assert.deepEqual(read.diagnostics, []);
 });
 
+test('maps view dependencies with view and relation kinds, including a sequence relation', async () => {
+  const read = await mapCatalog(
+    payload({
+      views: [
+        viewRow('public', 'dependent', {
+          definition: 'SELECT * FROM public.base',
+          dependsOn: [
+            { kind: 'view', schema: 'public', name: 'mat' },
+            { kind: 'view', schema: 'public', name: 'base' },
+            { kind: 'relation', schema: 'app', name: 'events' },
+            { kind: 'relation', schema: 'public', name: 'events_id_seq' },
+          ],
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(read.model.views, [
+    {
+      schema: 'public',
+      name: 'dependent',
+      materialized: false,
+      definition: 'SELECT * FROM public.base',
+      dependsOn: [
+        { kind: 'relation', schema: 'app', name: 'events' },
+        { kind: 'view', schema: 'public', name: 'base' },
+        { kind: 'relation', schema: 'public', name: 'events_id_seq' },
+        { kind: 'view', schema: 'public', name: 'mat' },
+      ],
+    },
+  ]);
+  assert.deepEqual(read.diagnostics, []);
+});
+
+test('refuses a view dependency whose kind is not view or relation', async () => {
+  await assert.rejects(
+    mapCatalog(
+      payload({
+        views: [
+          viewRow('public', 'v', {
+            dependsOn: [{ kind: 'edge', schema: 'public', name: 'base' }],
+          }),
+        ],
+      }),
+    ),
+    /catalog payload\.views\[0\]\.dependsOn\[0\]\.kind must be "view" or "relation"/,
+  );
+});
+
 test('refuses a view output column whose type is not a string', async () => {
   await assert.rejects(
     mapCatalog(

@@ -1233,6 +1233,9 @@ function copyView(view: View): View {
   return {
     ...view,
     ...(view.columns === undefined ? {} : { columns: view.columns.map(copyViewColumn) }),
+    ...(view.dependsOn === undefined
+      ? {}
+      : { dependsOn: view.dependsOn.map((dependency) => ({ ...dependency })) }),
     ...(view.indexes === undefined ? {} : { indexes: view.indexes.map(copyIndex) }),
   };
 }

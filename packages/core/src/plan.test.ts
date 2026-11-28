@@ -47,6 +47,7 @@ import type {
   TablePersistence,
   UniqueConstraint,
   View,
+  ViewDependency,
   ViewOutputColumn,
 } from './model.ts';
 import type {
@@ -9316,4 +9317,211 @@ test('privilege step payloads are independent copies of the target', () => {
   if (created.kind !== 'create-table') throw new Error('expected a create-table step');
   (created.table.privileges![0] as { grantee: string }).grantee = 'mutated';
   assert.equal(privileges[0]!.grantee, 'reader');
+});
+
+/**
+ * View dependency facts drive a pure plan-time pass: drops run dependents-first on the baseline
+ * graph, creates and replaces run dependencies-first on the target graph, and an unsafe graph is
+ * refused before any step is emitted. A dependency's `kind` disambiguates a view from any other
+ * relation, so a table or sequence fact never triggers a refusal.
+ */
+const viewDep = (
+  kind: ViewDependency['kind'],
+  name: string,
+  schema = 'public',
+): ViewDependency => ({ kind, schema, name });
+
+/** The names of the view steps of one kind, in emitted order. */
+const viewStepNames = (
+  steps: readonly Step[],
+  kind: 'drop-view' | 'create-view' | 'replace-view',
+): string[] =>
+  steps.flatMap((step) => {
+    if (step.kind === 'drop-view' && kind === 'drop-view') return [step.view.name];
+    if ((step.kind === 'create-view' || step.kind === 'replace-view') && kind === step.kind) {
+      return [step.view.name];
+    }
+    return [];
+  });
+
+test('view drops are ordered dependents-first on the baseline graph, stable by identity', () => {
+  const baseline = viewModel([
+    view('base'),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+    view('zz'),
+  ]);
+
+  // Once `dep` is emitted, `base` becomes ready and wins the tie against the unrelated `zz`.
+  assert.deepStrictEqual(viewStepNames(plan(baseline, viewModel([])).steps, 'drop-view'), [
+    'dep',
+    'base',
+    'zz',
+  ]);
+});
+
+test('view creates are ordered dependencies-first on the target graph, stable by identity', () => {
+  const target = viewModel([
+    view('zz'),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+    view('base'),
+  ]);
+
+  // Once `base` is emitted, `dep` becomes ready and wins the tie against the unrelated `zz`.
+  assert.deepStrictEqual(viewStepNames(plan(viewModel([]), target).steps, 'create-view'), [
+    'base',
+    'dep',
+    'zz',
+  ]);
+});
+
+test('view replaces are ordered dependencies-first on the target graph', () => {
+  const baseline = viewModel([
+    view('base'),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+    view('zz'),
+  ]);
+  const target = viewModel([
+    view('base', { definition: 'SELECT 2' }),
+    view('dep', { definition: 'SELECT 3', dependsOn: [viewDep('view', 'base')] }),
+    view('zz', { definition: 'SELECT 4' }),
+  ]);
+
+  assert.deepStrictEqual(viewStepNames(plan(baseline, target).steps, 'replace-view'), [
+    'base',
+    'dep',
+    'zz',
+  ]);
+});
+
+test('a target-only dependent does not block a view recreation and is created after its base', () => {
+  const baseline = viewModel([view('base', { columns: viewColumns(['a', 'integer']) })]);
+  const target = viewModel([
+    view('base', { columns: viewColumns(['x', 'integer']) }),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+  ]);
+
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(viewStepNames(steps, 'drop-view'), ['base']);
+  assert.deepStrictEqual(viewStepNames(steps, 'create-view'), ['base', 'dep']);
+});
+
+test('a baseline dependent whose target drops the fact blocks a view recreation', () => {
+  const baseline = viewModel([
+    view('base', { columns: viewColumns(['a', 'integer']) }),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+  ]);
+  const target = viewModel([view('base', { columns: viewColumns(['x', 'integer']) }), view('dep')]);
+
+  assert.throws(() => plan(baseline, target), {
+    name: 'ViewDependencyError',
+    message:
+      'view dependency: view public.base cannot be recreated while dependent views public.dep are not scheduled for drop',
+  });
+});
+
+test('an unchanged dependent blocks a view recreation and every blocker is named', () => {
+  const dependsOn = [viewDep('view', 'base')];
+  const baseline = viewModel([
+    view('base', { columns: viewColumns(['a', 'integer']) }),
+    view('zdep', { dependsOn }),
+    view('adep', { dependsOn }),
+  ]);
+  const target = viewModel([
+    view('base', { columns: viewColumns(['x', 'integer']) }),
+    view('zdep', { dependsOn }),
+    view('adep', { dependsOn }),
+  ]);
+
+  assert.throws(() => plan(baseline, target), {
+    name: 'ViewDependencyError',
+    message:
+      'view dependency: view public.base cannot be recreated while dependent views public.adep, public.zdep are not scheduled for drop',
+  });
+});
+
+test('dependents scheduled as replaces are converted to drop and create ahead of the base', () => {
+  const baseline = viewModel([
+    view('base', { columns: viewColumns(['a', 'integer']) }),
+    view('dep', { dependsOn: [viewDep('view', 'base')] }),
+  ]);
+  const target = viewModel([
+    view('base', { columns: viewColumns(['x', 'integer']) }),
+    view('dep', { definition: 'SELECT 2', dependsOn: [viewDep('view', 'base')] }),
+  ]);
+
+  const steps = plan(baseline, target).steps;
+  assert.deepStrictEqual(viewStepNames(steps, 'drop-view'), ['dep', 'base']);
+  assert.deepStrictEqual(viewStepNames(steps, 'create-view'), ['base', 'dep']);
+  assert.deepStrictEqual(viewStepNames(steps, 'replace-view'), []);
+});
+
+test('a relation dependency never blocks or refuses a view recreation', () => {
+  const baseline = viewModel([
+    view('base', { columns: viewColumns(['a', 'integer']) }),
+    view('dep', { dependsOn: [viewDep('relation', 'base')] }),
+  ]);
+  const target = viewModel([
+    view('base', { columns: viewColumns(['x', 'integer']) }),
+    view('dep', { dependsOn: [viewDep('relation', 'base')] }),
+  ]);
+
+  assert.deepStrictEqual(viewStepNames(plan(baseline, target).steps, 'drop-view'), ['base']);
+});
+
+test('a cycle among scheduled drop views is refused with every member named', () => {
+  const baseline = viewModel([
+    view('a', { dependsOn: [viewDep('view', 'b')] }),
+    view('b', { dependsOn: [viewDep('view', 'a')] }),
+  ]);
+
+  assert.throws(() => plan(baseline, viewModel([])), {
+    name: 'ViewDependencyError',
+    message: 'view dependency cycle among views public.a, public.b',
+  });
+});
+
+test('a cycle among unscheduled views does not refuse an unrelated plan', () => {
+  const cyclic = [
+    view('a', { dependsOn: [viewDep('view', 'b')] }),
+    view('b', { dependsOn: [viewDep('view', 'a')] }),
+  ];
+  const baseline = viewModel(cyclic);
+  const target = viewModel(cyclic, table('t', { columns: [column('id', { type: 'integer' })] }));
+
+  assert.deepStrictEqual(
+    plan(baseline, target).steps.map((step) => step.kind),
+    ['create-table'],
+  );
+});
+
+test('a scheduled view depending on an unmodeled view is refused', () => {
+  const baseline = viewModel([view('a', { dependsOn: [viewDep('view', 'missing')] })]);
+
+  assert.throws(() => plan(baseline, viewModel([])), {
+    name: 'ViewDependencyError',
+    message: 'view dependency: view public.a depends on unmodeled view public.missing',
+  });
+});
+
+test('an unmodeled relation dependency never refuses', () => {
+  const baseline = viewModel([view('a', { dependsOn: [viewDep('relation', 'missing')] })]);
+
+  assert.deepStrictEqual(viewStepNames(plan(baseline, viewModel([])).steps, 'drop-view'), ['a']);
+});
+
+test('an unmodeled view dependency in the target is refused at create time', () => {
+  const target = viewModel([view('a', { dependsOn: [viewDep('view', 'missing')] })]);
+
+  assert.throws(() => plan(viewModel([]), target), {
+    name: 'ViewDependencyError',
+    message: 'view dependency: view public.a depends on unmodeled view public.missing',
+  });
+});
+
+test('an unmodeled view dependency outside the scheduled set does not refuse', () => {
+  const views = [view('a', { dependsOn: [viewDep('view', 'missing')] }), view('b')];
+  const baseline = viewModel(views);
+  const target = viewModel(views);
+
+  assert.deepStrictEqual(plan(baseline, target).steps, []);
 });

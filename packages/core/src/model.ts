@@ -528,6 +528,16 @@ export interface ViewOutputColumn {
 }
 
 /**
+ * One relation a view reads, recorded as a plan-time dependency fact. The required `kind`
+ * discriminates a view from every other relation, so a table or sequence dependency can never be
+ * mistaken for an unmodeled view. Absent from `View.dependsOn` means no facts were recorded.
+ */
+export interface ViewDependency extends ViewIdentity {
+  /** Whether the referenced relation is a view (`v`/`m`) or any other relation. */
+  readonly kind: 'view' | 'relation';
+}
+
+/**
  * A view or materialized view and its definition. One array holds both kinds and one identity
  * names either, so a view and a materialized view never coexist under one name; `materialized`
  * is the discriminator that decides how a migration recreates it.
@@ -546,6 +556,12 @@ export interface View extends ViewIdentity {
    * Absent means unknown: a side without verifiable columns never drives the preflight decision.
    */
   readonly columns?: readonly ViewOutputColumn[];
+  /**
+   * The relations this view reads, as dependency facts for plan-time ordering. `view` members
+   * order drops/creates and gate the typed refusal; `relation` members are recorded for fidelity
+   * but never refuse. Absent means no facts were recorded.
+   */
+  readonly dependsOn?: readonly ViewDependency[];
   /**
    * Standalone indexes on a materialized view, in source order; absent means none. Matviews
    * only: an ordinary view cannot own an index. An empty array normalizes to absence in a

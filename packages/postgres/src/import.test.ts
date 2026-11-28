@@ -4783,6 +4783,7 @@ test('imports plain views and materialized views, sorted by identity', async () 
       name: 'plain',
       materialized: false,
       definition: "SELECT a,b,'AS' AS label FROM app.t WHERE a <> 'x' AND b IS NOT NULL",
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',
@@ -4796,6 +4797,67 @@ test('imports plain views and materialized views, sorted by identity', async () 
       materialized: false,
       definition: 'SELECT 1 AS one',
       columns: [{ name: 'one', type: '' }],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports view dependencies from range tables, qualifying unqualified names with the view schema', async () => {
+  const dump = [
+    `CREATE VIEW app.base AS SELECT 1 AS id;`,
+    `CREATE VIEW app.mid AS SELECT id FROM base;`,
+    `CREATE VIEW app.top AS SELECT mid.id FROM app.mid JOIN public.events e ON e.id = mid.id;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'base',
+      materialized: false,
+      definition: 'SELECT 1 AS id',
+      columns: [{ name: 'id', type: '' }],
+    },
+    {
+      schema: 'app',
+      name: 'mid',
+      materialized: false,
+      definition: 'SELECT id FROM base',
+      dependsOn: [{ kind: 'view', schema: 'app', name: 'base' }],
+    },
+    {
+      schema: 'app',
+      name: 'top',
+      materialized: false,
+      definition: 'SELECT mid.id FROM app.mid JOIN public.events e ON e.id = mid.id',
+      dependsOn: [
+        { kind: 'relation', schema: 'public', name: 'events' },
+        { kind: 'view', schema: 'app', name: 'mid' },
+      ],
+    },
+  ]);
+  assert.deepEqual(diagnostics, []);
+});
+
+test('imports table and sequence range dependencies as relations, deduplicated by identity', async () => {
+  const dump = [
+    `CREATE TABLE app.t (id integer);`,
+    `CREATE VIEW app.v AS SELECT a.id FROM app.t a JOIN app.t b ON a.id = b.id, app.t_id_seq;`,
+  ].join('\n');
+
+  const { model, diagnostics } = await importDump(dump);
+
+  assert.deepEqual(model.views, [
+    {
+      schema: 'app',
+      name: 'v',
+      materialized: false,
+      definition: 'SELECT a.id FROM app.t a JOIN app.t b ON a.id = b.id,app.t_id_seq',
+      dependsOn: [
+        { kind: 'relation', schema: 'app', name: 't' },
+        { kind: 'relation', schema: 'app', name: 't_id_seq' },
+      ],
     },
   ]);
   assert.deepEqual(diagnostics, []);
@@ -4870,6 +4932,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'both',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'local',
     },
     {
@@ -4877,6 +4940,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'implicit',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'cascaded',
     },
     {
@@ -4884,6 +4948,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'local',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'local',
     },
     {
@@ -4891,6 +4956,7 @@ test('reads view check options from the clause and from a check_option reloption
       name: 'option',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
       checkOption: 'cascaded',
     },
   ]);
@@ -4917,6 +4983,7 @@ test('flags every view reloption by name, still importing the view', async () =>
       name: 'options',
       materialized: false,
       definition: 'SELECT id FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
   ]);
   assert.deepEqual(diagnostics.map(describeDiagnostic), [
@@ -5235,12 +5302,14 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       materialized: false,
       definition:
         'WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',
       name: 'dollar',
       materialized: false,
       definition: 'SELECT a,(b + 1) AS c,$$WITH NO DATA$$ AS d,$tag$ ? AS ? $tag$ AS e FROM app.t',
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',
@@ -5267,6 +5336,7 @@ test('extracts view bodies past comments, quotes, dollar quotes, CTEs, and non-A
       materialized: false,
       definition: 'SELECT(a + 1) AS "AS" FROM app.t',
       columns: [{ name: 'AS', type: '' }],
+      dependsOn: [{ kind: 'relation', schema: 'app', name: 't' }],
     },
     {
       schema: 'app',

@@ -182,6 +182,7 @@ import type {
   UniqueConstraint,
   View,
   ViewCheckOption,
+  ViewDependency,
   ViewOutputColumn,
 } from '@schemamill/core';
 import {
@@ -3318,6 +3319,60 @@ function viewOutputColumns(query: Node | undefined): readonly ViewOutputColumn[]
 }
 
 /**
+ * Range-table relations a view reads, as dependency facts. Names are taken from every `RangeVar`
+ * reachable in the query tree (including `JOIN` arms and subqueries); an unqualified name is
+ * qualified with the view's own schema. A name already imported as a view is a `view` dependency,
+ * everything else — tables, sequences, and unmodeled relations — is a `relation` fact. Order is
+ * canonical by kind then identity, and repeated references to one relation collapse. The
+ * `search_path` caveat (a bare name that in DDL could resolve to another schema) is a named
+ * residual: the dump's own qualification is the only evidence available here.
+ */
+function viewDependencies(
+  query: Node | undefined,
+  schema: string,
+  views: ReadonlyMap<string, ViewDraft>,
+): readonly ViewDependency[] | undefined {
+  if (query === undefined) return undefined;
+  const relations: RangeVar[] = [];
+  collectRangeVars(query, relations);
+  const unique = new Map<string, ViewDependency>();
+  for (const relation of relations) {
+    if (relation.relname === undefined || relation.relname === '') continue;
+    const dependencySchema = relation.schemaname ?? schema;
+    const dependency: ViewDependency = {
+      kind: views.has(tableKey(dependencySchema, relation.relname)) ? 'view' : 'relation',
+      schema: dependencySchema,
+      name: relation.relname,
+    };
+    unique.set(tableKey(dependencySchema, relation.relname), dependency);
+  }
+  if (unique.size === 0) return undefined;
+  return [...unique.values()].sort(
+    (left, right) =>
+      compareStrings(left.kind, right.kind) ||
+      compareStrings(left.schema, right.schema) ||
+      compareStrings(left.name, right.name),
+  );
+}
+
+/** Walks every AST value under `node`, collecting relation references in source order. */
+function collectRangeVars(value: unknown, found: RangeVar[]): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectRangeVars(item, found);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'RangeVar') {
+      const relation = child as RangeVar | undefined;
+      if (relation !== undefined) found.push(relation);
+      continue;
+    }
+    if (child !== null && typeof child === 'object') collectRangeVars(child, found);
+  }
+}
+
+/**
  * Imports a plain view: the definition text, the check option, and a named flag for every inline
  * attribute the model cannot carry. A recursive view is skipped whole and named; see
  * `viewDefinitionText`.
@@ -3378,6 +3433,8 @@ function translateCreateView(
   };
   const columns = viewOutputColumns(create.query);
   if (columns !== undefined) draft.columns = columns;
+  const dependsOn = viewDependencies(create.query, schema, views);
+  if (dependsOn !== undefined) draft.dependsOn = dependsOn;
   if (checkOption !== undefined) draft.checkOption = checkOption;
   views.set(tableKey(schema, name), draft);
 }
@@ -5271,6 +5328,9 @@ function finalizeView(draft: ViewDraft): View {
   };
   if (draft.columns !== undefined) {
     view.columns = draft.columns.map((column) => ({ name: column.name, type: column.type }));
+  }
+  if (draft.dependsOn !== undefined) {
+    view.dependsOn = draft.dependsOn.map((dependency) => ({ ...dependency }));
   }
   if (indexes !== undefined) view.indexes = [...indexes].sort(compareIndexes);
   if (draft.checkOption !== undefined) view.checkOption = draft.checkOption;

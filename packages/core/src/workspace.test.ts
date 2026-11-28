@@ -2134,6 +2134,44 @@ test('serializeModel round-trips view output columns, including unknown types, w
   assert.doesNotMatch(serialized.slice(serialized.indexOf('"name": "unknown"')), /"columns"/);
 });
 
+test('serializeModel round-trips view dependencies and rejects an unknown dependency kind', async (t) => {
+  const dir = await fixtureDir(t);
+  const model: Model = {
+    tables: [],
+    sequences: [],
+    views: [
+      { schema: 'public', name: 'bare', materialized: false, definition: 'SELECT 2' },
+      {
+        schema: 'public',
+        name: 'dependent',
+        materialized: false,
+        definition: 'SELECT 1',
+        dependsOn: [
+          { kind: 'view', schema: 'public', name: 'base' },
+          { kind: 'relation', schema: 'app', name: 'events' },
+        ],
+      },
+    ],
+    extensions: [],
+  };
+  await writeWorkspace(dir, serializeModel(model));
+
+  const resolved = await resolveOk(dir);
+  assert.deepStrictEqual(resolved.model, model);
+  assert.equal(serializeModel(resolved.model), serializeModel(model));
+
+  const bad = JSON.stringify({
+    tables: [],
+    sequences: [],
+    views: [viewPayload({ dependsOn: [{ kind: 'edge', schema: 'public', name: 'base' }] })],
+  });
+  await writeWorkspace(dir, bad);
+  assert.equal(
+    (await resolveFail(dir)).message,
+    'invalid model: views[0].dependsOn[0].kind is not a valid view dependency kind',
+  );
+});
+
 test('serializeModel round-trips extensions with and without a comment without loss', async (t) => {
   const dir = await fixtureDir(t);
   const model: Model = {

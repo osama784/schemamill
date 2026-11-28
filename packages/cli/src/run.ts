@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import type { Diagnostic, Model, Plan, ReadResult } from '@schemamill/core';
-import { resolveWorkspace, SequenceOwnershipError } from '@schemamill/core';
+import { resolveWorkspace, SequenceOwnershipError, ViewDependencyError } from '@schemamill/core';
 import { importDump } from '@schemamill/postgres';
 
 import { formatDiagnostics, hasErrors, type Side } from './diagnostics.ts';
@@ -16,7 +16,7 @@ import { formatDiagnostics, hasErrors, type Side } from './diagnostics.ts';
  * `schemamill: <message>` line; a workspace resolution failure prints one `schemamill:
  * <message>` line carrying core's diagnostic verbatim; a returned `null` means such a failure
  * was reported, so the command must print no artifact and exit 1. A plan-time contract error —
- * `plan()` refusing a target sequence whose `ownedBy` does not resolve — goes through
+ * `plan()` refusing a dangling target sequence owner or an unsafe view dependency — goes through
  * `planOrReport`, which prints one `schemamill: <message>` line, sets the exit code to 1, and
  * returns `undefined`; every other thrown error is a bug and propagates. Otherwise each imported
  * side's diagnostics are written in order — baseline first, then target — and the returned exit
@@ -244,17 +244,19 @@ export async function importSide(ddl: string): Promise<ReadResult<Model, Diagnos
 }
 
 /**
- * Runs `run` and returns its plan, or reports the one reachable plan-time contract error and
- * returns `undefined`: a target sequence whose `ownedBy` names a table or column the target model
- * does not carry makes core's `plan()` throw `SequenceOwnershipError`, which is written as
- * exactly one `schemamill: <message>` stderr line with the exit code set to 1. Every other thrown
- * error is a bug and is rethrown. A command must print no artifact after `undefined`.
+ * Runs `run` and returns its plan, or reports a plan-time contract error and returns `undefined`:
+ * a dangling target sequence owner throws `SequenceOwnershipError` and an unsafe view dependency
+ * graph throws `ViewDependencyError`. Either is written as exactly one `schemamill: <message>`
+ * stderr line with the exit code set to 1. Every other thrown error is a bug and is rethrown. A
+ * command must print no artifact after `undefined`.
  */
 export function planOrReport(run: () => Plan): Plan | undefined {
   try {
     return run();
   } catch (error) {
-    if (!(error instanceof SequenceOwnershipError)) throw error;
+    if (!(error instanceof SequenceOwnershipError) && !(error instanceof ViewDependencyError)) {
+      throw error;
+    }
     process.stderr.write(`schemamill: ${error.message}\n`);
     process.exitCode = 1;
     return undefined;
